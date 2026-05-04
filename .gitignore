@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock
+.env
+.env.local
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.helm/
+.idea/
+.vscode/
+*.swp
+.DS_Store
