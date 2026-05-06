@@ -1,0 +1,69 @@
+[package]
+name = "helm-workspace"
+version = "0.1.2"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/helm-core",
+    "crates/helm-providers",
+    "crates/helm-tools",
+    "crates/helm-memory",
+    "crates/helm-agent",
+    "helm-cli",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/white-phantom/helm"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.29"
+mockito = "1"
+pretty_assertions = "1"
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+jsonschema = "0.28"
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-test = "0.4"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+helm-core = { path = "crates/helm-core" }
+helm-providers = { path = "crates/helm-providers" }
+helm-tools = { path = "crates/helm-tools" }
+helm-memory = { path = "crates/helm-memory" }
+helm-agent = { path = "crates/helm-agent" }
+
+[dev-dependencies]
+async-trait.workspace = true
+helm-agent.workspace = true
+helm-core.workspace = true
+helm-memory.workspace = true
+helm-providers.workspace = true
+helm-tools.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true

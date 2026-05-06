@@ -1,0 +1,35 @@
+[package]
+name = "helm-cli"
+version = "0.1.2"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "helm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+helm-agent.workspace = true
+helm-core.workspace = true
+helm-memory.workspace = true
+helm-providers.workspace = true
+helm-tools.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+mockito.workspace = true
+tempfile.workspace = true
