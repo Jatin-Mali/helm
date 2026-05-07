@@ -54,7 +54,14 @@ async fn groq_expands_shell_composition_in_output_file() {
         output_path.display()
     );
 
-    let _result = agent.run(&task).await.unwrap();
+    let _result = match agent.run(&task).await {
+        Ok(result) => result,
+        Err(error) if !live_strict() && is_live_provider_environment_error(&error.to_string()) => {
+            eprintln!("skipping Groq shell composition live test: {error}");
+            return;
+        }
+        Err(error) => panic!("Groq shell composition live test failed: {error}"),
+    };
     let content = fs::read_to_string(&output_path).unwrap();
 
     assert!(!content.contains("$(date)"));
@@ -67,4 +74,16 @@ fn contains_four_digit_year(text: &str) -> bool {
     text.as_bytes()
         .windows(4)
         .any(|window| window.iter().all(u8::is_ascii_digit))
+}
+
+fn is_live_provider_environment_error(error: &str) -> bool {
+    error.contains("HTTP 401")
+        || error.contains("invalid_api_key")
+        || error.contains("Invalid API Key")
+        || error.contains("HTTP 429")
+        || error.to_ascii_lowercase().contains("rate limit")
+}
+
+fn live_strict() -> bool {
+    std::env::var_os("HELM_LIVE_STRICT").is_some()
 }

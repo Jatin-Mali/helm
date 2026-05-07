@@ -107,6 +107,20 @@ pub fn quirks_for(provider: &str, model: &str) -> ProviderQuirks {
         };
     }
 
+    // gpt-oss models (e.g. openai/gpt-oss-20b on Groq) leak special tokens like
+    // <|channel|>commentary into tool names; force temperature=0 for determinism.
+    if model_lc.contains("gpt-oss") {
+        return ProviderQuirks {
+            force_temperature: Some(0.0),
+            system_prompt_addendum: None,
+            expected_format: ExpectedFormat::Native,
+            user_note: Some(
+                "gpt-oss models may leak special tokens into tool names; use llama-3.3-70b-versatile on Groq instead."
+                    .to_owned(),
+            ),
+        };
+    }
+
     // Anthropic / Gemini / NvidiaNim — full native tool call support, no overrides needed.
     ProviderQuirks::default()
 }

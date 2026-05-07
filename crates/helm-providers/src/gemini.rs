@@ -4,9 +4,10 @@ use std::{collections::HashMap, env, time::Duration};
 
 use async_trait::async_trait;
 use helm_core::{ContentBlock, Message, ProviderError, Role};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::provider::{ChatRequest, ChatResponse, Provider, StopReason, ToolSchema, Usage};
@@ -20,6 +21,7 @@ pub struct GeminiProvider {
     api_key: String,
     base_url: String,
     http: Client,
+    retry_delays: Vec<Duration>,
 }
 
 impl GeminiProvider {
@@ -45,6 +47,23 @@ impl GeminiProvider {
         api_key: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Result<Self, ProviderError> {
+        Self::with_base_url_and_retry_delays(
+            api_key,
+            base_url,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+            ],
+        )
+    }
+
+    /// Builds a Gemini provider with custom retry delays for deterministic tests.
+    pub fn with_base_url_and_retry_delays(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        retry_delays: Vec<Duration>,
+    ) -> Result<Self, ProviderError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -53,6 +72,7 @@ impl GeminiProvider {
             api_key: api_key.into(),
             base_url: base_url.into(),
             http,
+            retry_delays,
         })
     }
 
@@ -69,6 +89,47 @@ impl GeminiProvider {
             self.api_key
         )
     }
+
+    async fn post_once(
+        &self,
+        model: &str,
+        request: &ChatRequest,
+    ) -> Result<GeminiAttempt, ProviderError> {
+        let response = self
+            .http
+            .post(self.endpoint(model))
+            .header("content-type", "application/json")
+            .json(&GeminiRequest::from_chat_request(request)?)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| ProviderError::Request(error.to_string()))?;
+        if status.is_success() {
+            let parsed = serde_json::from_str::<GeminiResponse>(&body)
+                .map_err(|error| ProviderError::MalformedResponse(error.to_string()))?;
+            return Ok(GeminiAttempt::Success(parsed.into_chat_response()?));
+        }
+        Ok(GeminiAttempt::Status {
+            status,
+            body,
+            retryable: status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
+        })
+    }
+
+    async fn wait_before_retry(&self, attempt_index: usize) {
+        let delay = self
+            .retry_delays
+            .get(attempt_index)
+            .copied()
+            .unwrap_or_else(|| Duration::from_secs(0));
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -83,29 +144,49 @@ impl Provider for GeminiProvider {
         } else {
             request.model.as_str()
         };
-        let response = self
-            .http
-            .post(self.endpoint(model))
-            .header("content-type", "application/json")
-            .json(&GeminiRequest::from_chat_request(&request)?)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| ProviderError::Request(error.to_string()))?;
-        if !status.is_success() {
-            return Err(ProviderError::HttpStatus {
+        let max_attempts = self.retry_delays.len().max(1);
+        let mut last_status = None;
+        for attempt_index in 0..max_attempts {
+            match self.post_once(model, &request).await? {
+                GeminiAttempt::Success(response) => return Ok(response),
+                GeminiAttempt::Status {
+                    status,
+                    body,
+                    retryable,
+                } => {
+                    if !retryable {
+                        return Err(ProviderError::HttpStatus {
+                            status: status.as_u16(),
+                            body,
+                        });
+                    }
+                    last_status = Some((status, body));
+                    if attempt_index + 1 < max_attempts {
+                        self.wait_before_retry(attempt_index).await;
+                    }
+                }
+            }
+        }
+        match last_status {
+            Some((status, body)) => Err(ProviderError::HttpStatus {
                 status: status.as_u16(),
                 body,
-            });
+            }),
+            None => Err(ProviderError::Other(
+                "gemini request failed without status".to_owned(),
+            )),
         }
-        let parsed = serde_json::from_str::<GeminiResponse>(&body)
-            .map_err(|error| ProviderError::MalformedResponse(error.to_string()))?;
-        parsed.into_chat_response()
     }
+}
+
+#[derive(Debug)]
+enum GeminiAttempt {
+    Success(ChatResponse),
+    Status {
+        status: StatusCode,
+        body: String,
+        retryable: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -219,7 +300,7 @@ impl GeminiTool {
             function_declarations: vec![GeminiFunctionDeclaration {
                 name: schema.name.clone(),
                 description: schema.description.clone(),
-                parameters: schema.input_schema.clone(),
+                parameters: sanitize_gemini_schema(&schema.input_schema),
             }],
         }
     }
@@ -367,15 +448,34 @@ fn map_reqwest_error(error: reqwest::Error) -> ProviderError {
     }
 }
 
+fn sanitize_gemini_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(object) => {
+            let mut sanitized = Map::new();
+            for (key, value) in object {
+                if key == "additionalProperties" {
+                    continue;
+                }
+                sanitized.insert(key.clone(), sanitize_gemini_schema(value));
+            }
+            Value::Object(sanitized)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(sanitize_gemini_schema).collect()),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use helm_core::{ContentBlock, Message, ProviderError};
     use mockito::Matcher;
     use serde_json::json;
 
     use crate::provider::{ChatRequest, Provider, StopReason, ToolSchema};
 
-    use super::{GeminiProvider, GeminiRequest};
+    use super::{GeminiProvider, GeminiRequest, sanitize_gemini_schema};
 
     fn request() -> ChatRequest {
         ChatRequest {
@@ -584,6 +684,77 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn retry_503_then_success() {
+        let mut server = mockito::Server::new_async().await;
+        let failing = server
+            .mock("POST", "/v1beta/models/gemini-2.5-flash:generateContent")
+            .match_query(Matcher::UrlEncoded("key".to_owned(), "key".to_owned()))
+            .with_status(503)
+            .with_body("busy")
+            .expect(1)
+            .create_async()
+            .await;
+        let succeeding = server
+            .mock("POST", "/v1beta/models/gemini-2.5-flash:generateContent")
+            .match_query(Matcher::UrlEncoded("key".to_owned(), "key".to_owned()))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": "done"}]},
+                        "finishReason": "STOP"
+                    }]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = GeminiProvider::with_base_url_and_retry_delays(
+            "key",
+            server.url(),
+            vec![Duration::ZERO, Duration::ZERO],
+        )
+        .unwrap();
+
+        let response = provider.chat(request()).await.unwrap();
+
+        assert_eq!(
+            response.content,
+            vec![ContentBlock::Text("done".to_owned())]
+        );
+        failing.assert_async().await;
+        succeeding.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn retry_503_exhausts_error_path() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1beta/models/gemini-2.5-flash:generateContent")
+            .match_query(Matcher::UrlEncoded("key".to_owned(), "key".to_owned()))
+            .with_status(503)
+            .with_body("busy")
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = GeminiProvider::with_base_url_and_retry_delays(
+            "key",
+            server.url(),
+            vec![Duration::ZERO, Duration::ZERO],
+        )
+        .unwrap();
+
+        let error = provider.chat(request()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::HttpStatus { status: 503, .. }
+        ));
+        mock.assert_async().await;
+    }
+
     #[test]
     fn unknown_tool_result_id_errors_edge_case() {
         let mut request = request();
@@ -596,5 +767,57 @@ mod tests {
         let error = GeminiRequest::from_chat_request(&request).unwrap_err();
 
         assert!(matches!(error, ProviderError::InvalidConversation { .. }));
+    }
+
+    #[test]
+    fn gemini_schema_strips_additional_properties_recursively() {
+        let input = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "properties": {
+                        "PATH": {
+                            "type": "string",
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false
+                    }
+                }
+            }
+        });
+
+        let sanitized = sanitize_gemini_schema(&input);
+
+        assert_eq!(
+            sanitized,
+            json!({
+                "type": "object",
+                "properties": {
+                    "env": {
+                        "type": "object",
+                        "properties": {
+                            "PATH": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object"
+                        }
+                    }
+                }
+            })
+        );
     }
 }

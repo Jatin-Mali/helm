@@ -215,6 +215,7 @@ struct FileProviderConfig {
     base_url: Option<String>,
     model: Option<String>,
     api_key_env: Option<String>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +224,7 @@ struct ProviderSettings {
     base_url: Option<String>,
     model: Option<String>,
     api_key_env: Option<String>,
+    api_key: Option<String>,
     source: ProviderSource,
 }
 
@@ -254,6 +256,7 @@ impl ProviderSettings {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             api_key_env: self.api_key_env.clone(),
+            api_key: self.api_key.clone(),
             source: self.source,
         }
     }
@@ -300,6 +303,11 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Command::Run(args) => {
+            if config.is_none() && provider_settings.source == ProviderSource::Fallback {
+                eprintln!("HELM is not configured yet.");
+                eprintln!("Run `helm init` to choose a provider and set your API key.");
+                return Ok(());
+            }
             let provider_choice = resolve_provider_choice(provider_settings.choice);
             let (provider, model) =
                 build_provider(&provider_settings.with_choice(provider_choice))?;
@@ -410,8 +418,7 @@ async fn run() -> Result<()> {
             }
         },
         Command::Init(args) => {
-            let output = initialize_helm(&config_path, &db_path, &provider_settings, args.force)?;
-            print!("{output}");
+            interactive_init(&config_path, &db_path, args.force)?;
         }
         Command::Tui => {
             tui::run_tui(tui::TuiRuntime {
@@ -500,6 +507,7 @@ where
         provider_config.and_then(|provider| provider.model.as_ref().map(ToOwned::to_owned))
     });
     let api_key_env = provider_config.and_then(|provider| provider.api_key_env.clone());
+    let stored_api_key = provider_config.and_then(|provider| provider.api_key.clone());
 
     let selected = if let Some(choice) = cli_provider {
         Some((choice, ProviderSource::Cli))
@@ -516,13 +524,14 @@ where
 
     let mut settings = match selected {
         Some((ProviderChoice::Auto, _)) | None => {
-            auto_detect_provider_settings(base_url, model, api_key_env, &env_lookup)
+            auto_detect_provider_settings(base_url, model, api_key_env, stored_api_key, &env_lookup)
         }
         Some((choice, source)) => ProviderSettings {
             choice,
             base_url,
             model,
             api_key_env,
+            api_key: stored_api_key,
             source,
         },
     };
@@ -540,6 +549,7 @@ fn auto_detect_provider_settings<F>(
     base_url: Option<String>,
     model: Option<String>,
     api_key_env: Option<String>,
+    stored_api_key: Option<String>,
     env_lookup: &F,
 ) -> ProviderSettings
 where
@@ -570,6 +580,7 @@ where
                 base_url: detected_base_url,
                 model,
                 api_key_env: Some(env_name.to_owned()),
+                api_key: stored_api_key,
                 source: ProviderSource::EnvVar(env_name),
             };
         }
@@ -579,6 +590,7 @@ where
         base_url: base_url.or_else(|| Some(default_ollama_base_url())),
         model,
         api_key_env,
+        api_key: stored_api_key,
         source: ProviderSource::Fallback,
     }
 }
@@ -871,51 +883,163 @@ async fn render_audit_events(memory: &MemoryStore, episode: Option<&str>) -> Res
     Ok(format_audit_events(&events))
 }
 
-fn initialize_helm(
+fn write_helm_config(
     config_path: &Path,
     db_path: &Path,
-    settings: &ProviderSettings,
-    force: bool,
-) -> Result<String> {
-    if config_path.exists() && !force {
-        return Err(anyhow!(
-            "{} already exists; rerun with `helm init --force` to overwrite",
-            config_path.display()
-        ));
-    }
+    kind: &str,
+    model: &str,
+    base_url: Option<&str>,
+    api_key_env: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<()> {
     ensure_parent_dir(config_path)?;
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let kind = provider_choice_name(settings.choice);
-    let model = settings
-        .model
-        .clone()
-        .unwrap_or_else(|| default_model_name(settings.choice).to_owned());
-    let mut provider = toml::map::Map::new();
-    provider.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
-    provider.insert("model".to_owned(), toml::Value::String(model.clone()));
-    if let Some(base_url) = &settings.base_url {
-        provider.insert("base_url".to_owned(), toml::Value::String(base_url.clone()));
+    let mut provider_table = toml::map::Map::new();
+    provider_table.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
+    provider_table.insert("model".to_owned(), toml::Value::String(model.to_owned()));
+    if let Some(url) = base_url {
+        provider_table.insert("base_url".to_owned(), toml::Value::String(url.to_owned()));
     }
-    if let Some(api_key_env) = settings
-        .api_key_env
-        .clone()
-        .or_else(|| default_api_key_env(settings.choice).map(str::to_owned))
-    {
-        provider.insert("api_key_env".to_owned(), toml::Value::String(api_key_env));
+    if let Some(env_name) = api_key_env {
+        provider_table.insert(
+            "api_key_env".to_owned(),
+            toml::Value::String(env_name.to_owned()),
+        );
+    }
+    if let Some(key) = api_key {
+        provider_table.insert("api_key".to_owned(), toml::Value::String(key.to_owned()));
     }
     let mut root = toml::map::Map::new();
-    root.insert("provider".to_owned(), toml::Value::Table(provider));
+    root.insert("provider".to_owned(), toml::Value::Table(provider_table));
     let config_text = toml::to_string_pretty(&toml::Value::Table(root))?;
-    fs::write(config_path, config_text)
+    fs::write(config_path, &config_text)
         .with_context(|| format!("failed to write {}", config_path.display()))?;
-    Ok(format!(
-        "initialized HELM\nconfig: {}\ndatabase: {}\nprovider: {kind}\nmodel: {model}\n\nrun `helm doctor` next\n",
-        config_path.display(),
-        db_path.display()
-    ))
+    Ok(())
+}
+
+fn prompt(label: &str) -> Result<String> {
+    print!("{label}");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+    Ok(buf.trim().to_owned())
+}
+
+fn provider_key_url(choice: ProviderChoice) -> Option<&'static str> {
+    match choice {
+        ProviderChoice::Groq => Some("https://console.groq.com/keys"),
+        ProviderChoice::Anthropic => Some("https://console.anthropic.com/"),
+        ProviderChoice::Gemini => Some("https://aistudio.google.com/app/apikey"),
+        ProviderChoice::Openrouter => Some("https://openrouter.ai/keys"),
+        ProviderChoice::NvidiaNim => Some("https://build.nvidia.com/"),
+        _ => None,
+    }
+}
+
+fn interactive_init(config_path: &Path, db_path: &Path, force: bool) -> Result<()> {
+    if config_path.exists() && !force {
+        let answer = prompt(&format!(
+            "Config already exists at {}. Overwrite? [y/N] ",
+            config_path.display()
+        ))?;
+        if !answer.eq_ignore_ascii_case("y") {
+            println!("Aborted. Use `helm init --force` to overwrite.");
+            return Ok(());
+        }
+    }
+
+    println!("\nHELM — setup wizard\n");
+    println!("Choose your LLM provider:\n");
+    println!("  [1] Groq         (free, fast)  llama-3.3-70b-versatile");
+    println!("  [2] Anthropic    (Claude)       claude-3-5-haiku-20241022");
+    println!("  [3] Gemini       (Google)       gemini-2.0-flash");
+    println!("  [4] OpenRouter   (multi-model)  meta-llama/llama-3.3-70b-instruct");
+    println!("  [5] NVIDIA NIM   (hosted)       meta/llama-3.3-70b-instruct");
+    println!("  [6] Ollama       (local, free)  qwen3:4b");
+    println!("  [7] OpenAI-compat (custom URL)");
+    println!();
+
+    let choice = loop {
+        let answer = prompt("Enter number [1-7]: ")?;
+        match answer.as_str() {
+            "1" => break ProviderChoice::Groq,
+            "2" => break ProviderChoice::Anthropic,
+            "3" => break ProviderChoice::Gemini,
+            "4" => break ProviderChoice::Openrouter,
+            "5" => break ProviderChoice::NvidiaNim,
+            "6" => break ProviderChoice::Ollama,
+            "7" => break ProviderChoice::OpenaiCompat,
+            _ => println!("  Enter a number 1-7."),
+        }
+    };
+
+    let mut base_url: Option<String> = None;
+    let mut stored_key: Option<String> = None;
+
+    match choice {
+        ProviderChoice::Ollama => {
+            let url = prompt("Ollama URL [http://localhost:11434]: ")?;
+            if !url.is_empty() {
+                base_url = Some(url);
+            }
+        }
+        ProviderChoice::OpenaiCompat => {
+            let url = prompt("Base URL (e.g. https://api.openai.com/v1): ")?;
+            if !url.is_empty() {
+                base_url = Some(url);
+            }
+            let key = prompt("API key (leave blank if not required): ")?;
+            if !key.is_empty() {
+                stored_key = Some(key);
+            }
+        }
+        _ => {
+            let env_name = default_api_key_env(choice).unwrap_or("API_KEY");
+            if let Some(url) = provider_key_url(choice) {
+                println!("\nGet your API key at: {url}");
+            }
+            let key = prompt(&format!("Paste {env_name}: "))?;
+            if key.is_empty() {
+                println!("  (no key entered — you can set {env_name} in your shell later)");
+            } else {
+                stored_key = Some(key);
+            }
+        }
+    }
+
+    let default_model = default_model_name(choice);
+    let model_input = prompt(&format!("\nModel [{}]: ", default_model))?;
+    let model = if model_input.is_empty() {
+        default_model.to_owned()
+    } else {
+        model_input
+    };
+
+    let kind = provider_choice_name(choice);
+    write_helm_config(
+        config_path,
+        db_path,
+        kind,
+        &model,
+        base_url.as_deref(),
+        default_api_key_env(choice),
+        stored_key.as_deref(),
+    )?;
+
+    println!("\nConfig written: {}", config_path.display());
+    println!("  provider : {kind}");
+    println!("  model    : {model}");
+    println!();
+    println!("Next steps:");
+    println!("  helm doctor       — verify everything is working");
+    println!("  helm tui          — open the interactive terminal UI");
+    println!("  helm \"<task>\"     — run an agent task");
+    println!();
+
+    Ok(())
 }
 
 fn format_audit_events(events: &[AuditEventRecord]) -> String {
@@ -1575,11 +1699,10 @@ fn build_provider(settings: &ProviderSettings) -> Result<(Box<dyn Provider>, Str
                 .api_key_env
                 .as_deref()
                 .unwrap_or("ANTHROPIC_API_KEY");
-            let api_key = env::var(env_name).with_context(|| {
-                format!(
-                    "{env_name} is required for --provider anthropic; use --provider ollama for local models"
-                )
-            })?;
+            let api_key = env::var(env_name)
+                .ok()
+                .or_else(|| settings.api_key.clone())
+                .ok_or_else(|| anyhow!("{env_name} is not set; run `helm init` to configure"))?;
             let provider = AnthropicProvider::new(api_key)?;
             let model = settings
                 .model
@@ -1601,8 +1724,10 @@ fn build_provider(settings: &ProviderSettings) -> Result<(Box<dyn Provider>, Str
         ProviderChoice::Gemini => {
             let env_name = settings.api_key_env.as_deref().unwrap_or("GOOGLE_API_KEY");
             let api_key = env::var(env_name)
-                .or_else(|_| env::var("GEMINI_API_KEY"))
-                .with_context(|| format!("{env_name} or GEMINI_API_KEY is required for gemini"))?;
+                .ok()
+                .or_else(|| env::var("GEMINI_API_KEY").ok())
+                .or_else(|| settings.api_key.clone())
+                .ok_or_else(|| anyhow!("{env_name} is not set; run `helm init` to configure"))?;
             let provider = match settings.base_url.clone() {
                 Some(url) => GeminiProvider::with_base_url(api_key, url)?,
                 None => GeminiProvider::new(api_key)?,
@@ -1670,7 +1795,14 @@ fn resolve_provider_choice(choice: ProviderChoice) -> ProviderChoice {
 
 fn read_required_key(settings: &ProviderSettings, default_env: &str) -> Result<String> {
     let env_name = settings.api_key_env.as_deref().unwrap_or(default_env);
-    env::var(env_name).with_context(|| format!("{env_name} is required for {:?}", settings.choice))
+    env::var(env_name)
+        .ok()
+        .or_else(|| settings.api_key.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "{env_name} is not set and no key was found in config; run `helm init` to configure"
+            )
+        })
 }
 
 impl ProviderSource {
@@ -1700,7 +1832,7 @@ fn provider_choice_name(choice: ProviderChoice) -> &'static str {
 
 fn default_model_name(choice: ProviderChoice) -> &'static str {
     match choice {
-        ProviderChoice::Groq => "openai/gpt-oss-20b",
+        ProviderChoice::Groq => "llama-3.3-70b-versatile",
         ProviderChoice::Anthropic => AnthropicProvider::default_model(),
         ProviderChoice::Ollama | ProviderChoice::Auto => "qwen3:4b",
         ProviderChoice::Gemini => GeminiProvider::default_model(),
@@ -1710,7 +1842,7 @@ fn default_model_name(choice: ProviderChoice) -> &'static str {
     }
 }
 
-fn default_api_key_env(choice: ProviderChoice) -> Option<&'static str> {
+pub(crate) fn default_api_key_env(choice: ProviderChoice) -> Option<&'static str> {
     match choice {
         ProviderChoice::Groq => Some("GROQ_API_KEY"),
         ProviderChoice::Anthropic => Some("ANTHROPIC_API_KEY"),
@@ -1844,10 +1976,10 @@ mod tests {
     use super::{
         DoctorCheck, DoctorEnvReport, DoctorMemoryReport, DoctorOllamaModel, DoctorOllamaReport,
         DoctorProviderReport, DoctorQuirksReport, DoctorReport, DoctorToolReport, ProviderChoice,
-        ProviderSettings, ProviderSource, classify_exit_code, format_audit_events, format_models,
-        format_permissions, load_config, model_capability_warning_text, parse_capability_arg,
-        parse_cli_from, parse_scope_arg, render_doctor, render_replay, render_run_stdout,
-        resolve_provider_choice, resolve_provider_settings_with_env, supports_tools,
+        ProviderSource, classify_exit_code, format_audit_events, format_models, format_permissions,
+        load_config, model_capability_warning_text, parse_capability_arg, parse_cli_from,
+        parse_scope_arg, render_doctor, render_replay, render_run_stdout, resolve_provider_choice,
+        resolve_provider_settings_with_env, supports_tools,
     };
 
     fn empty_env(_name: &str) -> Option<String> {
@@ -1930,6 +2062,7 @@ mod tests {
                 base_url: Some("http://config:11434".to_owned()),
                 model: Some("qwen3:4b".to_owned()),
                 api_key_env: None,
+                api_key: None,
             }),
         };
 
@@ -1971,6 +2104,7 @@ mod tests {
                 base_url: None,
                 model: None,
                 api_key_env: None,
+                api_key: None,
             }),
         };
         let settings =
@@ -1991,6 +2125,7 @@ mod tests {
                 base_url: None,
                 model: Some("config-model".to_owned()),
                 api_key_env: None,
+                api_key: None,
             }),
         };
         let settings =
@@ -2010,6 +2145,7 @@ mod tests {
                 base_url: None,
                 model: None,
                 api_key_env: None,
+                api_key: None,
             }),
         };
         let settings =
@@ -2113,39 +2249,45 @@ mod tests {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let db_path = dir.path().join("helm.db");
-        let settings = ProviderSettings {
-            choice: ProviderChoice::Groq,
-            base_url: None,
-            model: Some("openai/gpt-oss-20b".to_owned()),
-            api_key_env: Some("GROQ_API_KEY".to_owned()),
-            source: ProviderSource::Cli,
-        };
 
-        let output = super::initialize_helm(&config_path, &db_path, &settings, false).unwrap();
+        super::write_helm_config(
+            &config_path,
+            &db_path,
+            "groq",
+            "llama-3.3-70b-versatile",
+            None,
+            Some("GROQ_API_KEY"),
+            Some("gsk_test"),
+        )
+        .unwrap();
         let config = fs::read_to_string(&config_path).unwrap();
 
-        assert!(output.contains("initialized HELM"));
         assert!(config.contains("kind = \"groq\""));
         assert!(config.contains("api_key_env = \"GROQ_API_KEY\""));
+        assert!(config.contains("api_key = \"gsk_test\""));
     }
 
     #[test]
-    fn init_refuses_existing_config_error_path() {
+    fn init_writes_ollama_config_no_key() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let db_path = dir.path().join("helm.db");
-        fs::write(&config_path, "existing").unwrap();
-        let settings = ProviderSettings {
-            choice: ProviderChoice::Ollama,
-            base_url: Some("http://localhost:11434".to_owned()),
-            model: None,
-            api_key_env: None,
-            source: ProviderSource::Fallback,
-        };
 
-        let error = super::initialize_helm(&config_path, &db_path, &settings, false).unwrap_err();
+        super::write_helm_config(
+            &config_path,
+            &db_path,
+            "ollama",
+            "qwen3:4b",
+            Some("http://localhost:11434"),
+            None,
+            None,
+        )
+        .unwrap();
+        let config = fs::read_to_string(&config_path).unwrap();
 
-        assert!(error.to_string().contains("already exists"));
+        assert!(config.contains("kind = \"ollama\""));
+        assert!(config.contains("base_url"));
+        assert!(!config.contains("api_key"));
     }
 
     #[test]

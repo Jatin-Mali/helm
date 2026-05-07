@@ -15,7 +15,7 @@ use tokio::time::sleep;
 use crate::provider::{ChatRequest, ChatResponse, Provider, StopReason, ToolSchema, Usage};
 
 const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
-const GROQ_DEFAULT_MODEL: &str = "openai/gpt-oss-20b";
+const GROQ_DEFAULT_MODEL: &str = "llama-3.3-70b-versatile";
 const GROQ_MAX_TOKENS: u32 = 1_024;
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const OPENROUTER_DEFAULT_MODEL: &str = "meta-llama/llama-3.3-70b-instruct";
@@ -465,7 +465,7 @@ impl OpenAiResponse {
             let input = parse_arguments(&call.function.arguments)?;
             content.push(ContentBlock::ToolUse {
                 id: call.id,
-                name: call.function.name,
+                name: sanitize_tool_name(call.function.name),
                 input,
             });
         }
@@ -644,6 +644,15 @@ fn user_message(
         messages.push(OpenAiMessage::text("user", text_parts.join("\n")));
     }
     Ok(messages)
+}
+
+/// Strip special-token suffixes that some models (e.g. gpt-oss) leak into tool names.
+/// Example: `"browser<|channel|>commentary"` → `"browser"`.
+fn sanitize_tool_name(name: String) -> String {
+    match name.find("<|") {
+        Some(idx) => name[..idx].trim_end().to_owned(),
+        None => name,
+    }
 }
 
 fn parse_arguments(arguments: &str) -> Result<Value, ProviderError> {

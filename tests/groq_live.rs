@@ -39,7 +39,14 @@ async fn groq_live_react_loop() {
         output_path.display()
     );
 
-    let result = agent.run(&task).await.unwrap();
+    let result = match agent.run(&task).await {
+        Ok(result) => result,
+        Err(error) if !live_strict() && is_live_provider_environment_error(&error.to_string()) => {
+            eprintln!("skipping Groq live test: {error}");
+            return;
+        }
+        Err(error) => panic!("Groq live test failed: {error}"),
+    };
     let episode = memory
         .get_episode(&result.episode_id)
         .await
@@ -59,4 +66,16 @@ async fn groq_live_react_loop() {
             .contains("hello from helm")
     );
     assert!(episode.model_capability_warning.is_none());
+}
+
+fn is_live_provider_environment_error(error: &str) -> bool {
+    error.contains("HTTP 401")
+        || error.contains("invalid_api_key")
+        || error.contains("Invalid API Key")
+        || error.contains("HTTP 429")
+        || error.to_ascii_lowercase().contains("rate limit")
+}
+
+fn live_strict() -> bool {
+    std::env::var_os("HELM_LIVE_STRICT").is_some()
 }

@@ -60,7 +60,16 @@ mod tests {
             ToolContext::new(dir.path().to_path_buf()),
         );
 
-        let result = agent.run("echo 'hello helm' to stdout").await.unwrap();
+        let result = match agent.run("echo 'hello helm' to stdout").await {
+            Ok(result) => result,
+            Err(error)
+                if !live_strict() && is_live_provider_environment_error(&error.to_string()) =>
+            {
+                eprintln!("skipping Groq hardened live test: {error}");
+                return;
+            }
+            Err(error) => panic!("Groq hardened live test failed: {error}"),
+        };
 
         assert!(
             !result.final_message.is_empty(),
@@ -80,5 +89,17 @@ mod tests {
         let q = quirks_for("groq", "mixtral-8x7b-32768");
         assert_eq!(q.force_temperature, Some(0.0));
         assert!(q.user_note.is_some());
+    }
+
+    fn is_live_provider_environment_error(error: &str) -> bool {
+        error.contains("HTTP 401")
+            || error.contains("invalid_api_key")
+            || error.contains("Invalid API Key")
+            || error.contains("HTTP 429")
+            || error.to_ascii_lowercase().contains("rate limit")
+    }
+
+    fn live_strict() -> bool {
+        std::env::var_os("HELM_LIVE_STRICT").is_some()
     }
 }

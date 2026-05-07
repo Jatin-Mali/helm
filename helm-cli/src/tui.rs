@@ -24,7 +24,9 @@ use ratatui::{
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::{ProviderSettings, build_provider, provider_choice_name};
+use crate::{
+    ProviderChoice, ProviderSettings, build_provider, default_api_key_env, provider_choice_name,
+};
 
 /// Runtime dependencies needed by the TUI.
 pub(crate) struct TuiRuntime {
@@ -225,8 +227,12 @@ enum ModalState {
         taint: String,
         detail: String,
     },
-    ProviderSelector,
-    ModelSelector,
+    ProviderSelector {
+        selected: usize,
+    },
+    ModelSelector {
+        input: String,
+    },
     Error(String),
     Help,
 }
@@ -302,6 +308,7 @@ impl CommandAction {
 
 struct TuiApp {
     runtime: Arc<TuiRuntimeInner>,
+    active_settings: ProviderSettings,
     session: SessionState,
     input: InputState,
     focus: PanelFocus,
@@ -319,7 +326,6 @@ struct TuiApp {
 }
 
 struct TuiRuntimeInner {
-    provider_settings: ProviderSettings,
     db_path: PathBuf,
     memory: Arc<MemoryStore>,
     max_iterations: Option<u32>,
@@ -333,13 +339,14 @@ impl TuiApp {
             .model
             .clone()
             .unwrap_or_else(|| "auto".to_owned());
+        let active_settings = runtime.provider_settings.clone();
         Self {
             runtime: Arc::new(TuiRuntimeInner {
-                provider_settings: runtime.provider_settings,
                 db_path: runtime.db_path,
                 memory: runtime.memory,
                 max_iterations: runtime.max_iterations,
             }),
+            active_settings,
             session: SessionState::default(),
             input: InputState::new(),
             focus: PanelFocus::Input,
@@ -583,6 +590,89 @@ impl TuiApp {
                 }
                 _ => {}
             },
+            Some(ModalState::ProviderSelector { .. }) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Char(d @ '1'..='7') => {
+                    let choices = provider_selector_list();
+                    let idx = (d as usize) - ('1' as usize);
+                    if let Some((choice, _)) = choices.get(idx) {
+                        let choice = *choice;
+                        let mut s = self.active_settings.with_choice(choice);
+                        s.api_key_env = default_api_key_env(choice).map(str::to_owned);
+                        s.model = None;
+                        self.active_settings = s;
+                        self.provider_name = provider_choice_name(choice).to_owned();
+                        self.model = "auto".to_owned();
+                        self.push_chat(
+                            MessageRole::System,
+                            format!(
+                                "Switched to {}. Type a task to begin.",
+                                provider_choice_name(choice)
+                            ),
+                        );
+                        self.modal = None;
+                    }
+                }
+                KeyCode::Up => {
+                    if let Some(ModalState::ProviderSelector { selected }) = &mut self.modal {
+                        *selected = selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(ModalState::ProviderSelector { selected }) = &mut self.modal {
+                        let max = provider_selector_list().len().saturating_sub(1);
+                        *selected = (*selected + 1).min(max);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(ModalState::ProviderSelector { selected }) = self.modal.clone() {
+                        let choices = provider_selector_list();
+                        if let Some((choice, _)) = choices.get(selected) {
+                            let choice = *choice;
+                            let mut s = self.active_settings.with_choice(choice);
+                            s.api_key_env = default_api_key_env(choice).map(str::to_owned);
+                            s.model = None;
+                            self.active_settings = s;
+                            self.provider_name = provider_choice_name(choice).to_owned();
+                            self.model = "auto".to_owned();
+                            self.push_chat(
+                                MessageRole::System,
+                                format!("Switched to {}.", provider_choice_name(choice)),
+                            );
+                        }
+                        self.modal = None;
+                    }
+                }
+                _ => {}
+            },
+            Some(ModalState::ModelSelector { .. }) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Enter => {
+                    if let Some(ModalState::ModelSelector { input }) = self.modal.clone() {
+                        let model = input.trim().to_owned();
+                        if !model.is_empty() {
+                            self.active_settings.model = Some(model.clone());
+                            self.model = model.clone();
+                            self.push_chat(
+                                MessageRole::System,
+                                format!("Model set to {model}. Type a task to begin."),
+                            );
+                        }
+                        self.modal = None;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(ModalState::ModelSelector { input }) = &mut self.modal {
+                        input.pop();
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if let Some(ModalState::ModelSelector { input }) = &mut self.modal {
+                        input.push(ch);
+                    }
+                }
+                _ => {}
+            },
             Some(_) => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     self.modal = None;
@@ -608,8 +698,9 @@ impl TuiApp {
         let run_id = self.active_run_id;
 
         let runtime = Arc::clone(&self.runtime);
+        let settings = self.active_settings.clone();
         self.agent_task = Some(tokio::spawn(async move {
-            let result = run_agent_task(runtime, task, tx.clone(), run_id).await;
+            let result = run_agent_task(runtime, settings, task, tx.clone(), run_id).await;
             tx.send(UiEvent::AgentDone { run_id, result }).ok();
         }));
 
@@ -852,8 +943,19 @@ impl TuiApp {
             CommandAction::NewSession => self.new_session(),
             CommandAction::Replay => self.push_chat(MessageRole::System, self.replay_hint()),
             CommandAction::Doctor => self.push_chat(MessageRole::System, self.doctor_hint()),
-            CommandAction::Provider => self.modal = Some(ModalState::ProviderSelector),
-            CommandAction::Model => self.modal = Some(ModalState::ModelSelector),
+            CommandAction::Provider => {
+                let current = provider_selector_list()
+                    .iter()
+                    .position(|(c, _)| *c == self.active_settings.choice)
+                    .unwrap_or(0);
+                self.modal = Some(ModalState::ProviderSelector { selected: current });
+            }
+            CommandAction::Model => {
+                let current_model = self.active_settings.model.clone().unwrap_or_default();
+                self.modal = Some(ModalState::ModelSelector {
+                    input: current_model,
+                });
+            }
             CommandAction::Permissions => {
                 self.modal = Some(ModalState::Permission {
                     capability: Capability::ShellShell,
@@ -881,11 +983,12 @@ impl TuiApp {
 
 async fn run_agent_task(
     runtime: Arc<TuiRuntimeInner>,
+    settings: ProviderSettings,
     task: String,
     tx: mpsc::UnboundedSender<UiEvent>,
     run_id: u64,
 ) -> Result<RunResult, HelmError> {
-    let (provider, model) = build_provider(&runtime.provider_settings)
+    let (provider, model) = build_provider(&settings)
         .map_err(|error| HelmError::Provider(helm_core::ProviderError::Other(error.to_string())))?;
     let mut budget = Budget::default();
     if let Some(max) = runtime.max_iterations {
@@ -1014,15 +1117,65 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
-        ModalState::ProviderSelector => {
-            Paragraph::new("Providers: Groq, OpenRouter, Gemini, NVIDIA NIM, Anthropic, Ollama, OpenAI-compatible\n\nUse `helm init --force` or config.toml to persist provider settings.\nEsc closes.")
-                .block(Block::default().borders(Borders::ALL).title("Provider Selector"))
+        ModalState::ProviderSelector { selected } => {
+            let choices = provider_selector_list();
+            let mut lines = vec![
+                Line::from("Press 1-7 or Up/Down+Enter to switch provider. Esc to cancel."),
+                Line::from(""),
+            ];
+            for (i, (choice, env_key)) in choices.iter().enumerate() {
+                let name = provider_choice_name(*choice);
+                let key_status = match env_key {
+                    Some(k) => {
+                        if std::env::var(k).is_ok() {
+                            format!("{k} ✓")
+                        } else {
+                            format!("{k} (unset)")
+                        }
+                    }
+                    None => "no key needed".to_owned(),
+                };
+                let label = format!("[{}] {:<16} {}", i + 1, name, key_status);
+                let style = if i == *selected {
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(label, style));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "Tip: set the env key then press the number. Run `helm init --force` to persist.",
+            ));
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Provider Selector"),
+                )
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
-        ModalState::ModelSelector => {
-            Paragraph::new("Enter model with CLI/config for now. Recommended: openai/gpt-oss-20b for Groq.\nEsc closes.")
-                .block(Block::default().borders(Borders::ALL).title("Model Selector"))
+        ModalState::ModelSelector { input } => {
+            let lines = vec![
+                Line::from("Type a model name and press Enter. Esc to cancel."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Model: ", Style::default().fg(Color::Gray)),
+                    Span::raw(input.as_str()),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(""),
+                Line::from(
+                    "Examples: llama-3.3-70b-versatile  claude-3-5-sonnet-20241022  qwen3:4b",
+                ),
+            ];
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Model Selector"),
+                )
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
@@ -1327,17 +1480,33 @@ fn sanitize_one_line(text: &str) -> String {
         .join(" ")
 }
 
+fn provider_selector_list() -> Vec<(ProviderChoice, Option<&'static str>)> {
+    vec![
+        (ProviderChoice::Groq, Some("GROQ_API_KEY")),
+        (ProviderChoice::Anthropic, Some("ANTHROPIC_API_KEY")),
+        (ProviderChoice::Openrouter, Some("OPENROUTER_API_KEY")),
+        (ProviderChoice::Gemini, Some("GOOGLE_API_KEY")),
+        (ProviderChoice::NvidiaNim, Some("NVIDIA_API_KEY")),
+        (ProviderChoice::OpenaiCompat, Some("OPENAI_API_KEY")),
+        (ProviderChoice::Ollama, None),
+    ]
+}
+
 fn friendly_error(error: &str) -> String {
     if error.contains("HTTP 401")
         || error.contains("invalid_api_key")
         || error.contains("Invalid API Key")
     {
-        "Invalid API key. Replace the provider key or run `helm init --force`.".to_owned()
+        "Invalid API key. Set the provider's env key (e.g. GROQ_API_KEY) and press Ctrl+P → Provider to switch, or run `helm init --force`.".to_owned()
     } else if error.contains("HTTP 429") || error.contains("rate_limit") {
-        "Rate limited. Wait for the provider reset, switch model, or switch provider.".to_owned()
+        "Rate limited. Wait for the provider reset, switch model (Ctrl+P → Model), or switch provider (Ctrl+P → Provider).".to_owned()
     } else if error.contains("model") && error.contains("not found") {
-        "Model not found. For Ollama run `ollama pull qwen3:4b`, or choose an installed model."
-            .to_owned()
+        "Model not found. For Ollama run `ollama pull qwen3:4b`. Use Ctrl+P → Model to change model.".to_owned()
+    } else if error.contains("HTTP 400")
+        || error.contains("tool_use")
+        || error.contains("tool name")
+    {
+        "Provider rejected a tool call (HTTP 400). The model may not support tool use. Switch to a different model (Ctrl+P → Model) or provider (Ctrl+P → Provider).".to_owned()
     } else {
         error.to_owned()
     }
@@ -1365,6 +1534,7 @@ mod tests {
                 base_url: Some("http://localhost:11434".to_owned()),
                 model: Some("qwen3:4b".to_owned()),
                 api_key_env: None,
+                api_key: None,
                 source: crate::ProviderSource::Fallback,
             },
             db_path: db,
