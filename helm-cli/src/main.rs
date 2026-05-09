@@ -1285,7 +1285,7 @@ async fn interactive_init(
     println!();
     println!("Next steps:");
     println!("  helm doctor       — verify everything is working");
-    println!("  helm tui          — open the interactive terminal UI");
+    println!("  helm              — open the interactive terminal UI");
     println!("  helm \"<task>\"     — run an agent task");
     println!();
 
