@@ -9,19 +9,20 @@ HELM is a self-hosted AI agent that gives you natural-language control over a Li
 ## Install
 
 ```sh
-curl -fsSL https://github.com/white-phantom/helm/releases/latest/download/install.sh | sh
+./install.sh
 ```
 
-Supports x86\_64 and ARM64. Installs to `~/.local/bin/helm` and adds it to your PATH automatically.
+Supports x86\_64 and ARM64. Installs to `~/.local/bin/helm` and adds it to
+your PATH automatically when release assets are published for this fork.
 
 ---
 
 ## Quick start
 
 ```sh
-curl -fsSL https://helm.sh/install | sh
-helm init
-helm
+cargo build --release -p helm-cli
+./target/release/helm init
+./target/release/helm doctor
 ```
 
 You only need to do `helm init` once per machine. The key is stored at
@@ -53,9 +54,9 @@ Model [llama-3.3-70b-versatile]: (press Enter to use default)
 Config written to ~/.helm/config.toml
 Database created at ~/.helm/helm.db
 
-  helm "show me what's eating my disk"
-  helm tui
-  helm doctor
+  ./target/release/helm "show me what's eating my disk"
+  ./target/release/helm tui
+  ./target/release/helm doctor
 ```
 
 Run `helm doctor` to verify everything is wired up.
@@ -65,18 +66,18 @@ Run `helm doctor` to verify everything is wired up.
 ## Commands
 
 ```sh
-helm "<task>"                          # run a one-shot task
-helm tui                               # interactive terminal UI
-helm init                              # re-run setup (change provider/model/key)
-helm doctor                            # health check: provider, DB, tools, quirks
-helm episodes --limit 10               # list recent runs
-helm replay <episode_id>               # inspect a previous run step by step
-helm audit verify                      # verify the HMAC audit chain
-helm audit show                        # tail the audit log
-helm skills list|show|approve|test     # manage the skills library
-helm permissions list|grant|revoke     # manage capability grants
-helm secrets list|set|get|delete|path   # manage persistent provider keys
-helm models                            # list available models for active provider
+helm "<task>"                         # run a one-shot task
+helm tui                              # interactive terminal UI
+helm init                             # re-run setup (change provider/model/key)
+helm doctor                           # health check: provider, DB, tools, quirks
+helm episodes --limit 10              # list recent runs
+helm replay <episode_id>              # inspect a previous run step by step
+helm audit verify                     # verify the HMAC audit chain
+helm audit show                       # tail the audit log
+helm skills list|show|approve|test    # manage the skills library
+helm permissions list|grant|revoke    # manage capability grants
+helm secrets list|set|get|delete|path # manage persistent provider keys
+helm models                           # list available models for active provider
 ```
 
 ---
@@ -134,9 +135,9 @@ Full threat model: `docs/threat-model.md`
 ## Build from Source
 
 ```sh
-git clone https://github.com/white-phantom/helm
+git clone https://github.com/Jatin-Mali/helm
 cd helm
-cargo build --release
+cargo build --release -p helm-cli
 ./target/release/helm init
 ```
 

@@ -282,6 +282,16 @@ fn validate_denylist(path: &Path) -> Result<(), ToolError> {
         if component == ".gnupg" || component == ".aws" || component == "credentials" {
             return Err(ToolError::PathDenied(path.to_path_buf()));
         }
+        if component == ".helm" {
+            if let Some(next) = components.get(index + 1) {
+                if matches!(
+                    next.as_str(),
+                    "secrets.toml" | ".secrets.toml.lock" | "helm.db" | "helm.log"
+                ) {
+                    return Err(ToolError::PathDenied(path.to_path_buf()));
+                }
+            }
+        }
         if component == ".ssh" {
             if let Some(next) = components.get(index + 1) {
                 if next.starts_with("id_") {
@@ -348,7 +358,7 @@ mod tests {
 
     use crate::tool::{Tool, ToolContext, ToolError};
 
-    use super::{FsReadTool, select_lines, validate_existing_path};
+    use super::{FsReadTool, select_lines, validate_denylist, validate_existing_path};
 
     fn ctx_at(dir: &tempfile::TempDir) -> ToolContext {
         ToolContext::new(dir.path().to_path_buf())
@@ -428,6 +438,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let error =
             validate_existing_path(std::path::Path::new("/etc/shadow"), &ctx_at(&dir)).unwrap_err();
+
+        assert!(matches!(error, ToolError::PathDenied(_)));
+    }
+
+    #[test]
+    fn denylist_rejects_helm_secret_store() {
+        let fake_home = tempdir().unwrap();
+        let helm_dir = fake_home.path().join(".helm");
+        fs::create_dir_all(&helm_dir).unwrap();
+        let path = helm_dir.join("secrets.toml");
+        fs::write(&path, "OPENROUTER_API_KEY = \"sk-or-test\"\n").unwrap();
+
+        let error = validate_denylist(&path).unwrap_err();
 
         assert!(matches!(error, ToolError::PathDenied(_)));
     }

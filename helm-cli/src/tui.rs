@@ -445,16 +445,13 @@ impl TuiApp {
         let config_path = runtime.config_path.clone();
         let mut active_settings = runtime.provider_settings.clone();
 
-        // Auto-populate API key from env var if not in secrets store, then persist it there.
+        // Load a provider key from the environment for this session when present,
+        // but do not persist it automatically. Persisting a key should remain an
+        // explicit user action through `helm init` or `helm secrets`.
         if active_settings.api_key.is_none() {
             if let Some(env_name) = default_api_key_env(active_settings.choice) {
-                let in_store = runtime.secrets.get(env_name).ok().flatten().is_some();
-                if !in_store {
-                    if let Ok(key) = std::env::var(env_name) {
-                        active_settings.api_key = Some(key.clone());
-                        // Persist to 0600 secrets store — never write key to config.toml.
-                        let _ = runtime.secrets.set(env_name, helm_core::Secret::new(key));
-                    }
+                if let Ok(key) = std::env::var(env_name) {
+                    active_settings.api_key = Some(key);
                 }
             }
         }

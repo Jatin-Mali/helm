@@ -22,7 +22,7 @@ members = [
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/white-phantom/helm"
+repository = "https://github.com/Jatin-Mali/helm"
 
 [workspace.dependencies]
 anyhow = "1"

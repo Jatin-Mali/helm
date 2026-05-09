@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-repo="${HELM_REPO:-https://github.com/white-phantom/helm}"
+repo="${HELM_REPO:-https://github.com/Jatin-Mali/helm}"
 version="${HELM_VERSION:-latest}"
 install_dir="${HELM_INSTALL_DIR:-$HOME/.local/bin}"
 state_dir="${HELM_STATE_DIR:-$HOME/.helm}"
@@ -15,10 +15,11 @@ case "$arch" in
   *) echo "unsupported architecture: $arch" >&2; exit 2 ;;
 esac
 
+asset="helm-$target"
 if [ "$version" = "latest" ]; then
-  url="$repo/releases/latest/download/helm-$target"
+  url="$repo/releases/latest/download/$asset"
 else
-  url="$repo/releases/download/$version/helm-$target"
+  url="$repo/releases/download/$version/$asset"
 fi
 
 tmp="$(mktemp)"
@@ -26,7 +27,18 @@ cleanup() { rm -f "$tmp"; }
 trap cleanup EXIT
 
 echo "downloading $url"
-curl -fsSL "$url" -o "$tmp"
+if ! curl -fsSL "$url" -o "$tmp"; then
+  echo "" >&2
+  echo "failed to download a release binary from:" >&2
+  echo "  $url" >&2
+  echo "" >&2
+  echo "If this fork does not publish release assets yet, build from source instead:" >&2
+  echo "  git clone $repo" >&2
+  echo "  cd helm" >&2
+  echo "  cargo build --release -p helm-cli" >&2
+  echo "  ./target/release/helm doctor" >&2
+  exit 1
+fi
 chmod +x "$tmp"
 mv "$tmp" "$install_dir/helm"
 echo "installed $install_dir/helm"

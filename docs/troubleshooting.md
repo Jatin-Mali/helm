@@ -5,7 +5,7 @@
 Use a tool-capable model and prefer shell redirection:
 
 ```sh
-HELM_MODEL=openai/gpt-oss-20b helm "create /tmp/hello.txt with the output of date and uname -a"
+HELM_MODEL=llama-3.3-70b-versatile helm "create /tmp/hello.txt with the output of date and uname -a"
 ```
 
 ## Groq rate limits
@@ -20,7 +20,7 @@ GROQ_API_KEY=$GROQ_API_KEY cargo test --workspace -- --ignored --test-threads=1
 
 ```sh
 ollama pull qwen3:4b
-helm models
+./target/release/helm models
 ```
 
 ## Browser tool missing
@@ -37,6 +37,6 @@ pinchtab nav https://example.com --snap
 Grant only the capability needed:
 
 ```sh
-helm permissions grant shell.shell --scope once
-helm permissions list
+./target/release/helm permissions grant shell.shell --scope once
+./target/release/helm permissions list
 ```
