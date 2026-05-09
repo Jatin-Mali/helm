@@ -16,13 +16,19 @@ Supports x86\_64 and ARM64. Installs to `~/.local/bin/helm` and adds it to your 
 
 ---
 
-## First Run
+## Quick start
 
 ```sh
+curl -fsSL https://helm.sh/install | sh
 helm init
+helm
 ```
 
-Interactive setup — runs once, takes 60 seconds:
+You only need to do `helm init` once per machine. The key is stored at
+`~/.helm/secrets.toml` (mode 0600), so fresh terminals work without
+re-exporting provider environment variables.
+
+Interactive setup:
 
 ```
 HELM Setup Wizard
@@ -69,6 +75,7 @@ helm audit verify                      # verify the HMAC audit chain
 helm audit show                        # tail the audit log
 helm skills list|show|approve|test     # manage the skills library
 helm permissions list|grant|revoke     # manage capability grants
+helm secrets list|set|get|delete|path   # manage persistent provider keys
 helm models                            # list available models for active provider
 ```
 
@@ -86,7 +93,9 @@ helm models                            # list available models for active provid
 | Ollama | Local, free | — |
 | OpenAI-compat | Varies | varies |
 
-Keys set in `helm init` are stored in `~/.helm/config.toml`. Environment variables always take priority.
+Keys set in `helm init` are stored in `~/.helm/secrets.toml` (mode 0600).
+Resolution order: `--api-key` override → secrets store → environment variable.
+Run `helm secrets import-env` once to migrate keys from your current shell.
 
 ---
 

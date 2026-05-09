@@ -3,7 +3,7 @@
 use std::{env, time::Duration};
 
 use async_trait::async_trait;
-use helm_core::ProviderError;
+use helm_core::{ProviderError, Secret};
 use reqwest::{Client, StatusCode};
 #[cfg(test)]
 use serde::Deserialize;
@@ -20,7 +20,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     client: Client,
-    api_key: String,
+    api_key: Secret,
     base_url: String,
     retry_delays: Vec<Duration>,
 }
@@ -34,13 +34,13 @@ impl AnthropicProvider {
     }
 
     /// Builds an Anthropic provider for the default API endpoint.
-    pub fn new(api_key: impl Into<String>) -> Result<Self, ProviderError> {
+    pub fn new(api_key: impl Into<Secret>) -> Result<Self, ProviderError> {
         Self::with_base_url(api_key, DEFAULT_BASE_URL)
     }
 
     /// Builds an Anthropic provider with a custom base URL for tests.
     pub fn with_base_url(
-        api_key: impl Into<String>,
+        api_key: impl Into<Secret>,
         base_url: impl Into<String>,
     ) -> Result<Self, ProviderError> {
         Self::with_base_url_and_retry_delays(
@@ -56,7 +56,7 @@ impl AnthropicProvider {
 
     /// Builds an Anthropic provider with custom retry delays for deterministic tests.
     pub fn with_base_url_and_retry_delays(
-        api_key: impl Into<String>,
+        api_key: impl Into<Secret>,
         base_url: impl Into<String>,
         retry_delays: Vec<Duration>,
     ) -> Result<Self, ProviderError> {
@@ -85,7 +85,7 @@ impl AnthropicProvider {
         let response = self
             .client
             .post(self.endpoint())
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&AnthropicRequest::from_chat_request(request))
@@ -260,7 +260,7 @@ fn extract_error_message(body: &str) -> String {
 mod tests {
     use std::{io, time::Duration};
 
-    use helm_core::ContentBlock;
+    use helm_core::{ContentBlock, Secret};
     use mockito::Matcher;
     use serde_json::json;
     use tokio::{io::AsyncWriteExt, net::TcpListener};
@@ -407,7 +407,7 @@ mod tests {
             .unwrap();
         let provider = AnthropicProvider {
             client,
-            api_key: "key".to_owned(),
+            api_key: Secret::new("key"),
             base_url: format!("http://{addr}"),
             retry_delays: Vec::new(),
         };

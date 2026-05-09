@@ -3,7 +3,7 @@
 use std::{collections::HashMap, env, time::Duration};
 
 use async_trait::async_trait;
-use helm_core::{ContentBlock, Message, ProviderError, Role};
+use helm_core::{ContentBlock, Message, ProviderError, Role, Secret};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -18,7 +18,7 @@ const GEMINI_DEFAULT_MODEL: &str = "gemini-2.5-flash";
 /// Provider backed by Google's Gemini `generateContent` API.
 #[derive(Debug, Clone)]
 pub struct GeminiProvider {
-    api_key: String,
+    api_key: Secret,
     base_url: String,
     http: Client,
     retry_delays: Vec<Duration>,
@@ -38,13 +38,13 @@ impl GeminiProvider {
     }
 
     /// Builds a Gemini provider for the default Google endpoint.
-    pub fn new(api_key: impl Into<String>) -> Result<Self, ProviderError> {
+    pub fn new(api_key: impl Into<Secret>) -> Result<Self, ProviderError> {
         Self::with_base_url(api_key, GEMINI_BASE_URL)
     }
 
     /// Builds a Gemini provider with a custom base URL for tests.
     pub fn with_base_url(
-        api_key: impl Into<String>,
+        api_key: impl Into<Secret>,
         base_url: impl Into<String>,
     ) -> Result<Self, ProviderError> {
         Self::with_base_url_and_retry_delays(
@@ -60,7 +60,7 @@ impl GeminiProvider {
 
     /// Builds a Gemini provider with custom retry delays for deterministic tests.
     pub fn with_base_url_and_retry_delays(
-        api_key: impl Into<String>,
+        api_key: impl Into<Secret>,
         base_url: impl Into<String>,
         retry_delays: Vec<Duration>,
     ) -> Result<Self, ProviderError> {
@@ -86,7 +86,7 @@ impl GeminiProvider {
             "{}/v1beta/models/{}:generateContent?key={}",
             self.base_url.trim_end_matches('/'),
             model,
-            self.api_key
+            self.api_key.expose()
         )
     }
 

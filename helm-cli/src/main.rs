@@ -1,12 +1,13 @@
 //! Command-line entry point for HELM.
 
+mod secrets;
 mod tui;
 
 use std::{
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -17,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use helm_agent::{Budget, ReactAgent, RunResult};
-use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError};
+use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError, Secret};
 use helm_memory::{
     AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, StepRecord,
 };
@@ -26,6 +27,7 @@ use helm_providers::{
     OpenAiCompatProvider, Provider, StopReason, ToolSchema, quirks_for,
 };
 use helm_tools::ToolRegistry;
+use secrets::SecretsStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
@@ -49,6 +51,13 @@ struct Cli {
     #[arg(long, value_enum, global = true)]
     provider: Option<ProviderChoice>,
     #[arg(
+        long,
+        value_name = "KEY",
+        global = true,
+        help = "API key override for this process only"
+    )]
+    api_key: Option<String>,
+    #[arg(
         long = "base-url",
         alias = "ollama-url",
         value_name = "URL",
@@ -71,6 +80,7 @@ enum Command {
     Permissions(PermissionsArgs),
     Audit(AuditArgs),
     Skills(SkillsArgs),
+    Secrets(SecretsArgs),
     Init(InitArgs),
     Tui,
 }
@@ -184,9 +194,53 @@ struct SkillTestArgs {
 }
 
 #[derive(Debug, Args)]
+struct SecretsArgs {
+    #[command(subcommand)]
+    command: SecretsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretsCommand {
+    List,
+    Set(SecretsSetArgs),
+    Get(SecretsGetArgs),
+    Delete(SecretsDeleteArgs),
+    Path,
+    ImportEnv,
+}
+
+#[derive(Debug, Args)]
+struct SecretsSetArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(
+        long,
+        value_name = "VALUE",
+        help = "Set value directly (non-interactive)"
+    )]
+    value: Option<String>,
+    #[arg(long, help = "Read value from stdin")]
+    from_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+struct SecretsGetArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+}
+
+#[derive(Debug, Args)]
+struct SecretsDeleteArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+}
+
+#[derive(Debug, Args)]
 struct InitArgs {
     #[arg(long, help = "Overwrite an existing ~/.helm/config.toml")]
     force: bool,
+    #[arg(long, help = "Skip API key validation")]
+    no_validate: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -207,6 +261,7 @@ enum ProviderChoice {
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     provider: Option<FileProviderConfig>,
+    security: Option<FileSecurityConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -216,6 +271,11 @@ struct FileProviderConfig {
     model: Option<String>,
     api_key_env: Option<String>,
     api_key: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileSecurityConfig {
+    tui_paste_key_modal: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,10 +351,17 @@ async fn run() -> Result<()> {
     init_tracing(cli.verbose, tui_log_path.as_deref())?;
     let config_path = default_config_path()?;
     let config = load_config(&config_path)?;
-    let provider_settings =
-        resolve_provider_settings(config.as_ref(), cli.provider, cli.base_url, cli.model)?;
+    let provider_settings = resolve_provider_settings(
+        config.as_ref(),
+        cli.provider,
+        cli.base_url,
+        cli.model,
+        cli.api_key,
+    )?;
     let db_path = cli.db_path.unwrap_or(default_db_path()?);
     ensure_parent_dir(&db_path)?;
+    let secrets_store =
+        SecretsStore::open_default().map_err(|e| anyhow!("failed to open secrets store: {e}"))?;
     let memory = Arc::new(
         MemoryStore::open(&db_path)
             .await
@@ -309,8 +376,10 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
             let provider_choice = resolve_provider_choice(provider_settings.choice);
-            let (provider, model) =
-                build_provider(&provider_settings.with_choice(provider_choice))?;
+            let (provider, model) = build_provider(
+                &provider_settings.with_choice(provider_choice),
+                &secrets_store,
+            )?;
             let mut budget = Budget::default();
             if let Some(max_iterations) = cli.max_iterations {
                 budget.max_iterations = max_iterations;
@@ -332,7 +401,7 @@ async fn run() -> Result<()> {
             print!("{report}");
         }
         Command::Doctor(args) => {
-            let report = run_doctor(&provider_settings, &db_path, &memory).await?;
+            let report = run_doctor(&provider_settings, &db_path, &memory, &secrets_store).await?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -417,8 +486,18 @@ async fn run() -> Result<()> {
                 println!("{result}");
             }
         },
+        Command::Secrets(args) => {
+            run_secrets_command(args, &secrets_store)?;
+        }
         Command::Init(args) => {
-            interactive_init(&config_path, &db_path, args.force)?;
+            interactive_init(
+                &config_path,
+                &db_path,
+                args.force,
+                args.no_validate,
+                &secrets_store,
+            )
+            .await?;
         }
         Command::Tui => {
             tui::run_tui(tui::TuiRuntime {
@@ -426,8 +505,104 @@ async fn run() -> Result<()> {
                 db_path,
                 memory,
                 max_iterations: cli.max_iterations,
+                config_path,
+                secrets: secrets_store,
+                tui_paste_key_modal: config
+                    .as_ref()
+                    .and_then(|config| config.security.as_ref())
+                    .and_then(|security| security.tui_paste_key_modal)
+                    .unwrap_or(true),
             })
             .await?;
+        }
+    }
+    Ok(())
+}
+
+fn run_secrets_command(args: SecretsArgs, store: &SecretsStore) -> Result<()> {
+    match args.command {
+        SecretsCommand::List => {
+            let names = store.list_names().map_err(|e| anyhow!("{e}"))?;
+            if names.is_empty() {
+                println!("no secrets stored");
+            } else {
+                for name in names {
+                    println!("{name}");
+                }
+            }
+        }
+        SecretsCommand::Set(args) => {
+            let value = if args.from_stdin {
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf.trim_end_matches('\n').trim_end_matches('\r').to_owned()
+            } else if let Some(v) = args.value {
+                eprintln!(
+                    "warning: --value can be recorded in shell history; prefer masked prompt or --from-stdin"
+                );
+                v
+            } else if !io::stdin().is_terminal() {
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf.trim_end_matches('\n').trim_end_matches('\r').to_owned()
+            } else {
+                rpassword::prompt_password(format!("Value for {} (masked): ", args.name))
+                    .map_err(|e| anyhow!("failed to read password: {e}"))?
+            };
+            let chars = value.chars().count();
+            if value.is_empty() {
+                return Err(anyhow!("value cannot be empty"));
+            }
+            store
+                .set(&args.name, Secret::new(value))
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("set {} ({} chars, mode 0600)", args.name, chars);
+        }
+        SecretsCommand::Get(args) => match store.get(&args.name).map_err(|e| anyhow!("{e}"))? {
+            Some(s) => println!("{}", s.expose()),
+            None => return Err(anyhow!("no secret stored for {}", args.name)),
+        },
+        SecretsCommand::Delete(args) => {
+            if io::stdin().is_terminal() {
+                let answer = prompt(&format!("Delete {} from secrets store? [y/N] ", args.name))?;
+                if !answer.eq_ignore_ascii_case("y") {
+                    println!("aborted");
+                    return Ok(());
+                }
+            }
+            if store.delete(&args.name).map_err(|e| anyhow!("{e}"))? {
+                println!("deleted {}", args.name);
+            } else {
+                println!("no secret stored for {}", args.name);
+            }
+        }
+        SecretsCommand::Path => {
+            println!("{}", store.path().display());
+        }
+        SecretsCommand::ImportEnv => {
+            let env_vars = [
+                "ANTHROPIC_API_KEY",
+                "GROQ_API_KEY",
+                "OPENAI_API_KEY",
+                "OPENROUTER_API_KEY",
+                "NVIDIA_API_KEY",
+                "GOOGLE_API_KEY",
+                "GEMINI_API_KEY",
+            ];
+            let mut imported = 0usize;
+            for var in env_vars {
+                if let Ok(v) = env::var(var) {
+                    if !v.is_empty() {
+                        if store.get(var).map_err(|e| anyhow!("{e}"))?.is_some() {
+                            eprintln!("warning: overwriting stored {var}");
+                        }
+                        store.set(var, Secret::new(v)).map_err(|e| anyhow!("{e}"))?;
+                        println!("imported {var}");
+                        imported += 1;
+                    }
+                }
+            }
+            println!("imported {imported} secret(s)");
         }
     }
     Ok(())
@@ -483,10 +658,16 @@ fn resolve_provider_settings(
     cli_provider: Option<ProviderChoice>,
     cli_base_url: Option<String>,
     cli_model: Option<String>,
+    cli_api_key: Option<String>,
 ) -> Result<ProviderSettings> {
-    resolve_provider_settings_with_env(config, cli_provider, cli_base_url, cli_model, |name| {
-        env::var(name).ok()
-    })
+    resolve_provider_settings_with_env(
+        config,
+        cli_provider,
+        cli_base_url,
+        cli_model,
+        cli_api_key,
+        |name| env::var(name).ok(),
+    )
 }
 
 fn resolve_provider_settings_with_env<F>(
@@ -494,6 +675,7 @@ fn resolve_provider_settings_with_env<F>(
     cli_provider: Option<ProviderChoice>,
     cli_base_url: Option<String>,
     cli_model: Option<String>,
+    cli_api_key: Option<String>,
     env_lookup: F,
 ) -> Result<ProviderSettings>
 where
@@ -507,7 +689,8 @@ where
         provider_config.and_then(|provider| provider.model.as_ref().map(ToOwned::to_owned))
     });
     let api_key_env = provider_config.and_then(|provider| provider.api_key_env.clone());
-    let stored_api_key = provider_config.and_then(|provider| provider.api_key.clone());
+    let stored_api_key =
+        cli_api_key.or_else(|| provider_config.and_then(|provider| provider.api_key.clone()));
 
     let selected = if let Some(choice) = cli_provider {
         Some((choice, ProviderSource::Cli))
@@ -612,7 +795,9 @@ fn apply_provider_defaults(settings: &mut ProviderSettings) {
 
 fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
     if args.len() <= 1 {
-        return args;
+        let mut normalized = args;
+        normalized.push(OsString::from("tui"));
+        return normalized;
     }
     let mut normalized = Vec::with_capacity(args.len().saturating_add(1));
     if let Some(program) = args.first() {
@@ -657,6 +842,7 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "permissions"
                 | "audit"
                 | "skills"
+                | "secrets"
                 | "init"
                 | "help"
                 | "tui"
@@ -672,6 +858,7 @@ fn is_value_taking_flag(arg: &OsString) -> bool {
                 | "--max-iterations"
                 | "--model"
                 | "--provider"
+                | "--api-key"
                 | "--base-url"
                 | "--ollama-url",
         )
@@ -883,7 +1070,7 @@ async fn render_audit_events(memory: &MemoryStore, episode: Option<&str>) -> Res
     Ok(format_audit_events(&events))
 }
 
-fn write_helm_config(
+pub(crate) fn write_helm_config(
     config_path: &Path,
     db_path: &Path,
     kind: &str,
@@ -939,7 +1126,13 @@ fn provider_key_url(choice: ProviderChoice) -> Option<&'static str> {
     }
 }
 
-fn interactive_init(config_path: &Path, db_path: &Path, force: bool) -> Result<()> {
+async fn interactive_init(
+    config_path: &Path,
+    db_path: &Path,
+    force: bool,
+    no_validate: bool,
+    store: &SecretsStore,
+) -> Result<()> {
     if config_path.exists() && !force {
         let answer = prompt(&format!(
             "Config already exists at {}. Overwrite? [y/N] ",
@@ -977,7 +1170,8 @@ fn interactive_init(config_path: &Path, db_path: &Path, force: bool) -> Result<(
     };
 
     let mut base_url: Option<String> = None;
-    let mut stored_key: Option<String> = None;
+    let mut secret_key: Option<Secret> = None;
+    let mut secret_key_name: Option<&str> = None;
 
     match choice {
         ProviderChoice::Ollama => {
@@ -991,9 +1185,11 @@ fn interactive_init(config_path: &Path, db_path: &Path, force: bool) -> Result<(
             if !url.is_empty() {
                 base_url = Some(url);
             }
-            let key = prompt("API key (leave blank if not required): ")?;
+            let key = rpassword::prompt_password("API key (masked, leave blank if not required): ")
+                .map_err(|e| anyhow!("failed to read password: {e}"))?;
             if !key.is_empty() {
-                stored_key = Some(key);
+                secret_key = Some(Secret::new(key));
+                secret_key_name = Some("OPENAI_API_KEY");
             }
         }
         _ => {
@@ -1001,11 +1197,61 @@ fn interactive_init(config_path: &Path, db_path: &Path, force: bool) -> Result<(
             if let Some(url) = provider_key_url(choice) {
                 println!("\nGet your API key at: {url}");
             }
-            let key = prompt(&format!("Paste {env_name}: "))?;
+            let key = rpassword::prompt_password(format!("Paste {env_name} (masked): "))
+                .map_err(|e| anyhow!("failed to read password: {e}"))?;
             if key.is_empty() {
                 println!("  (no key entered — you can set {env_name} in your shell later)");
             } else {
-                stored_key = Some(key);
+                secret_key = Some(Secret::new(key));
+                secret_key_name = Some(env_name);
+            }
+        }
+    }
+
+    // Store the API key in secrets.toml (not in config.toml).
+    if let (Some(key), Some(name)) = (&secret_key, secret_key_name) {
+        store
+            .set(name, key.clone())
+            .map_err(|e| anyhow!("failed to store secret: {e}"))?;
+        if !no_validate {
+            print!("  validating key… ");
+            let _ = io::stdout().flush();
+            let dummy_settings = ProviderSettings {
+                choice,
+                base_url: base_url.clone(),
+                model: None,
+                api_key_env: Some(name.to_owned()),
+                api_key: None,
+                source: ProviderSource::Cli,
+            };
+            match build_provider(&dummy_settings, store) {
+                Ok((provider, model)) => {
+                    let req = helm_providers::ChatRequest {
+                        model: model.clone(),
+                        system: None,
+                        messages: vec![helm_core::Message::user("Reply with one word.")],
+                        tools: vec![],
+                        max_tokens: 1,
+                        temperature: 0.0,
+                    };
+                    match provider.chat(req).await {
+                        Ok(_) => println!("ok"),
+                        Err(e) => {
+                            println!("failed ({e})");
+                            let answer = prompt("  Save anyway? [y/N] ")?;
+                            if !answer.eq_ignore_ascii_case("y") {
+                                store.delete(name).map_err(|error| {
+                                    anyhow!("failed to remove invalid stored key: {error}")
+                                })?;
+                                return Err(anyhow!("API key validation failed"));
+                            }
+                            eprintln!(
+                                "  Key stored but validation failed. Run `helm doctor` after setup."
+                            );
+                        }
+                    }
+                }
+                Err(e) => println!("(skipped — {e})"),
             }
         }
     }
@@ -1019,6 +1265,7 @@ fn interactive_init(config_path: &Path, db_path: &Path, force: bool) -> Result<(
     };
 
     let kind = provider_choice_name(choice);
+    // Write config without the plain-text key (key lives in secrets.toml).
     write_helm_config(
         config_path,
         db_path,
@@ -1026,12 +1273,15 @@ fn interactive_init(config_path: &Path, db_path: &Path, force: bool) -> Result<(
         &model,
         base_url.as_deref(),
         default_api_key_env(choice),
-        stored_key.as_deref(),
+        None,
     )?;
 
     println!("\nConfig written: {}", config_path.display());
     println!("  provider : {kind}");
     println!("  model    : {model}");
+    if secret_key_name.is_some() {
+        println!("  key      : stored in {}", store.path().display());
+    }
     println!();
     println!("Next steps:");
     println!("  helm doctor       — verify everything is working");
@@ -1112,6 +1362,16 @@ struct DoctorReport {
     ollama: DoctorOllamaReport,
     other_providers_detected: Vec<DoctorEnvReport>,
     quirks: DoctorQuirksReport,
+    secrets: DoctorSecretsReport,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorSecretsReport {
+    store_path: String,
+    store_exists: bool,
+    store_permissions_ok: bool,
+    keys_stored: Vec<String>,
+    env_overrides: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1179,8 +1439,9 @@ async fn run_doctor(
     settings: &ProviderSettings,
     db_path: &Path,
     memory: &MemoryStore,
+    store: &SecretsStore,
 ) -> Result<DoctorReport> {
-    let provider_report = run_provider_doctor(settings).await;
+    let provider_report = run_provider_doctor(settings, store).await;
     let memory_report = run_memory_doctor(db_path, memory).await?;
     let tools = run_tools_doctor();
     let ollama = run_ollama_doctor(
@@ -1200,6 +1461,7 @@ async fn run_doctor(
         system_prompt_addendum: q.system_prompt_addendum.is_some(),
         user_note: q.user_note,
     };
+    let secrets = run_secrets_doctor(store);
     Ok(DoctorReport {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         provider: provider_report,
@@ -1208,13 +1470,59 @@ async fn run_doctor(
         ollama,
         other_providers_detected: provider_env_reports(),
         quirks,
+        secrets,
     })
 }
 
-async fn run_provider_doctor(settings: &ProviderSettings) -> DoctorProviderReport {
+fn run_secrets_doctor(store: &SecretsStore) -> DoctorSecretsReport {
+    let store_path = store.path().display().to_string();
+    let store_exists = store.path().exists();
+    let keys_stored = store.list_names().unwrap_or_default();
+    let store_permissions_ok = if store_exists {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(store.path())
+                .map(|m| m.permissions().mode() & 0o777 == 0o600)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    } else {
+        true
+    };
+    let tracked_env_vars = [
+        "ANTHROPIC_API_KEY",
+        "GROQ_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "NVIDIA_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+    ];
+    let env_overrides = tracked_env_vars
+        .iter()
+        .filter(|&&v| env::var(v).is_ok() && keys_stored.iter().any(|stored| stored == v))
+        .map(|&v| v.to_owned())
+        .collect();
+    DoctorSecretsReport {
+        store_path,
+        store_exists,
+        store_permissions_ok,
+        keys_stored,
+        env_overrides,
+    }
+}
+
+async fn run_provider_doctor(
+    settings: &ProviderSettings,
+    store: &SecretsStore,
+) -> DoctorProviderReport {
     let resolved = provider_choice_name(settings.choice).to_owned();
     let source = settings.source.human().to_owned();
-    match build_provider(settings) {
+    match build_provider(settings, store) {
         Ok((provider, model)) => {
             let (reachable, tool_calls) = probe_provider(provider.as_ref(), &model).await;
             DoctorProviderReport {
@@ -1518,6 +1826,36 @@ fn render_doctor(report: &DoctorReport) -> String {
     if let Some(note) = &report.quirks.user_note {
         output.push_str(&format!("  note: {note}\n"));
     }
+    output.push('\n');
+    output.push_str("[secrets]\n");
+    output.push_str(&format!("  store: {}", report.secrets.store_path));
+    if report.secrets.store_exists {
+        output.push_str(&format!(
+            " ({})\n",
+            if report.secrets.store_permissions_ok {
+                "0600"
+            } else {
+                "INSECURE: not 0600"
+            }
+        ));
+    } else {
+        output.push_str(" (missing)\n");
+    }
+    if report.secrets.keys_stored.is_empty() {
+        output.push_str("  keys present: none\n");
+    } else {
+        output.push_str(&format!(
+            "  keys present: {}\n",
+            report.secrets.keys_stored.join(", ")
+        ));
+    }
+    if !report.secrets.env_overrides.is_empty() {
+        output.push_str(&format!(
+            "  keys also present via env: {}\n",
+            report.secrets.env_overrides.join(", ")
+        ));
+        output.push_str("  warning: secrets store takes precedence over env fallback\n");
+    }
     output
 }
 
@@ -1683,10 +2021,13 @@ fn default_ollama_base_url() -> String {
     env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_owned())
 }
 
-fn build_provider(settings: &ProviderSettings) -> Result<(Box<dyn Provider>, String)> {
+fn build_provider(
+    settings: &ProviderSettings,
+    store: &SecretsStore,
+) -> Result<(Box<dyn Provider>, String)> {
     match settings.choice {
         ProviderChoice::Groq => {
-            let api_key = read_required_key(settings, "GROQ_API_KEY")?;
+            let api_key = resolve_provider_key("GROQ_API_KEY", settings, store)?;
             let provider = OpenAiCompatProvider::groq(api_key)?;
             let model = settings
                 .model
@@ -1695,14 +2036,7 @@ fn build_provider(settings: &ProviderSettings) -> Result<(Box<dyn Provider>, Str
             Ok((Box::new(provider), model))
         }
         ProviderChoice::Anthropic => {
-            let env_name = settings
-                .api_key_env
-                .as_deref()
-                .unwrap_or("ANTHROPIC_API_KEY");
-            let api_key = env::var(env_name)
-                .ok()
-                .or_else(|| settings.api_key.clone())
-                .ok_or_else(|| anyhow!("{env_name} is not set; run `helm init` to configure"))?;
+            let api_key = resolve_provider_key("ANTHROPIC_API_KEY", settings, store)?;
             let provider = AnthropicProvider::new(api_key)?;
             let model = settings
                 .model
@@ -1723,11 +2057,15 @@ fn build_provider(settings: &ProviderSettings) -> Result<(Box<dyn Provider>, Str
         }
         ProviderChoice::Gemini => {
             let env_name = settings.api_key_env.as_deref().unwrap_or("GOOGLE_API_KEY");
-            let api_key = env::var(env_name)
-                .ok()
-                .or_else(|| env::var("GEMINI_API_KEY").ok())
-                .or_else(|| settings.api_key.clone())
-                .ok_or_else(|| anyhow!("{env_name} is not set; run `helm init` to configure"))?;
+            let api_key = lookup_provider_key(env_name, settings, store)?
+                .or(if env_name == "GOOGLE_API_KEY" {
+                    lookup_provider_key("GEMINI_API_KEY", settings, store)?
+                } else {
+                    None
+                })
+                .ok_or_else(|| {
+                    anyhow!("{env_name} is not set; run `helm secrets set {env_name}` to configure")
+                })?;
             let provider = match settings.base_url.clone() {
                 Some(url) => GeminiProvider::with_base_url(api_key, url)?,
                 None => GeminiProvider::new(api_key)?,
@@ -1739,7 +2077,7 @@ fn build_provider(settings: &ProviderSettings) -> Result<(Box<dyn Provider>, Str
             Ok((Box::new(provider), model))
         }
         ProviderChoice::Openrouter => {
-            let api_key = read_required_key(settings, "OPENROUTER_API_KEY")?;
+            let api_key = resolve_provider_key("OPENROUTER_API_KEY", settings, store)?;
             let provider = OpenAiCompatProvider::openrouter(api_key)?;
             let model = settings
                 .model
@@ -1748,7 +2086,7 @@ fn build_provider(settings: &ProviderSettings) -> Result<(Box<dyn Provider>, Str
             Ok((Box::new(provider), model))
         }
         ProviderChoice::NvidiaNim => {
-            let api_key = read_required_key(settings, "NVIDIA_API_KEY")?;
+            let api_key = resolve_provider_key("NVIDIA_API_KEY", settings, store)?;
             let provider = OpenAiCompatProvider::nvidia_nim(api_key)?;
             let model = settings
                 .model
@@ -1758,9 +2096,7 @@ fn build_provider(settings: &ProviderSettings) -> Result<(Box<dyn Provider>, Str
         }
         ProviderChoice::OpenaiCompat => {
             let api_key = match settings.api_key_env.as_deref() {
-                Some(env_name) => Some(env::var(env_name).with_context(|| {
-                    format!("{env_name} is required for openai-compatible provider")
-                })?),
+                Some(env_name) => Some(resolve_provider_key(env_name, settings, store)?),
                 None => None,
             };
             let base_url = settings
@@ -1775,8 +2111,8 @@ fn build_provider(settings: &ProviderSettings) -> Result<(Box<dyn Provider>, Str
                 .base_url(base_url)
                 .default_model(default_model.clone())
                 .label("openai-compat");
-            if let Some(api_key) = api_key {
-                builder = builder.api_key(api_key);
+            if let Some(key) = api_key {
+                builder = builder.api_key(key);
             }
             let provider = builder.build()?;
             Ok((Box::new(provider), default_model))
@@ -1784,25 +2120,43 @@ fn build_provider(settings: &ProviderSettings) -> Result<(Box<dyn Provider>, Str
         ProviderChoice::Auto => {
             let mut detected = settings.clone();
             apply_provider_defaults(&mut detected);
-            build_provider(&detected)
+            build_provider(&detected, store)
         }
     }
 }
 
-fn resolve_provider_choice(choice: ProviderChoice) -> ProviderChoice {
-    choice
+fn resolve_provider_key(
+    default_env: &str,
+    settings: &ProviderSettings,
+    store: &SecretsStore,
+) -> Result<Secret> {
+    let env_name = settings.api_key_env.as_deref().unwrap_or(default_env);
+    lookup_provider_key(env_name, settings, store)?.ok_or_else(|| {
+        anyhow!(
+            "{env_name} is not set; run `helm secrets set {env_name}` or `helm init` to configure"
+        )
+    })
 }
 
-fn read_required_key(settings: &ProviderSettings, default_env: &str) -> Result<String> {
-    let env_name = settings.api_key_env.as_deref().unwrap_or(default_env);
-    env::var(env_name)
-        .ok()
-        .or_else(|| settings.api_key.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "{env_name} is not set and no key was found in config; run `helm init` to configure"
-            )
-        })
+fn lookup_provider_key(
+    env_name: &str,
+    settings: &ProviderSettings,
+    store: &SecretsStore,
+) -> Result<Option<Secret>> {
+    // settings.api_key acts as the CLI-level override (set via --api-key or TUI input)
+    let cli_override = settings
+        .api_key
+        .as_ref()
+        .map(|key| Secret::new(key.clone()));
+    Ok(secrets::resolve_secret(
+        env_name,
+        cli_override.as_ref(),
+        store,
+    )?)
+}
+
+fn resolve_provider_choice(choice: ProviderChoice) -> ProviderChoice {
+    choice
 }
 
 impl ProviderSource {
@@ -1830,7 +2184,7 @@ fn provider_choice_name(choice: ProviderChoice) -> &'static str {
     }
 }
 
-fn default_model_name(choice: ProviderChoice) -> &'static str {
+pub(crate) fn default_model_name(choice: ProviderChoice) -> &'static str {
     match choice {
         ProviderChoice::Groq => "llama-3.3-70b-versatile",
         ProviderChoice::Anthropic => AnthropicProvider::default_model(),
@@ -1854,7 +2208,7 @@ pub(crate) fn default_api_key_env(choice: ProviderChoice) -> Option<&'static str
 }
 
 fn init_tracing(verbose: bool, log_path: Option<&Path>) -> Result<()> {
-    let default_filter = if verbose { "helm=debug" } else { "helm=info" };
+    let default_filter = if verbose { "helm=debug" } else { "helm=warn" };
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(default_filter))
         .map_err(|error| anyhow!("invalid tracing filter: {error}"))?;
@@ -1975,11 +2329,12 @@ mod tests {
 
     use super::{
         DoctorCheck, DoctorEnvReport, DoctorMemoryReport, DoctorOllamaModel, DoctorOllamaReport,
-        DoctorProviderReport, DoctorQuirksReport, DoctorReport, DoctorToolReport, ProviderChoice,
-        ProviderSource, classify_exit_code, format_audit_events, format_models, format_permissions,
-        load_config, model_capability_warning_text, parse_capability_arg, parse_cli_from,
-        parse_scope_arg, render_doctor, render_replay, render_run_stdout, resolve_provider_choice,
-        resolve_provider_settings_with_env, supports_tools,
+        DoctorProviderReport, DoctorQuirksReport, DoctorReport, DoctorSecretsReport,
+        DoctorToolReport, ProviderChoice, ProviderSource, classify_exit_code, format_audit_events,
+        format_models, format_permissions, load_config, model_capability_warning_text,
+        parse_capability_arg, parse_cli_from, parse_scope_arg, render_doctor, render_replay,
+        render_run_stdout, resolve_provider_choice, resolve_provider_settings_with_env,
+        supports_tools,
     };
 
     fn empty_env(_name: &str) -> Option<String> {
@@ -2013,7 +2368,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = load_config(&dir.path().join("missing.toml")).unwrap();
         let settings =
-            resolve_provider_settings_with_env(config.as_ref(), None, None, None, empty_env)
+            resolve_provider_settings_with_env(config.as_ref(), None, None, None, None, empty_env)
                 .unwrap();
 
         assert_eq!(settings.choice, ProviderChoice::Ollama);
@@ -2045,7 +2400,7 @@ mod tests {
 
         let config = load_config(&path).unwrap();
         let settings =
-            resolve_provider_settings_with_env(config.as_ref(), None, None, None, empty_env)
+            resolve_provider_settings_with_env(config.as_ref(), None, None, None, None, empty_env)
                 .unwrap();
 
         assert_eq!(settings.choice, ProviderChoice::Ollama);
@@ -2064,6 +2419,7 @@ mod tests {
                 api_key_env: None,
                 api_key: None,
             }),
+            security: None,
         };
 
         let settings = resolve_provider_settings_with_env(
@@ -2071,6 +2427,7 @@ mod tests {
             Some(ProviderChoice::Anthropic),
             Some("http://flag:11434".to_owned()),
             Some("claude".to_owned()),
+            Some("flag-key".to_owned()),
             empty_env,
         )
         .unwrap();
@@ -2078,6 +2435,7 @@ mod tests {
         assert_eq!(settings.choice, ProviderChoice::Anthropic);
         assert_eq!(settings.base_url, Some("http://flag:11434".to_owned()));
         assert_eq!(settings.model, Some("claude".to_owned()));
+        assert_eq!(settings.api_key, Some("flag-key".to_owned()));
         assert_eq!(settings.source, ProviderSource::Cli);
     }
 
@@ -2086,6 +2444,7 @@ mod tests {
         let settings = resolve_provider_settings_with_env(
             None,
             Some(ProviderChoice::Ollama),
+            None,
             None,
             None,
             |name| (name == "HELM_PROVIDER").then(|| "groq".to_owned()),
@@ -2106,9 +2465,10 @@ mod tests {
                 api_key_env: None,
                 api_key: None,
             }),
+            security: None,
         };
         let settings =
-            resolve_provider_settings_with_env(Some(&config), None, None, None, |name| {
+            resolve_provider_settings_with_env(Some(&config), None, None, None, None, |name| {
                 (name == "HELM_PROVIDER").then(|| "groq".to_owned())
             })
             .unwrap();
@@ -2127,9 +2487,10 @@ mod tests {
                 api_key_env: None,
                 api_key: None,
             }),
+            security: None,
         };
         let settings =
-            resolve_provider_settings_with_env(Some(&config), None, None, None, |name| {
+            resolve_provider_settings_with_env(Some(&config), None, None, None, None, |name| {
                 (name == "HELM_MODEL").then(|| "env-model".to_owned())
             })
             .unwrap();
@@ -2147,9 +2508,10 @@ mod tests {
                 api_key_env: None,
                 api_key: None,
             }),
+            security: None,
         };
         let settings =
-            resolve_provider_settings_with_env(Some(&config), None, None, None, |name| {
+            resolve_provider_settings_with_env(Some(&config), None, None, None, None, |name| {
                 (name == "GROQ_API_KEY").then(|| "set".to_owned())
             })
             .unwrap();
@@ -2160,7 +2522,7 @@ mod tests {
 
     #[test]
     fn auto_detect_env_precedence() {
-        let settings = resolve_provider_settings_with_env(None, None, None, None, |name| {
+        let settings = resolve_provider_settings_with_env(None, None, None, None, None, |name| {
             matches!(name, "GROQ_API_KEY" | "ANTHROPIC_API_KEY").then(|| "set".to_owned())
         })
         .unwrap();
@@ -2172,7 +2534,7 @@ mod tests {
 
     #[test]
     fn auto_detect_openai_sets_base_url() {
-        let settings = resolve_provider_settings_with_env(None, None, None, None, |name| {
+        let settings = resolve_provider_settings_with_env(None, None, None, None, None, |name| {
             (name == "OPENAI_API_KEY").then(|| "set".to_owned())
         })
         .unwrap();
@@ -2195,10 +2557,11 @@ mod tests {
             ("GOOGLE_API_KEY", ProviderChoice::Gemini),
             ("GEMINI_API_KEY", ProviderChoice::Gemini),
         ] {
-            let settings = resolve_provider_settings_with_env(None, None, None, None, |name| {
-                (name == env_name).then(|| "set".to_owned())
-            })
-            .unwrap();
+            let settings =
+                resolve_provider_settings_with_env(None, None, None, None, None, |name| {
+                    (name == env_name).then(|| "set".to_owned())
+                })
+                .unwrap();
 
             assert_eq!(settings.choice, expected, "env {env_name}");
         }
@@ -2215,6 +2578,12 @@ mod tests {
             }
             _ => panic!("expected run commands"),
         }
+    }
+
+    #[test]
+    fn no_args_opens_tui() {
+        let parsed = parse_cli_from(["helm"]).unwrap();
+        assert!(matches!(parsed.command, super::Command::Tui));
     }
 
     #[test]
@@ -2242,6 +2611,30 @@ mod tests {
                 command: super::AuditCommand::Show(_)
             })
         ));
+    }
+
+    #[test]
+    fn secrets_subcommands_parse_happy_path() {
+        for args in [
+            vec!["helm", "secrets", "list"],
+            vec!["helm", "secrets", "set", "GROQ_API_KEY"],
+            vec!["helm", "secrets", "set", "GROQ_API_KEY", "--from-stdin"],
+            vec![
+                "helm",
+                "secrets",
+                "set",
+                "GROQ_API_KEY",
+                "--value",
+                "gsk_test",
+            ],
+            vec!["helm", "secrets", "get", "GROQ_API_KEY"],
+            vec!["helm", "secrets", "delete", "GROQ_API_KEY"],
+            vec!["helm", "secrets", "path"],
+            vec!["helm", "secrets", "import-env"],
+        ] {
+            let parsed = parse_cli_from(args).unwrap();
+            assert!(matches!(parsed.command, super::Command::Secrets(_)));
+        }
     }
 
     #[test]
@@ -2570,6 +2963,13 @@ mod tests {
                 system_prompt_addendum: false,
                 user_note: Some("Groq open-weight models require temperature=0.".to_owned()),
             },
+            secrets: DoctorSecretsReport {
+                store_path: "/home/user/.helm/secrets.toml".to_owned(),
+                store_exists: true,
+                store_permissions_ok: true,
+                keys_stored: vec!["GROQ_API_KEY".to_owned()],
+                env_overrides: Vec::new(),
+            },
         };
 
         let output = render_doctor(&report);
@@ -2627,6 +3027,13 @@ mod tests {
                 force_temperature: Some(0.0),
                 system_prompt_addendum: true,
                 user_note: Some("Ollama bare-JSON tool calls.".to_owned()),
+            },
+            secrets: DoctorSecretsReport {
+                store_path: "/home/user/.helm/secrets.toml".to_owned(),
+                store_exists: false,
+                store_permissions_ok: false,
+                keys_stored: Vec::new(),
+                env_overrides: Vec::new(),
             },
         };
 

@@ -10,5 +10,15 @@ Cargo.lock
 .helm/
 .idea/
 .vscode/
+.claude/
+.cursorrules
+.mcp.json
+.opencode.json
+.windsurfrules
+GEMINI.md
 *.swp
 .DS_Store
+/codex
+/claude-code
+/hermes-agent
+/opencode

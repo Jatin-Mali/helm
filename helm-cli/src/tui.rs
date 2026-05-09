@@ -9,8 +9,9 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use helm_agent::{AgentEvent, AgentEventSink, Budget, ReactAgent, RunResult};
-use helm_core::{Capability, HelmError};
+use helm_core::{Capability, HelmError, Message};
 use helm_memory::MemoryStore;
+use helm_providers::ChatRequest;
 use helm_tools::ToolRegistry;
 use ratatui::{
     Frame, Terminal,
@@ -24,16 +25,21 @@ use ratatui::{
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
+use crate::secrets::SecretsStore;
 use crate::{
-    ProviderChoice, ProviderSettings, build_provider, default_api_key_env, provider_choice_name,
+    ProviderChoice, ProviderSettings, build_provider, default_api_key_env, default_model_name,
+    provider_choice_name, write_helm_config,
 };
 
 /// Runtime dependencies needed by the TUI.
 pub(crate) struct TuiRuntime {
     pub(crate) provider_settings: ProviderSettings,
     pub(crate) db_path: PathBuf,
+    pub(crate) config_path: PathBuf,
     pub(crate) memory: Arc<MemoryStore>,
     pub(crate) max_iterations: Option<u32>,
+    pub(crate) secrets: SecretsStore,
+    pub(crate) tui_paste_key_modal: bool,
 }
 
 /// Starts the interactive terminal UI.
@@ -62,6 +68,7 @@ enum UiEvent {
     },
     AgentDone {
         run_id: u64,
+        task: String,
         result: Result<RunResult, HelmError>,
     },
     Tick,
@@ -231,7 +238,18 @@ enum ModalState {
         selected: usize,
     },
     ModelSelector {
+        query: String,
+        selected: usize,
+    },
+    ApiKeyInput {
+        choice: ProviderChoice,
         input: String,
+    },
+    AuthRequired {
+        provider_name: String,
+        env_name: String,
+        input: String,
+        error: Option<String>,
     },
     Error(String),
     Help,
@@ -258,6 +276,15 @@ impl CommandPaletteState {
             .filter(|action| action.label().to_ascii_lowercase().contains(&query))
             .collect()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelCatalogEntry {
+    group: &'static str,
+    label: &'static str,
+    provider: ProviderChoice,
+    model: &'static str,
+    note: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +331,36 @@ impl CommandAction {
             Self::Help => "Help",
         }
     }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::NewSession => "new",
+            Self::Replay => "replay",
+            Self::Doctor => "doctor",
+            Self::Provider => "provider",
+            Self::Model => "model",
+            Self::Permissions => "permissions",
+            Self::Audit => "audit",
+            Self::Skills => "skills",
+            Self::Browser => "browser",
+            Self::Help => "help",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::NewSession => "clear transcript and start over",
+            Self::Replay => "show replay command for this episode",
+            Self::Doctor => "show provider and system diagnostics hint",
+            Self::Provider => "switch LLM backend",
+            Self::Model => "edit active model id",
+            Self::Permissions => "grant or inspect capabilities",
+            Self::Audit => "verify audit log chain",
+            Self::Skills => "inspect local skill library",
+            Self::Browser => "browser automation status",
+            Self::Help => "keyboard shortcuts and commands",
+        }
+    }
 }
 
 struct TuiApp {
@@ -314,6 +371,7 @@ struct TuiApp {
     focus: PanelFocus,
     modal: Option<ModalState>,
     palette: CommandPaletteState,
+    slash_popup: Option<usize>,
     running: bool,
     spinner: usize,
     provider_name: String,
@@ -323,28 +381,50 @@ struct TuiApp {
     active_tool_cells: HashMap<String, usize>,
     active_run_id: u64,
     agent_task: Option<JoinHandle<()>>,
+    pending_auth_retry: Option<String>,
 }
 
 struct TuiRuntimeInner {
     db_path: PathBuf,
+    config_path: PathBuf,
     memory: Arc<MemoryStore>,
     max_iterations: Option<u32>,
+    secrets: SecretsStore,
+    tui_paste_key_modal: bool,
 }
 
 impl TuiApp {
     fn new(runtime: TuiRuntime) -> Self {
-        let provider_name = provider_choice_name(runtime.provider_settings.choice).to_owned();
-        let model = runtime
-            .provider_settings
+        let config_path = runtime.config_path.clone();
+        let mut active_settings = runtime.provider_settings.clone();
+
+        // Auto-populate API key from env var if not in secrets store, then persist it there.
+        if active_settings.api_key.is_none() {
+            if let Some(env_name) = default_api_key_env(active_settings.choice) {
+                let in_store = runtime.secrets.get(env_name).ok().flatten().is_some();
+                if !in_store {
+                    if let Ok(key) = std::env::var(env_name) {
+                        active_settings.api_key = Some(key.clone());
+                        // Persist to 0600 secrets store — never write key to config.toml.
+                        let _ = runtime.secrets.set(env_name, helm_core::Secret::new(key));
+                    }
+                }
+            }
+        }
+
+        let provider_name = provider_choice_name(active_settings.choice).to_owned();
+        let model = active_settings
             .model
             .clone()
             .unwrap_or_else(|| "auto".to_owned());
-        let active_settings = runtime.provider_settings.clone();
         Self {
             runtime: Arc::new(TuiRuntimeInner {
                 db_path: runtime.db_path,
+                config_path,
                 memory: runtime.memory,
                 max_iterations: runtime.max_iterations,
+                secrets: runtime.secrets,
+                tui_paste_key_modal: runtime.tui_paste_key_modal,
             }),
             active_settings,
             session: SessionState::default(),
@@ -352,6 +432,7 @@ impl TuiApp {
             focus: PanelFocus::Input,
             modal: None,
             palette: CommandPaletteState::new(),
+            slash_popup: None,
             running: false,
             spinner: 0,
             provider_name,
@@ -361,6 +442,7 @@ impl TuiApp {
             active_tool_cells: HashMap::new(),
             active_run_id: 0,
             agent_task: None,
+            pending_auth_retry: None,
         }
     }
 
@@ -408,7 +490,11 @@ impl TuiApp {
                 }
                 Ok(false)
             }
-            UiEvent::AgentDone { run_id, result } => {
+            UiEvent::AgentDone {
+                run_id,
+                task,
+                result,
+            } => {
                 if run_id != self.active_run_id {
                     return Ok(false);
                 }
@@ -442,8 +528,22 @@ impl TuiApp {
                     }
                     Err(error) => {
                         self.status_note = "failed".to_owned();
-                        self.push_chat(MessageRole::Error, friendly_error(&error.to_string()));
-                        self.modal = Some(ModalState::Error(friendly_error(&error.to_string())));
+                        let msg = error.to_string();
+                        self.push_chat(MessageRole::Error, friendly_error(&msg));
+                        if is_auth_error(&msg) && self.runtime.tui_paste_key_modal {
+                            let env_name = default_api_key_env(self.active_settings.choice)
+                                .unwrap_or("API_KEY")
+                                .to_owned();
+                            self.pending_auth_retry = Some(task);
+                            self.modal = Some(ModalState::AuthRequired {
+                                provider_name: self.provider_name.clone(),
+                                env_name,
+                                input: String::new(),
+                                error: None,
+                            });
+                        } else {
+                            self.modal = Some(ModalState::Error(friendly_error(&msg)));
+                        }
                     }
                 }
                 Ok(false)
@@ -457,7 +557,46 @@ impl TuiApp {
         tx: mpsc::UnboundedSender<UiEvent>,
     ) -> Result<bool> {
         if self.modal.is_some() {
-            return self.handle_modal_key(key);
+            return self.handle_modal_key(key, tx).await;
+        }
+
+        // Slash popup navigation (intercept before normal input handling)
+        if self.slash_popup.is_some() && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Esc => {
+                    self.slash_popup = None;
+                    return Ok(false);
+                }
+                KeyCode::Up => {
+                    if let Some(sel) = &mut self.slash_popup {
+                        *sel = sel.saturating_sub(1);
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    let max = self.slash_filtered().len().saturating_sub(1);
+                    if let Some(sel) = &mut self.slash_popup {
+                        *sel = (*sel + 1).min(max);
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.execute_slash_from_popup();
+                    return Ok(false);
+                }
+                KeyCode::Tab => {
+                    let filtered = self.slash_filtered();
+                    if let Some(sel) = self.slash_popup {
+                        if let Some(cmd) = filtered.get(sel) {
+                            self.input.text = format!("/{}", cmd.slug());
+                            self.input.cursor = self.input.text.chars().count();
+                            self.update_slash_popup();
+                        }
+                    }
+                    return Ok(false);
+                }
+                _ => {}
+            }
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -498,9 +637,18 @@ impl TuiApp {
                 self.input.insert_newline()
             }
             KeyCode::Enter => self.submit(tx).await?,
-            KeyCode::Char(ch) => self.input.insert(ch),
-            KeyCode::Backspace => self.input.backspace(),
-            KeyCode::Delete => self.input.delete(),
+            KeyCode::Char(ch) => {
+                self.input.insert(ch);
+                self.update_slash_popup();
+            }
+            KeyCode::Backspace => {
+                self.input.backspace();
+                self.update_slash_popup();
+            }
+            KeyCode::Delete => {
+                self.input.delete();
+                self.update_slash_popup();
+            }
             KeyCode::Left => self.input.cursor = self.input.cursor.saturating_sub(1),
             KeyCode::Right => {
                 self.input.cursor = (self.input.cursor + 1).min(self.input.text.chars().count());
@@ -522,7 +670,11 @@ impl TuiApp {
         Ok(false)
     }
 
-    fn handle_modal_key(&mut self, key: KeyEvent) -> Result<bool> {
+    async fn handle_modal_key(
+        &mut self,
+        key: KeyEvent,
+        tx: mpsc::UnboundedSender<UiEvent>,
+    ) -> Result<bool> {
         match self.modal.clone() {
             Some(ModalState::CommandPalette) => match key.code {
                 KeyCode::Esc => self.modal = None,
@@ -596,21 +748,7 @@ impl TuiApp {
                     let choices = provider_selector_list();
                     let idx = (d as usize) - ('1' as usize);
                     if let Some((choice, _)) = choices.get(idx) {
-                        let choice = *choice;
-                        let mut s = self.active_settings.with_choice(choice);
-                        s.api_key_env = default_api_key_env(choice).map(str::to_owned);
-                        s.model = None;
-                        self.active_settings = s;
-                        self.provider_name = provider_choice_name(choice).to_owned();
-                        self.model = "auto".to_owned();
-                        self.push_chat(
-                            MessageRole::System,
-                            format!(
-                                "Switched to {}. Type a task to begin.",
-                                provider_choice_name(choice)
-                            ),
-                        );
-                        self.modal = None;
+                        self.apply_provider_choice(*choice);
                     }
                 }
                 KeyCode::Up => {
@@ -628,19 +766,10 @@ impl TuiApp {
                     if let Some(ModalState::ProviderSelector { selected }) = self.modal.clone() {
                         let choices = provider_selector_list();
                         if let Some((choice, _)) = choices.get(selected) {
-                            let choice = *choice;
-                            let mut s = self.active_settings.with_choice(choice);
-                            s.api_key_env = default_api_key_env(choice).map(str::to_owned);
-                            s.model = None;
-                            self.active_settings = s;
-                            self.provider_name = provider_choice_name(choice).to_owned();
-                            self.model = "auto".to_owned();
-                            self.push_chat(
-                                MessageRole::System,
-                                format!("Switched to {}.", provider_choice_name(choice)),
-                            );
+                            self.apply_provider_choice(*choice);
+                        } else {
+                            self.modal = None;
                         }
-                        self.modal = None;
                     }
                 }
                 _ => {}
@@ -648,26 +777,135 @@ impl TuiApp {
             Some(ModalState::ModelSelector { .. }) => match key.code {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Enter => {
-                    if let Some(ModalState::ModelSelector { input }) = self.modal.clone() {
-                        let model = input.trim().to_owned();
-                        if !model.is_empty() {
-                            self.active_settings.model = Some(model.clone());
-                            self.model = model.clone();
-                            self.push_chat(
-                                MessageRole::System,
-                                format!("Model set to {model}. Type a task to begin."),
-                            );
+                    if let Some(ModalState::ModelSelector { query, selected }) = self.modal.clone()
+                    {
+                        let entries = filtered_model_catalog(&query);
+                        if let Some(entry) = entries.get(selected).copied() {
+                            self.apply_model_entry(entry);
+                        } else if !query.trim().is_empty() {
+                            self.apply_manual_model(query.trim().to_owned());
                         }
-                        self.modal = None;
+                    }
+                }
+                KeyCode::Up => {
+                    if let Some(ModalState::ModelSelector { selected, .. }) = &mut self.modal {
+                        *selected = selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(ModalState::ModelSelector { query, selected }) = &mut self.modal {
+                        let max = filtered_model_catalog(query).len().saturating_sub(1);
+                        *selected = (*selected + 1).min(max);
                     }
                 }
                 KeyCode::Backspace => {
-                    if let Some(ModalState::ModelSelector { input }) = &mut self.modal {
+                    if let Some(ModalState::ModelSelector { query, selected }) = &mut self.modal {
+                        query.pop();
+                        *selected = 0;
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if let Some(ModalState::ModelSelector { query, selected }) = &mut self.modal {
+                        query.push(ch);
+                        *selected = 0;
+                    }
+                }
+                _ => {}
+            },
+            Some(ModalState::ApiKeyInput { .. }) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Enter => {
+                    if let Some(ModalState::ApiKeyInput { choice, input }) = self.modal.clone() {
+                        let key = input.trim().to_owned();
+                        if key.is_empty() {
+                            self.push_chat(
+                                MessageRole::System,
+                                "API key cannot be empty. Press Esc to cancel.",
+                            );
+                        } else {
+                            self.apply_provider_with_key(choice, key);
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(ModalState::ApiKeyInput { input, .. }) = &mut self.modal {
                         input.pop();
                     }
                 }
                 KeyCode::Char(ch) => {
-                    if let Some(ModalState::ModelSelector { input }) = &mut self.modal {
+                    if let Some(ModalState::ApiKeyInput { input, .. }) = &mut self.modal {
+                        input.push(ch);
+                    }
+                }
+                _ => {}
+            },
+            Some(ModalState::AuthRequired { .. }) => match key.code {
+                KeyCode::Esc => {
+                    self.pending_auth_retry = None;
+                    self.modal = None;
+                }
+                KeyCode::Enter => {
+                    if let Some(ModalState::AuthRequired {
+                        provider_name,
+                        env_name,
+                        ..
+                    }) = self.modal.clone()
+                    {
+                        let key_val = match &mut self.modal {
+                            Some(ModalState::AuthRequired { input, .. }) => {
+                                let value = input.trim().to_owned();
+                                input.clear();
+                                value
+                            }
+                            _ => String::new(),
+                        };
+                        if key_val.is_empty() {
+                            if let Some(ModalState::AuthRequired { error, .. }) = &mut self.modal {
+                                *error = Some("API key cannot be empty.".to_owned());
+                            }
+                        } else {
+                            self.status_note = "validating key".to_owned();
+                            match self.validate_key(&key_val).await {
+                                Ok(()) => {
+                                    let secret = helm_core::Secret::new(key_val.clone());
+                                    if let Err(e) = self.runtime.secrets.set(&env_name, secret) {
+                                        if let Some(ModalState::AuthRequired { error, .. }) =
+                                            &mut self.modal
+                                        {
+                                            *error = Some(format!("Failed to save key: {e}"));
+                                        }
+                                    } else {
+                                        self.active_settings.api_key = Some(key_val);
+                                        self.push_chat(
+                                            MessageRole::System,
+                                            format!(
+                                                "API key saved for {provider_name}. Retrying the task."
+                                            ),
+                                        );
+                                        self.modal = None;
+                                        if let Some(task) = self.pending_auth_retry.take() {
+                                            self.start_task(task, tx, false).await?;
+                                        }
+                                    }
+                                }
+                                Err(error_text) => {
+                                    if let Some(ModalState::AuthRequired { error, .. }) =
+                                        &mut self.modal
+                                    {
+                                        *error = Some(error_text);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(ModalState::AuthRequired { input, .. }) = &mut self.modal {
+                        input.pop();
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if let Some(ModalState::AuthRequired { input, .. }) = &mut self.modal {
                         input.push(ch);
                     }
                 }
@@ -690,7 +928,28 @@ impl TuiApp {
         let Some(task) = self.input.take_submit() else {
             return Ok(());
         };
-        self.push_chat(MessageRole::User, task.clone());
+        if self.input_looks_like_unknown_slash(&task) {
+            self.push_chat(
+                MessageRole::Error,
+                format!("Unknown command `{task}`. Type /help or press Ctrl+P."),
+            );
+            return Ok(());
+        }
+        self.start_task(task, tx, true).await
+    }
+
+    async fn start_task(
+        &mut self,
+        task: String,
+        tx: mpsc::UnboundedSender<UiEvent>,
+        echo_user: bool,
+    ) -> Result<()> {
+        if self.running {
+            return Ok(());
+        }
+        if echo_user {
+            self.push_chat(MessageRole::User, task.clone());
+        }
         self.record_tool_event("queued", "agent", "task submitted");
         self.running = true;
         self.status_note = "running".to_owned();
@@ -699,12 +958,41 @@ impl TuiApp {
 
         let runtime = Arc::clone(&self.runtime);
         let settings = self.active_settings.clone();
+        let task_for_event = task.clone();
         self.agent_task = Some(tokio::spawn(async move {
             let result = run_agent_task(runtime, settings, task, tx.clone(), run_id).await;
-            tx.send(UiEvent::AgentDone { run_id, result }).ok();
+            tx.send(UiEvent::AgentDone {
+                run_id,
+                task: task_for_event,
+                result,
+            })
+            .ok();
         }));
 
         Ok(())
+    }
+
+    async fn validate_key(&self, key: &str) -> Result<(), String> {
+        let mut settings = self.active_settings.clone();
+        settings.api_key = Some(key.to_owned());
+        let (provider, model) =
+            build_provider(&settings, &self.runtime.secrets).map_err(|error| error.to_string())?;
+        let request = ChatRequest {
+            model,
+            system: None,
+            messages: vec![Message::user("Reply ok.")],
+            tools: vec![],
+            max_tokens: 1,
+            temperature: 0.0,
+        };
+        provider.chat(request).await.map(|_| ()).map_err(|error| {
+            let text = error.to_string();
+            if is_auth_error(&text) {
+                "Validation failed: invalid API key.".to_owned()
+            } else {
+                format!("Validation failed: {}", truncate(text, 180))
+            }
+        })
     }
 
     fn cancel_running_task(&mut self) {
@@ -932,6 +1220,144 @@ impl TuiApp {
         self.modal = None;
     }
 
+    fn apply_provider_choice(&mut self, choice: ProviderChoice) {
+        // Check env var for this provider (don't carry over key from previous provider)
+        let env_key = default_api_key_env(choice).and_then(|env_name| std::env::var(env_name).ok());
+
+        if choice == ProviderChoice::Ollama || env_key.is_some() {
+            let key = env_key.as_deref();
+            self.apply_provider_with_key(choice, key.unwrap_or("").to_owned());
+        } else {
+            // No key available — prompt the user
+            let mut s = self.active_settings.with_choice(choice);
+            s.api_key_env = default_api_key_env(choice).map(str::to_owned);
+            s.api_key = None;
+            s.model = None;
+            self.active_settings = s;
+            self.modal = Some(ModalState::ApiKeyInput {
+                choice,
+                input: String::new(),
+            });
+        }
+    }
+
+    fn apply_provider_with_key(&mut self, choice: ProviderChoice, key: String) {
+        let mut s = self.active_settings.with_choice(choice);
+        s.api_key_env = default_api_key_env(choice).map(str::to_owned);
+        s.api_key = if key.is_empty() {
+            None
+        } else {
+            Some(key.clone())
+        };
+        s.model = None;
+        self.active_settings = s;
+        self.provider_name = provider_choice_name(choice).to_owned();
+        self.model = "auto".to_owned();
+        self.modal = None;
+        self.push_chat(
+            MessageRole::System,
+            format!(
+                "Switched to {}. Type a task to begin.",
+                provider_choice_name(choice)
+            ),
+        );
+        self.save_provider_to_config(choice, if key.is_empty() { None } else { Some(&key) });
+    }
+
+    fn apply_model_entry(&mut self, entry: ModelCatalogEntry) {
+        let mut settings = self.active_settings.with_choice(entry.provider);
+        settings.api_key_env = default_api_key_env(entry.provider).map(str::to_owned);
+        settings.model = Some(entry.model.to_owned());
+        if settings.choice != self.active_settings.choice {
+            settings.api_key = None;
+        }
+        self.active_settings = settings;
+        self.provider_name = provider_choice_name(entry.provider).to_owned();
+        self.model = entry.model.to_owned();
+        self.modal = None;
+        self.push_chat(
+            MessageRole::System,
+            format!(
+                "Model set to {} ({}) via {}. Type a task to begin.",
+                entry.label, entry.model, self.provider_name
+            ),
+        );
+        self.save_provider_to_config(entry.provider, None);
+    }
+
+    fn apply_manual_model(&mut self, model: String) {
+        self.active_settings.model = Some(model.clone());
+        self.model = model.clone();
+        self.modal = None;
+        self.push_chat(
+            MessageRole::System,
+            format!("Model set to {model}. Type a task to begin."),
+        );
+        self.save_provider_to_config(self.active_settings.choice, None);
+    }
+
+    fn save_provider_to_config(&self, choice: ProviderChoice, key: Option<&str>) {
+        let model = self
+            .active_settings
+            .model
+            .as_deref()
+            .unwrap_or_else(|| default_model_name(choice));
+        let _ = write_helm_config(
+            &self.runtime.config_path,
+            &self.runtime.db_path,
+            provider_choice_name(choice),
+            model,
+            self.active_settings.base_url.as_deref(),
+            default_api_key_env(choice),
+            key,
+        );
+    }
+
+    fn slash_filtered(&self) -> Vec<CommandAction> {
+        let raw = self.input.text.trim_start_matches('/').to_ascii_lowercase();
+        let query = raw.split_whitespace().next().unwrap_or("");
+        CommandAction::all()
+            .into_iter()
+            .filter(|a| a.slug().starts_with(query))
+            .collect()
+    }
+
+    fn input_looks_like_unknown_slash(&self, text: &str) -> bool {
+        let Some(command) = text.trim().strip_prefix('/') else {
+            return false;
+        };
+        let slug = command.split_whitespace().next().unwrap_or("");
+        !slug.is_empty()
+            && !CommandAction::all()
+                .iter()
+                .any(|action| action.slug() == slug)
+    }
+
+    fn update_slash_popup(&mut self) {
+        if self.input.text.starts_with('/') {
+            let filtered = self.slash_filtered();
+            if filtered.is_empty() {
+                self.slash_popup = None;
+            } else {
+                let max = filtered.len().saturating_sub(1);
+                self.slash_popup = Some(self.slash_popup.unwrap_or(0).min(max));
+            }
+        } else {
+            self.slash_popup = None;
+        }
+    }
+
+    fn execute_slash_from_popup(&mut self) {
+        let filtered = self.slash_filtered();
+        if let Some(sel) = self.slash_popup {
+            if let Some(cmd) = filtered.get(sel).copied() {
+                self.input.clear();
+                self.slash_popup = None;
+                self.execute_command(cmd);
+            }
+        }
+    }
+
     fn open_palette(&mut self) {
         self.palette = CommandPaletteState::new();
         self.modal = Some(ModalState::CommandPalette);
@@ -951,9 +1377,15 @@ impl TuiApp {
                 self.modal = Some(ModalState::ProviderSelector { selected: current });
             }
             CommandAction::Model => {
-                let current_model = self.active_settings.model.clone().unwrap_or_default();
                 self.modal = Some(ModalState::ModelSelector {
-                    input: current_model,
+                    query: String::new(),
+                    selected: model_catalog()
+                        .iter()
+                        .position(|entry| {
+                            entry.provider == self.active_settings.choice
+                                && entry.model == self.model.as_str()
+                        })
+                        .unwrap_or(0),
                 });
             }
             CommandAction::Permissions => {
@@ -988,7 +1420,7 @@ async fn run_agent_task(
     tx: mpsc::UnboundedSender<UiEvent>,
     run_id: u64,
 ) -> Result<RunResult, HelmError> {
-    let (provider, model) = build_provider(&settings)
+    let (provider, model) = build_provider(&settings, &runtime.secrets)
         .map_err(|error| HelmError::Provider(helm_core::ProviderError::Other(error.to_string())))?;
     let mut budget = Budget::default();
     if let Some(max) = runtime.max_iterations {
@@ -1048,6 +1480,10 @@ fn render_app(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     render_chat(app, vertical[1], buf);
     render_input(app, vertical[2], buf);
 
+    if app.slash_popup.is_some() && app.modal.is_none() {
+        render_slash_popup(app, vertical[2], buf);
+    }
+
     if let Some(modal) = &app.modal {
         render_modal(app, modal, centered_rect(72, 52, area), buf);
     }
@@ -1061,27 +1497,96 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     };
     let episode = app.session.episode_id.as_deref().unwrap_or("-");
     let text = format!(
-        " {spinner} HELM  provider={} model={} episode={}  {}  Ctrl+C cancel/quit  Ctrl+P  PgUp/PgDn",
+        " {spinner} HELM  {} / {}  episode {}  {}   Ctrl+P palette  / commands  Ctrl+C cancel/quit",
         app.provider_name,
         app.model,
         truncate(episode, 8),
         truncate(&app.status_note, 36)
     );
     Paragraph::new(text)
-        .style(Style::default().fg(Color::Black).bg(Color::Green))
+        .style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(if app.running {
+                    Color::Yellow
+                } else {
+                    Color::Cyan
+                })
+                .add_modifier(Modifier::BOLD),
+        )
         .render(area, buf);
 }
 
 fn render_chat(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let lines = chat_lines(&app.session.chat);
-    let visible = visible_lines_from_bottom(lines, area.height, app.session.transcript_scroll);
+    let visible = visible_lines_from_bottom(
+        lines,
+        area.height.saturating_sub(2),
+        app.session.transcript_scroll,
+    );
     Paragraph::new(visible)
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT)
+                .style(Style::default().fg(Color::DarkGray)),
+        )
         .wrap(Wrap { trim: false })
         .render(area, buf);
 }
 
+fn render_slash_popup(app: &TuiApp, input_area: Rect, buf: &mut Buffer) {
+    let filtered = {
+        let raw = app.input.text.trim_start_matches('/').to_ascii_lowercase();
+        let query = raw.split_whitespace().next().unwrap_or("").to_owned();
+        CommandAction::all()
+            .into_iter()
+            .filter(|a| a.slug().starts_with(query.as_str()))
+            .collect::<Vec<_>>()
+    };
+    if filtered.is_empty() {
+        return;
+    }
+    let selected = app.slash_popup.unwrap_or(0);
+    let popup_h = (filtered.len() as u16 + 2).min(input_area.y.saturating_sub(1).max(4));
+    let popup_w = 58_u16.min(input_area.width.saturating_sub(2));
+    let popup_rect = Rect {
+        x: input_area.x + 1,
+        y: input_area.y.saturating_sub(popup_h),
+        width: popup_w,
+        height: popup_h,
+    };
+    let lines: Vec<Line> = filtered
+        .iter()
+        .enumerate()
+        .map(|(i, cmd)| {
+            let style = if i == selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            Line::styled(
+                format!(
+                    " /{:<11} {:<18} {}",
+                    cmd.slug(),
+                    cmd.label(),
+                    truncate(cmd.description(), 22)
+                ),
+                style,
+            )
+        })
+        .collect();
+    Clear.render(popup_rect, buf);
+    Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Commands  ↑↓ Tab Enter Esc"),
+        )
+        .render(popup_rect, buf);
+}
+
 fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let title = "Prompt  Enter submit | Alt+Enter newline";
+    let title = "Prompt  Enter submit | Alt+Enter newline | / commands";
     let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(app.input.text.as_str())
         .block(block)
@@ -1156,25 +1661,131 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
-        ModalState::ModelSelector { input } => {
-            let lines = vec![
-                Line::from("Type a model name and press Enter. Esc to cancel."),
-                Line::from(""),
+        ModalState::ModelSelector { query, selected } => {
+            let entries = filtered_model_catalog(query);
+            let mut lines = vec![
                 Line::from(vec![
-                    Span::styled("Model: ", Style::default().fg(Color::Gray)),
-                    Span::raw(input.as_str()),
+                    Span::styled("Search ", Style::default().fg(Color::Gray)),
+                    Span::raw(query.as_str()),
                     Span::styled("█", Style::default().fg(Color::Yellow)),
                 ]),
                 Line::from(""),
-                Line::from(
-                    "Examples: llama-3.3-70b-versatile  claude-3-5-sonnet-20241022  qwen3:4b",
-                ),
+            ];
+            let mut last_group = "";
+            let visible_rows = 18usize;
+            let start = if *selected >= visible_rows {
+                selected.saturating_add(1).saturating_sub(visible_rows)
+            } else {
+                0
+            };
+            for (index, entry) in entries.iter().enumerate().skip(start).take(visible_rows) {
+                if entry.group != last_group {
+                    if !last_group.is_empty() {
+                        lines.push(Line::from(""));
+                    }
+                    lines.push(Line::styled(
+                        entry.group,
+                        Style::default()
+                            .fg(Color::LightMagenta)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    last_group = entry.group;
+                }
+                let note = entry.note.unwrap_or("");
+                let row = format!(
+                    "{:<34} {:<14} {}",
+                    entry.label,
+                    provider_choice_name(entry.provider),
+                    note
+                );
+                let style = if index == *selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(244, 181, 132))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(row, style));
+            }
+            if entries.is_empty() && !query.trim().is_empty() {
+                lines.push(Line::from("No catalog match."));
+                lines.push(Line::from(format!(
+                    "Press Enter to use `{}` for the current provider.",
+                    query.trim()
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("Enter select  Esc close  Type to filter"));
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title("Select Model"))
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
+        }
+        ModalState::ApiKeyInput { choice, input } => {
+            let env_name = default_api_key_env(*choice).unwrap_or("API_KEY");
+            let lines = vec![
+                Line::from(format!(
+                    "Paste your {} API key and press Enter. Esc to cancel.",
+                    provider_choice_name(*choice)
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Key: ", Style::default().fg(Color::Gray)),
+                    Span::raw("*".repeat(input.len())),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(""),
+                Line::from(format!(
+                    "Or set ${env_name} in your shell and switch provider again."
+                )),
             ];
             Paragraph::new(lines)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title("Model Selector"),
+                        .title("API Key Setup"),
+                )
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
+        }
+        ModalState::AuthRequired {
+            provider_name,
+            env_name,
+            input,
+            error,
+        } => {
+            let mut lines = vec![
+                Line::from(format!(
+                    "Authentication failed for {}. Enter your API key:",
+                    provider_name
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Key: ", Style::default().fg(Color::Gray)),
+                    Span::raw("•".repeat(input.len())),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(""),
+                Line::from(format!(
+                    "Key will be saved to secrets store (also set ${env_name} to avoid this prompt)."
+                )),
+                Line::from(""),
+                Line::from("Enter to save  Esc to cancel"),
+            ];
+            if let Some(error) = error {
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    error.as_str(),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("API Key Required")
+                        .style(Style::default().fg(Color::Yellow)),
                 )
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
@@ -1208,7 +1819,15 @@ fn render_palette(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         } else {
             Style::default()
         };
-        lines.push(Line::styled(command.label(), style));
+        lines.push(Line::styled(
+            format!(
+                "{:<20} /{:<12} {}",
+                command.label(),
+                command.slug(),
+                command.description()
+            ),
+            style,
+        ));
     }
     Paragraph::new(lines)
         .block(
@@ -1492,6 +2111,211 @@ fn provider_selector_list() -> Vec<(ProviderChoice, Option<&'static str>)> {
     ]
 }
 
+fn model_catalog() -> &'static [ModelCatalogEntry] {
+    &[
+        ModelCatalogEntry {
+            group: "Recent",
+            label: "Groq Llama 3.3 70B",
+            provider: ProviderChoice::Groq,
+            model: "llama-3.3-70b-versatile",
+            note: Some("tools"),
+        },
+        ModelCatalogEntry {
+            group: "Recent",
+            label: "Kimi K2.6",
+            provider: ProviderChoice::NvidiaNim,
+            model: "moonshotai/kimi-k2.6",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "Recent",
+            label: "GLM 5.1",
+            provider: ProviderChoice::NvidiaNim,
+            model: "z-ai/glm-5.1",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "Recent",
+            label: "DeepSeek V4 Pro",
+            provider: ProviderChoice::NvidiaNim,
+            model: "deepseek-ai/deepseek-v4-pro",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "Groq",
+            label: "Llama 3.3 70B Versatile",
+            provider: ProviderChoice::Groq,
+            model: "llama-3.3-70b-versatile",
+            note: Some("tools"),
+        },
+        ModelCatalogEntry {
+            group: "Groq",
+            label: "Llama 3.1 8B Instant",
+            provider: ProviderChoice::Groq,
+            model: "llama-3.1-8b-instant",
+            note: Some("fast"),
+        },
+        ModelCatalogEntry {
+            group: "Groq",
+            label: "GPT OSS 120B",
+            provider: ProviderChoice::Groq,
+            model: "openai/gpt-oss-120b",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "Groq",
+            label: "GPT OSS 20B",
+            provider: ProviderChoice::Groq,
+            model: "openai/gpt-oss-20b",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "Google",
+            label: "Gemini 2.5 Flash",
+            provider: ProviderChoice::Gemini,
+            model: "gemini-2.5-flash",
+            note: Some("free"),
+        },
+        ModelCatalogEntry {
+            group: "Google",
+            label: "Gemini 2.5 Flash Lite",
+            provider: ProviderChoice::Gemini,
+            model: "gemini-2.5-flash-lite",
+            note: Some("free"),
+        },
+        ModelCatalogEntry {
+            group: "Google",
+            label: "Gemini 2.5 Pro",
+            provider: ProviderChoice::Gemini,
+            model: "gemini-2.5-pro",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "Google",
+            label: "Gemini 2.0 Flash",
+            provider: ProviderChoice::Gemini,
+            model: "gemini-2.0-flash",
+            note: Some("free"),
+        },
+        ModelCatalogEntry {
+            group: "Google",
+            label: "Gemini 3 Pro Preview",
+            provider: ProviderChoice::Gemini,
+            model: "gemini-3-pro-preview",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "NVIDIA",
+            label: "Kimi K2.6",
+            provider: ProviderChoice::NvidiaNim,
+            model: "moonshotai/kimi-k2.6",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "NVIDIA",
+            label: "GLM 5.1",
+            provider: ProviderChoice::NvidiaNim,
+            model: "z-ai/glm-5.1",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "NVIDIA",
+            label: "DeepSeek V4 Pro",
+            provider: ProviderChoice::NvidiaNim,
+            model: "deepseek-ai/deepseek-v4-pro",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "NVIDIA",
+            label: "Nemotron 3 Super 120B",
+            provider: ProviderChoice::NvidiaNim,
+            model: "nvidia/nemotron-3-super-120b",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "OpenRouter",
+            label: "Kimi K2.6",
+            provider: ProviderChoice::Openrouter,
+            model: "moonshotai/kimi-k2.6",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "OpenRouter",
+            label: "DeepSeek Chat",
+            provider: ProviderChoice::Openrouter,
+            model: "deepseek/deepseek-chat",
+            note: Some("free"),
+        },
+        ModelCatalogEntry {
+            group: "OpenRouter",
+            label: "DeepSeek Reasoner",
+            provider: ProviderChoice::Openrouter,
+            model: "deepseek/deepseek-r1",
+            note: Some("free"),
+        },
+        ModelCatalogEntry {
+            group: "OpenRouter",
+            label: "Qwen 3 Coder",
+            provider: ProviderChoice::Openrouter,
+            model: "qwen/qwen3-coder",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "OpenRouter",
+            label: "Gemma 3 31B Free",
+            provider: ProviderChoice::Openrouter,
+            model: "google/gemma-3-31b-it:free",
+            note: Some("free"),
+        },
+        ModelCatalogEntry {
+            group: "Anthropic",
+            label: "Claude Opus 4.1",
+            provider: ProviderChoice::Anthropic,
+            model: "claude-opus-4-1-20250805",
+            note: None,
+        },
+        ModelCatalogEntry {
+            group: "Anthropic",
+            label: "Claude 3.5 Haiku",
+            provider: ProviderChoice::Anthropic,
+            model: "claude-3-5-haiku-20241022",
+            note: Some("fast"),
+        },
+        ModelCatalogEntry {
+            group: "Local",
+            label: "Qwen3 4B",
+            provider: ProviderChoice::Ollama,
+            model: "qwen3:4b",
+            note: Some("local"),
+        },
+    ]
+}
+
+fn filtered_model_catalog(query: &str) -> Vec<ModelCatalogEntry> {
+    let query = query.trim().to_ascii_lowercase();
+    model_catalog()
+        .iter()
+        .copied()
+        .filter(|entry| {
+            query.is_empty()
+                || entry.label.to_ascii_lowercase().contains(&query)
+                || entry.model.to_ascii_lowercase().contains(&query)
+                || entry.group.to_ascii_lowercase().contains(&query)
+                || provider_choice_name(entry.provider)
+                    .to_ascii_lowercase()
+                    .contains(&query)
+        })
+        .collect()
+}
+
+fn is_auth_error(error: &str) -> bool {
+    error.contains("HTTP 401")
+        || error.contains("invalid_api_key")
+        || error.contains("Invalid API Key")
+        || error.contains("Unauthorized")
+        || error.contains("authentication_error")
+}
+
 fn friendly_error(error: &str) -> String {
     if error.contains("HTTP 401")
         || error.contains("invalid_api_key")
@@ -1528,6 +2352,7 @@ mod tests {
                 .block_on(MemoryStore::open(&db))
                 .unwrap(),
         );
+        let secrets = SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap();
         TuiApp::new(TuiRuntime {
             provider_settings: ProviderSettings {
                 choice: crate::ProviderChoice::Ollama,
@@ -1538,8 +2363,11 @@ mod tests {
                 source: crate::ProviderSource::Fallback,
             },
             db_path: db,
+            config_path: PathBuf::from("/tmp/helm-test-config.toml"),
             memory,
             max_iterations: Some(2),
+            secrets,
+            tui_paste_key_modal: true,
         })
     }
 
@@ -1620,6 +2448,78 @@ mod tests {
     fn friendly_errors_are_actionable() {
         assert!(friendly_error("provider returned HTTP 401").contains("Invalid API key"));
         assert!(friendly_error("provider returned HTTP 429").contains("Rate limited"));
+    }
+
+    #[test]
+    fn auth_401_opens_modal_and_keeps_retry_task() {
+        let mut app = app();
+        app.active_settings.choice = ProviderChoice::Groq;
+        app.provider_name = "groq".to_owned();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(app.handle_ui_event(
+                UiEvent::AgentDone {
+                    run_id: app.active_run_id,
+                    task: "check services".to_owned(),
+                    result: Err(HelmError::Provider(helm_core::ProviderError::HttpStatus {
+                        status: 401,
+                        body: "bad key".to_owned(),
+                    })),
+                },
+                tx,
+            ))
+            .unwrap();
+
+        assert!(matches!(app.modal, Some(ModalState::AuthRequired { .. })));
+        assert_eq!(app.pending_auth_retry, Some("check services".to_owned()));
+    }
+
+    #[test]
+    fn auth_modal_escape_dismisses_cleanly() {
+        let mut app = app();
+        app.pending_auth_retry = Some("retry me".to_owned());
+        app.modal = Some(ModalState::AuthRequired {
+            provider_name: "groq".to_owned(),
+            env_name: "GROQ_API_KEY".to_owned(),
+            input: String::new(),
+            error: None,
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx))
+            .unwrap();
+
+        assert!(app.modal.is_none());
+        assert!(app.pending_auth_retry.is_none());
+    }
+
+    #[test]
+    fn auth_modal_never_renders_raw_key() {
+        let mut app = app();
+        app.modal = Some(ModalState::AuthRequired {
+            provider_name: "groq".to_owned(),
+            env_name: "GROQ_API_KEY".to_owned(),
+            input: "SECRET_KEY_VALUE".to_owned(),
+            error: None,
+        });
+
+        let buffer = render_to_buffer(app, 80, 24);
+        let text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(!text.contains("SECRET_KEY_VALUE"));
+        assert!(text.contains("••••"));
     }
 
     #[test]
@@ -1739,6 +2639,37 @@ mod tests {
             ),
             "append /tmp/a"
         );
+    }
+
+    #[test]
+    fn model_catalog_filters_across_providers() {
+        let models = filtered_model_catalog("gemini 2.5 flash");
+        assert!(models.iter().any(|entry| {
+            entry.provider == ProviderChoice::Gemini && entry.model == "gemini-2.5-flash"
+        }));
+
+        let models = filtered_model_catalog("kimi");
+        assert!(models.iter().any(|entry| {
+            entry.provider == ProviderChoice::NvidiaNim && entry.model == "moonshotai/kimi-k2.6"
+        }));
+    }
+
+    #[test]
+    fn applying_catalog_model_switches_provider_and_model() {
+        let mut app = app();
+        let entry = filtered_model_catalog("deepseek v4")
+            .into_iter()
+            .find(|entry| entry.provider == ProviderChoice::NvidiaNim)
+            .unwrap();
+
+        app.apply_model_entry(entry);
+
+        assert_eq!(app.active_settings.choice, ProviderChoice::NvidiaNim);
+        assert_eq!(
+            app.active_settings.model,
+            Some("deepseek-ai/deepseek-v4-pro".to_owned())
+        );
+        assert_eq!(app.provider_name, "nvidia-nim");
     }
 
     #[test]

@@ -3,10 +3,10 @@
 use std::{collections::HashSet, env, time::Duration};
 
 use async_trait::async_trait;
-use helm_core::{ContentBlock, Message, ProviderError, Role};
+use helm_core::{ContentBlock, Message, ProviderError, Role, Secret};
 use reqwest::{
     Client, StatusCode,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER},
+    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -28,7 +28,7 @@ const OPENAI_DEFAULT_MODEL: &str = "gpt-4o-mini";
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatProvider {
     base_url: String,
-    api_key: Option<String>,
+    api_key: Option<Secret>,
     default_model: String,
     http: Client,
     /// Used in `name()` for logs and episodes; for example `groq`.
@@ -50,7 +50,7 @@ impl OpenAiCompatProvider {
     }
 
     /// Builds a Groq provider from an explicit API key.
-    pub fn groq(api_key: impl Into<String>) -> Result<Self, ProviderError> {
+    pub fn groq(api_key: impl Into<Secret>) -> Result<Self, ProviderError> {
         Self::builder()
             .base_url(GROQ_BASE_URL)
             .api_key(api_key)
@@ -66,7 +66,7 @@ impl OpenAiCompatProvider {
     }
 
     /// Builds an OpenRouter provider from an explicit API key.
-    pub fn openrouter(api_key: impl Into<String>) -> Result<Self, ProviderError> {
+    pub fn openrouter(api_key: impl Into<Secret>) -> Result<Self, ProviderError> {
         let mut provider = Self::builder()
             .base_url(OPENROUTER_BASE_URL)
             .api_key(api_key)
@@ -85,7 +85,7 @@ impl OpenAiCompatProvider {
     }
 
     /// Builds an NVIDIA NIM provider from an explicit API key.
-    pub fn nvidia_nim(api_key: impl Into<String>) -> Result<Self, ProviderError> {
+    pub fn nvidia_nim(api_key: impl Into<Secret>) -> Result<Self, ProviderError> {
         Self::builder()
             .base_url(NVIDIA_NIM_BASE_URL)
             .api_key(api_key)
@@ -101,7 +101,7 @@ impl OpenAiCompatProvider {
     }
 
     /// Builds an OpenAI API provider from an explicit API key.
-    pub fn openai(api_key: impl Into<String>) -> Result<Self, ProviderError> {
+    pub fn openai(api_key: impl Into<Secret>) -> Result<Self, ProviderError> {
         Self::builder()
             .base_url(OPENAI_BASE_URL)
             .api_key(api_key)
@@ -135,12 +135,16 @@ impl OpenAiCompatProvider {
 
     async fn post_once(&self, request: &ChatRequest) -> Result<ProviderAttempt, ProviderError> {
         let body = OpenAiRequest::from_chat_request(request, self.default_model(), self.label)?;
+        self.post_body(body).await
+    }
+
+    async fn post_body(&self, body: OpenAiRequest) -> Result<ProviderAttempt, ProviderError> {
         let mut builder = self
             .http
             .post(self.endpoint())
             .header(CONTENT_TYPE, "application/json");
         if let Some(api_key) = &self.api_key {
-            builder = builder.header(AUTHORIZATION, format!("Bearer {api_key}"));
+            builder = builder.bearer_auth(api_key.expose());
         }
         for (name, value) in &self.extra_headers {
             builder = builder.header(name, value);
@@ -180,6 +184,16 @@ impl OpenAiCompatProvider {
             sleep(delay).await;
         }
     }
+
+    async fn post_without_native_tools(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<ProviderAttempt, ProviderError> {
+        let mut fallback = request.clone();
+        fallback.tools.clear();
+        let body = OpenAiRequest::from_chat_request(&fallback, self.default_model(), self.label)?;
+        self.post_body(body).await
+    }
 }
 
 #[async_trait]
@@ -200,6 +214,20 @@ impl Provider for OpenAiCompatProvider {
                     retry_after,
                     retryable,
                 } => {
+                    if status == StatusCode::BAD_REQUEST
+                        && !request.tools.is_empty()
+                        && !request_contains_tool_results(&request)
+                    {
+                        match self.post_without_native_tools(&request).await? {
+                            ProviderAttempt::Success(response) => return Ok(response),
+                            ProviderAttempt::Status { status, body, .. } => {
+                                return Err(ProviderError::HttpStatus {
+                                    status: status.as_u16(),
+                                    body,
+                                });
+                            }
+                        }
+                    }
                     if !retryable {
                         return Err(ProviderError::HttpStatus {
                             status: status.as_u16(),
@@ -229,7 +257,7 @@ impl Provider for OpenAiCompatProvider {
 #[derive(Debug, Default)]
 pub struct OpenAiCompatProviderBuilder {
     base_url: Option<String>,
-    api_key: Option<String>,
+    api_key: Option<Secret>,
     default_model: Option<String>,
     label: Option<&'static str>,
 }
@@ -242,7 +270,7 @@ impl OpenAiCompatProviderBuilder {
     }
 
     /// Sets the optional bearer API key.
-    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+    pub fn api_key(mut self, api_key: impl Into<Secret>) -> Self {
         self.api_key = Some(api_key.into());
         self
     }
@@ -272,7 +300,7 @@ impl OpenAiCompatProviderBuilder {
             .map_err(|error| ProviderError::Request(error.to_string()))?;
         Ok(OpenAiCompatProvider {
             base_url,
-            api_key: self.api_key.filter(|value| !value.trim().is_empty()),
+            api_key: self.api_key.filter(|s| !s.is_empty()),
             default_model,
             http,
             label,
@@ -334,6 +362,7 @@ fn finite_positive_duration(seconds: f64) -> Option<Duration> {
 struct OpenAiRequest {
     model: String,
     messages: Vec<OpenAiMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAiTool>,
     temperature: f32,
     max_tokens: u32,
@@ -509,7 +538,7 @@ struct OpenAiChoice {
 struct OpenAiResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_tool_calls")]
     tool_calls: Vec<OpenAiResponseToolCall>,
 }
 
@@ -542,6 +571,24 @@ fn message_to_openai(
         Role::Assistant => assistant_message(message, known_tool_ids),
         Role::User => user_message(message, known_tool_ids),
     }
+}
+
+fn request_contains_tool_results(request: &ChatRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    })
+}
+
+fn null_to_empty_tool_calls<'de, D>(
+    deserializer: D,
+) -> Result<Vec<OpenAiResponseToolCall>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<OpenAiResponseToolCall>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn message_text_only(message: &Message, role: &str) -> Result<Vec<OpenAiMessage>, ProviderError> {
@@ -1013,6 +1060,48 @@ mod tests {
             response.into_chat_response().unwrap().stop_reason,
             StopReason::ToolUse
         );
+    }
+
+    #[test]
+    fn null_tool_calls_is_treated_as_empty() {
+        let response: OpenAiResponse = serde_json::from_value(json!({
+            "id": "chatcmpl_1",
+            "choices": [{
+                "message": {"role": "assistant", "content": "hello", "tool_calls": null},
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+
+        let response = response.into_chat_response().unwrap();
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            response.content,
+            vec![ContentBlock::Text("hello".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_request_with_tools_retries_without_native_tools() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("POST", "/chat/completions")
+            .with_status(400)
+            .with_body("tools are not supported")
+            .create_async()
+            .await;
+        let second = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body(success_body("stop"))
+            .create_async()
+            .await;
+
+        let response = provider(server.url()).chat(request()).await.unwrap();
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        first.assert_async().await;
+        second.assert_async().await;
     }
 
     #[test]
