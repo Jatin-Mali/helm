@@ -200,7 +200,10 @@ helm/
 **TUI key bindings** (in `tui.rs`):
 - `Ctrl+C` — quit (or cancel task)
 - `Ctrl+P` — command palette
-- `PgUp/PgDn` — scroll output
+- `Ctrl+L` — clear current visible session
+- `PgUp/PgDn` — scroll transcript by half a screen
+- `Ctrl+Home/Ctrl+End` — jump to transcript top/latest
+- Mouse wheel — scroll transcript
 - In ProviderSelector: digits 1-7 switch provider; Up/Down navigate; Enter apply
 - In ModelSelector: type to edit model string; Enter apply
 
@@ -208,6 +211,9 @@ helm/
 - `active_settings: ProviderSettings` on `TuiApp` — mutated by ProviderSelector/ModelSelector; passed to every new task via `run_agent_task()`
 - `ModalState` enum — CommandPalette / Permission / ProviderSelector / ModelSelector / Error / Help
 - `friendly_error()` — maps raw error strings to user-readable messages (including HTTP 400 tool rejection)
+- TUI theme colors are `Color::Rgb` constants at the top of `tui.rs`; keep the blue palette centralized.
+- Transcript scrolling is bottom-relative via `session.transcript_scroll` and rendered with `Paragraph::scroll`, not manual line slicing.
+- `EnableMouseCapture`/`DisableMouseCapture` are paired in `run_tui`; do not add mouse support without preserving terminal cleanup.
 
 **Grep targets:**
 - `ModalState::` — all modal variants

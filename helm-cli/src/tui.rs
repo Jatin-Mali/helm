@@ -1,10 +1,20 @@
 //! Full-screen HELM terminal UI built with ratatui.
 
-use std::{collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    io,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -21,7 +31,7 @@ use ratatui::{
     prelude::Widget,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -30,6 +40,29 @@ use crate::{
     ProviderChoice, ProviderSettings, build_provider, default_api_key_env, default_model_name,
     provider_choice_name, write_helm_config,
 };
+
+const APP_BG: Color = Color::Rgb(11, 19, 30);
+const APP_FG: Color = Color::Rgb(208, 214, 224);
+const HEADER_BG: Color = Color::Rgb(26, 41, 64);
+const HEADER_BORDER: Color = Color::Rgb(45, 123, 215);
+const USER_BG: Color = Color::Rgb(31, 44, 60);
+const USER_FG: Color = Color::Rgb(224, 229, 240);
+const USER_BAR: Color = Color::Rgb(45, 123, 215);
+const ASSISTANT_BG: Color = Color::Rgb(13, 26, 40);
+const ASSISTANT_FG: Color = Color::Rgb(200, 210, 224);
+const ASSISTANT_BAR: Color = Color::Rgb(74, 144, 217);
+const TOOL_BG: Color = Color::Rgb(18, 35, 59);
+const TOOL_FG: Color = Color::Rgb(139, 164, 204);
+const ERROR_BG: Color = Color::Rgb(31, 17, 21);
+const ERROR_FG: Color = Color::Rgb(242, 139, 130);
+const ERROR_BAR: Color = Color::Rgb(217, 58, 58);
+const INPUT_BG: Color = Color::Rgb(10, 17, 24);
+const INPUT_FOCUS: Color = Color::Rgb(45, 123, 215);
+const INPUT_IDLE: Color = Color::Rgb(42, 58, 74);
+const MODAL_BG: Color = Color::Rgb(19, 34, 53);
+const MODAL_FG: Color = Color::Rgb(203, 209, 222);
+const DIM_FG: Color = Color::Rgb(103, 119, 139);
+const SUCCESS_FG: Color = Color::Rgb(111, 221, 137);
 
 /// Runtime dependencies needed by the TUI.
 pub(crate) struct TuiRuntime {
@@ -46,7 +79,8 @@ pub(crate) struct TuiRuntime {
 pub(crate) async fn run_tui(runtime: TuiRuntime) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("failed to enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
     terminal.clear().ok();
@@ -54,7 +88,12 @@ pub(crate) async fn run_tui(runtime: TuiRuntime) -> Result<()> {
     let result = TuiApp::new(runtime).run(&mut terminal).await;
 
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .ok();
     terminal.show_cursor().ok();
     result
 }
@@ -379,9 +418,17 @@ struct TuiApp {
     status_note: String,
     pending_tool_summaries: HashMap<String, String>,
     active_tool_cells: HashMap<String, usize>,
+    toast: Option<ToastState>,
+    last_chat_height: Cell<u16>,
     active_run_id: u64,
     agent_task: Option<JoinHandle<()>>,
     pending_auth_retry: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToastState {
+    text: String,
+    created: Instant,
 }
 
 struct TuiRuntimeInner {
@@ -440,6 +487,8 @@ impl TuiApp {
             status_note: "ready".to_owned(),
             pending_tool_summaries: HashMap::new(),
             active_tool_cells: HashMap::new(),
+            toast: None,
+            last_chat_height: Cell::new(10),
             active_run_id: 0,
             agent_task: None,
             pending_auth_retry: None,
@@ -478,10 +527,33 @@ impl TuiApp {
             UiEvent::Input(Event::Key(key)) if key.kind == event::KeyEventKind::Press => {
                 self.handle_key(key, tx).await
             }
+            UiEvent::Input(Event::Mouse(mouse)) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        let step = usize::from(self.last_chat_height.get().max(6) / 3);
+                        self.session.transcript_scroll =
+                            self.session.transcript_scroll.saturating_add(step.max(1));
+                    }
+                    MouseEventKind::ScrollDown => {
+                        let step = usize::from(self.last_chat_height.get().max(6) / 3);
+                        self.session.transcript_scroll =
+                            self.session.transcript_scroll.saturating_sub(step.max(1));
+                    }
+                    _ => {}
+                }
+                Ok(false)
+            }
             UiEvent::Input(Event::Resize(_, _)) => Ok(false),
             UiEvent::Input(_) => Ok(false),
             UiEvent::Tick => {
                 self.spinner = self.spinner.wrapping_add(1);
+                if self
+                    .toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.created.elapsed() > Duration::from_secs(2))
+                {
+                    self.toast = None;
+                }
                 Ok(false)
             }
             UiEvent::Agent { run_id, event } => {
@@ -625,7 +697,9 @@ impl TuiApp {
                         "No pending permission request to deny.",
                     );
                 }
-                KeyCode::Char('l') => {}
+                KeyCode::Char('l') => self.clear_transcript(),
+                KeyCode::Home => self.session.transcript_scroll = usize::MAX / 2,
+                KeyCode::End => self.session.transcript_scroll = 0,
                 KeyCode::Char('u') => self.input.clear(),
                 _ => {}
             }
@@ -658,10 +732,14 @@ impl TuiApp {
             KeyCode::Up => self.input.previous_history(),
             KeyCode::Down => self.input.next_history(),
             KeyCode::PageUp => {
-                self.session.transcript_scroll = self.session.transcript_scroll.saturating_add(5)
+                let step = usize::from(self.last_chat_height.get().max(6) / 2);
+                self.session.transcript_scroll =
+                    self.session.transcript_scroll.saturating_add(step.max(1));
             }
             KeyCode::PageDown => {
-                self.session.transcript_scroll = self.session.transcript_scroll.saturating_sub(5)
+                let step = usize::from(self.last_chat_height.get().max(6) / 2);
+                self.session.transcript_scroll =
+                    self.session.transcript_scroll.saturating_sub(step.max(1));
             }
             KeyCode::Tab | KeyCode::BackTab => self.focus = PanelFocus::Input,
             KeyCode::Esc => self.focus = PanelFocus::Input,
@@ -702,6 +780,7 @@ impl TuiApp {
             Some(ModalState::Permission { capability, .. }) => match key.code {
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.push_chat(MessageRole::System, "Permission denied.");
+                    self.toast("Permission denied");
                     self.modal = None;
                 }
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -713,6 +792,7 @@ impl TuiApp {
                             .ok();
                     });
                     self.push_chat(MessageRole::System, format!("Granted {capability} once."));
+                    self.toast("Permission granted once");
                     self.modal = None;
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -727,6 +807,7 @@ impl TuiApp {
                         MessageRole::System,
                         format!("Granted {capability} for session."),
                     );
+                    self.toast("Permission granted for session");
                     self.modal = None;
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -738,6 +819,7 @@ impl TuiApp {
                             .ok();
                     });
                     self.push_chat(MessageRole::System, format!("Granted {capability} always."));
+                    self.toast("Permission granted always");
                     self.modal = None;
                 }
                 _ => {}
@@ -1124,6 +1206,13 @@ impl TuiApp {
         self.session.transcript_scroll = 0;
     }
 
+    fn toast(&mut self, text: impl Into<String>) {
+        self.toast = Some(ToastState {
+            text: sanitize_one_line(&text.into()),
+            created: Instant::now(),
+        });
+    }
+
     fn record_tool_event(
         &mut self,
         status: impl Into<String>,
@@ -1151,7 +1240,7 @@ impl TuiApp {
             .get(id)
             .cloned()
             .unwrap_or_else(|| name.to_owned());
-        let text = format!("running {name}: {summary}");
+        let text = format!("{name}: {summary} ...");
         self.status_note = format!("running {name}");
         self.session.chat.push(ChatMessage {
             role: MessageRole::Activity,
@@ -1170,9 +1259,9 @@ impl TuiApp {
         let preview = tool_output_preview(content);
         let text = if success {
             if preview.is_empty() {
-                format!("ran {name}: {summary}")
+                format!("{name}: {summary}")
             } else {
-                format!("ran {name}: {summary}\n{preview}")
+                format!("{name}: {summary}\n{preview}")
             }
         } else if preview.is_empty() {
             format!("{name} failed: {summary}")
@@ -1218,6 +1307,12 @@ impl TuiApp {
         self.input.clear();
         self.push_chat(MessageRole::System, "New session started.");
         self.modal = None;
+    }
+
+    fn clear_transcript(&mut self) {
+        self.session.chat.clear();
+        self.session.transcript_scroll = 0;
+        self.push_chat(MessageRole::System, "Transcript cleared.");
     }
 
     fn apply_provider_choice(&mut self, choice: ProviderChoice) {
@@ -1467,71 +1562,132 @@ fn render_app(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         return;
     }
 
+    Block::default()
+        .style(Style::default().bg(APP_BG).fg(APP_FG))
+        .render(area, buf);
+
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Min(6),
             Constraint::Length(input_height(&app.input.text, area.width)),
+            Constraint::Length(1),
         ])
         .split(area);
 
     render_status(app, vertical[0], buf);
     render_chat(app, vertical[1], buf);
     render_input(app, vertical[2], buf);
+    render_footer(app, vertical[3], buf);
 
     if app.slash_popup.is_some() && app.modal.is_none() {
         render_slash_popup(app, vertical[2], buf);
     }
 
+    if let Some(toast) = &app.toast {
+        render_toast(toast, area, buf);
+    }
+
     if let Some(modal) = &app.modal {
+        render_dim_overlay(area, buf);
         render_modal(app, modal, centered_rect(72, 52, area), buf);
     }
 }
 
 fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
     let spinner = if app.running {
         ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"][app.spinner % 8]
     } else {
-        " "
+        "H"
     };
     let episode = app.session.episode_id.as_deref().unwrap_or("-");
-    let text = format!(
-        " {spinner} HELM  {} / {}  episode {}  {}   Ctrl+P palette  / commands  Ctrl+C cancel/quit",
-        app.provider_name,
-        app.model,
-        truncate(episode, 8),
-        truncate(&app.status_note, 36)
-    );
-    Paragraph::new(text)
-        .style(
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" {spinner} HELM "),
             Style::default()
-                .fg(Color::Black)
-                .bg(if app.running {
-                    Color::Yellow
-                } else {
-                    Color::Cyan
-                })
+                .fg(Color::White)
+                .bg(HEADER_BG)
                 .add_modifier(Modifier::BOLD),
-        )
-        .render(area, buf);
+        ),
+        Span::styled(
+            format!(" {} / {} ", app.provider_name, truncate(&app.model, 42)),
+            Style::default().fg(APP_FG).bg(HEADER_BG),
+        ),
+        Span::styled(
+            format!(" episode {} ", truncate(episode, 8)),
+            Style::default().fg(DIM_FG).bg(HEADER_BG),
+        ),
+        Span::styled(
+            format!(" {} ", truncate(&app.status_note, 36)),
+            Style::default()
+                .fg(if app.running { SUCCESS_FG } else { APP_FG })
+                .bg(HEADER_BG),
+        ),
+        Span::styled(
+            "  Ctrl+P palette  / commands  Ctrl+C cancel/quit",
+            Style::default().fg(DIM_FG).bg(HEADER_BG),
+        ),
+    ]);
+    Paragraph::new(line)
+        .style(Style::default().bg(HEADER_BG))
+        .render(chunks[0], buf);
+    Paragraph::new("─".repeat(chunks[1].width as usize))
+        .style(Style::default().fg(HEADER_BORDER).bg(APP_BG))
+        .render(chunks[1], buf);
 }
 
 fn render_chat(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let lines = chat_lines(&app.session.chat);
-    let visible = visible_lines_from_bottom(
-        lines,
-        area.height.saturating_sub(2),
-        app.session.transcript_scroll,
-    );
-    Paragraph::new(visible)
+    let viewport_height = area.height.saturating_sub(2);
+    app.last_chat_height.set(viewport_height);
+    let (top_offset, scroll_from_bottom, max_scroll) =
+        transcript_scroll_offsets(lines.len(), viewport_height, app.session.transcript_scroll);
+    let title = if scroll_from_bottom > 0 {
+        format!("Transcript  ↑ {} lines newer below", scroll_from_bottom)
+    } else if max_scroll > 0 {
+        "Transcript  at latest".to_owned()
+    } else {
+        "Transcript".to_owned()
+    };
+    Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::LEFT | Borders::RIGHT)
-                .style(Style::default().fg(Color::DarkGray)),
+                .title(title)
+                .border_style(Style::default().fg(INPUT_IDLE))
+                .style(Style::default().fg(APP_FG).bg(APP_BG)),
         )
+        .scroll((top_offset.min(u16::MAX as usize) as u16, 0))
         .wrap(Wrap { trim: false })
         .render(area, buf);
+
+    if max_scroll > 0 && top_offset > 0 {
+        let indicator = Rect {
+            x: area.x.saturating_add(2),
+            y: area.y,
+            width: 14.min(area.width.saturating_sub(4)),
+            height: 1,
+        };
+        Paragraph::new("↑ earlier")
+            .style(Style::default().fg(DIM_FG).bg(APP_BG))
+            .render(indicator, buf);
+    }
+    if scroll_from_bottom > 0 {
+        let indicator = Rect {
+            x: area.x.saturating_add(2),
+            y: area.y.saturating_add(area.height.saturating_sub(1)),
+            width: 12.min(area.width.saturating_sub(4)),
+            height: 1,
+        };
+        Paragraph::new("↓ latest")
+            .style(Style::default().fg(HEADER_BORDER).bg(APP_BG))
+            .render(indicator, buf);
+    }
 }
 
 fn render_slash_popup(app: &TuiApp, input_area: Rect, buf: &mut Buffer) {
@@ -1560,9 +1716,12 @@ fn render_slash_popup(app: &TuiApp, input_area: Rect, buf: &mut Buffer) {
         .enumerate()
         .map(|(i, cmd)| {
             let style = if i == selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
-            } else {
                 Style::default()
+                    .fg(Color::White)
+                    .bg(HEADER_BORDER)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(APP_FG).bg(MODAL_BG)
             };
             Line::styled(
                 format!(
@@ -1580,18 +1739,78 @@ fn render_slash_popup(app: &TuiApp, input_area: Rect, buf: &mut Buffer) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(Style::default().fg(HEADER_BORDER))
+                .style(Style::default().fg(MODAL_FG).bg(MODAL_BG))
                 .title("Commands  ↑↓ Tab Enter Esc"),
         )
         .render(popup_rect, buf);
 }
 
 fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let title = "Prompt  Enter submit | Alt+Enter newline | / commands";
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let paragraph = Paragraph::new(app.input.text.as_str())
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let counter = format!("{} chars  Enter to send", app.input.text.chars().count());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Prompt ")
+        .title_bottom(Line::styled(
+            counter,
+            Style::default().fg(DIM_FG).bg(INPUT_BG),
+        ))
+        .border_style(Style::default().fg(match app.focus {
+            PanelFocus::Input => INPUT_FOCUS,
+        }))
+        .style(Style::default().fg(Color::White).bg(INPUT_BG));
+    let body = if app.input.text.is_empty() {
+        vec![Line::from(vec![
+            Span::styled(
+                "❯ ",
+                Style::default().fg(USER_BAR).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Ask HELM to do something...",
+                Style::default().fg(DIM_FG).add_modifier(Modifier::ITALIC),
+            ),
+        ])]
+    } else {
+        app.input
+            .text
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                if index == 0 {
+                    Line::from(vec![
+                        Span::styled(
+                            "❯ ",
+                            Style::default().fg(USER_BAR).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(line.to_owned()),
+                    ])
+                } else {
+                    Line::from(vec![Span::raw("  "), Span::raw(line.to_owned())])
+                }
+            })
+            .collect()
+    };
+    let paragraph = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
     paragraph.render(area, buf);
+}
+
+fn render_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let line = Line::from(vec![
+        Span::styled(" ^P ", Style::default().fg(HEADER_BORDER).bg(APP_BG)),
+        Span::styled("Palette", Style::default().fg(DIM_FG).bg(APP_BG)),
+        Span::styled(" | ", Style::default().fg(INPUT_IDLE).bg(APP_BG)),
+        Span::styled("^C ", Style::default().fg(HEADER_BORDER).bg(APP_BG)),
+        Span::styled("Cancel", Style::default().fg(DIM_FG).bg(APP_BG)),
+        Span::styled(" | ", Style::default().fg(INPUT_IDLE).bg(APP_BG)),
+        Span::styled("^L ", Style::default().fg(HEADER_BORDER).bg(APP_BG)),
+        Span::styled("Clear", Style::default().fg(DIM_FG).bg(APP_BG)),
+        Span::styled(" | ", Style::default().fg(INPUT_IDLE).bg(APP_BG)),
+        Span::styled("/ ", Style::default().fg(HEADER_BORDER).bg(APP_BG)),
+        Span::styled("Commands", Style::default().fg(DIM_FG).bg(APP_BG)),
+    ]);
+    Paragraph::new(line)
+        .style(Style::default().fg(DIM_FG).bg(APP_BG))
+        .render(area, buf);
 }
 
 fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) {
@@ -1605,20 +1824,24 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
             detail,
         } => {
             let text = vec![
-                Line::from(format!("capability: {capability}")),
-                Line::from(format!("tool: {tool_name}")),
-                Line::from(format!("taint: {taint}")),
+                modal_kv("tool", tool_name),
+                modal_kv("capability", &capability.to_string()),
+                modal_kv("taint", taint),
                 Line::from(""),
-                Line::from(detail.as_str()),
+                Line::styled(detail.as_str(), Style::default().fg(MODAL_FG)),
                 Line::from(""),
-                Line::from("[y] once  [s] session  [a] always  [n/Esc] deny"),
+                Line::from(vec![
+                    key_span("[Y] Once"),
+                    Span::raw("  "),
+                    key_span("[S] Session"),
+                    Span::raw("  "),
+                    key_span("[A] Always"),
+                    Span::raw("  "),
+                    Span::styled("[N/Esc] Deny", Style::default().fg(ERROR_FG)),
+                ]),
             ];
             Paragraph::new(text)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Permission Required"),
-                )
+                .block(modal_block(" Permission Required "))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
@@ -1642,9 +1865,12 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 };
                 let label = format!("[{}] {:<16} {}", i + 1, name, key_status);
                 let style = if i == *selected {
-                    Style::default().fg(Color::Black).bg(Color::Yellow)
-                } else {
                     Style::default()
+                        .fg(Color::White)
+                        .bg(HEADER_BORDER)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MODAL_FG).bg(MODAL_BG)
                 };
                 lines.push(Line::styled(label, style));
             }
@@ -1653,11 +1879,7 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 "Tip: set the env key then press the number. Run `helm init --force` to persist.",
             ));
             Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Provider Selector"),
-                )
+                .block(modal_block(" Provider Selector "))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
@@ -1700,11 +1922,11 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 );
                 let style = if index == *selected {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Rgb(244, 181, 132))
+                        .fg(Color::White)
+                        .bg(HEADER_BORDER)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
+                    Style::default().fg(MODAL_FG).bg(MODAL_BG)
                 };
                 lines.push(Line::styled(row, style));
             }
@@ -1718,7 +1940,7 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
             lines.push(Line::from(""));
             lines.push(Line::from("Enter select  Esc close  Type to filter"));
             Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title("Select Model"))
+                .block(modal_block(" Select Model "))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
@@ -1741,11 +1963,7 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 )),
             ];
             Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("API Key Setup"),
-                )
+                .block(modal_block(" API Key Setup "))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
@@ -1781,25 +1999,20 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 ));
             }
             Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("API Key Required")
-                        .style(Style::default().fg(Color::Yellow)),
-                )
+                .block(modal_block(" API Key Required "))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
         ModalState::Error(message) => {
             Paragraph::new(message.as_str())
-                .block(Block::default().borders(Borders::ALL).title("Error"))
-                .style(Style::default().fg(Color::Red))
+                .block(modal_block(" Error "))
+                .style(Style::default().fg(ERROR_FG).bg(MODAL_BG))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
         ModalState::Help => {
             Paragraph::new("Enter submit | Alt+Enter newline | Ctrl+P commands | Ctrl+N new session | Ctrl+C cancel running task, then Ctrl+C again to quit | PageUp/PageDown scroll")
-                .block(Block::default().borders(Borders::ALL).title("Help"))
+                .block(modal_block(" Help "))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
@@ -1815,9 +2028,12 @@ fn render_palette(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     lines.push(Line::from(""));
     for (index, command) in commands.iter().enumerate() {
         let style = if index == app.palette.selected {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
-        } else {
             Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BORDER)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MODAL_FG).bg(MODAL_BG)
         };
         lines.push(Line::styled(
             format!(
@@ -1830,55 +2046,159 @@ fn render_palette(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         ));
     }
     Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Command Palette"),
-        )
+        .block(modal_block(" Command Palette "))
         .render(area, buf);
 }
 
 fn chat_lines(messages: &[ChatMessage]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for message in messages {
-        let (label, style) = match message.role {
+        let (bar, icon, icon_style, text_style) = match message.role {
             MessageRole::User => (
-                "❯",
-                Style::default()
-                    .fg(Color::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
+                USER_BAR,
+                "▸",
+                Style::default().fg(USER_BAR).add_modifier(Modifier::BOLD),
+                Style::default().fg(USER_FG).bg(USER_BG),
             ),
             MessageRole::Assistant => (
-                " ",
+                ASSISTANT_BAR,
+                "H",
                 Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
+                    .fg(ASSISTANT_BAR)
+                    .add_modifier(Modifier::DIM),
+                Style::default().fg(ASSISTANT_FG).bg(ASSISTANT_BG),
             ),
-            MessageRole::System => ("•", Style::default().fg(Color::DarkGray)),
-            MessageRole::Activity => ("•", Style::default().fg(Color::DarkGray)),
+            MessageRole::System => (
+                INPUT_IDLE,
+                "•",
+                Style::default().fg(DIM_FG),
+                Style::default().fg(DIM_FG).bg(APP_BG),
+            ),
+            MessageRole::Activity => (
+                TOOL_BG,
+                tool_activity_icon(&message.text),
+                Style::default().fg(TOOL_FG).bg(TOOL_BG),
+                Style::default().fg(TOOL_FG).bg(TOOL_BG),
+            ),
             MessageRole::Error => (
-                "!",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ERROR_BAR,
+                "✖",
+                Style::default().fg(ERROR_FG).add_modifier(Modifier::BOLD),
+                Style::default().fg(ERROR_FG).bg(ERROR_BG),
             ),
         };
+        let mut emitted_any = false;
         for (index, line) in message.text.lines().enumerate() {
+            emitted_any = true;
             if index == 0 {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{label:>2}  "), style),
-                    Span::raw(line.to_owned()),
+                    Span::styled("   ", Style::default().bg(bar)),
+                    Span::styled(
+                        " ",
+                        Style::default().bg(match message.role {
+                            MessageRole::User => USER_BG,
+                            MessageRole::Assistant => ASSISTANT_BG,
+                            MessageRole::Activity => TOOL_BG,
+                            MessageRole::Error => ERROR_BG,
+                            MessageRole::System => APP_BG,
+                        }),
+                    ),
+                    Span::styled(format!("{icon} "), icon_style),
+                    Span::styled(line.to_owned(), text_style),
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::raw(line.to_owned()),
+                    Span::styled("   ", Style::default().bg(bar)),
+                    Span::styled("   ", text_style),
+                    Span::styled(line.to_owned(), text_style),
                 ]));
             }
         }
+        if !emitted_any {
+            lines.push(Line::from(vec![
+                Span::styled("   ", Style::default().bg(bar)),
+                Span::styled("   ", text_style),
+            ]));
+        }
         if message.role != MessageRole::Activity {
-            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                "─".repeat(16),
+                Style::default().fg(INPUT_IDLE).bg(APP_BG),
+            ));
         }
     }
     lines
+}
+
+fn tool_activity_icon(text: &str) -> &'static str {
+    if text.ends_with("...") {
+        "⚙"
+    } else if text.contains("failed") || text.contains("denied") {
+        "✗"
+    } else {
+        "✓"
+    }
+}
+
+fn modal_block(title: &'static str) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BORDER)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(HEADER_BORDER))
+        .style(Style::default().fg(MODAL_FG).bg(MODAL_BG))
+}
+
+fn modal_kv(label: &'static str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<11} "), Style::default().fg(DIM_FG)),
+        Span::styled(value.to_owned(), Style::default().fg(MODAL_FG)),
+    ])
+}
+
+fn key_span(text: &'static str) -> Span<'static> {
+    Span::styled(
+        text,
+        Style::default()
+            .fg(Color::White)
+            .bg(HEADER_BORDER)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn render_dim_overlay(area: Rect, buf: &mut Buffer) {
+    let overlay = Block::default().style(Style::default().bg(Color::Black).fg(DIM_FG));
+    overlay.render(area, buf);
+}
+
+fn render_toast(toast: &ToastState, area: Rect, buf: &mut Buffer) {
+    let width = (toast.text.chars().count() as u16 + 6)
+        .clamp(24, 52)
+        .min(area.width.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(width + 2),
+        y: area.y + area.height.saturating_sub(4),
+        width,
+        height: 3.min(area.height),
+    };
+    Clear.render(rect, buf);
+    Paragraph::new(Line::from(vec![
+        Span::styled("✓ ", Style::default().fg(SUCCESS_FG).bg(TOOL_BG)),
+        Span::styled(toast.text.clone(), Style::default().fg(APP_FG).bg(TOOL_BG)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(HEADER_BORDER))
+            .style(Style::default().bg(TOOL_BG)),
+    )
+    .render(rect, buf);
 }
 
 fn visible_activity_text(item: &ToolTimelineItem) -> Option<String> {
@@ -2015,18 +2335,15 @@ fn tool_output_preview(content: &str) -> String {
     truncate(useful.join("\n"), 220)
 }
 
-fn visible_lines_from_bottom(
-    lines: Vec<Line<'static>>,
-    height: u16,
+fn transcript_scroll_offsets(
+    total_lines: usize,
+    viewport_height: u16,
     scroll_from_bottom: usize,
-) -> Vec<Line<'static>> {
-    let height = height as usize;
-    if height == 0 || lines.len() <= height {
-        return lines;
-    }
-    let end = lines.len().saturating_sub(scroll_from_bottom).max(height);
-    let start = end.saturating_sub(height);
-    lines[start..end.min(lines.len())].to_vec()
+) -> (usize, usize, usize) {
+    let max_scroll = total_lines.saturating_sub(viewport_height as usize);
+    let scroll_from_bottom = scroll_from_bottom.min(max_scroll);
+    let top_offset = max_scroll.saturating_sub(scroll_from_bottom);
+    (top_offset, scroll_from_bottom, max_scroll)
 }
 
 fn input_height(input: &str, width: u16) -> u16 {
@@ -2576,7 +2893,7 @@ mod tests {
         assert_eq!(app.session.chat.len(), 1);
         assert_eq!(
             app.session.chat[0].text,
-            "running shell: shell `date && uname -a` -> /tmp/helm.txt"
+            "shell: shell `date && uname -a` -> /tmp/helm.txt ..."
         );
 
         app.apply_agent_event(AgentEvent::ToolCallFinished {
@@ -2591,7 +2908,7 @@ mod tests {
         assert!(
             app.session.chat[0]
                 .text
-                .contains("ran shell: shell `date && uname -a`")
+                .contains("shell: shell `date && uname -a`")
         );
         assert!(app.session.chat[0].text.contains("Linux PHANTOM"));
     }
@@ -2674,13 +2991,20 @@ mod tests {
 
     #[test]
     fn transcript_scrolls_from_bottom() {
-        let lines = (0..20)
-            .map(|index| Line::from(format!("line {index}")))
-            .collect::<Vec<_>>();
-        let visible = visible_lines_from_bottom(lines.clone(), 5, 0);
-        assert_eq!(visible.first().unwrap().to_string(), "line 15");
-        let visible = visible_lines_from_bottom(lines, 5, 5);
-        assert_eq!(visible.first().unwrap().to_string(), "line 10");
+        let (top, from_bottom, max) = transcript_scroll_offsets(20, 5, 0);
+        assert_eq!(top, 15);
+        assert_eq!(from_bottom, 0);
+        assert_eq!(max, 15);
+
+        let (top, from_bottom, max) = transcript_scroll_offsets(20, 5, 5);
+        assert_eq!(top, 10);
+        assert_eq!(from_bottom, 5);
+        assert_eq!(max, 15);
+
+        let (top, from_bottom, max) = transcript_scroll_offsets(20, 5, usize::MAX / 2);
+        assert_eq!(top, 0);
+        assert_eq!(from_bottom, 15);
+        assert_eq!(max, 15);
     }
 
     #[test]
