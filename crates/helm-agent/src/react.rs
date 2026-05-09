@@ -31,7 +31,12 @@ Tools:
 
 - process/service/package/disk/network/logs: typed Linux system-control tools. Prefer these over raw shell for process, systemd, package-manager, disk, port/network, and journalctl tasks because their inputs are stricter and easier to verify.
 
-Plan briefly, act, verify. After each tool call, check the result before continuing. When the task is done, give a short summary of what you did and what the user should know.
+Execution policy:
+1. Plan first: before touching the machine, decide the shortest safe path and list only the next concrete checks you need.
+2. Prefer one reliable typed tool call over many speculative shell commands.
+3. For disk-capacity/root-cause tasks, start with `disk df` for the exact path, then `disk du` with a small limit on the mounted filesystem, then `disk largest_files` only if directory totals do not explain the issue. Avoid raw `du /home/*` and unbounded `find /home` commands.
+4. After each tool call, inspect the result before continuing. If a tool returns partial output or a timeout, narrow the path and retry with a smaller scope instead of repeating the same broad scan.
+5. When the task is done, give a short summary of what you found, the root cause if known, and the safest fix.
 
 Be precise. Do not fabricate file contents or command output. If a tool returns an error, address it or tell the user honestly. If you wrote a file, read it back to verify before declaring success."#;
 

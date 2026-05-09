@@ -35,11 +35,11 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    /// Creates a context rooted at `working_dir` with v0.1 defaults.
+    /// Creates a context rooted at `working_dir` with v1.0.1 defaults.
     pub fn new(working_dir: PathBuf) -> Self {
         Self {
             working_dir,
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(120),
             max_output_bytes: 1024 * 1024,
         }
     }
@@ -69,7 +69,7 @@ mod tests {
         let ctx = ToolContext::new(PathBuf::from("/tmp"));
 
         assert_eq!(ctx.working_dir, PathBuf::from("/tmp"));
-        assert_eq!(ctx.timeout, Duration::from_secs(30));
+        assert_eq!(ctx.timeout, Duration::from_secs(120));
         assert_eq!(ctx.max_output_bytes, 1024 * 1024);
     }
 

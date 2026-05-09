@@ -1,6 +1,6 @@
 //! Small command runner shared by typed Linux tools.
 
-use std::{path::Path, time::Instant};
+use std::{path::Path, time::Duration, time::Instant};
 
 use serde_json::{Map, Value, json};
 use tokio::{process::Command, time};
@@ -12,11 +12,20 @@ pub async fn run_command(
     args: &[String],
     ctx: &ToolContext,
 ) -> Result<ToolOutput, ToolError> {
+    run_command_with_timeout(program, args, ctx, ctx.timeout).await
+}
+
+pub async fn run_command_with_timeout(
+    program: &str,
+    args: &[String],
+    ctx: &ToolContext,
+    timeout_duration: Duration,
+) -> Result<ToolOutput, ToolError> {
     let started = Instant::now();
     let mut command = Command::new(program);
     command.args(args).current_dir(&ctx.working_dir);
     command.kill_on_drop(true);
-    let output = match time::timeout(ctx.timeout, command.output()).await {
+    let output = match time::timeout(timeout_duration, command.output()).await {
         Ok(output) => output?,
         Err(_) => return Err(ToolError::Timeout),
     };

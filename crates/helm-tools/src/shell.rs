@@ -141,7 +141,44 @@ impl Tool for ShellTool {
             Err(_) => {
                 child.kill().await?;
                 let _ = child.wait().await;
-                return Err(ToolError::Timeout);
+                let stdout_bytes = stdout_task
+                    .await
+                    .map_err(|error| ToolError::Other(format!("stdout task failed: {error}")))??;
+                let stderr_bytes = stderr_task
+                    .await
+                    .map_err(|error| ToolError::Other(format!("stderr task failed: {error}")))??;
+                if let Some(task) = stdin_task {
+                    task.await.map_err(|error| {
+                        ToolError::Other(format!("stdin task failed: {error}"))
+                    })??;
+                }
+                let stdout_text = String::from_utf8_lossy(&stdout_bytes);
+                let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+                let timeout_secs = ctx.timeout.as_secs();
+                let full = format!(
+                    "STDOUT:\n{stdout_text}\nSTDERR:\n{stderr_text}\n[timed out after {timeout_secs}s; process killed]"
+                );
+                let (content, truncated, omitted) = truncate_string(&full, ctx.max_output_bytes);
+                let mut metadata = Map::new();
+                metadata.insert("mode".to_owned(), json!(parsed.mode.as_str()));
+                metadata.insert("exit_code".to_owned(), Value::Null);
+                metadata.insert("stdout_bytes".to_owned(), json!(stdout_bytes.len()));
+                metadata.insert("stderr_bytes".to_owned(), json!(stderr_bytes.len()));
+                metadata.insert("stdin_bytes".to_owned(), json!(parsed.stdin_bytes()));
+                metadata.insert(
+                    "duration_ms".to_owned(),
+                    json!(duration_ms(started.elapsed())),
+                );
+                metadata.insert("timed_out".to_owned(), Value::Bool(true));
+                metadata.insert("truncated".to_owned(), Value::Bool(truncated));
+                if truncated {
+                    metadata.insert("omitted_bytes".to_owned(), json!(omitted));
+                }
+                return Ok(ToolOutput {
+                    content,
+                    success: false,
+                    metadata,
+                });
             }
         };
 
@@ -496,12 +533,14 @@ mod tests {
     async fn timeout_kills_process_edge_case() {
         let (_dir, mut ctx) = ctx();
         ctx.timeout = Duration::from_millis(50);
-        let error = ShellTool
+        let output = ShellTool
             .execute(json!({"command": "sleep", "args": ["2"]}), &ctx)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(error, ToolError::Timeout));
+        assert!(!output.success);
+        assert!(output.content.contains("timed out after"));
+        assert_eq!(output.metadata.get("timed_out"), Some(&json!(true)));
     }
 
     #[tokio::test]

@@ -98,6 +98,13 @@ helm/
 - `ToolRegistry::register` — tool registration
 - `taint` in browser.rs — marks browser output as external-tainted
 
+**v1.0.1 reliability notes:**
+- `ToolContext::new()` defaults to a 120s per-tool timeout.
+- `disk df` honors the requested `path`; do not ignore mount-specific paths.
+- `disk du` returns sorted top-level usage with a 5-minute scan window. Prefer it over raw `du -sh /home/*`.
+- `disk largest_files` uses a bounded `find | sort | head` pipeline and returns human-readable sizes.
+- `shell` returns partial stdout/stderr on timeout with `success=false` instead of dropping all output.
+
 ---
 
 ## crates/helm-memory
@@ -161,6 +168,11 @@ helm/
 - `EvidenceVerifier::verify` — post-condition checks
 - `parse_tool_calls` — multi-format tool call parsing
 - `BudgetTracker::check` — budget enforcement
+
+**v1.0.1 execution policy:**
+- The default system prompt requires plan-first execution before tool use.
+- Disk/root-cause tasks should follow `disk df` → `disk du` → scoped `disk largest_files`.
+- Repeating the same broad timed-out command is a bug; narrow the path or use typed tools.
 
 ---
 

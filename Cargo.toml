@@ -1,6 +1,6 @@
 [package]
 name = "helm-workspace"
-version = "0.1.2"
+version = "1.0.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
