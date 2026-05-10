@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
-use helm_agent::{Budget, ReactAgent, RunResult};
+use helm_agent::{Budget, CancellationToken, ReactAgent, RunResult};
 use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError, Secret};
 use helm_memory::{
     AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, StepRecord,
@@ -496,7 +496,14 @@ async fn run() -> Result<()> {
             }
             budget.auto_approve = cli.yes;
             budget.read_only = cli.read_only;
-            let agent = ReactAgent::new(provider, ToolRegistry::default(), memory, budget, model)?;
+            let cancel = CancellationToken::new();
+            let agent = ReactAgent::new(provider, ToolRegistry::default(), memory, budget, model)?
+                .with_cancel_token(cancel.child());
+            let signal_cancel = cancel.child();
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                signal_cancel.cancel();
+            });
             let result = agent.run(&args.task).await?;
             print_run_result(&result);
         }

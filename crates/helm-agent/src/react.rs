@@ -54,6 +54,7 @@ pub struct ReactAgent {
     tool_context: ToolContext,
     quirks: ProviderQuirks,
     forced_initial_taint: Option<Taint>,
+    cancel_token: Option<crate::cancel::CancellationToken>,
 }
 
 /// Live event emitted while an agent run is executing.
@@ -237,7 +238,15 @@ impl ReactAgent {
             tool_context,
             quirks,
             forced_initial_taint: None,
+            cancel_token: None,
         }
+    }
+
+    /// Attaches a cancellation token.  Calling `token.cancel()` from any
+    /// thread will cause the run loop to stop at the next iteration boundary.
+    pub fn with_cancel_token(mut self, token: crate::cancel::CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
     }
 
     /// Replaces the default system prompt with a caller-provided prompt.
@@ -333,6 +342,40 @@ impl ReactAgent {
                 sink.emit(AgentEvent::RunFinished {
                     result: result.clone(),
                 });
+                return Ok(result);
+            }
+
+            // Cooperative cancellation check — runs at every iteration boundary.
+            if self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()) {
+                self.persist_corrections(
+                    &episode_id,
+                    corrections_used,
+                    format_recovery_used,
+                    &response_format_log,
+                    total_turns_summarized,
+                )
+                .await?;
+                self.memory
+                    .finish_episode(
+                        &episode_id,
+                        EpisodeOutcome::Cancelled,
+                        Some(&final_message),
+                        None,
+                    )
+                    .await?;
+                let result = RunResult::from_parts(
+                    RunResultParts {
+                        episode_id,
+                        final_message,
+                        last_assistant_text,
+                        model_capability_warning,
+                        corrections_used,
+                        format_recovery_used,
+                        total_turns_summarized,
+                    },
+                    &tracker,
+                );
+                sink.emit(AgentEvent::RunFinished { result: result.clone() });
                 return Ok(result);
             }
 

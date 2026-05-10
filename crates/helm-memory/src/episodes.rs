@@ -27,6 +27,8 @@ pub enum EpisodeOutcome {
     Partial,
     /// The task failed and the error was recorded.
     Failure,
+    /// The task was cancelled by the user (Ctrl+C or token).
+    Cancelled,
 }
 
 impl EpisodeOutcome {
@@ -36,6 +38,7 @@ impl EpisodeOutcome {
             Self::Success => "success",
             Self::Partial => "partial",
             Self::Failure => "failure",
+            Self::Cancelled => "cancelled",
         }
     }
 }

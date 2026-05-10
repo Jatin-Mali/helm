@@ -232,9 +232,11 @@ helm/
 **v1.3 additions:**
 - `src/model_router.rs` — `ModelRouter`: routes tasks to models by `TaskComplexity` (Simple/Medium/Complex); `classify(goal)` uses word-count + "then"/comma heuristics; `route(complexity)` picks cheapest capable model
 
+**v1.4 additions:**
+- `src/cancel.rs` — `CancellationToken`: `Arc<AtomicBool>` shared flag; `cancel()`, `is_cancelled()`, `child()`; checked at every loop iteration in `ReactAgent`; wired to `tokio::signal::ctrl_c()` in CLI
+
 **Missing (planned):**
 - `src/roles.rs` — sub-agent specialization (v2.0)
-- `src/cancel.rs` — cancellation tokens (v1.4)
 
 **Grep targets:**
 - `AgentEvent::` — event sink for monitoring
