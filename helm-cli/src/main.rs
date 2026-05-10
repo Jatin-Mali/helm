@@ -27,7 +27,7 @@ use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
     OpenAiCompatProvider, Provider, StopReason, ToolSchema, quirks_for,
 };
-use helm_tools::ToolRegistry;
+use helm_tools::{Tool, ToolContext, ToolRegistry};
 use secrets::SecretsStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -225,6 +225,10 @@ enum McpCommand {
     Add(McpAddArgs),
     /// Remove a configured MCP server
     Remove(McpRemoveArgs),
+    /// Test a configured MCP server by listing its tools
+    Test(McpTestArgs),
+    /// Run a tool on a configured MCP server
+    Run(McpRunArgs),
 }
 
 #[derive(Debug, Args)]
@@ -241,6 +245,22 @@ struct McpAddArgs {
 struct McpRemoveArgs {
     #[arg(value_name = "NAME")]
     name: String,
+}
+
+#[derive(Debug, Args)]
+struct McpTestArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+}
+
+#[derive(Debug, Args)]
+struct McpRunArgs {
+    #[arg(value_name = "SERVER")]
+    server: String,
+    #[arg(value_name = "TOOL")]
+    tool: String,
+    #[arg(long, value_name = "JSON", default_value = "{}")]
+    arguments: String,
 }
 
 #[derive(Debug, Args)]
@@ -606,7 +626,7 @@ async fn run() -> Result<()> {
             }
         },
         Command::Mcp(args) => {
-            run_mcp_command(args)?;
+            run_mcp_command(args).await?;
         }
         Command::Secrets(args) => {
             run_secrets_command(args, &secrets_store)?;
@@ -650,7 +670,7 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-fn run_mcp_command(args: McpArgs) -> Result<()> {
+async fn run_mcp_command(args: McpArgs) -> Result<()> {
     let config_path = helm_tools::default_mcp_config_path()
         .ok_or_else(|| anyhow::anyhow!("could not determine HOME directory"))?;
 
@@ -744,6 +764,41 @@ fn run_mcp_command(args: McpArgs) -> Result<()> {
             std::fs::write(&config_path, out.trim_start())
                 .map_err(|e| anyhow::anyhow!("failed to write config: {e}"))?;
             println!("Removed MCP server '{}'", rem_args.name);
+        }
+        McpCommand::Test(test_args) => {
+            let cwd = env::current_dir().context("failed to determine current directory")?;
+            let output = helm_tools::McpTool
+                .execute(
+                    json!({
+                        "action": "list_tools",
+                        "server": test_args.name,
+                    }),
+                    &ToolContext::new(cwd),
+                )
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("{}", output.content);
+        }
+        McpCommand::Run(run_args) => {
+            let arguments: serde_json::Value = serde_json::from_str(&run_args.arguments)
+                .with_context(|| format!("invalid JSON for --arguments: {}", run_args.arguments))?;
+            if !arguments.is_object() {
+                anyhow::bail!("--arguments must be a JSON object");
+            }
+            let cwd = env::current_dir().context("failed to determine current directory")?;
+            let output = helm_tools::McpTool
+                .execute(
+                    json!({
+                        "action": "call",
+                        "server": run_args.server,
+                        "tool": run_args.tool,
+                        "arguments": arguments,
+                    }),
+                    &ToolContext::new(cwd),
+                )
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("{}", output.content);
         }
     }
     Ok(())
@@ -3138,6 +3193,28 @@ mod tests {
         for shell in ["bash", "zsh", "fish"] {
             let parsed = parse_cli_from(["helm", "completion", shell]).unwrap();
             assert!(matches!(parsed.command, super::Command::Completion(_)));
+        }
+    }
+
+    #[test]
+    fn mcp_subcommands_parse_happy_path() {
+        for args in [
+            vec!["helm", "mcp", "list"],
+            vec!["helm", "mcp", "add", "gmail", "node", "server.js"],
+            vec!["helm", "mcp", "remove", "gmail"],
+            vec!["helm", "mcp", "test", "gmail"],
+            vec![
+                "helm",
+                "mcp",
+                "run",
+                "gmail",
+                "draft_reply",
+                "--arguments",
+                "{\"id\":\"1\"}",
+            ],
+        ] {
+            let parsed = parse_cli_from(args).unwrap();
+            assert!(matches!(parsed.command, super::Command::Mcp(_)));
         }
     }
 

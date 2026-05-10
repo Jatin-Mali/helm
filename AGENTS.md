@@ -156,7 +156,7 @@ helm/
 
 **v1.1 additions:**
 - `src/git.rs` — `GitTool`: 11 git actions (status, log, diff, add, commit, push, pull, branch, checkout, stash, clone) via `tokio::process::Command`. Requires `Capability::ShellExec`.
-- `src/mcp.rs` — `McpTool`: JSON-RPC 2.0 stdio bridge to external MCP servers. Config at `~/.helm/mcp-servers.toml`. Actions: `list_tools`, `call`. CLI: `helm mcp {list,add,remove}`.
+- `src/mcp.rs` — `McpTool`: JSON-RPC 2.0 stdio bridge to external MCP servers. Config at `~/.helm/mcp-servers.toml`. Actions: `list_tools`, `call`. CLI: `helm mcp {list,add,remove,test,run}`.
 
 **Grep targets:**
 - `impl Tool for` — find all tool implementations
@@ -366,8 +366,8 @@ helm/
 | `~/.helm/audit.log` | HMAC-chained audit log (line-delimited JSON) |
 | `~/.helm/skills/` | Skill markdown files (versioned) |
 | `~/.helm/helm.db` | SQLite database (episodes, steps, capability grants) |
-| `~/.helm/mcp-servers.toml` | MCP server configs (v1.1) — managed via `helm mcp {list,add,remove}` |
-| `~/.helm/user_profile.toml` | Learned user preferences (v1.3, not yet implemented) |
+| `~/.helm/mcp-servers.toml` | MCP server configs (v1.1) — managed via `helm mcp {list,add,remove,test,run}` |
+| `~/.helm/user_profile.toml` | Learned user preferences (v1.3) |
 
 ---
 

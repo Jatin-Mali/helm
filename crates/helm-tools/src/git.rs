@@ -1,10 +1,14 @@
 //! Git version-control tool for HELM.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::process::Command;
+use tokio::time;
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
@@ -105,37 +109,51 @@ impl Tool for GitTool {
         };
 
         match action {
-            "status" => git_status(&cwd, &input).await,
-            "log" => git_log(&cwd, &input).await,
-            "diff" => git_diff(&cwd, &input).await,
-            "add" => git_add(&cwd, &input).await,
-            "commit" => git_commit(&cwd, &input).await,
-            "push" => git_push(&cwd, &input).await,
-            "pull" => git_pull(&cwd, &input).await,
-            "branch" => git_branch(&cwd, &input).await,
-            "checkout" => git_checkout(&cwd, &input).await,
-            "stash" => git_stash(&cwd, &input).await,
-            "clone" => git_clone(&cwd, &input).await,
+            "status" => git_status(ctx, &cwd, &input).await,
+            "log" => git_log(ctx, &cwd, &input).await,
+            "diff" => git_diff(ctx, &cwd, &input).await,
+            "add" => git_add(ctx, &cwd, &input).await,
+            "commit" => git_commit(ctx, &cwd, &input).await,
+            "push" => git_push(ctx, &cwd, &input).await,
+            "pull" => git_pull(ctx, &cwd, &input).await,
+            "branch" => git_branch(ctx, &cwd, &input).await,
+            "checkout" => git_checkout(ctx, &cwd, &input).await,
+            "stash" => git_stash(ctx, &cwd, &input).await,
+            "clone" => git_clone(ctx, &cwd, &input).await,
             _ => Err(ToolError::InvalidInput(format!("unknown action: {action}"))),
         }
     }
 }
 
 /// Run a git command in the given directory and collect stdout/stderr/status.
-async fn run_git(cwd: &Path, args: &[&str]) -> Result<(String, String, bool), ToolError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?;
+async fn run_git(ctx: &ToolContext, cwd: &Path, args: &[String]) -> Result<ToolOutput, ToolError> {
+    let started = Instant::now();
+    let mut command = Command::new("git");
+    command.args(args).current_dir(cwd).kill_on_drop(true);
+    let output = match time::timeout(ctx.timeout, command.output()).await {
+        Ok(output) => output.map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?,
+        Err(_) => return Err(ToolError::Timeout),
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    Ok((stdout, stderr, output.status.success()))
+    let mut metadata = Map::new();
+    metadata.insert("program".to_owned(), json!("git"));
+    metadata.insert("args".to_owned(), json!(args));
+    metadata.insert(
+        "duration_ms".to_owned(),
+        json!(started.elapsed().as_millis()),
+    );
+    make_output(&stdout, &stderr, output.status.success(), ctx, metadata)
 }
 
-fn make_output(stdout: &str, stderr: &str, success: bool) -> Result<ToolOutput, ToolError> {
+fn make_output(
+    stdout: &str,
+    stderr: &str,
+    success: bool,
+    ctx: &ToolContext,
+    mut metadata: Map<String, Value>,
+) -> Result<ToolOutput, ToolError> {
     let content = if success {
         if stdout.trim().is_empty() {
             "(no output)".to_owned()
@@ -150,47 +168,49 @@ fn make_output(stdout: &str, stderr: &str, success: bool) -> Result<ToolOutput, 
             format!("error: {msg}")
         }
     };
+    let (content, truncated) = truncate_string(&content, ctx.max_output_bytes);
+    metadata.insert("truncated".to_owned(), json!(truncated));
     Ok(ToolOutput {
         content,
         success,
-        metadata: Map::new(),
+        metadata,
     })
 }
 
-async fn git_status(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
-    let mut cmd = Command::new("git");
-    cmd.arg("status").current_dir(cwd);
+fn git_args(base: &[&str]) -> Vec<String> {
+    base.iter().map(|s| (*s).to_owned()).collect()
+}
+
+fn truncate_string(input: &str, max_bytes: usize) -> (String, bool) {
+    if input.len() <= max_bytes {
+        return (input.to_owned(), false);
+    }
+    let mut end = max_bytes;
+    while !input.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    (format!("{}\n[output truncated]", &input[..end]), true)
+}
+
+async fn git_status(ctx: &ToolContext, cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+    let mut args = git_args(&["status"]);
     if input["short"].as_bool().unwrap_or(false) {
-        cmd.arg("--short");
+        args.push("--short".to_owned());
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    make_output(&stdout, &stderr, output.status.success())
+    run_git(ctx, cwd, &args).await
 }
 
-async fn git_log(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+async fn git_log(ctx: &ToolContext, cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
     let limit = input["limit"].as_u64().unwrap_or(20);
-    let mut cmd = Command::new("git");
-    cmd.args(["log", "--oneline", "--decorate"])
-        .arg(format!("-{limit}"))
-        .current_dir(cwd);
+    let mut args = git_args(&["log", "--oneline", "--decorate"]);
+    args.push(format!("-{limit}"));
     if input["all"].as_bool().unwrap_or(false) {
-        cmd.arg("--all");
+        args.push("--all".to_owned());
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    make_output(&stdout, &stderr, output.status.success())
+    run_git(ctx, cwd, &args).await
 }
 
-async fn git_diff(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+async fn git_diff(ctx: &ToolContext, cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
     let staged = input["staged"].as_bool().unwrap_or(false);
     let files: Vec<String> = input["files"]
         .as_array()
@@ -201,25 +221,18 @@ async fn git_diff(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
         })
         .unwrap_or_default();
 
-    let mut cmd = Command::new("git");
-    cmd.arg("diff").current_dir(cwd);
+    let mut args = git_args(&["diff"]);
     if staged {
-        cmd.arg("--cached");
+        args.push("--cached".to_owned());
     }
     if !files.is_empty() {
-        cmd.arg("--");
-        cmd.args(&files);
+        args.push("--".to_owned());
+        args.extend(files);
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    make_output(&stdout, &stderr, output.status.success())
+    run_git(ctx, cwd, &args).await
 }
 
-async fn git_add(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+async fn git_add(ctx: &ToolContext, cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
     let files: Vec<String> = input["files"]
         .as_array()
         .map(|a| {
@@ -235,90 +248,64 @@ async fn git_add(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
         ));
     }
 
-    let mut cmd = Command::new("git");
-    cmd.arg("add").arg("--").args(&files).current_dir(cwd);
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    make_output(&stdout, &stderr, output.status.success())
+    let mut args = git_args(&["add", "--"]);
+    args.extend(files);
+    run_git(ctx, cwd, &args).await
 }
 
-async fn git_commit(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+async fn git_commit(ctx: &ToolContext, cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
     let message = input["message"]
         .as_str()
         .ok_or_else(|| ToolError::InvalidInput("commit requires 'message'".into()))?;
 
-    let (stdout, stderr, success) = run_git(cwd, &["commit", "-m", message]).await?;
-    make_output(&stdout, &stderr, success)
+    run_git(ctx, cwd, &git_args(&["commit", "-m", message])).await
 }
 
-async fn git_push(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+async fn git_push(ctx: &ToolContext, cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
     let remote = input["remote"].as_str().unwrap_or("origin");
-    let mut cmd = Command::new("git");
-    cmd.args(["push", remote]).current_dir(cwd);
+    let mut args = git_args(&["push", remote]);
     if let Some(branch) = input["branch"].as_str() {
-        cmd.arg(branch);
+        args.push(branch.to_owned());
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    make_output(&stdout, &stderr, output.status.success())
+    run_git(ctx, cwd, &args).await
 }
 
-async fn git_pull(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+async fn git_pull(ctx: &ToolContext, cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
     let remote = input["remote"].as_str().unwrap_or("origin");
-    let mut cmd = Command::new("git");
-    cmd.args(["pull", remote]).current_dir(cwd);
+    let mut args = git_args(&["pull", remote]);
     if let Some(branch) = input["branch"].as_str() {
-        cmd.arg(branch);
+        args.push(branch.to_owned());
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    make_output(&stdout, &stderr, output.status.success())
+    run_git(ctx, cwd, &args).await
 }
 
-async fn git_branch(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+async fn git_branch(ctx: &ToolContext, cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
     if input["create"].as_bool().unwrap_or(false) {
         let branch = input["branch"].as_str().ok_or_else(|| {
             ToolError::InvalidInput("branch create requires 'branch' name".into())
         })?;
-        let (stdout, stderr, success) = run_git(cwd, &["checkout", "-b", branch]).await?;
-        return make_output(&stdout, &stderr, success);
+        return run_git(ctx, cwd, &git_args(&["checkout", "-b", branch])).await;
     }
     if input["delete"].as_bool().unwrap_or(false) {
         let branch = input["branch"].as_str().ok_or_else(|| {
             ToolError::InvalidInput("branch delete requires 'branch' name".into())
         })?;
-        let (stdout, stderr, success) = run_git(cwd, &["branch", "-d", branch]).await?;
-        return make_output(&stdout, &stderr, success);
+        return run_git(ctx, cwd, &git_args(&["branch", "-d", branch])).await;
     }
 
     // List branches.
-    let mut cmd = Command::new("git");
-    cmd.arg("branch").current_dir(cwd);
+    let mut args = git_args(&["branch"]);
     if input["all"].as_bool().unwrap_or(false) {
-        cmd.arg("-a");
+        args.push("-a".to_owned());
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    make_output(&stdout, &stderr, output.status.success())
+    run_git(ctx, cwd, &args).await
 }
 
-async fn git_checkout(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+async fn git_checkout(
+    ctx: &ToolContext,
+    cwd: &Path,
+    input: &Value,
+) -> Result<ToolOutput, ToolError> {
     let branch = input["branch"]
         .as_str()
         .ok_or_else(|| ToolError::InvalidInput("checkout requires 'branch'".into()))?;
@@ -331,54 +318,41 @@ async fn git_checkout(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError
         })
         .unwrap_or_default();
 
-    let mut cmd = Command::new("git");
-    cmd.arg("checkout").arg(branch).current_dir(cwd);
+    let mut args = git_args(&["checkout", branch]);
     if !files.is_empty() {
-        cmd.arg("--").args(&files);
+        args.push("--".to_owned());
+        args.extend(files);
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    make_output(&stdout, &stderr, output.status.success())
+    run_git(ctx, cwd, &args).await
 }
 
-async fn git_stash(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+async fn git_stash(ctx: &ToolContext, cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
     let sub = input["stash_action"].as_str().unwrap_or("push");
-    let args: &[&str] = match sub {
-        "push" => &["stash", "push"],
-        "pop" => &["stash", "pop"],
-        "list" => &["stash", "list"],
-        "drop" => &["stash", "drop"],
+    let args = match sub {
+        "push" => git_args(&["stash", "push"]),
+        "pop" => git_args(&["stash", "pop"]),
+        "list" => git_args(&["stash", "list"]),
+        "drop" => git_args(&["stash", "drop"]),
         _ => {
             return Err(ToolError::InvalidInput(format!(
                 "unknown stash_action: {sub}"
             )));
         }
     };
-    let (stdout, stderr, success) = run_git(cwd, args).await?;
-    make_output(&stdout, &stderr, success)
+    run_git(ctx, cwd, &args).await
 }
 
-async fn git_clone(cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
+async fn git_clone(ctx: &ToolContext, cwd: &Path, input: &Value) -> Result<ToolOutput, ToolError> {
     let url = input["url"]
         .as_str()
         .ok_or_else(|| ToolError::InvalidInput("clone requires 'url'".into()))?;
 
-    let mut cmd = Command::new("git");
-    cmd.args(["clone", url]).current_dir(cwd);
+    let mut args = git_args(&["clone"]);
     if let Some(branch) = input["branch"].as_str() {
-        cmd.args(["-b", branch]);
+        args.extend(git_args(&["-b", branch]));
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    make_output(&stdout, &stderr, output.status.success())
+    args.push(url.to_owned());
+    run_git(ctx, cwd, &args).await
 }
 
 #[cfg(test)]
@@ -561,5 +535,30 @@ mod tests {
         assert!(result.success);
         // Short format uses ?? for untracked
         assert!(result.content.contains("??"));
+    }
+
+    #[tokio::test]
+    async fn git_output_is_truncated_by_tool_context_edge_case() {
+        let (_dir, path) = temp_repo();
+        std::fs::write(path.join("f.txt"), "v1\n").unwrap();
+        let tool = GitTool;
+        tool.execute(json!({"action": "add", "files": ["f.txt"]}), &ctx(&path))
+            .await
+            .unwrap();
+        tool.execute(json!({"action": "commit", "message": "v1"}), &ctx(&path))
+            .await
+            .unwrap();
+        std::fs::write(path.join("f.txt"), "v2\nv3\nv4\nv5\n").unwrap();
+
+        let mut context = ctx(&path);
+        context.max_output_bytes = 16;
+        let output = tool
+            .execute(json!({"action": "diff"}), &context)
+            .await
+            .unwrap();
+
+        assert!(output.success);
+        assert!(output.content.contains("output truncated"));
+        assert_eq!(output.metadata.get("truncated"), Some(&json!(true)));
     }
 }
