@@ -193,9 +193,9 @@ helm/
 - `src/graph.rs` — `EntityGraph`: SQLite-backed knowledge graph; `upsert_entity`, `search_by_name`, `add_relation`, `neighbors`
 - `src/procedures.rs` — `ProcedureStore`: named step sequences; `insert`, `find_by_goal` (LIKE match), `record_success`
 
-**Missing (planned):**
-- `src/skill_learner.rs` — Voyager-style learning (v1.3)
-- `src/user_profile.rs` — user-style learning (v1.3)
+**v1.3 additions:**
+- `src/skill_learner.rs` — `SkillLearner`: finds/creates procedures on success, promotes to skill file at `promote_threshold` hits; `learn(goal, steps)`, `suggest(goal, limit)`
+- `src/user_profile.rs` — `UserProfileStore`: SQLite-backed user prefs; `set_preferred_model`, `set_verbosity`, `record_correction`, `record_goal`
 
 **Grep targets:**
 - `stable_hash_hex` — audit chain hashing
@@ -229,8 +229,10 @@ helm/
 **v1.2 additions:**
 - `src/plan_cache.rs` — `PlanCache`: SQLite plan cache keyed by `goal_hash()` (lowercase-trim + DefaultHasher); `get` auto-increments hit_count, `put` upserts, `invalidate` removes
 
+**v1.3 additions:**
+- `src/model_router.rs` — `ModelRouter`: routes tasks to models by `TaskComplexity` (Simple/Medium/Complex); `classify(goal)` uses word-count + "then"/comma heuristics; `route(complexity)` picks cheapest capable model
+
 **Missing (planned):**
-- `src/model_router.rs` — meta-learning / model routing (v1.3)
 - `src/roles.rs` — sub-agent specialization (v2.0)
 - `src/cancel.rs` — cancellation tokens (v1.4)
 
