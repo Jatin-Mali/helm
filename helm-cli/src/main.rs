@@ -98,6 +98,8 @@ enum Command {
     Config(ConfigArgs),
     /// Generate shell completion scripts
     Completion(CompletionArgs),
+    /// Manage MCP server configurations
+    Mcp(McpArgs),
     Tui,
 }
 
@@ -207,6 +209,38 @@ struct SkillDisableArgs {
 struct SkillTestArgs {
     #[arg(value_name = "ID")]
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct McpArgs {
+    #[command(subcommand)]
+    command: McpCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// List configured MCP servers
+    List,
+    /// Add a new MCP server
+    Add(McpAddArgs),
+    /// Remove a configured MCP server
+    Remove(McpRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+struct McpAddArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(value_name = "COMMAND")]
+    command: String,
+    #[arg(value_name = "ARGS", trailing_var_arg = true)]
+    args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct McpRemoveArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -564,6 +598,9 @@ async fn run() -> Result<()> {
                 println!("{result}");
             }
         },
+        Command::Mcp(args) => {
+            run_mcp_command(args)?;
+        }
         Command::Secrets(args) => {
             run_secrets_command(args, &secrets_store)?;
         }
@@ -601,6 +638,105 @@ async fn run() -> Result<()> {
                 read_only: cli.read_only,
             })
             .await?;
+        }
+    }
+    Ok(())
+}
+
+fn run_mcp_command(args: McpArgs) -> Result<()> {
+    let config_path = helm_tools::default_mcp_config_path()
+        .ok_or_else(|| anyhow::anyhow!("could not determine HOME directory"))?;
+
+    match args.command {
+        McpCommand::List => {
+            let config = helm_tools::load_mcp_config().map_err(|e| anyhow::anyhow!("{e}"))?;
+            if config.servers.is_empty() {
+                println!("No MCP servers configured.");
+                println!("Add one with: helm mcp add <name> <command> [args...]");
+            } else {
+                for server in &config.servers {
+                    let args_str = if server.args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", server.args.join(" "))
+                    };
+                    println!("{}: {}{}", server.name, server.command, args_str);
+                }
+            }
+        }
+        McpCommand::Add(add_args) => {
+            let mut config = if config_path.exists() {
+                let raw = std::fs::read_to_string(&config_path)
+                    .map_err(|e| anyhow::anyhow!("failed to read config: {e}"))?;
+                toml::from_str::<helm_tools::McpConfig>(&raw)
+                    .map_err(|e| anyhow::anyhow!("malformed config: {e}"))?
+            } else {
+                helm_tools::McpConfig::default()
+            };
+
+            if config.servers.iter().any(|s| s.name == add_args.name) {
+                anyhow::bail!("server '{}' already configured", add_args.name);
+            }
+
+            config.servers.push(helm_tools::McpServerConfig {
+                name: add_args.name.clone(),
+                command: add_args.command,
+                args: add_args.args,
+                env: vec![],
+            });
+
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow::anyhow!("failed to create config dir: {e}"))?;
+            }
+
+            let mut out = String::new();
+            for server in &config.servers {
+                out.push_str("\n[[servers]]\n");
+                out.push_str(&format!("name = {:?}\n", server.name));
+                out.push_str(&format!("command = {:?}\n", server.command));
+                if !server.args.is_empty() {
+                    let args_toml: Vec<String> =
+                        server.args.iter().map(|a| format!("{a:?}")).collect();
+                    out.push_str(&format!("args = [{}]\n", args_toml.join(", ")));
+                }
+            }
+
+            std::fs::write(&config_path, out.trim_start())
+                .map_err(|e| anyhow::anyhow!("failed to write config: {e}"))?;
+            println!("Added MCP server '{}'", add_args.name);
+        }
+        McpCommand::Remove(rem_args) => {
+            let mut config = if config_path.exists() {
+                let raw = std::fs::read_to_string(&config_path)
+                    .map_err(|e| anyhow::anyhow!("failed to read config: {e}"))?;
+                toml::from_str::<helm_tools::McpConfig>(&raw)
+                    .map_err(|e| anyhow::anyhow!("malformed config: {e}"))?
+            } else {
+                helm_tools::McpConfig::default()
+            };
+
+            let before = config.servers.len();
+            config.servers.retain(|s| s.name != rem_args.name);
+            if config.servers.len() == before {
+                anyhow::bail!("no server named '{}'", rem_args.name);
+            }
+
+            let mut out = String::new();
+            for server in &config.servers {
+                out.push_str("\n[[servers]]\n");
+                out.push_str(&format!("name = {:?}\n", server.name));
+                out.push_str(&format!("command = {:?}\n", server.command));
+                if !server.args.is_empty() {
+                    let args_toml: Vec<String> =
+                        server.args.iter().map(|a| format!("{a:?}")).collect();
+                    out.push_str(&format!("args = [{}]\n", args_toml.join(", ")));
+                }
+            }
+
+            std::fs::write(&config_path, out.trim_start())
+                .map_err(|e| anyhow::anyhow!("failed to write config: {e}"))?;
+            println!("Removed MCP server '{}'", rem_args.name);
         }
     }
     Ok(())
@@ -1032,6 +1168,7 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "init"
                 | "config"
                 | "completion"
+                | "mcp"
                 | "help"
                 | "tui"
         )

@@ -4,6 +4,68 @@
 
 ---
 
+## Mandatory Rules
+
+These are release-blocking rules. Follow them for every change.
+
+1. **Fork identity must stay correct**
+   - Repository URLs, installer URLs, release headers, and docs must point to
+     `Jatin-Mali/helm`, not upstream or placeholder values.
+   - Grep before shipping:
+     - `rg -n "white-phantom|github.com/helm|helm.sh/install" .`
+
+2. **Never persist plaintext provider keys outside the secrets store**
+   - `~/.helm/secrets.toml` is the only persistent store for provider secrets.
+   - `config.toml` must never contain `provider.api_key` or any raw key value.
+   - The TUI must never silently copy env keys into the secrets store on startup.
+   - Resolution order remains:
+     `--api-key` override → secrets store → environment variable.
+
+3. **HELM local state is sensitive**
+   - Treat these paths as protected local state:
+     - `~/.helm/secrets.toml`
+     - `~/.helm/.secrets.toml.lock`
+     - `~/.helm/helm.db`
+     - `~/.helm/helm.log`
+   - `fs_read` must deny these by default.
+   - Redaction must hide both provider-style keys and these HELM paths before
+     persistence and trace logging.
+
+4. **Do not weaken redaction or audit persistence**
+   - Before writing goals, transcript content, final messages, warnings, audit
+     fields, or trace summaries, pass them through `helm_core::redact_secrets`.
+   - Terminal output can remain human-readable when required, but local
+     persistence and tracing must be redacted.
+
+5. **Installer and release flow must stay usable**
+   - `install.sh` must either install a published asset or fail with clear
+     source-build instructions.
+   - The release workflow must publish:
+     - `install.sh`
+     - `helm-x86_64-unknown-linux-gnu`
+     - `helm-x86_64-unknown-linux-gnu.sha256`
+   - GitHub Actions release jobs need `contents: write`.
+
+6. **README/docs must match the real build path**
+   - Source build path is:
+     - `cargo build --release -p helm-cli`
+     - `./target/release/helm`
+   - Keep release-install and source-build instructions clearly separated.
+   - Document first-run provider setup and secrets behavior accurately.
+
+7. **Release gate before tagging**
+   - Required before moving a release tag:
+     - `cargo fmt --check`
+     - `cargo clippy --workspace --all-targets -- -D warnings`
+     - `cargo test --workspace --all-targets`
+     - `cargo build --release -p helm-cli`
+
+8. **Do not commit local debugging artifacts**
+   - CI logs, ad hoc `test/` dumps, scratch files like `1_test.txt`, and other
+     one-off local evidence should stay untracked unless explicitly requested.
+
+---
+
 ## Workspace Layout
 
 ```
@@ -34,12 +96,14 @@ helm/
 | `src/taint.rs` | `TaintLevel` (User/Tool/External), `Tainted<T>` | External content cannot escalate to `*.write` |
 | `src/message.rs` | `Role`, `ContentBlock`, `Message` | Wire format for all LLM chat |
 | `src/error.rs` | `HelmError`, `BudgetError`, `ProviderError`, `ToolError` | All error types in one place |
+| `src/secret.rs` | `Secret`, `redact_secrets()` | Secret wrapper + persistence/log redaction |
 | `src/lib.rs` | re-exports | — |
 
 **Grep targets:**
 - `Capability::` — all capability usages
 - `TaintLevel::External` — taint escalation checks
 - `ContentBlock::ToolUse` — tool call format
+- `redact_secrets` — all mandatory redaction call sites
 
 ---
 
@@ -61,6 +125,7 @@ helm/
 - `sanitize_tool_name()` in `openai_compat.rs` — strips `<|...|>` token leaks from model output
 - `quirks_for()` in `quirks.rs` — call this before every ChatRequest to apply overrides
 - `GROQ_DEFAULT_MODEL` in `openai_compat.rs` = `"llama-3.3-70b-versatile"` (not gpt-oss)
+- OpenRouter `HTTP-Referer` must point at `https://github.com/Jatin-Mali/helm`
 
 **Grep targets:**
 - `impl Provider for` — find all provider implementations
@@ -89,14 +154,15 @@ helm/
 | `src/registry.rs` | `ToolRegistry` | Dynamic tool registration + lookup |
 | `src/validator.rs` | `InputValidator` | Path traversal checks, input sanitization |
 
-**Missing (not yet implemented):**
-- `src/git.rs` — planned for v1.1
-- `src/mcp.rs` — planned for v1.1
+**v1.1 additions:**
+- `src/git.rs` — `GitTool`: 11 git actions (status, log, diff, add, commit, push, pull, branch, checkout, stash, clone) via `tokio::process::Command`. Requires `Capability::ShellExec`.
+- `src/mcp.rs` — `McpTool`: JSON-RPC 2.0 stdio bridge to external MCP servers. Config at `~/.helm/mcp-servers.toml`. Actions: `list_tools`, `call`. CLI: `helm mcp {list,add,remove}`.
 
 **Grep targets:**
 - `impl Tool for` — find all tool implementations
 - `ToolRegistry::register` — tool registration
 - `taint` in browser.rs — marks browser output as external-tainted
+- `validate_denylist` in `fs_read.rs` — protected path enforcement for HELM local state
 
 **v1.0.1 reliability notes:**
 - `ToolContext::new()` defaults to a 120s per-tool timeout.
@@ -120,6 +186,8 @@ helm/
 - Episode lifecycle: `insert_episode` → `append_step` → `finish_episode`
 - Audit: `append_audit_event` with prev_hash chaining → `verify_chain()`
 - Skills: `list()`, `show(name)`, `approve(name)`, `test(name)` (gold-example validation)
+- Persistence must redact secrets before writing episode goals, steps, final
+  messages, warnings, audit fields, or errors.
 
 **Missing (planned):**
 - `src/graph.rs` — entity graph (v1.2)
@@ -173,6 +241,7 @@ helm/
 - The default system prompt requires plan-first execution before tool use.
 - Disk/root-cause tasks should follow `disk df` → `disk du` → scoped `disk largest_files`.
 - Repeating the same broad timed-out command is a bug; narrow the path or use typed tools.
+- Provider trace summaries must be redacted before `trace!` logging.
 
 ---
 
@@ -200,6 +269,13 @@ helm/
 - `helm secrets {list,set,get,delete,path,import-env}` — persistent provider-key management
 - `helm skills {list,show,approve,test}` — skill library management
 
+**Config/secrets rules:**
+- `write_helm_config()` must not accept or write plaintext provider keys.
+- `FileProviderConfig` should not grow a persistent `api_key` field again.
+- `helm init` stores keys in `secrets.toml`; `config.toml` stores only provider metadata.
+- TUI provider switching may use an in-memory key for the active session, but
+  it must persist only to `SecretsStore`, never to config.
+
 **TUI key bindings** (in `tui.rs`):
 - `Ctrl+C` — quit (or cancel task)
 - `Ctrl+P` — command palette
@@ -213,6 +289,11 @@ helm/
 - Mouse wheel — scroll transcript
 - In ProviderSelector: digits 1-7 switch provider; Up/Down navigate; Enter apply
 - In ModelSelector: type to edit model string; Enter apply
+
+**TUI security rules:**
+- Startup may read env keys for the active session, but must not auto-save them.
+- Auth/onboarding key entry may save to `SecretsStore` only after explicit user action.
+- Rendered auth input must stay masked and never appear in transcript snapshots.
 
 **Key patterns:**
 - `active_settings: ProviderSettings` on `TuiApp` — mutated by ProviderSelector/ModelSelector; passed to every new task via `run_agent_task()`
@@ -257,6 +338,11 @@ helm/
 | `docs/threat-model.md` | Security model, taint system, attack surface |
 | `docs/troubleshooting.md` | Common errors and fixes |
 
+**Docs rules:**
+- Keep release install, source build, and first-run setup accurate for this fork.
+- If release assets are not guaranteed for all architectures, say so plainly.
+- Security docs must explain the difference between env-only use and stored-key use.
+
 ---
 
 ## Config Files (Runtime, not in repo)
@@ -267,7 +353,7 @@ helm/
 | `~/.helm/audit.log` | HMAC-chained audit log (line-delimited JSON) |
 | `~/.helm/skills/` | Skill markdown files (versioned) |
 | `~/.helm/helm.db` | SQLite database (episodes, steps, capability grants) |
-| `~/.helm/mcp-servers.toml` | MCP server configs (v1.1, not yet implemented) |
+| `~/.helm/mcp-servers.toml` | MCP server configs (v1.1) — managed via `helm mcp {list,add,remove}` |
 | `~/.helm/user_profile.toml` | Learned user preferences (v1.3, not yet implemented) |
 
 ---

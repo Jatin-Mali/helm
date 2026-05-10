@@ -13,11 +13,12 @@ jsonschema.workspace = true
 helm-core.workspace = true
 helm-providers.workspace = true
 reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

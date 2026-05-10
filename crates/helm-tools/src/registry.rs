@@ -11,7 +11,9 @@ use crate::{
     disk::DiskTool,
     fs_read::FsReadTool,
     fs_write::FsWriteTool,
+    git::GitTool,
     logs::LogsTool,
+    mcp::McpTool,
     network::NetworkTool,
     package::PackageTool,
     process::ProcessTool,
@@ -34,7 +36,7 @@ impl ToolRegistry {
         }
     }
 
-    /// Creates a registry containing the default v0.1 tools.
+    /// Creates a registry containing the default v1.1 tools.
     pub fn with_default_tools() -> Self {
         let mut registry = Self::new();
         registry.register(Box::<ShellTool>::default());
@@ -47,6 +49,8 @@ impl ToolRegistry {
         registry.register(Box::<NetworkTool>::default());
         registry.register(Box::<LogsTool>::default());
         registry.register(Box::<BrowserTool>::default());
+        registry.register(Box::<GitTool>::default());
+        registry.register(Box::<McpTool>::default());
         registry
     }
 
@@ -133,6 +137,8 @@ pub fn required_capability_for_tool(name: &str, input: &Value) -> Capability {
         "process" => Capability::ShellExec,
         "disk" => Capability::FsRead,
         "logs" => Capability::ShellExec,
+        "git" => Capability::ShellExec,
+        "mcp" => Capability::ShellExec,
         name if name.contains("delete") => Capability::FsDelete,
         _ => Capability::ShellShell,
     }
@@ -202,9 +208,11 @@ mod tests {
             .into_iter()
             .map(|schema| schema.name)
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 12);
         assert!(names.iter().any(|name| name == "shell"));
         assert!(names.iter().any(|name| name == "browser"));
+        assert!(names.iter().any(|name| name == "git"));
+        assert!(names.iter().any(|name| name == "mcp"));
     }
 
     #[test]
