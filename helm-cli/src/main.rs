@@ -101,6 +101,14 @@ enum Command {
     /// Manage MCP server configurations
     Mcp(McpArgs),
     Tui,
+    /// Manage sessions (list/delete/export/resume)
+    Sessions(SessionsArgs),
+    /// Export episode to file
+    Export(ExportArgs),
+    /// Manage file snapshots and undo/redo
+    Undo(UndoArgs),
+    /// Show cost and usage statistics
+    Stats(StatsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -152,6 +160,55 @@ struct PermissionGrantArgs {
 struct PermissionRevokeArgs {
     #[arg(value_name = "CAPABILITY")]
     capability: String,
+}
+
+#[derive(Debug, Args)]
+struct SessionsArgs {
+    #[command(subcommand)]
+    command: SessionsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionsCommand {
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    Delete {
+        id: String,
+    },
+    Export {
+        id: String,
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    Resume {
+        id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct ExportArgs {
+    #[arg(value_name = "EPISODE_ID")]
+    episode_id: String,
+    #[arg(long, value_name = "FORMAT", default_value = "json")]
+    format: String,
+    #[arg(long, value_name = "OUTPUT")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct UndoArgs {
+    #[arg(value_name = "N", default_value_t = 1)]
+    n: u32,
+    #[arg(long)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct StatsArgs {
+    #[arg(long)]
+    since: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -482,7 +539,10 @@ async fn run() -> Result<()> {
         cli.model,
         cli.api_key,
     )?;
-    let db_path = cli.db_path.unwrap_or(default_db_path()?);
+    let db_path = match cli.db_path.clone() {
+        Some(p) => p,
+        None => default_db_path()?,
+    };
     ensure_parent_dir(&db_path)?;
     let secrets_store =
         SecretsStore::open_default().map_err(|e| anyhow!("failed to open secrets store: {e}"))?;
@@ -592,6 +652,157 @@ async fn run() -> Result<()> {
                 print!("{report}");
             }
         },
+        Command::Sessions(args) => match args.command {
+            SessionsCommand::List { limit } => {
+                let sessions_dir = dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+                    .join("helm");
+                let db_path = cli
+                    .db_path
+                    .clone()
+                    .unwrap_or_else(|| sessions_dir.join("helm.db"));
+                let store =
+                    helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots"))
+                        .await?;
+                let sessions = store.list_sessions(limit).await?;
+                for s in sessions {
+                    println!(
+                        "[{}] {} | {} | {}",
+                        s.id,
+                        s.name,
+                        s.goal.chars().take(50).collect::<String>(),
+                        DateTime::from_timestamp_millis(s.updated_at)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            SessionsCommand::Delete { id } => {
+                let sessions_dir = dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+                    .join("helm");
+                let db_path = cli
+                    .db_path
+                    .clone()
+                    .unwrap_or_else(|| sessions_dir.join("helm.db"));
+                let store =
+                    helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots"))
+                        .await?;
+                let deleted = store.delete_session(&id).await?;
+                println!("deleted {} session(s)", deleted);
+            }
+            SessionsCommand::Export { id, format } => {
+                let sessions_dir = dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+                    .join("helm");
+                let db_path = cli
+                    .db_path
+                    .clone()
+                    .unwrap_or_else(|| sessions_dir.join("helm.db"));
+                let store =
+                    helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots"))
+                        .await?;
+                let content = store.export_session(&id, &format).await?;
+                println!("{content}");
+            }
+            SessionsCommand::Resume { id } => {
+                let sessions_dir = dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+                    .join("helm");
+                let db_path = cli
+                    .db_path
+                    .clone()
+                    .unwrap_or_else(|| sessions_dir.join("helm.db"));
+                let store =
+                    helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots"))
+                        .await?;
+                let session = store
+                    .get_session(&id)
+                    .await?
+                    .ok_or_else(|| anyhow!("session not found: {}", id))?;
+                println!(
+                    "resuming session: {}\ngoal: {}\nepisode: {}",
+                    session.name, session.goal, session.episode_id
+                );
+            }
+        },
+        Command::Export(args) => {
+            let episode = memory
+                .episode_by_id(&args.episode_id)
+                .await?
+                .ok_or_else(|| anyhow!("episode not found"))?;
+            let content = match args.format.as_str() {
+                "json" => {
+                    let obj = serde_json::json!({
+                        "id": episode.id,
+                        "goal": episode.goal,
+                        "outcome": episode.outcome,
+                        "started_at": episode.started_at,
+                        "ended_at": episode.ended_at,
+                        "tokens_in": episode.tokens_in,
+                        "tokens_out": episode.tokens_out,
+                        "final_message": episode.final_message,
+                    });
+                    serde_json::to_string_pretty(&obj).map_err(|e| anyhow!(e))?
+                }
+                "md" => {
+                    let ts = DateTime::from_timestamp_millis(episode.started_at)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_default();
+                    format!(
+                        "# Episode: {}\n\n**Goal:** {}\n**Outcome:** {}\n**Started:** {}\n\n```\n{}\n```",
+                        episode.id,
+                        episode.goal,
+                        episode.outcome.as_deref().unwrap_or("unknown"),
+                        ts,
+                        episode.final_message.as_deref().unwrap_or("(no message)")
+                    )
+                }
+                _ => return Err(anyhow!("unsupported format: {}", args.format)),
+            };
+            if let Some(path) = args.output {
+                fs::write(&path, &content)?;
+                println!("exported to {}", path.display());
+            } else {
+                print!("{content}");
+            }
+        }
+        Command::Undo(args) => {
+            let sessions_dir = dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+                .join("helm");
+            let db_path = cli
+                .db_path
+                .clone()
+                .unwrap_or_else(|| sessions_dir.join("helm.db"));
+            let store =
+                helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots")).await?;
+            if let Some(sid) = args.session_id {
+                let snapshots = store.list_snapshots(&sid).await?;
+                if snapshots.is_empty() {
+                    println!("no snapshots for session {}", sid);
+                } else {
+                    let target = snapshots.get((args.n as usize - 1).min(snapshots.len() - 1));
+                    if let Some(snap) = target {
+                        let content = store.restore_snapshot(&snap.id).await?;
+                        println!(
+                            "snapshot {} (step {}):\n{}",
+                            snap.id, snap.step_index, content
+                        );
+                    }
+                }
+            } else {
+                println!("use --session-id to specify a session for undo");
+            }
+        }
+        Command::Stats(_args) => {
+            let counts = memory.episode_outcome_counts().await?;
+            let _total = memory.episode_count().await?;
+            println!(
+                "Total episodes: {}\n  success: {}\n  partial: {}\n  failure: {}",
+                counts.total, counts.success, counts.partial, counts.failure
+            );
+        }
         Command::Skills(args) => match args.command {
             SkillsCommand::List => {
                 let manager = helm_memory::SkillsManager::new();

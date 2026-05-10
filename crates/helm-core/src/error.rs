@@ -102,6 +102,15 @@ pub enum MemoryError {
     /// A blocking task failed before returning a memory-store result.
     #[error("blocking task failed: {0}")]
     Join(String),
+    /// A requested entity was not found.
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// General other error.
+    #[error("error: {0}")]
+    Other(String),
+    /// Invalid input provided.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 /// Error returned when a ReAct run exceeds its configured budget.

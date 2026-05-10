@@ -117,9 +117,11 @@ impl PlanCache {
 
     pub fn count(&self) -> Result<u64, PlanCacheError> {
         let conn = lock(&self.conn)?;
-        conn.query_row("SELECT COUNT(*) FROM plan_cache", [], |row| row.get::<_, i64>(0))
-            .map(|n| n as u64)
-            .map_err(PlanCacheError::Sqlite)
+        conn.query_row("SELECT COUNT(*) FROM plan_cache", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|n| n as u64)
+        .map_err(PlanCacheError::Sqlite)
     }
 
     /// Returns all cached plans ordered by hit_count desc.
@@ -130,7 +132,8 @@ impl PlanCache {
              FROM plan_cache ORDER BY hit_count DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], row_to_plan)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(PlanCacheError::Sqlite)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(PlanCacheError::Sqlite)
     }
 }
 
@@ -209,7 +212,8 @@ mod tests {
     #[test]
     fn put_and_get_happy_path() {
         let c = cache();
-        c.put("deploy nginx", &steps(&["shell", "service"])).unwrap();
+        c.put("deploy nginx", &steps(&["shell", "service"]))
+            .unwrap();
         let plan = c.get("deploy nginx").unwrap().unwrap();
         assert_eq!(plan.goal_text, "deploy nginx");
         assert_eq!(plan.steps.len(), 2);

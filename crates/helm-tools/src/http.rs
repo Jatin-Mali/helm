@@ -1,0 +1,185 @@
+//! HTTP tool: generic GET/POST/PUT/DELETE with domain allowlist.
+
+use std::collections::HashSet;
+
+use async_trait::async_trait;
+use reqwest::{Client, Method};
+use serde_json::{Value, json};
+
+use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+
+pub struct HttpTool {
+    client: Client,
+    allowed_domains: HashSet<String>,
+}
+
+impl HttpTool {
+    pub fn new(allowed_domains: HashSet<String>) -> Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("reqwest client must build");
+        Self {
+            client,
+            allowed_domains,
+        }
+    }
+
+    fn check_domain(&self, url: &str) -> Result<(), ToolError> {
+        if self.allowed_domains.is_empty() {
+            return Ok(());
+        }
+        let parsed = url::Url::parse(url)
+            .map_err(|e| ToolError::InvalidInput(format!("invalid URL: {e}")))?;
+        let host = parsed.host_str().unwrap_or("");
+        if !self.allowed_domains.contains(host) {
+            return Err(ToolError::InvalidInput(format!(
+                "domain '{host}' not in allowlist: {:?}",
+                self.allowed_domains
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Tool for HttpTool {
+    fn name(&self) -> &'static str {
+        "http"
+    }
+
+    fn description(&self) -> &'static str {
+        "Generic HTTP client: GET, POST, PUT, DELETE with domain allowlist."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "action": { "type": "string", "enum": ["get", "post", "put", "delete", "head", "patch"] },
+                "url": { "type": "string", "description": "Full URL to request" },
+                "headers": { "type": "object", "description": "HTTP headers as key-value pairs" },
+                "body": { "type": "string", "description": "Request body for POST/PUT/PATCH" }
+            },
+            "required": ["action", "url"]
+        })
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("action required".into()))?;
+        let url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("url required".into()))?;
+
+        self.check_domain(url)?;
+
+        let method = match action {
+            "get" => Method::GET,
+            "post" => Method::POST,
+            "put" => Method::PUT,
+            "delete" => Method::DELETE,
+            "head" => Method::HEAD,
+            "patch" => Method::PATCH,
+            _ => {
+                return Err(ToolError::InvalidInput(format!(
+                    "unsupported HTTP method: {action}"
+                )));
+            }
+        };
+
+        let mut req = self.client.request(method, url);
+        if let Some(headers) = input.get("headers").and_then(Value::as_object) {
+            for (k, v) in headers {
+                if let Some(s) = v.as_str() {
+                    req = req.header(k, s);
+                }
+            }
+        }
+        if let Some(body) = input.get("body").and_then(Value::as_str) {
+            req = req.body(body.to_string());
+        }
+
+        let response = req
+            .send()
+            .await
+            .map_err(|e| ToolError::Other(format!("request failed: {e}")))?;
+
+        let status = response.status().as_u16();
+        let headers: serde_json::Map<String, Value> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), json!(v.to_str().unwrap_or(""))))
+            .collect();
+
+        let body = response
+            .text()
+            .await
+            .map_err(|e| ToolError::Other(format!("failed to read response body: {e}")))?;
+
+        let body_len = body.len();
+        let truncated = body_len > ctx.max_output_bytes;
+        let content = if truncated {
+            format!(
+                "[truncated {} bytes]\n{}",
+                body_len,
+                &body[..ctx.max_output_bytes.min(body_len)]
+            )
+        } else {
+            body
+        };
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("status".into(), json!(status));
+        metadata.insert("headers".into(), json!(headers));
+        metadata.insert("truncated".into(), json!(truncated));
+        metadata.insert("content_length".into(), json!(body_len));
+
+        Ok(ToolOutput {
+            content,
+            success: status < 400,
+            metadata,
+        })
+    }
+}
+
+impl Default for HttpTool {
+    fn default() -> Self {
+        Self::new(HashSet::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use crate::tool::{Tool, ToolContext};
+
+    use super::HttpTool;
+
+    #[tokio::test]
+    async fn schema_has_get_post_delete() {
+        let schema = HttpTool::default().input_schema();
+        let actions = schema.pointer("/properties/action/enum").unwrap();
+        assert!(actions.as_array().unwrap().contains(&json!("get")));
+        assert!(actions.as_array().unwrap().contains(&json!("post")));
+    }
+
+    #[tokio::test]
+    async fn empty_body_is_ok() {
+        let dir = tempdir().unwrap();
+        let tool = HttpTool::default();
+        let result = tool
+            .execute(
+                json!({"action": "get", "url": "https://httpbin.org/get"}),
+                &ToolContext::new(dir.path().into()),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+}

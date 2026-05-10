@@ -154,15 +154,18 @@ helm/
 | `src/registry.rs` | `ToolRegistry` | Dynamic tool registration + lookup |
 | `src/validator.rs` | `InputValidator` | Path traversal checks, input sanitization |
 
-**v1.1 additions:**
-- `src/git.rs` — `GitTool`: 11 git actions (status, log, diff, add, commit, push, pull, branch, checkout, stash, clone) via `tokio::process::Command`. Requires `Capability::ShellExec`.
-- `src/mcp.rs` — `McpTool`: JSON-RPC 2.0 stdio bridge to external MCP servers. Config at `~/.helm/mcp-servers.toml`. Actions: `list_tools`, `call`. CLI: `helm mcp {list,add,remove,test,run}`.
-
 **Grep targets:**
 - `impl Tool for` — find all tool implementations
 - `ToolRegistry::register` — tool registration
 - `taint` in browser.rs — marks browser output as external-tainted
 - `validate_denylist` in `fs_read.rs` — protected path enforcement for HELM local state
+
+**Partially implemented (not wired into runtime):**
+- `src/git.rs` — `GitTool`: 11 git actions (status, log, diff, add, commit, push, pull, branch, checkout, stash, clone) via `tokio::process::Command`. Requires `Capability::ShellExec`.
+- `src/mcp.rs` — `McpTool`: JSON-RPC 2.0 stdio bridge to external MCP servers. Config at `~/.helm/mcp-servers.toml`. Actions: `list_tools`, `call`. CLI: `helm mcp {list,add,remove,test,run}`.
+
+**v1.1 missing (see backlog.md):**
+- L14 HTTP tool, L15 grep/glob via ripgrep
 
 **v1.0.1 reliability notes:**
 - `ToolContext::new()` defaults to a 120s per-tool timeout.
@@ -189,13 +192,15 @@ helm/
 - Persistence must redact secrets before writing episode goals, steps, final
   messages, warnings, audit fields, or errors.
 
-**v1.2 additions:**
+**Partially implemented (not wired into runtime):**
 - `src/graph.rs` — `EntityGraph`: SQLite-backed knowledge graph; `upsert_entity`, `search_by_name`, `add_relation`, `neighbors`
 - `src/procedures.rs` — `ProcedureStore`: named step sequences; `insert`, `find_by_goal` (LIKE match), `record_success`
 
-**v1.3 additions:**
+**Partially implemented (not wired into runtime, v1.3):**
 - `src/skill_learner.rs` — `SkillLearner`: finds/creates procedures on success, promotes to skill file at `promote_threshold` hits; `learn(goal, steps)`, `suggest(goal, limit)`
 - `src/user_profile.rs` — `UserProfileStore`: SQLite-backed user prefs; `set_preferred_model`, `set_verbosity`, `record_correction`, `record_goal`
+
+**Note:** Roadmap says `~/.helm/user_profile.toml` but implementation is SQLite-backed store. See backlog.md.
 
 **Grep targets:**
 - `stable_hash_hex` — audit chain hashing
@@ -226,16 +231,14 @@ helm/
 - `ServiceStatus { service, status }`
 - `HttpStatus { url, status }`
 
-**v1.2 additions:**
+**Partially implemented (not wired into runtime):**
 - `src/plan_cache.rs` — `PlanCache`: SQLite plan cache keyed by `goal_hash()` (lowercase-trim + DefaultHasher); `get` auto-increments hit_count, `put` upserts, `invalidate` removes
-
-**v1.3 additions:**
 - `src/model_router.rs` — `ModelRouter`: routes tasks to models by `TaskComplexity` (Simple/Medium/Complex); `classify(goal)` uses word-count + "then"/comma heuristics; `route(complexity)` picks cheapest capable model
 
-**v1.4 additions:**
+**Done (v1.4):**
 - `src/cancel.rs` — `CancellationToken`: `Arc<AtomicBool>` shared flag; `cancel()`, `is_cancelled()`, `child()`; checked at every loop iteration in `ReactAgent`; wired to `tokio::signal::ctrl_c()` in CLI
 
-**v1.5 additions:**
+**Done (v1.5):**
 - `AgentEvent::TextDelta { chunk: String }` — emitted after every `AssistantText` event, splitting text into ≤64-byte chunks for progressive rendering; consumers reconstruct full text by concatenating chunks
 - `execute_single_tool()` — extracted helper (private) that runs one tool call and returns `(ContentBlock, Taint, u32)` (result, taint_delta, corrections_delta); annotated `#[allow(clippy::too_many_arguments)]`
 - `execute_tool_uses()` — refactored to collect all `ToolUse` blocks, snapshot `current_taint` and `corrections_used`, build a Vec of `execute_single_tool` futures, run them with `futures::future::join_all`, then merge taint escalations and corrections deltas; result order preserved
@@ -243,6 +246,8 @@ helm/
 
 **Missing (planned):**
 - `src/roles.rs` — sub-agent specialization (v2.0)
+- `src/plan_cache.rs` wiring into ReactAgent planning path (v1.2)
+- `src/model_router.rs` integration into provider selection (v1.3)
 
 **Grep targets:**
 - `AgentEvent::` — event sink for monitoring; `TextDelta` for streaming chunks
@@ -367,7 +372,9 @@ helm/
 | `~/.helm/skills/` | Skill markdown files (versioned) |
 | `~/.helm/helm.db` | SQLite database (episodes, steps, capability grants) |
 | `~/.helm/mcp-servers.toml` | MCP server configs (v1.1) — managed via `helm mcp {list,add,remove,test,run}` |
-| `~/.helm/user_profile.toml` | Learned user preferences (v1.3) |
+| `~/.helm/sessions/` | Session/conversation persistence (v1.1) — list/delete/export/resume |
+| `~/.helm/snapshots/` | File edit snapshots for undo/redo (v1.1) |
+| `~/.helm/user_profile.toml` | Planned user preferences (v1.3); current impl is SQLite at `helm.db` tables |
 
 ---
 

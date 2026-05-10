@@ -14,6 +14,7 @@ use crate::{
     budget::{Budget, BudgetTracker},
     context_window,
     parser::{ResponseFormat, parse_tool_calls},
+    plan_cache::PlanCache,
     supervisor::EvidenceVerifier,
 };
 
@@ -56,6 +57,7 @@ pub struct ReactAgent {
     quirks: ProviderQuirks,
     forced_initial_taint: Option<Taint>,
     cancel_token: Option<crate::cancel::CancellationToken>,
+    plan_cache: Option<Arc<PlanCache>>,
 }
 
 /// Live event emitted while an agent run is executing.
@@ -147,8 +149,15 @@ pub enum AgentEvent {
         capability: Capability,
         /// Tool name.
         tool_name: String,
-        /// Current taint.
-        taint: Taint,
+        /// Taint at time of request.
+        taint: String,
+    },
+    /// A plan was found in the cache — 0 planner tokens used.
+    PlanCacheHit {
+        /// Normalized goal hash that matched.
+        goal_hash: String,
+        /// Number of steps in the cached plan.
+        steps: u32,
     },
     /// A text-format tool call was recovered.
     FormatRecoveryUsed {
@@ -245,6 +254,7 @@ impl ReactAgent {
             quirks,
             forced_initial_taint: None,
             cancel_token: None,
+            plan_cache: None,
         }
     }
 
@@ -252,6 +262,12 @@ impl ReactAgent {
     /// thread will cause the run loop to stop at the next iteration boundary.
     pub fn with_cancel_token(mut self, token: crate::cancel::CancellationToken) -> Self {
         self.cancel_token = Some(token);
+        self
+    }
+
+    /// Attaches a plan cache for goal-hash-based plan reuse.
+    pub fn with_plan_cache(mut self, cache: Arc<PlanCache>) -> Self {
+        self.plan_cache = Some(cache);
         self
     }
 
@@ -286,6 +302,56 @@ impl ReactAgent {
             episode_id: episode_id.clone(),
             goal: goal.to_owned(),
         });
+
+        // Check plan cache for exact goal match before planning.
+        if let Some(ref cache) = self.plan_cache {
+            if let Ok(Some(cached)) = cache.get(goal) {
+                info!(
+                    "plan cache hit for goal hash {} (hit_count={})",
+                    cached.goal_hash, cached.hit_count
+                );
+                sink.emit(AgentEvent::PlanCacheHit {
+                    goal_hash: cached.goal_hash,
+                    steps: cached.steps.len() as u32,
+                });
+                // Return cached plan steps as final message.
+                let steps_desc: Vec<String> = cached
+                    .steps
+                    .iter()
+                    .map(|s| format!("{}: {}", s.tool, s.description))
+                    .collect();
+                let final_message = format!(
+                    "[cached plan, {} steps]\n{}\n\nRun with cached plan?",
+                    cached.steps.len(),
+                    steps_desc.join("\n")
+                );
+                self.memory
+                    .finish_episode(
+                        &episode_id,
+                        EpisodeOutcome::Partial,
+                        Some(&final_message),
+                        None,
+                    )
+                    .await?;
+                let result = RunResult {
+                    episode_id,
+                    final_message,
+                    last_assistant_text: None,
+                    model_capability_warning: None,
+                    corrections_used: 0,
+                    format_recovery_used: false,
+                    total_turns_summarized: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    iterations: 0,
+                };
+                sink.emit(AgentEvent::RunFinished {
+                    result: result.clone(),
+                });
+                return Ok(result);
+            }
+        }
+
         let mut step_index = 0_u32;
         let mut messages = vec![helm_core::Message::user(goal)];
         self.memory
@@ -813,7 +879,7 @@ impl ReactAgent {
                 sink.emit(AgentEvent::PermissionRequested {
                     capability,
                     tool_name: name.to_owned(),
-                    taint: taint_snapshot.clone(),
+                    taint: format!("{:?}", taint_snapshot),
                 });
                 sink.emit(AgentEvent::ToolCallDenied {
                     id: id.to_owned(),

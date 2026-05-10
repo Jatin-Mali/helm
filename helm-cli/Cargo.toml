@@ -16,6 +16,7 @@ chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 crossterm.workspace = true
+dirs.workspace = true
 ratatui.workspace = true
 helm-agent.workspace = true
 helm-core.workspace = true

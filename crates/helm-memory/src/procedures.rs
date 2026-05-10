@@ -66,7 +66,11 @@ impl ProcedureStore {
     }
 
     /// Insert a new procedure.  Returns its generated id.
-    pub fn insert(&self, goal_pattern: &str, steps: &[ProcedureStep]) -> Result<String, ProcedureError> {
+    pub fn insert(
+        &self,
+        goal_pattern: &str,
+        steps: &[ProcedureStep],
+    ) -> Result<String, ProcedureError> {
         let id = uuid_v4();
         let steps_json = serde_json::to_string(steps)?;
         let conn = lock(&self.conn)?;
@@ -90,7 +94,8 @@ impl ProcedureStore {
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pattern, limit], row_to_procedure)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(ProcedureError::Sqlite)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(ProcedureError::Sqlite)
     }
 
     /// Increment success_count and update last_used for a procedure.
@@ -114,7 +119,8 @@ impl ProcedureStore {
              FROM procedures ORDER BY success_count DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], row_to_procedure)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(ProcedureError::Sqlite)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(ProcedureError::Sqlite)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Procedure>, ProcedureError> {
@@ -136,9 +142,11 @@ impl ProcedureStore {
 
     pub fn count(&self) -> Result<u64, ProcedureError> {
         let conn = lock(&self.conn)?;
-        conn.query_row("SELECT COUNT(*) FROM procedures", [], |row| row.get::<_, i64>(0))
-            .map(|n| n as u64)
-            .map_err(ProcedureError::Sqlite)
+        conn.query_row("SELECT COUNT(*) FROM procedures", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|n| n as u64)
+        .map_err(ProcedureError::Sqlite)
     }
 }
 
@@ -205,7 +213,9 @@ mod tests {
     #[test]
     fn insert_and_get_happy_path() {
         let s = store();
-        let id = s.insert("deploy nginx", &steps(&["shell", "service"])).unwrap();
+        let id = s
+            .insert("deploy nginx", &steps(&["shell", "service"]))
+            .unwrap();
         let p = s.get(&id).unwrap().unwrap();
         assert_eq!(p.goal_pattern, "deploy nginx");
         assert_eq!(p.steps.len(), 2);
@@ -215,8 +225,10 @@ mod tests {
     #[test]
     fn find_by_goal_substring_happy_path() {
         let s = store();
-        s.insert("deploy nginx on staging", &steps(&["shell"])).unwrap();
-        s.insert("deploy redis on staging", &steps(&["shell"])).unwrap();
+        s.insert("deploy nginx on staging", &steps(&["shell"]))
+            .unwrap();
+        s.insert("deploy redis on staging", &steps(&["shell"]))
+            .unwrap();
         s.insert("check disk usage", &steps(&["disk"])).unwrap();
 
         let results = s.find_by_goal("deploy", 10).unwrap();

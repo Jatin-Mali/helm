@@ -14,6 +14,10 @@ helm-core.workspace = true
 helm-providers.workspace = true
 reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
+regex.workspace = true
+ignore.workspace = true
+globset.workspace = true
+url.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

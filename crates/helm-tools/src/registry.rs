@@ -12,11 +12,13 @@ use crate::{
     fs_read::FsReadTool,
     fs_write::FsWriteTool,
     git::GitTool,
+    http::HttpTool,
     logs::LogsTool,
     mcp::McpTool,
     network::NetworkTool,
     package::PackageTool,
     process::ProcessTool,
+    search::SearchTool,
     service::ServiceTool,
     shell::ShellTool,
     tool::{Tool, ToolContext, ToolError, ToolOutput},
@@ -51,6 +53,8 @@ impl ToolRegistry {
         registry.register(Box::<BrowserTool>::default());
         registry.register(Box::<GitTool>::default());
         registry.register(Box::<McpTool>::default());
+        registry.register(Box::<HttpTool>::default());
+        registry.register(Box::<SearchTool>::default());
         registry
     }
 
@@ -134,6 +138,8 @@ pub fn required_capability_for_tool(name: &str, input: &Value) -> Capability {
             Capability::BrowserControl
         }
         "network" => Capability::NetworkOut,
+        "http" => Capability::NetworkOut,
+        "search" => Capability::FsRead,
         "process" => Capability::ShellExec,
         "disk" => Capability::FsRead,
         "logs" => Capability::ShellExec,
@@ -208,7 +214,7 @@ mod tests {
             .into_iter()
             .map(|schema| schema.name)
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 14);
         assert!(names.iter().any(|name| name == "shell"));
         assert!(names.iter().any(|name| name == "browser"));
         assert!(names.iter().any(|name| name == "git"));

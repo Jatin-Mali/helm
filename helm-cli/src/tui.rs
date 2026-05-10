@@ -64,6 +64,77 @@ const MODAL_FG: Color = Color::Rgb(203, 209, 222);
 const DIM_FG: Color = Color::Rgb(103, 119, 139);
 const SUCCESS_FG: Color = Color::Rgb(111, 221, 137);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+    Dim,
+    Dracula,
+    Solarized,
+    #[allow(dead_code)]
+    Custom {
+        bg: Color,
+        fg: Color,
+        accent: Color,
+    },
+}
+
+#[allow(dead_code)]
+impl Theme {
+    pub fn colors(&self) -> (Color, Color, Color) {
+        match self {
+            Theme::Dark => (
+                Color::Rgb(11, 19, 30),
+                Color::Rgb(208, 214, 224),
+                Color::Rgb(45, 123, 215),
+            ),
+            Theme::Light => (
+                Color::Rgb(254, 254, 254),
+                Color::Rgb(26, 26, 26),
+                Color::Rgb(45, 123, 215),
+            ),
+            Theme::Dim => (
+                Color::Rgb(40, 40, 40),
+                Color::Rgb(180, 180, 180),
+                Color::Rgb(45, 123, 215),
+            ),
+            Theme::Dracula => (
+                Color::Rgb(40, 42, 54),
+                Color::Rgb(248, 248, 242),
+                Color::Rgb(98, 114, 164),
+            ),
+            Theme::Solarized => (
+                Color::Rgb(0, 43, 54),
+                Color::Rgb(131, 148, 150),
+                Color::Rgb(181, 137, 0),
+            ),
+            Theme::Custom { bg, fg, accent } => (*bg, *fg, *accent),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+            Theme::Dim => "dim",
+            Theme::Dracula => "dracula",
+            Theme::Solarized => "solarized",
+            Theme::Custom { .. } => "custom",
+        }
+    }
+
+    pub fn all() -> Vec<Theme> {
+        vec![
+            Theme::Dark,
+            Theme::Light,
+            Theme::Dim,
+            Theme::Dracula,
+            Theme::Solarized,
+        ]
+    }
+}
+
 /// Runtime dependencies needed by the TUI.
 pub(crate) struct TuiRuntime {
     pub(crate) provider_settings: ProviderSettings,
@@ -267,7 +338,7 @@ enum PanelFocus {
     Input,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum ModalState {
     CommandPalette,
     Permission {
@@ -295,6 +366,16 @@ enum ModalState {
     },
     Error(String),
     Help,
+    #[allow(dead_code)]
+    ThemeSelector {
+        selected: usize,
+    },
+    #[allow(dead_code)]
+    CostMeter {
+        session_tokens_in: u64,
+        session_tokens_out: u64,
+        session_cost_usd: f64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,6 +588,8 @@ pub struct TuiApp {
     pending_auth_retry: Option<String>,
     session_tokens_in: u32,
     session_tokens_out: u32,
+    #[allow(dead_code)]
+    theme: Theme,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,6 +671,7 @@ impl TuiApp {
             pending_auth_retry: None,
             session_tokens_in: 0,
             session_tokens_out: 0,
+            theme: Theme::default(),
         }
     }
 
@@ -1332,7 +1416,8 @@ impl TuiApp {
             }
             AgentEvent::RunFinished { .. }
             | AgentEvent::RunFailed { .. }
-            | AgentEvent::TextDelta { .. } => {}
+            | AgentEvent::TextDelta { .. }
+            | AgentEvent::PlanCacheHit { .. } => {}
         }
     }
 
@@ -2285,6 +2370,44 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
         ModalState::Help => {
             Paragraph::new("Enter submit | Alt+Enter newline | Ctrl+P commands | Ctrl+N new session | Ctrl+C cancel running task, then Ctrl+C again to quit | PageUp/PageDown scroll | Ctrl+T toggle sidebar | Shift+Tab toggle mode | Ctrl+H/? help")
                 .block(modal_block(" Help "))
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
+        }
+        ModalState::ThemeSelector { selected } => {
+            let themes = Theme::all();
+            let mut lines = vec![Line::from(vec![Span::styled(
+                "Theme Selector (↑↓ navigate, Enter apply) ",
+                Style::default().fg(Color::Cyan),
+            )])];
+            for (i, theme) in themes.iter().enumerate() {
+                let style = if i == *selected {
+                    Style::default().fg(Color::White).bg(HEADER_BORDER)
+                } else {
+                    Style::default().fg(MODAL_FG)
+                };
+                lines.push(Line::styled(format!("  {} ", theme.name()), style));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "  /theme <name> — switch theme inline ",
+                Style::default().fg(DIM_FG),
+            )]));
+            Paragraph::new(lines)
+                .block(modal_block(" Theme "))
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
+        }
+        ModalState::CostMeter {
+            session_tokens_in,
+            session_tokens_out,
+            session_cost_usd,
+        } => {
+            let content = format!(
+                "Session Stats\n\nTokens in: {}\nTokens out: {}\nEst. cost: ${:.4}",
+                session_tokens_in, session_tokens_out, session_cost_usd
+            );
+            Paragraph::new(content)
+                .block(modal_block(" Cost Meter "))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }

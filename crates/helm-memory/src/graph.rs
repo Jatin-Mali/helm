@@ -103,7 +103,8 @@ impl EntityGraph {
              WHERE name LIKE ?1 ORDER BY name LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pattern, limit], row_to_entity)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(GraphError::Sqlite)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(GraphError::Sqlite)
     }
 
     /// Add or update a directed relation between two entities.
@@ -135,8 +136,8 @@ impl EntityGraph {
                 weight: row.get(3)?,
             };
             let attrs_str: String = row.get(7)?;
-            let attrs: Value = serde_json::from_str(&attrs_str)
-                .unwrap_or(Value::Object(serde_json::Map::new()));
+            let attrs: Value =
+                serde_json::from_str(&attrs_str).unwrap_or(Value::Object(serde_json::Map::new()));
             let entity = Entity {
                 id: row.get(4)?,
                 kind: row.get(5)?,
@@ -145,14 +146,17 @@ impl EntityGraph {
             };
             Ok((rel, entity))
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(GraphError::Sqlite)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(GraphError::Sqlite)
     }
 
     pub fn entity_count(&self) -> Result<u64, GraphError> {
         let conn = lock(&self.conn)?;
-        conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get::<_, i64>(0))
-            .map(|n| n as u64)
-            .map_err(GraphError::Sqlite)
+        conn.query_row("SELECT COUNT(*) FROM entities", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|n| n as u64)
+        .map_err(GraphError::Sqlite)
     }
 }
 
@@ -160,8 +164,8 @@ impl EntityGraph {
 
 fn row_to_entity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entity> {
     let attrs_str: String = row.get(3)?;
-    let attributes: Value = serde_json::from_str(&attrs_str)
-        .unwrap_or(Value::Object(serde_json::Map::new()));
+    let attributes: Value =
+        serde_json::from_str(&attrs_str).unwrap_or(Value::Object(serde_json::Map::new()));
     Ok(Entity {
         id: row.get(0)?,
         kind: row.get(1)?,

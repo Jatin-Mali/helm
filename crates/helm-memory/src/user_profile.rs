@@ -67,13 +67,17 @@ impl UserProfileStore {
     pub fn open(path: &Path) -> Result<Self, UserProfileError> {
         let conn = Connection::open(path)?;
         run_migrations(&conn)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self, UserProfileError> {
         let conn = Connection::open_in_memory()?;
         run_migrations(&conn)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     pub fn get(&self) -> Result<UserPreferences, UserProfileError> {
@@ -195,7 +199,10 @@ mod tests {
     fn set_and_get_preferred_model_happy_path() {
         let s = store();
         s.set_preferred_model("groq/openai/gpt-oss-120b").unwrap();
-        assert_eq!(s.get().unwrap().preferred_model.unwrap(), "groq/openai/gpt-oss-120b");
+        assert_eq!(
+            s.get().unwrap().preferred_model.unwrap(),
+            "groq/openai/gpt-oss-120b"
+        );
     }
 
     #[test]

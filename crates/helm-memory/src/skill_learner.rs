@@ -23,7 +23,11 @@ pub struct SkillLearner {
 
 impl SkillLearner {
     pub fn new(procedures: ProcedureStore, skills: SkillsManager) -> Self {
-        Self { procedures, skills, promote_threshold: 3 }
+        Self {
+            procedures,
+            skills,
+            promote_threshold: 3,
+        }
     }
 
     pub fn with_promote_threshold(mut self, n: u32) -> Self {
@@ -56,7 +60,10 @@ impl SkillLearner {
             None
         };
 
-        Ok(LearnResult { procedure_id: proc_id, promoted_skill })
+        Ok(LearnResult {
+            procedure_id: proc_id,
+            promoted_skill,
+        })
     }
 
     /// Return procedures relevant to `goal`, ranked by success count.
@@ -88,7 +95,13 @@ pub struct LearnResult {
 
 fn slugify(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|p| !p.is_empty())
@@ -118,20 +131,31 @@ mod tests {
     use crate::skills::SkillsManager;
 
     fn steps(tools: &[&str]) -> Vec<ProcedureStep> {
-        tools.iter().map(|t| ProcedureStep { tool: t.to_string(), input: json!({}) }).collect()
+        tools
+            .iter()
+            .map(|t| ProcedureStep {
+                tool: t.to_string(),
+                input: json!({}),
+            })
+            .collect()
     }
 
     fn learner(threshold: u32) -> (SkillLearner, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let procs = ProcedureStore::open_in_memory().unwrap();
         let skills = SkillsManager::with_dir(dir.path().to_path_buf());
-        (SkillLearner::new(procs, skills).with_promote_threshold(threshold), dir)
+        (
+            SkillLearner::new(procs, skills).with_promote_threshold(threshold),
+            dir,
+        )
     }
 
     #[test]
     fn learn_creates_procedure_happy_path() {
         let (l, _d) = learner(5);
-        let r = l.learn("deploy nginx", &steps(&["shell", "service"])).unwrap();
+        let r = l
+            .learn("deploy nginx", &steps(&["shell", "service"]))
+            .unwrap();
         assert!(!r.procedure_id.is_empty());
         assert!(r.promoted_skill.is_none());
     }
@@ -167,7 +191,10 @@ mod tests {
 
     #[test]
     fn slugify_normalizes_correctly_edge_case() {
-        assert_eq!(slugify("Deploy NGINX on Staging!"), "deploy-nginx-on-staging");
+        assert_eq!(
+            slugify("Deploy NGINX on Staging!"),
+            "deploy-nginx-on-staging"
+        );
         assert_eq!(slugify("  run tests  "), "run-tests");
     }
 }
