@@ -109,6 +109,8 @@ enum Command {
     Undo(UndoArgs),
     /// Show cost and usage statistics
     Stats(StatsArgs),
+    /// Manage knowledge graph and memory
+    Memory(MemoryArgs),
 }
 
 #[derive(Debug, Args)]
@@ -209,6 +211,40 @@ struct UndoArgs {
 struct StatsArgs {
     #[arg(long)]
     since: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MemoryArgs {
+    #[command(subcommand)]
+    command: MemoryCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum MemoryCommand {
+    /// List entities in the knowledge graph
+    Graph {
+        #[arg(long)]
+        entity_type: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Export memory to JSON file
+    Export {
+        #[arg(short, long)]
+        output: String,
+    },
+    /// Import memory from JSON file
+    Import {
+        #[arg(short, long)]
+        input: String,
+    },
+    /// Prune stale relations older than N days or below confidence threshold
+    Gc {
+        #[arg(long, default_value = "90")]
+        age_days: u32,
+        #[arg(long, default_value = "0.1")]
+        min_confidence: f32,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -876,6 +912,9 @@ async fn run() -> Result<()> {
                 read_only: cli.read_only,
             })
             .await?;
+        }
+        Command::Memory(args) => {
+            run_memory_command(args, &memory).await?;
         }
     }
     Ok(())
@@ -3062,6 +3101,62 @@ fn classify_exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
     } else {
         1
     }
+}
+
+async fn run_memory_command(args: MemoryArgs, _memory: &Arc<MemoryStore>) -> Result<()> {
+    use helm_memory::EntityGraph;
+
+    // Get or create graph at a standard location
+    let graph_path = dirs::data_local_dir()
+        .ok_or_else(|| anyhow!("could not determine data directory"))?
+        .join("helm")
+        .join("graph.db");
+
+    if let Some(parent) = graph_path.parent() {
+        fs::create_dir_all(parent).context("failed to create graph directory")?;
+    }
+
+    let graph =
+        EntityGraph::open(&graph_path).map_err(|e| anyhow!("failed to open graph: {}", e))?;
+
+    match args.command {
+        MemoryCommand::Graph { entity_type, name } => {
+            let entities = graph
+                .find_entities(entity_type.as_deref(), name.as_deref())
+                .map_err(|e| anyhow!("graph error: {}", e))?;
+            if entities.is_empty() {
+                println!("No entities found.");
+            } else {
+                for entity in entities {
+                    println!("{}: {} [{}]", entity.id, entity.name, entity.kind);
+                }
+            }
+        }
+        MemoryCommand::Export { output } => {
+            let json = graph
+                .export_json()
+                .map_err(|e| anyhow!("export error: {}", e))?;
+            fs::write(&output, json).context(format!("failed to write to {}", output))?;
+            println!("Exported to: {}", output);
+        }
+        MemoryCommand::Import { input } => {
+            let json = fs::read_to_string(&input).context(format!("failed to read {}", input))?;
+            let (ents, rels) = graph
+                .import_json(&json)
+                .map_err(|e| anyhow!("import error: {}", e))?;
+            println!("Imported {} entities and {} relations", ents, rels);
+        }
+        MemoryCommand::Gc {
+            age_days,
+            min_confidence,
+        } => {
+            let pruned = graph
+                .prune_stale_relations(age_days, min_confidence)
+                .map_err(|e| anyhow!("gc error: {}", e))?;
+            println!("Pruned {} relations", pruned);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

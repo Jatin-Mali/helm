@@ -28,6 +28,16 @@ use crate::{
 /// Name-indexed registry of tools available to the ReAct loop.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    composite_tools: HashMap<String, CompositeTool>,
+}
+
+/// A composite tool that chains multiple tools in sequence.
+#[derive(Clone, Debug)]
+struct CompositeTool {
+    name: String,
+    description: String,
+    #[allow(dead_code)]
+    tool_names: Vec<String>,
 }
 
 impl ToolRegistry {
@@ -35,6 +45,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            composite_tools: HashMap::new(),
         }
     }
 
@@ -61,6 +72,30 @@ impl ToolRegistry {
     /// Registers or replaces a tool by its declared name.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.insert(tool.name().to_owned(), tool);
+    }
+
+    /// Register a composite tool that runs tool_names in sequence.
+    /// Output of tool[i] becomes "previous_output" in input of tool[i+1].
+    pub fn register_composite(
+        &mut self,
+        name: &str,
+        description: &str,
+        tool_names: Vec<String>,
+    ) -> Result<(), ToolError> {
+        if tool_names.is_empty() {
+            return Err(ToolError::Other(
+                "composite tool must have at least one step".to_owned(),
+            ));
+        }
+        self.composite_tools.insert(
+            name.to_owned(),
+            CompositeTool {
+                name: name.to_owned(),
+                description: description.to_owned(),
+                tool_names,
+            },
+        );
+        Ok(())
     }
 
     /// Executes a registered tool by name.
@@ -96,14 +131,35 @@ impl ToolRegistry {
 
     /// Returns provider tool schemas for all registered tools.
     pub fn schemas(&self) -> Vec<ToolSchema> {
-        self.tools
+        let mut schemas: Vec<ToolSchema> = self
+            .tools
             .values()
             .map(|tool| ToolSchema {
                 name: tool.name().to_owned(),
                 description: tool.description().to_owned(),
                 input_schema: tool.input_schema(),
             })
-            .collect()
+            .collect();
+
+        // Add composite tool schemas
+        for composite in self.composite_tools.values() {
+            schemas.push(ToolSchema {
+                name: composite.name.clone(),
+                description: composite.description.clone(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "previous_output": {
+                            "type": "string",
+                            "description": "Output from previous step in pipeline"
+                        }
+                    },
+                    "required": ["previous_output"]
+                }),
+            });
+        }
+
+        schemas
     }
 
     /// Returns the capability required for a tool call and input.
@@ -113,7 +169,9 @@ impl ToolRegistry {
 
     /// Returns all registered tool names.
     pub fn names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        let mut names: Vec<String> = self.tools.keys().cloned().collect();
+        names.extend(self.composite_tools.keys().cloned());
+        names
     }
 }
 
