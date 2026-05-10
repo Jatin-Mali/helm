@@ -3,6 +3,7 @@
 pub mod budget;
 pub mod context_window;
 pub mod parser;
+pub mod plan_cache;
 pub mod react;
 pub mod supervisor;
 

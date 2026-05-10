@@ -189,12 +189,13 @@ helm/
 - Persistence must redact secrets before writing episode goals, steps, final
   messages, warnings, audit fields, or errors.
 
+**v1.2 additions:**
+- `src/graph.rs` — `EntityGraph`: SQLite-backed knowledge graph; `upsert_entity`, `search_by_name`, `add_relation`, `neighbors`
+- `src/procedures.rs` — `ProcedureStore`: named step sequences; `insert`, `find_by_goal` (LIKE match), `record_success`
+
 **Missing (planned):**
-- `src/graph.rs` — entity graph (v1.2)
-- `src/procedures.rs` — procedural memory (v1.2)
 - `src/skill_learner.rs` — Voyager-style learning (v1.3)
 - `src/user_profile.rs` — user-style learning (v1.3)
-- `src/plan_cache.rs` — move here or into helm-agent (v1.2)
 
 **Grep targets:**
 - `stable_hash_hex` — audit chain hashing
@@ -225,8 +226,10 @@ helm/
 - `ServiceStatus { service, status }`
 - `HttpStatus { url, status }`
 
+**v1.2 additions:**
+- `src/plan_cache.rs` — `PlanCache`: SQLite plan cache keyed by `goal_hash()` (lowercase-trim + DefaultHasher); `get` auto-increments hit_count, `put` upserts, `invalidate` removes
+
 **Missing (planned):**
-- `src/plan_cache.rs` — plan caching by goal embedding (v1.2)
 - `src/model_router.rs` — meta-learning / model routing (v1.3)
 - `src/roles.rs` — sub-agent specialization (v2.0)
 - `src/cancel.rs` — cancellation tokens (v1.4)
