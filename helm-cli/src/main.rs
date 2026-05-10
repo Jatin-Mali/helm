@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
-use helm_agent::{Budget, CancellationToken, ReactAgent, RunResult};
+use helm_agent::{AgentEvent, AgentEventSink, Budget, CancellationToken, ReactAgent, RunResult};
 use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError, Secret};
 use helm_memory::{
     AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, StepRecord,
@@ -504,7 +504,7 @@ async fn run() -> Result<()> {
                 tokio::signal::ctrl_c().await.ok();
                 signal_cancel.cancel();
             });
-            let result = agent.run(&args.task).await?;
+            let result = agent.run_with_events(&args.task, &CliProgressSink).await?;
             print_run_result(&result);
         }
         Command::Replay(args) => {
@@ -1225,6 +1225,37 @@ fn unknown_subcommand_error(args: &[OsString]) -> Option<String> {
         "unknown subcommand: {}; use `helm run \"...\"` for task text",
         first.to_string_lossy()
     ))
+}
+
+/// Prints tool-start/finish lines to stderr while the agent runs.
+struct CliProgressSink;
+
+impl AgentEventSink for CliProgressSink {
+    fn emit(&self, event: AgentEvent) {
+        match event {
+            AgentEvent::ToolCallStarted { name, .. } => {
+                eprintln!("[tool] {name} …");
+            }
+            AgentEvent::ToolCallFinished {
+                name,
+                success,
+                content,
+                ..
+            } => {
+                let status = if success { "ok" } else { "err" };
+                let preview: String = content.chars().take(80).collect();
+                eprintln!("[{status}] {name}: {preview}");
+            }
+            AgentEvent::TextDelta { chunk } => {
+                // Progressive output to stdout when the terminal is interactive.
+                if std::io::stdout().is_terminal() {
+                    print!("{chunk}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn print_run_result(result: &RunResult) {

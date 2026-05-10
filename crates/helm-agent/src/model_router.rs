@@ -26,13 +26,19 @@ pub struct ModelRouter {
 
 impl ModelRouter {
     pub fn new(default_model: impl Into<String>) -> Self {
-        Self { routes: Vec::new(), default_model: default_model.into() }
+        Self {
+            routes: Vec::new(),
+            default_model: default_model.into(),
+        }
     }
 
     /// Register a model for tasks up to `max_complexity`.
     /// Call multiple times to build the routing table.
     pub fn add_route(&mut self, model_id: impl Into<String>, max_complexity: TaskComplexity) {
-        self.routes.push(ModelRoute { model_id: model_id.into(), max_complexity });
+        self.routes.push(ModelRoute {
+            model_id: model_id.into(),
+            max_complexity,
+        });
     }
 
     /// Classify a raw goal string into a complexity tier based on heuristics.
@@ -54,8 +60,11 @@ impl ModelRouter {
     /// Among capable routes, picks the one with the lowest max_complexity
     /// (cheapest model that can handle the task).
     pub fn route(&self, complexity: TaskComplexity) -> &str {
-        let capable: Vec<&ModelRoute> =
-            self.routes.iter().filter(|r| r.max_complexity >= complexity).collect();
+        let capable: Vec<&ModelRoute> = self
+            .routes
+            .iter()
+            .filter(|r| r.max_complexity >= complexity)
+            .collect();
 
         capable
             .into_iter()
@@ -91,12 +100,16 @@ mod tests {
     #[test]
     fn classify_short_goal_is_simple_happy_path() {
         assert_eq!(ModelRouter::classify("list files"), TaskComplexity::Simple);
-        assert_eq!(ModelRouter::classify("check disk usage"), TaskComplexity::Simple);
+        assert_eq!(
+            ModelRouter::classify("check disk usage"),
+            TaskComplexity::Simple
+        );
     }
 
     #[test]
     fn classify_multi_step_is_complex_happy_path() {
-        let goal = "deploy the app, then run migrations, then restart the service and verify health";
+        let goal =
+            "deploy the app, then run migrations, then restart the service and verify health";
         assert_eq!(ModelRouter::classify(goal), TaskComplexity::Complex);
     }
 

@@ -235,11 +235,17 @@ helm/
 **v1.4 additions:**
 - `src/cancel.rs` — `CancellationToken`: `Arc<AtomicBool>` shared flag; `cancel()`, `is_cancelled()`, `child()`; checked at every loop iteration in `ReactAgent`; wired to `tokio::signal::ctrl_c()` in CLI
 
+**v1.5 additions:**
+- `AgentEvent::TextDelta { chunk: String }` — emitted after every `AssistantText` event, splitting text into ≤64-byte chunks for progressive rendering; consumers reconstruct full text by concatenating chunks
+- `execute_single_tool()` — extracted helper (private) that runs one tool call and returns `(ContentBlock, Taint, u32)` (result, taint_delta, corrections_delta); annotated `#[allow(clippy::too_many_arguments)]`
+- `execute_tool_uses()` — refactored to collect all `ToolUse` blocks, snapshot `current_taint` and `corrections_used`, build a Vec of `execute_single_tool` futures, run them with `futures::future::join_all`, then merge taint escalations and corrections deltas; result order preserved
+- `futures` crate added to workspace and `helm-agent`
+
 **Missing (planned):**
 - `src/roles.rs` — sub-agent specialization (v2.0)
 
 **Grep targets:**
-- `AgentEvent::` — event sink for monitoring
+- `AgentEvent::` — event sink for monitoring; `TextDelta` for streaming chunks
 - `EvidenceVerifier::verify` — post-condition checks
 - `parse_tool_calls` — multi-format tool call parsing
 - `BudgetTracker::check` — budget enforcement
@@ -258,7 +264,7 @@ helm/
 
 | File | Key Items |
 |------|-----------|
-| `src/main.rs` | `ProviderChoice`, `ProviderSettings`, `build_provider()`, `default_api_key_env()`, all subcommands |
+| `src/main.rs` | `ProviderChoice`, `ProviderSettings`, `build_provider()`, `default_api_key_env()`, `CliProgressSink`, all subcommands |
 | `src/tui.rs` | `TuiApp`, `ModalState`, `TuiRuntimeInner`, `render_modal()`, `handle_modal_key()` |
 
 **Subcommands** (all in `main.rs`):

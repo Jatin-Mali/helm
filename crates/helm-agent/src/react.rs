@@ -2,6 +2,7 @@
 
 use std::{env, path::Path, sync::Arc};
 
+use futures::future::join_all;
 use helm_core::{Capability, ContentBlock, HelmError, ProviderError, Taint};
 use helm_memory::{AuditEventInput, EpisodeOutcome, MemoryStore, StepRole, stable_hash_hex};
 use helm_providers::{ChatRequest, ChatResponse, Provider, ProviderQuirks, StopReason, quirks_for};
@@ -91,6 +92,11 @@ pub enum AgentEvent {
     AssistantText {
         /// Full text block content.
         text: String,
+    },
+    /// A chunk of assistant text for progressive rendering (fake-streaming).
+    TextDelta {
+        /// Partial text chunk (up to 64 chars).
+        chunk: String,
     },
     /// A tool call was parsed from native or recovered output.
     ToolCallParsed {
@@ -375,7 +381,9 @@ impl ReactAgent {
                     },
                     &tracker,
                 );
-                sink.emit(AgentEvent::RunFinished { result: result.clone() });
+                sink.emit(AgentEvent::RunFinished {
+                    result: result.clone(),
+                });
                 return Ok(result);
             }
 
@@ -462,6 +470,14 @@ impl ReactAgent {
 
             if let Some(text) = extract_optional_text(&assistant_content) {
                 sink.emit(AgentEvent::AssistantText { text: text.clone() });
+                // Emit TextDelta chunks for progressive rendering.
+                for chunk in text.as_bytes().chunks(64) {
+                    if let Ok(s) = std::str::from_utf8(chunk) {
+                        sink.emit(AgentEvent::TextDelta {
+                            chunk: s.to_owned(),
+                        });
+                    }
+                }
                 last_assistant_text = Some(text);
             }
             for block in &assistant_content {
@@ -697,135 +713,183 @@ impl ReactAgent {
         current_taint: &mut Taint,
         sink: &dyn AgentEventSink,
     ) -> Vec<ContentBlock> {
-        let mut results = Vec::new();
-        for block in assistant_content {
-            if let ContentBlock::ToolUse { id, name, input } = block {
-                debug!(tool = name, tool_use_id = id, "executing tool");
-                let capability = self.tools.required_capability(name, input);
-                let authorization = self.authorize_tool_call(capability, current_taint).await;
-                let result = match authorization {
-                    Ok(Authorization::Allowed { grant_id }) => {
-                        sink.emit(AgentEvent::ToolCallValidated {
-                            id: id.clone(),
-                            name: name.clone(),
-                        });
-                        sink.emit(AgentEvent::ToolCallStarted {
-                            id: id.clone(),
-                            name: name.clone(),
-                        });
-                        let result = self
-                            .tools
-                            .execute(name, input.clone(), &self.tool_context)
-                            .await;
-                        let (decision, output_hash) = match &result {
-                            Ok(output) => ("allow", stable_hash_hex(&output.content)),
-                            Err(error) => ("allow", stable_hash_hex(&error.to_string())),
-                        };
-                        self.audit_tool_event(ToolAudit {
-                            episode_id,
-                            tool_name: name,
-                            input,
-                            capability,
-                            taint: current_taint,
-                            decision,
-                            output_hash: &output_hash,
-                        })
-                        .await;
-                        if let Some(grant_id) = grant_id {
-                            if let Err(error) = self.memory.consume_grant_if_once(&grant_id).await {
-                                warn!(error = %error, "failed to consume one-shot grant");
-                            }
-                        }
-                        result
-                    }
-                    Ok(Authorization::Denied { reason }) => {
-                        sink.emit(AgentEvent::PermissionRequested {
-                            capability,
-                            tool_name: name.clone(),
-                            taint: current_taint.clone(),
-                        });
-                        sink.emit(AgentEvent::ToolCallDenied {
-                            id: id.clone(),
-                            name: name.clone(),
-                            reason: reason.clone(),
-                        });
-                        let denial_hash = stable_hash_hex(&reason);
-                        self.audit_tool_event(ToolAudit {
-                            episode_id,
-                            tool_name: name,
-                            input,
-                            capability,
-                            taint: current_taint,
-                            decision: "deny",
-                            output_hash: &denial_hash,
-                        })
-                        .await;
-                        Err(helm_tools::ToolError::InvalidInput(reason))
-                    }
-                    Err(error) => Err(helm_tools::ToolError::Other(error.to_string())),
-                };
-                let tool_result = match result {
-                    Ok(output) => ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: output.content,
-                        is_error: !output.success,
-                    },
-                    Err(error) => {
-                        // Layer 3: if this is a validation error and we still have
-                        // correction budget, include the schema in the result so the
-                        // model can self-correct.
-                        let is_validation_error =
-                            matches!(error, helm_tools::ToolError::InvalidInput(_));
-                        let content = if is_validation_error && *corrections_used < MAX_CORRECTIONS
-                        {
-                            *corrections_used += 1;
-                            // Attempt to attach the tool's schema as a hint.
-                            let schema_hint =
-                                build_correction_hint(name, &self.tools, &error.to_string());
-                            warn!(
-                                tool = name,
-                                corrections_used = *corrections_used,
-                                "sending corrective tool result"
-                            );
-                            sink.emit(AgentEvent::CorrectionUsed {
-                                count: *corrections_used,
-                                tool_name: name.clone(),
-                            });
-                            schema_hint
-                        } else {
-                            error.to_string()
-                        };
-                        sink.emit(AgentEvent::ToolCallFinished {
-                            id: id.clone(),
-                            name: name.clone(),
-                            success: false,
-                            content: content.clone(),
-                        });
-                        ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content,
-                            is_error: true,
-                        }
-                    }
-                };
-                if let ContentBlock::ToolResult {
-                    content, is_error, ..
-                } = &tool_result
-                {
-                    if !*is_error {
-                        sink.emit(AgentEvent::ToolCallFinished {
-                            id: id.clone(),
-                            name: name.clone(),
-                            success: true,
-                            content: content.clone(),
-                        });
-                    }
+        let tool_uses: Vec<(&str, &str, &Value)> = assistant_content
+            .iter()
+            .filter_map(|b| {
+                if let ContentBlock::ToolUse { id, name, input } = b {
+                    Some((id.as_str(), name.as_str(), input))
+                } else {
+                    None
                 }
-                results.push(tool_result);
-                *current_taint = current_taint.escalate(&taint_after_tool(name));
-            }
+            })
+            .collect();
+
+        if tool_uses.is_empty() {
+            return Vec::new();
+        }
+
+        let taint_snapshot = current_taint.clone();
+        let corrections_budget = *corrections_used;
+
+        let futures: Vec<_> = tool_uses
+            .iter()
+            .map(|(id, name, input)| {
+                self.execute_single_tool(
+                    episode_id,
+                    id,
+                    name,
+                    input,
+                    corrections_budget,
+                    taint_snapshot.clone(),
+                    sink,
+                )
+            })
+            .collect();
+
+        let batch = join_all(futures).await;
+
+        let mut results = Vec::new();
+        for (tool_result, taint_delta, corrections_delta) in batch {
+            *current_taint = current_taint.escalate(&taint_delta);
+            *corrections_used = corrections_used.saturating_add(corrections_delta);
+            results.push(tool_result);
         }
         results
+    }
+
+    /// Execute one tool call and return `(result, taint_delta, corrections_delta)`.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_single_tool(
+        &self,
+        episode_id: &str,
+        id: &str,
+        name: &str,
+        input: &Value,
+        corrections_budget: u32,
+        taint_snapshot: Taint,
+        sink: &dyn AgentEventSink,
+    ) -> (ContentBlock, Taint, u32) {
+        debug!(tool = name, tool_use_id = id, "executing tool");
+        let capability = self.tools.required_capability(name, input);
+        let authorization = self.authorize_tool_call(capability, &taint_snapshot).await;
+        let mut corrections_delta: u32 = 0;
+
+        let result = match authorization {
+            Ok(Authorization::Allowed { grant_id }) => {
+                sink.emit(AgentEvent::ToolCallValidated {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                });
+                sink.emit(AgentEvent::ToolCallStarted {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                });
+                let result = self
+                    .tools
+                    .execute(name, input.clone(), &self.tool_context)
+                    .await;
+                let (decision, output_hash) = match &result {
+                    Ok(output) => ("allow", stable_hash_hex(&output.content)),
+                    Err(error) => ("allow", stable_hash_hex(&error.to_string())),
+                };
+                self.audit_tool_event(ToolAudit {
+                    episode_id,
+                    tool_name: name,
+                    input,
+                    capability,
+                    taint: &taint_snapshot,
+                    decision,
+                    output_hash: &output_hash,
+                })
+                .await;
+                if let Some(grant_id) = grant_id {
+                    if let Err(error) = self.memory.consume_grant_if_once(&grant_id).await {
+                        warn!(error = %error, "failed to consume one-shot grant");
+                    }
+                }
+                result
+            }
+            Ok(Authorization::Denied { reason }) => {
+                sink.emit(AgentEvent::PermissionRequested {
+                    capability,
+                    tool_name: name.to_owned(),
+                    taint: taint_snapshot.clone(),
+                });
+                sink.emit(AgentEvent::ToolCallDenied {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    reason: reason.clone(),
+                });
+                let denial_hash = stable_hash_hex(&reason);
+                self.audit_tool_event(ToolAudit {
+                    episode_id,
+                    tool_name: name,
+                    input,
+                    capability,
+                    taint: &taint_snapshot,
+                    decision: "deny",
+                    output_hash: &denial_hash,
+                })
+                .await;
+                Err(helm_tools::ToolError::InvalidInput(reason))
+            }
+            Err(error) => Err(helm_tools::ToolError::Other(error.to_string())),
+        };
+
+        let tool_result = match result {
+            Ok(output) => ContentBlock::ToolResult {
+                tool_use_id: id.to_owned(),
+                content: output.content,
+                is_error: !output.success,
+            },
+            Err(error) => {
+                let is_validation_error = matches!(error, helm_tools::ToolError::InvalidInput(_));
+                let content = if is_validation_error && corrections_budget < MAX_CORRECTIONS {
+                    corrections_delta = 1;
+                    let schema_hint = build_correction_hint(name, &self.tools, &error.to_string());
+                    warn!(
+                        tool = name,
+                        corrections_used = corrections_budget + 1,
+                        "sending corrective tool result"
+                    );
+                    sink.emit(AgentEvent::CorrectionUsed {
+                        count: corrections_budget + 1,
+                        tool_name: name.to_owned(),
+                    });
+                    schema_hint
+                } else {
+                    error.to_string()
+                };
+                sink.emit(AgentEvent::ToolCallFinished {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    success: false,
+                    content: content.clone(),
+                });
+                ContentBlock::ToolResult {
+                    tool_use_id: id.to_owned(),
+                    content,
+                    is_error: true,
+                }
+            }
+        };
+
+        if let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &tool_result
+        {
+            if !*is_error {
+                sink.emit(AgentEvent::ToolCallFinished {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    success: true,
+                    content: content.clone(),
+                });
+            }
+        }
+
+        let taint_delta = taint_after_tool(name);
+        (tool_result, taint_delta, corrections_delta)
     }
 
     async fn authorize_tool_call(
@@ -1973,5 +2037,104 @@ mod tests {
         assert_eq!(result.corrections_used, 3);
         assert!(result.format_recovery_used);
         assert_eq!(result.total_turns_summarized, 0);
+    }
+
+    // v1.5 tests
+
+    #[tokio::test]
+    async fn text_delta_emitted_for_assistant_text_happy_path() {
+        let (_dir, _memory, agent) = agent(
+            vec![response(
+                vec![ContentBlock::Text("hello world from HELM".to_owned())],
+                StopReason::EndTurn,
+            )],
+            Budget::default(),
+        )
+        .await;
+        let collector = EventCollector::default();
+        agent
+            .run_with_events("say hello", &collector)
+            .await
+            .unwrap();
+        let events = collector.events.lock().unwrap().clone();
+        // At least one TextDelta must be emitted for the assistant response.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TextDelta { .. })),
+            "expected at least one TextDelta event"
+        );
+        // All TextDelta chunks concatenated must rebuild the original text.
+        let rebuilt: String = events
+            .iter()
+            .filter_map(|e| {
+                if let AgentEvent::TextDelta { chunk } = e {
+                    Some(chunk.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(rebuilt, "hello world from HELM");
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_execution_both_results_collected_happy_path() {
+        let dir = tempdir().unwrap();
+        let memory = Arc::new(
+            MemoryStore::open(&dir.path().join("parallel.db"))
+                .await
+                .unwrap(),
+        );
+        memory
+            .grant_capability(Capability::ShellExec, GrantScope::Always)
+            .await
+            .unwrap();
+        // Provider returns two tool-use blocks in the same response.
+        let agent = ReactAgent::with_tool_context(
+            Box::new(MockProvider::new(vec![
+                response(
+                    vec![
+                        ContentBlock::ToolUse {
+                            id: "t1".to_owned(),
+                            name: "shell".to_owned(),
+                            input: json!({"command": "echo", "args": ["a"]}),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "t2".to_owned(),
+                            name: "shell".to_owned(),
+                            input: json!({"command": "echo", "args": ["b"]}),
+                        },
+                    ],
+                    StopReason::ToolUse,
+                ),
+                response(
+                    vec![ContentBlock::Text("both done".to_owned())],
+                    StopReason::EndTurn,
+                ),
+            ])),
+            ToolRegistry::default(),
+            Arc::clone(&memory),
+            Budget::default(),
+            "mock",
+            ToolContext::new(dir.path().to_path_buf()),
+        );
+        let collector = EventCollector::default();
+        let result = agent
+            .run_with_events("echo a and b", &collector)
+            .await
+            .unwrap();
+        assert_eq!(result.final_message, "both done");
+        let events = collector.events.lock().unwrap().clone();
+        // Both tool calls must appear as finished-success.
+        let finished_ok: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCallFinished { success: true, .. }))
+            .collect();
+        assert_eq!(
+            finished_ok.len(),
+            2,
+            "expected two successful ToolCallFinished events"
+        );
     }
 }

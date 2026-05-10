@@ -1330,7 +1330,9 @@ impl TuiApp {
                 self.push_chat(MessageRole::Error, warning.clone());
                 self.record_tool_event("warn", "verify", warning);
             }
-            AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. } => {}
+            AgentEvent::RunFinished { .. }
+            | AgentEvent::RunFailed { .. }
+            | AgentEvent::TextDelta { .. } => {}
         }
     }
 

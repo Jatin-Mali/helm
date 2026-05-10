@@ -27,6 +27,7 @@ repository = "https://github.com/Jatin-Mali/helm"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
+futures = "0.3"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
