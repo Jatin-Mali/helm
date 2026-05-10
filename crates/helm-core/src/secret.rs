@@ -42,6 +42,19 @@ impl From<&str> for Secret {
     }
 }
 
+/// Redacts known API key patterns from a string.
+pub fn redact_secrets(input: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(sk-[a-zA-Z0-9_-]{20,}|gsk_[a-zA-Z0-9_-]{20,}|nvapi-[a-zA-Z0-9_-]{20,}|AIza[0-9A-Za-z-_]{35})",
+        )
+        .unwrap_or_else(|error| panic!("invalid built-in secret redaction regex: {error}"))
+    });
+    re.replace_all(input, "***REDACTED***").into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,6 +30,7 @@ async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = "0.28"
 ratatui = "0.29"
 mockito = "1"
@@ -41,6 +42,7 @@ rpassword = "7"
 rusqlite = { version = "0.32", features = ["bundled"] }
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+regex = "1"
 jsonschema = "0.28"
 serde_json = "1"
 tempfile = "3"

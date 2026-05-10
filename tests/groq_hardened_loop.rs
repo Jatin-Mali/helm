@@ -55,6 +55,7 @@ mod tests {
                 max_input_tokens: 8_000,
                 max_output_tokens: 512,
                 max_wall_time: std::time::Duration::from_secs(60),
+                ..Budget::default()
             },
             model,
             ToolContext::new(dir.path().to_path_buf()),

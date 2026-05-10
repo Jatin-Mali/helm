@@ -28,6 +28,15 @@ You only need to do `helm init` once per machine. The key is stored at
 `~/.helm/secrets.toml` (mode 0600), so fresh terminals work without
 re-exporting provider environment variables.
 
+## Use HELM If / Use Cowork If
+
+| Use HELM if... | Use Cowork if... |
+|---|---|
+| You want a self-hosted Linux operations agent | You want a cloud-hosted managed agent |
+| You need shell, service, package, disk, and audit control on one machine | You need team collaboration and shared cloud workflows |
+| Privacy matters and you want local SQLite/audit storage | You are comfortable with cloud processing |
+| You want a single local binary and a terminal-first UI | You want a broader SaaS workflow surface |
+
 Interactive setup:
 
 ```

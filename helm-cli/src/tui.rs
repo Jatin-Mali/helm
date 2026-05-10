@@ -31,7 +31,7 @@ use ratatui::{
     prelude::Widget,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, ListItem, Paragraph, Wrap},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -73,6 +73,8 @@ pub(crate) struct TuiRuntime {
     pub(crate) max_iterations: Option<u32>,
     pub(crate) secrets: SecretsStore,
     pub(crate) tui_paste_key_modal: bool,
+    pub(crate) auto_approve: bool,
+    pub(crate) read_only: bool,
 }
 
 /// Starts the interactive terminal UI.
@@ -157,6 +159,7 @@ struct SessionState {
     episode_id: Option<String>,
     chat: Vec<ChatMessage>,
     transcript_scroll: usize,
+    tool_timeline: Vec<ToolTimelineItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +332,7 @@ struct ModelCatalogEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandAction {
     NewSession,
+    Clear,
     Replay,
     Doctor,
     Provider,
@@ -337,6 +341,10 @@ enum CommandAction {
     Audit,
     Skills,
     Browser,
+    Init,
+    Sessions,
+    Resume,
+    Quit,
     Help,
 }
 
@@ -344,6 +352,7 @@ impl CommandAction {
     fn all() -> Vec<Self> {
         vec![
             Self::NewSession,
+            Self::Clear,
             Self::Replay,
             Self::Doctor,
             Self::Provider,
@@ -352,6 +361,10 @@ impl CommandAction {
             Self::Audit,
             Self::Skills,
             Self::Browser,
+            Self::Init,
+            Self::Sessions,
+            Self::Resume,
+            Self::Quit,
             Self::Help,
         ]
     }
@@ -359,6 +372,7 @@ impl CommandAction {
     fn label(self) -> &'static str {
         match self {
             Self::NewSession => "New Session",
+            Self::Clear => "Clear Transcript",
             Self::Replay => "Replay Episode",
             Self::Doctor => "Doctor",
             Self::Provider => "Provider Selector",
@@ -367,6 +381,10 @@ impl CommandAction {
             Self::Audit => "Audit Verify",
             Self::Skills => "Skills",
             Self::Browser => "Browser Status",
+            Self::Init => "Init AGENTS.md",
+            Self::Sessions => "Sessions",
+            Self::Resume => "Resume",
+            Self::Quit => "Quit",
             Self::Help => "Help",
         }
     }
@@ -374,6 +392,7 @@ impl CommandAction {
     fn slug(self) -> &'static str {
         match self {
             Self::NewSession => "new",
+            Self::Clear => "clear",
             Self::Replay => "replay",
             Self::Doctor => "doctor",
             Self::Provider => "provider",
@@ -382,6 +401,10 @@ impl CommandAction {
             Self::Audit => "audit",
             Self::Skills => "skills",
             Self::Browser => "browser",
+            Self::Init => "init",
+            Self::Sessions => "sessions",
+            Self::Resume => "resume",
+            Self::Quit => "quit",
             Self::Help => "help",
         }
     }
@@ -389,6 +412,7 @@ impl CommandAction {
     fn description(self) -> &'static str {
         match self {
             Self::NewSession => "clear transcript and start over",
+            Self::Clear => "clear the visible transcript",
             Self::Replay => "show replay command for this episode",
             Self::Doctor => "show provider and system diagnostics hint",
             Self::Provider => "switch LLM backend",
@@ -397,21 +421,79 @@ impl CommandAction {
             Self::Audit => "verify audit log chain",
             Self::Skills => "inspect local skill library",
             Self::Browser => "browser automation status",
+            Self::Init => "generate AGENTS.md in the current project",
+            Self::Sessions => "show session-resume guidance",
+            Self::Resume => "show resume guidance",
+            Self::Quit => "exit HELM",
             Self::Help => "keyboard shortcuts and commands",
+        }
+    }
+
+    fn matches_slug(self, slug: &str) -> bool {
+        match self {
+            Self::Quit => matches!(slug, "quit" | "exit" | "q"),
+            Self::NewSession => matches!(slug, "new" | "n"),
+            Self::Clear => slug == "clear",
+            Self::Replay => slug == "replay",
+            Self::Doctor => slug == "doctor",
+            Self::Provider => slug == "provider",
+            Self::Model => slug == "model",
+            Self::Permissions => slug == "permissions",
+            Self::Audit => slug == "audit",
+            Self::Skills => slug == "skills",
+            Self::Browser => matches!(slug, "browser" | "tools"),
+            Self::Init => slug == "init",
+            Self::Sessions => slug == "sessions",
+            Self::Resume => slug == "resume",
+            Self::Help => slug == "help",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Option<Self> {
+        Self::all()
+            .into_iter()
+            .find(|action| action.matches_slug(slug))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMode {
+    Chat,
+    Plan,
+    AutoAccept,
+}
+
+impl AgentMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Chat => Self::Plan,
+            Self::Plan => Self::AutoAccept,
+            Self::AutoAccept => Self::Chat,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Plan => "Plan",
+            Self::AutoAccept => "Auto-Accept",
         }
     }
 }
 
-struct TuiApp {
+pub struct TuiApp {
     runtime: Arc<TuiRuntimeInner>,
     active_settings: ProviderSettings,
     session: SessionState,
     input: InputState,
     focus: PanelFocus,
     modal: Option<ModalState>,
-    palette: CommandPaletteState,
     slash_popup: Option<usize>,
+    command_palette: CommandPaletteState,
     running: bool,
+    shutdown: bool,
+    mode: AgentMode,
+    show_sidebar: bool,
     spinner: usize,
     provider_name: String,
     model: String,
@@ -423,6 +505,8 @@ struct TuiApp {
     active_run_id: u64,
     agent_task: Option<JoinHandle<()>>,
     pending_auth_retry: Option<String>,
+    session_tokens_in: u32,
+    session_tokens_out: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,6 +548,14 @@ impl TuiApp {
             .model
             .clone()
             .unwrap_or_else(|| "auto".to_owned());
+        let mode = if runtime.read_only {
+            AgentMode::Plan
+        } else if runtime.auto_approve {
+            AgentMode::AutoAccept
+        } else {
+            AgentMode::Chat
+        };
+
         Self {
             runtime: Arc::new(TuiRuntimeInner {
                 db_path: runtime.db_path,
@@ -478,9 +570,12 @@ impl TuiApp {
             input: InputState::new(),
             focus: PanelFocus::Input,
             modal: None,
-            palette: CommandPaletteState::new(),
             slash_popup: None,
+            command_palette: CommandPaletteState::new(),
             running: false,
+            shutdown: false,
+            mode,
+            show_sidebar: false,
             spinner: 0,
             provider_name,
             model,
@@ -492,6 +587,8 @@ impl TuiApp {
             active_run_id: 0,
             agent_task: None,
             pending_auth_retry: None,
+            session_tokens_in: 0,
+            session_tokens_out: 0,
         }
     }
 
@@ -587,7 +684,8 @@ impl TuiApp {
                             && final_text != "(no final message)"
                             && !self.chat_ends_with(MessageRole::Assistant, &final_text)
                         {
-                            self.push_chat(MessageRole::Assistant, final_text);
+                            let redacted = helm_core::redact_secrets(&final_text);
+                            self.push_chat(MessageRole::Assistant, redacted);
                         }
                         self.record_tool_event(
                             "done",
@@ -654,7 +752,7 @@ impl TuiApp {
                 }
                 KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
                     self.execute_slash_from_popup();
-                    return Ok(false);
+                    return Ok(self.shutdown);
                 }
                 KeyCode::Tab => {
                     let filtered = self.slash_filtered();
@@ -680,9 +778,19 @@ impl TuiApp {
                     }
                     return Ok(true);
                 }
+                KeyCode::Char('d') if self.input.text.is_empty() => return Ok(true),
+                KeyCode::Char('j') => self.input.insert_newline(),
                 KeyCode::Char('n') => self.new_session(),
                 KeyCode::Char('p') => self.open_palette(),
                 KeyCode::Char('r') => self.push_chat(MessageRole::System, self.replay_hint()),
+                KeyCode::Char('t') => {
+                    self.show_sidebar = !self.show_sidebar;
+                    self.toast(if self.show_sidebar {
+                        "Sidebar visible"
+                    } else {
+                        "Sidebar hidden"
+                    });
+                }
                 KeyCode::Char('a') => {
                     self.modal = Some(ModalState::Permission {
                         capability: Capability::ShellShell,
@@ -691,11 +799,8 @@ impl TuiApp {
                         detail: "No pending permission request.".to_owned(),
                     });
                 }
-                KeyCode::Char('d') => {
-                    self.push_chat(
-                        MessageRole::System,
-                        "No pending permission request to deny.",
-                    );
+                KeyCode::Char('h') => {
+                    self.modal = Some(ModalState::Help);
                 }
                 KeyCode::Char('l') => self.clear_transcript(),
                 KeyCode::Home => self.session.transcript_scroll = usize::MAX / 2,
@@ -707,10 +812,21 @@ impl TuiApp {
         }
 
         match key.code {
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Enter
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
                 self.input.insert_newline()
             }
-            KeyCode::Enter => self.submit(tx).await?,
+            KeyCode::Enter => {
+                self.submit(tx).await?;
+                if self.shutdown {
+                    return Ok(true);
+                }
+            }
+            KeyCode::Char('?') if self.input.text.is_empty() => {
+                self.modal = Some(ModalState::Help);
+            }
             KeyCode::Char(ch) => {
                 self.input.insert(ch);
                 self.update_slash_popup();
@@ -741,7 +857,11 @@ impl TuiApp {
                 self.session.transcript_scroll =
                     self.session.transcript_scroll.saturating_sub(step.max(1));
             }
-            KeyCode::Tab | KeyCode::BackTab => self.focus = PanelFocus::Input,
+            KeyCode::Tab => self.focus = PanelFocus::Input,
+            KeyCode::BackTab => {
+                self.mode = self.mode.next();
+                self.toast(format!("Mode changed to {}", self.mode.as_str()));
+            }
             KeyCode::Esc => self.focus = PanelFocus::Input,
             _ => {}
         }
@@ -757,23 +877,26 @@ impl TuiApp {
             Some(ModalState::CommandPalette) => match key.code {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Enter => {
-                    let commands = self.palette.filtered();
-                    if let Some(command) = commands.get(self.palette.selected).copied() {
+                    let commands = self.command_palette.filtered();
+                    if let Some(command) = commands.get(self.command_palette.selected).copied() {
                         self.execute_command(command);
+                        return Ok(self.shutdown);
                     }
                 }
                 KeyCode::Char(ch) => {
-                    self.palette.query.push(ch);
-                    self.palette.selected = 0;
+                    self.command_palette.query.push(ch);
+                    self.command_palette.selected = 0;
                 }
                 KeyCode::Backspace => {
-                    self.palette.query.pop();
-                    self.palette.selected = 0;
+                    self.command_palette.query.pop();
+                    self.command_palette.selected = 0;
                 }
-                KeyCode::Up => self.palette.selected = self.palette.selected.saturating_sub(1),
+                KeyCode::Up => {
+                    self.command_palette.selected = self.command_palette.selected.saturating_sub(1)
+                }
                 KeyCode::Down => {
-                    let max = self.palette.filtered().len().saturating_sub(1);
-                    self.palette.selected = (self.palette.selected + 1).min(max);
+                    let max = self.command_palette.filtered().len().saturating_sub(1);
+                    self.command_palette.selected = (self.command_palette.selected + 1).min(max);
                 }
                 _ => {}
             },
@@ -1010,11 +1133,16 @@ impl TuiApp {
         let Some(task) = self.input.take_submit() else {
             return Ok(());
         };
-        if self.input_looks_like_unknown_slash(&task) {
-            self.push_chat(
-                MessageRole::Error,
-                format!("Unknown command `{task}`. Type /help or press Ctrl+P."),
-            );
+        if let Some(command_text) = task.trim().strip_prefix('/') {
+            let slug = command_text.split_whitespace().next().unwrap_or("");
+            if let Some(command) = CommandAction::from_slug(slug) {
+                self.execute_command(command);
+            } else {
+                self.push_chat(
+                    MessageRole::Error,
+                    format!("Unknown command `{task}`. Type /help or press Ctrl+P."),
+                );
+            }
             return Ok(());
         }
         self.start_task(task, tx, true).await
@@ -1036,13 +1164,15 @@ impl TuiApp {
         self.running = true;
         self.status_note = "running".to_owned();
         self.active_run_id = self.active_run_id.saturating_add(1);
+        self.session.transcript_scroll = 0;
         let run_id = self.active_run_id;
 
         let runtime = Arc::clone(&self.runtime);
         let settings = self.active_settings.clone();
         let task_for_event = task.clone();
+        let mode = self.mode;
         self.agent_task = Some(tokio::spawn(async move {
-            let result = run_agent_task(runtime, settings, task, tx.clone(), run_id).await;
+            let result = run_agent_task(runtime, settings, task, tx.clone(), run_id, mode).await;
             tx.send(UiEvent::AgentDone {
                 run_id,
                 task: task_for_event,
@@ -1139,14 +1269,19 @@ impl TuiApp {
                 stop_reason,
                 tokens_in,
                 tokens_out,
-            } => self.record_tool_event(
-                "done",
-                "provider",
-                format!("{iteration:?} {stop_reason:?}, {tokens_in}/{tokens_out} tokens"),
-            ),
+            } => {
+                self.session_tokens_in = self.session_tokens_in.saturating_add(tokens_in);
+                self.session_tokens_out = self.session_tokens_out.saturating_add(tokens_out);
+                self.record_tool_event(
+                    "done",
+                    "provider",
+                    format!("{iteration:?} {stop_reason:?}, {tokens_in}/{tokens_out} tokens"),
+                );
+            }
             AgentEvent::AssistantText { text } => {
                 if !text.trim().is_empty() {
-                    self.push_chat(MessageRole::Assistant, text);
+                    let redacted = helm_core::redact_secrets(&text);
+                    self.push_chat(MessageRole::Assistant, redacted);
                 }
             }
             AgentEvent::ToolCallParsed { id, name, input } => {
@@ -1166,11 +1301,13 @@ impl TuiApp {
                 content,
                 ..
             } => {
-                self.finish_tool_cell(&id, &name, success, &content);
+                let redacted = helm_core::redact_secrets(&content);
+                self.finish_tool_cell(&id, &name, success, &redacted);
             }
             AgentEvent::ToolCallDenied { name, reason, .. } => {
-                self.record_tool_event("deny", name, reason.clone());
-                self.push_chat(MessageRole::Error, reason);
+                let redacted = helm_core::redact_secrets(&reason);
+                self.record_tool_event("deny", name, redacted.clone());
+                self.push_chat(MessageRole::Error, redacted);
             }
             AgentEvent::PermissionRequested {
                 capability,
@@ -1224,6 +1361,7 @@ impl TuiApp {
             tool: sanitize_one_line(&tool.into()),
             detail: sanitize_one_line(&detail.into()),
         };
+        self.session.tool_timeline.push(item.clone());
         self.status_note = activity_status_note(&item);
         if let Some(text) = visible_activity_text(&item) {
             self.session.chat.push(ChatMessage {
@@ -1304,6 +1442,8 @@ impl TuiApp {
 
     fn new_session(&mut self) {
         self.session = SessionState::default();
+        self.session_tokens_in = 0;
+        self.session_tokens_out = 0;
         self.input.clear();
         self.push_chat(MessageRole::System, "New session started.");
         self.modal = None;
@@ -1413,19 +1553,8 @@ impl TuiApp {
         let query = raw.split_whitespace().next().unwrap_or("");
         CommandAction::all()
             .into_iter()
-            .filter(|a| a.slug().starts_with(query))
+            .filter(|a| a.slug().starts_with(query) || a.matches_slug(query))
             .collect()
-    }
-
-    fn input_looks_like_unknown_slash(&self, text: &str) -> bool {
-        let Some(command) = text.trim().strip_prefix('/') else {
-            return false;
-        };
-        let slug = command.split_whitespace().next().unwrap_or("");
-        !slug.is_empty()
-            && !CommandAction::all()
-                .iter()
-                .any(|action| action.slug() == slug)
     }
 
     fn update_slash_popup(&mut self) {
@@ -1454,7 +1583,7 @@ impl TuiApp {
     }
 
     fn open_palette(&mut self) {
-        self.palette = CommandPaletteState::new();
+        self.command_palette = CommandPaletteState::new();
         self.modal = Some(ModalState::CommandPalette);
     }
 
@@ -1462,6 +1591,7 @@ impl TuiApp {
         self.modal = None;
         match command {
             CommandAction::NewSession => self.new_session(),
+            CommandAction::Clear => self.clear_transcript(),
             CommandAction::Replay => self.push_chat(MessageRole::System, self.replay_hint()),
             CommandAction::Doctor => self.push_chat(MessageRole::System, self.doctor_hint()),
             CommandAction::Provider => {
@@ -1499,6 +1629,31 @@ impl TuiApp {
                 self.record_tool_event("skills", "library", "run `helm skills list`")
             }
             CommandAction::Browser => self.push_chat(MessageRole::System, self.browser_hint()),
+            CommandAction::Init => match crate::generate_agents_md_for_dir(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ) {
+                Ok(Some(path)) => self.push_chat(
+                    MessageRole::System,
+                    format!("Generated {}.", path.display()),
+                ),
+                Ok(None) => self.push_chat(
+                    MessageRole::System,
+                    "Current directory does not look like a project; no AGENTS.md generated.",
+                ),
+                Err(error) => self.push_chat(
+                    MessageRole::Error,
+                    format!("failed to generate AGENTS.md: {error}"),
+                ),
+            },
+            CommandAction::Sessions => self.push_chat(
+                MessageRole::System,
+                "Sessions are not resumable yet. Use `helm episodes` and `helm replay <id>`.",
+            ),
+            CommandAction::Resume => self.push_chat(
+                MessageRole::System,
+                "Resume is not implemented yet. Use `helm episodes` and `helm replay <id>`.",
+            ),
+            CommandAction::Quit => self.shutdown = true,
             CommandAction::Help => self.modal = Some(ModalState::Help),
         }
     }
@@ -1514,6 +1669,7 @@ async fn run_agent_task(
     task: String,
     tx: mpsc::UnboundedSender<UiEvent>,
     run_id: u64,
+    mode: AgentMode,
 ) -> Result<RunResult, HelmError> {
     let (provider, model) = build_provider(&settings, &runtime.secrets)
         .map_err(|error| HelmError::Provider(helm_core::ProviderError::Other(error.to_string())))?;
@@ -1521,6 +1677,8 @@ async fn run_agent_task(
     if let Some(max) = runtime.max_iterations {
         budget.max_iterations = max;
     }
+    budget.read_only = mode == AgentMode::Plan;
+    budget.auto_approve = mode == AgentMode::AutoAccept;
     let agent = ReactAgent::new(
         provider,
         ToolRegistry::default(),
@@ -1566,20 +1724,34 @@ fn render_app(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .style(Style::default().bg(APP_BG).fg(APP_FG))
         .render(area, buf);
 
+    let (main_area, sidebar_area) = if app.show_sidebar && area.width > 60 {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(40), Constraint::Length(30)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(6),
-            Constraint::Length(input_height(&app.input.text, area.width)),
+            Constraint::Length(input_height(&app.input.text, main_area.width)),
             Constraint::Length(1),
         ])
-        .split(area);
+        .split(main_area);
 
     render_status(app, vertical[0], buf);
     render_chat(app, vertical[1], buf);
     render_input(app, vertical[2], buf);
     render_footer(app, vertical[3], buf);
+
+    if let Some(sidebar_rect) = sidebar_area {
+        render_sidebar(app, sidebar_rect, buf);
+    }
 
     if app.slash_popup.is_some() && app.modal.is_none() {
         render_slash_popup(app, vertical[2], buf);
@@ -1595,6 +1767,47 @@ fn render_app(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     }
 }
 
+fn render_sidebar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(HEADER_BORDER))
+        .title(Span::styled(
+            " Tool History ",
+            Style::default().fg(DIM_FG).add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let items: Vec<ListItem> = app
+        .session
+        .tool_timeline
+        .iter()
+        .rev()
+        .map(|item| {
+            let color = match item.status.as_str() {
+                "queued" => DIM_FG,
+                "starting" => TOOL_FG,
+                "done" | "ok" => SUCCESS_FG,
+                "failed" | "denied" => ERROR_FG,
+                _ => DIM_FG,
+            };
+            let header = Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", item.status),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(&item.tool, Style::default().fg(APP_FG)),
+            ]);
+            let detail = Line::styled(format!("  {}", item.detail), Style::default().fg(DIM_FG));
+            ListItem::new(vec![header, detail])
+        })
+        .collect();
+
+    let list = ratatui::widgets::List::new(items);
+    list.render(inner, buf);
+}
+
 fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1606,6 +1819,11 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         "H"
     };
     let episode = app.session.episode_id.as_deref().unwrap_or("-");
+    let mode_style = match app.mode {
+        AgentMode::Chat => Style::default().fg(Color::White).bg(HEADER_BORDER),
+        AgentMode::Plan => Style::default().fg(Color::White).bg(INPUT_IDLE),
+        AgentMode::AutoAccept => Style::default().fg(Color::White).bg(SUCCESS_FG),
+    };
     let line = Line::from(vec![
         Span::styled(
             format!(" {spinner} HELM "),
@@ -1623,14 +1841,18 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             Style::default().fg(DIM_FG).bg(HEADER_BG),
         ),
         Span::styled(
+            format!(" [{}] ", app.mode.as_str().to_ascii_uppercase()),
+            mode_style.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {} ", token_status(app)),
+            Style::default().fg(DIM_FG).bg(HEADER_BG),
+        ),
+        Span::styled(
             format!(" {} ", truncate(&app.status_note, 36)),
             Style::default()
                 .fg(if app.running { SUCCESS_FG } else { APP_FG })
                 .bg(HEADER_BG),
-        ),
-        Span::styled(
-            "  Ctrl+P palette  / commands  Ctrl+C cancel/quit",
-            Style::default().fg(DIM_FG).bg(HEADER_BG),
         ),
     ]);
     Paragraph::new(line)
@@ -1795,22 +2017,58 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let mode_label = match _app.mode {
+        AgentMode::Chat => "CHAT",
+        AgentMode::Plan => "PLAN",
+        AgentMode::AutoAccept => "AUTO",
+    };
+    let mode_hint = match _app.mode {
+        AgentMode::Chat => "Shift+Tab -> Plan",
+        AgentMode::Plan => "READ-ONLY | Shift+Tab -> Auto",
+        AgentMode::AutoAccept => "AUTO-ACCEPT | Shift+Tab -> Chat",
+    };
     let line = Line::from(vec![
-        Span::styled(" ^P ", Style::default().fg(HEADER_BORDER).bg(APP_BG)),
-        Span::styled("Palette", Style::default().fg(DIM_FG).bg(APP_BG)),
-        Span::styled(" | ", Style::default().fg(INPUT_IDLE).bg(APP_BG)),
-        Span::styled("^C ", Style::default().fg(HEADER_BORDER).bg(APP_BG)),
-        Span::styled("Cancel", Style::default().fg(DIM_FG).bg(APP_BG)),
-        Span::styled(" | ", Style::default().fg(INPUT_IDLE).bg(APP_BG)),
-        Span::styled("^L ", Style::default().fg(HEADER_BORDER).bg(APP_BG)),
-        Span::styled("Clear", Style::default().fg(DIM_FG).bg(APP_BG)),
-        Span::styled(" | ", Style::default().fg(INPUT_IDLE).bg(APP_BG)),
-        Span::styled("/ ", Style::default().fg(HEADER_BORDER).bg(APP_BG)),
-        Span::styled("Commands", Style::default().fg(DIM_FG).bg(APP_BG)),
+        Span::styled(
+            format!(" [{mode_label}] "),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BORDER)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ^P Palette ", Style::default().fg(DIM_FG).bg(APP_BG)),
+        Span::styled("|", Style::default().fg(INPUT_IDLE).bg(APP_BG)),
+        Span::styled(" ^C Cancel ", Style::default().fg(DIM_FG).bg(APP_BG)),
+        Span::styled("|", Style::default().fg(INPUT_IDLE).bg(APP_BG)),
+        Span::styled(" ^L Clear ", Style::default().fg(DIM_FG).bg(APP_BG)),
+        Span::styled("|", Style::default().fg(INPUT_IDLE).bg(APP_BG)),
+        Span::styled(" / Commands ", Style::default().fg(DIM_FG).bg(APP_BG)),
+        Span::styled("|", Style::default().fg(INPUT_IDLE).bg(APP_BG)),
+        Span::styled(
+            format!(" {mode_hint} "),
+            Style::default().fg(DIM_FG).bg(APP_BG),
+        ),
     ]);
     Paragraph::new(line)
         .style(Style::default().fg(DIM_FG).bg(APP_BG))
         .render(area, buf);
+}
+
+fn token_status(app: &TuiApp) -> String {
+    let estimate = estimated_cost(
+        app.active_settings.choice,
+        app.session_tokens_in,
+        app.session_tokens_out,
+    );
+    match estimate {
+        Some(cost) => format!(
+            "{} in / {} out | ${cost:.4}",
+            app.session_tokens_in, app.session_tokens_out
+        ),
+        None => format!(
+            "{} in / {} out",
+            app.session_tokens_in, app.session_tokens_out
+        ),
+    }
 }
 
 fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) {
@@ -2011,7 +2269,7 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 .render(area, buf);
         }
         ModalState::Help => {
-            Paragraph::new("Enter submit | Alt+Enter newline | Ctrl+P commands | Ctrl+N new session | Ctrl+C cancel running task, then Ctrl+C again to quit | PageUp/PageDown scroll")
+            Paragraph::new("Enter submit | Alt+Enter newline | Ctrl+P commands | Ctrl+N new session | Ctrl+C cancel running task, then Ctrl+C again to quit | PageUp/PageDown scroll | Ctrl+T toggle sidebar | Shift+Tab toggle mode | Ctrl+H/? help")
                 .block(modal_block(" Help "))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
@@ -2020,14 +2278,14 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
 }
 
 fn render_palette(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let commands = app.palette.filtered();
+    let commands = app.command_palette.filtered();
     let mut lines = vec![Line::from(vec![
         Span::styled("query: ", Style::default().fg(Color::Gray)),
-        Span::raw(app.palette.query.as_str()),
+        Span::raw(app.command_palette.query.as_str()),
     ])];
     lines.push(Line::from(""));
     for (index, command) in commands.iter().enumerate() {
-        let style = if index == app.palette.selected {
+        let style = if index == app.command_palette.selected {
             Style::default()
                 .fg(Color::White)
                 .bg(HEADER_BORDER)
@@ -2249,6 +2507,23 @@ fn activity_status_note(item: &ToolTimelineItem) -> String {
         "cancel" => "cancelled".to_owned(),
         _ => format!("{} {}", item.status, item.tool),
     }
+}
+
+fn estimated_cost(provider: ProviderChoice, tokens_in: u32, tokens_out: u32) -> Option<f64> {
+    let (input_per_million, output_per_million) = match provider {
+        ProviderChoice::Anthropic => (3.0_f64, 15.0_f64),
+        ProviderChoice::OpenaiCompat => (0.15_f64, 0.60_f64),
+        ProviderChoice::Openrouter => (0.50_f64, 1.50_f64),
+        ProviderChoice::Groq
+        | ProviderChoice::Gemini
+        | ProviderChoice::NvidiaNim
+        | ProviderChoice::Ollama
+        | ProviderChoice::Auto => return None,
+    };
+    Some(
+        (f64::from(tokens_in) / 1_000_000.0_f64) * input_per_million
+            + (f64::from(tokens_out) / 1_000_000.0_f64) * output_per_million,
+    )
 }
 
 fn tool_call_summary(name: &str, input: &serde_json::Value) -> String {
@@ -2685,6 +2960,8 @@ mod tests {
             max_iterations: Some(2),
             secrets,
             tui_paste_key_modal: true,
+            auto_approve: false,
+            read_only: false,
         })
     }
 

@@ -268,6 +268,7 @@ impl MemoryStore {
         let conn = Arc::clone(&self.conn);
         let episode_id = episode_id.to_owned();
         let content_json = serde_json::to_string(content)?;
+        let content_json = helm_core::redact_secrets(&content_json);
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
             guard
@@ -311,8 +312,8 @@ impl MemoryStore {
     ) -> Result<(), MemoryError> {
         let conn = Arc::clone(&self.conn);
         let episode_id = episode_id.to_owned();
-        let final_message = final_message.map(str::to_owned);
-        let error = error.map(str::to_owned);
+        let final_message = final_message.map(helm_core::redact_secrets);
+        let error = error.map(helm_core::redact_secrets);
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
             guard
@@ -672,8 +673,13 @@ impl MemoryStore {
     }
 
     /// Appends one hash-chained audit event and returns its event hash.
-    pub async fn append_audit_event(&self, input: AuditEventInput) -> Result<String, MemoryError> {
+    pub async fn append_audit_event(
+        &self,
+        mut input: AuditEventInput,
+    ) -> Result<String, MemoryError> {
         let conn = Arc::clone(&self.conn);
+        input.input_hash = helm_core::redact_secrets(&input.input_hash);
+        input.output_hash = helm_core::redact_secrets(&input.output_hash);
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
             let previous_hash = latest_audit_hash(&guard)?;

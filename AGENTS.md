@@ -195,12 +195,19 @@ helm/
 - `helm models` — list models for active provider
 - `helm permissions` — manage capability grants
 - `helm audit` — view/verify audit log chain
+- `helm config {get,set,edit,validate,path}` — config inspection and mutation
+- `helm completion {bash,zsh,fish}` — shell completion generation
+- `helm secrets {list,set,get,delete,path,import-env}` — persistent provider-key management
 - `helm skills {list,show,approve,test}` — skill library management
 
 **TUI key bindings** (in `tui.rs`):
 - `Ctrl+C` — quit (or cancel task)
 - `Ctrl+P` — command palette
+- `Ctrl+J` / `Alt+Enter` / `Shift+Enter` — insert newline
 - `Ctrl+L` — clear current visible session
+- `Ctrl+D` on empty input — quit
+- `Ctrl+T` — toggle tool-history sidebar
+- `Shift+Tab` — cycle modes (`Chat` → `Plan` → `Auto-Accept`)
 - `PgUp/PgDn` — scroll transcript by half a screen
 - `Ctrl+Home/Ctrl+End` — jump to transcript top/latest
 - Mouse wheel — scroll transcript
@@ -209,11 +216,12 @@ helm/
 
 **Key patterns:**
 - `active_settings: ProviderSettings` on `TuiApp` — mutated by ProviderSelector/ModelSelector; passed to every new task via `run_agent_task()`
-- `ModalState` enum — CommandPalette / Permission / ProviderSelector / ModelSelector / Error / Help
+- `ModalState` enum — CommandPalette / Permission / ProviderSelector / ModelSelector / ApiKeyInput / AuthRequired / Error / Help
 - `friendly_error()` — maps raw error strings to user-readable messages (including HTTP 400 tool rejection)
 - TUI theme colors are `Color::Rgb` constants at the top of `tui.rs`; keep the blue palette centralized.
 - Transcript scrolling is bottom-relative via `session.transcript_scroll` and rendered with `Paragraph::scroll`, not manual line slicing.
 - `EnableMouseCapture`/`DisableMouseCapture` are paired in `run_tui`; do not add mouse support without preserving terminal cleanup.
+- `CommandAction::from_slug()` handles slash-command aliases such as `/quit`, `/exit`, and `/q`.
 
 **Grep targets:**
 - `ModalState::` — all modal variants

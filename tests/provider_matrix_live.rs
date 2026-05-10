@@ -27,6 +27,7 @@ async fn run_provider_case(
             max_input_tokens: 12_000,
             max_output_tokens: 1_024,
             max_wall_time: Duration::from_secs(120),
+            ..Budget::default()
         },
         model,
         ToolContext::new(dir.path().to_path_buf()),

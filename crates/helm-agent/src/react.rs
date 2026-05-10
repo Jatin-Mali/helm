@@ -219,13 +219,21 @@ impl ReactAgent {
     ) -> Self {
         let model_str: String = model.into();
         let quirks = quirks_for(provider.name(), &model_str);
+        let mut system_prompt = DEFAULT_SYSTEM_PROMPT.to_owned();
+        if let Ok(context) = load_project_context(&tool_context.working_dir) {
+            if !context.is_empty() {
+                system_prompt.push_str("\n\n# Project Context\n\n");
+                system_prompt.push_str(&context);
+            }
+        }
+
         Self {
             provider,
             tools,
             memory,
             budget,
             model: model_str,
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
+            system_prompt,
             tool_context,
             quirks,
             forced_initial_taint: None,
@@ -782,6 +790,16 @@ impl ReactAgent {
         capability: Capability,
         taint: &Taint,
     ) -> Result<Authorization, HelmError> {
+        if self.budget.read_only && capability.is_write() {
+            return Ok(Authorization::Denied {
+                reason: format!(
+                    "permission denied: capability '{capability}' requires write access but agent is running in read-only mode"
+                ),
+            });
+        }
+        if self.budget.auto_approve {
+            return Ok(Authorization::Allowed { grant_id: None });
+        }
         let needs_fresh =
             taint.is_external() && capability.requires_fresh_grant_for_external_taint();
         let needs_grant = capability.requires_grant_by_default() || needs_fresh;
@@ -870,6 +888,39 @@ impl ReactAgent {
             .await?;
         Ok(())
     }
+}
+
+fn load_project_context(working_dir: &Path) -> Result<String, std::io::Error> {
+    const FILES: &[&str] = &["AGENTS.md", "HELM.md", "CLAUDE.md", ".helm/context.md"];
+    const MAX_CHARS: usize = 4_000;
+
+    let mut output = String::new();
+    for relative in FILES {
+        let path = working_dir.join(relative);
+        if !path.is_file() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)?;
+        if content.trim().is_empty() {
+            continue;
+        }
+        let remaining = MAX_CHARS.saturating_sub(output.chars().count());
+        if remaining == 0 {
+            break;
+        }
+        let heading = format!("## {}\n\n", relative);
+        if heading.chars().count() >= remaining {
+            break;
+        }
+        output.push_str(&heading);
+        let take = remaining.saturating_sub(heading.chars().count());
+        output.extend(content.chars().take(take));
+        output.push_str("\n\n");
+        if output.chars().count() >= MAX_CHARS {
+            break;
+        }
+    }
+    Ok(output)
 }
 
 enum Authorization {
@@ -1487,6 +1538,7 @@ mod tests {
             max_input_tokens: 1_000,
             max_output_tokens: 1_000,
             max_wall_time: Duration::from_secs(60),
+            ..Budget::default()
         };
         let responses = vec![
             response(
@@ -1831,6 +1883,31 @@ mod tests {
         );
 
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn project_context_loads_known_files_and_caps_length() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "agents").unwrap();
+        std::fs::write(dir.path().join("HELM.md"), "helm").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "claude").unwrap();
+        std::fs::create_dir_all(dir.path().join(".helm")).unwrap();
+        std::fs::write(dir.path().join(".helm/context.md"), "x".repeat(5_000)).unwrap();
+
+        let context = super::load_project_context(dir.path()).unwrap();
+
+        assert!(context.contains("AGENTS.md"));
+        assert!(context.contains("HELM.md"));
+        assert!(context.contains("CLAUDE.md"));
+        assert!(context.contains(".helm/context.md"));
+        assert!(context.chars().count() <= 4_100);
+    }
+
+    #[test]
+    fn project_context_ignores_missing_files() {
+        let dir = tempdir().unwrap();
+        let context = super::load_project_context(dir.path()).unwrap();
+        assert!(context.is_empty());
     }
 
     #[test]

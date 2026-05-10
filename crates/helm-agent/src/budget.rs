@@ -15,6 +15,10 @@ pub struct Budget {
     pub max_output_tokens: u32,
     /// Maximum wall-clock runtime allowed.
     pub max_wall_time: Duration,
+    /// Whether to auto-approve all capability requests (dangerously skip permissions).
+    pub auto_approve: bool,
+    /// Whether to permanently deny all write capabilities (plan mode).
+    pub read_only: bool,
 }
 
 impl Default for Budget {
@@ -24,6 +28,8 @@ impl Default for Budget {
             max_input_tokens: 200_000,
             max_output_tokens: 50_000,
             max_wall_time: Duration::from_secs(5 * 60),
+            auto_approve: false,
+            read_only: false,
         }
     }
 }

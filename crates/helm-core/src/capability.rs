@@ -61,6 +61,20 @@ impl Capability {
         )
     }
 
+    /// Returns whether this capability can mutate state (used for read-only mode).
+    pub fn is_write(self) -> bool {
+        matches!(
+            self,
+            Self::FsWrite
+                | Self::FsDelete
+                | Self::ShellExec
+                | Self::ShellShell
+                | Self::SystemService
+                | Self::PkgInstall
+                | Self::Sudo
+        )
+    }
+
     /// Returns whether external-tainted context needs a fresh grant.
     pub fn requires_fresh_grant_for_external_taint(self) -> bool {
         matches!(

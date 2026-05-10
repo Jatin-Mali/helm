@@ -16,7 +16,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 use helm_agent::{Budget, ReactAgent, RunResult};
 use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError, Secret};
 use helm_memory::{
@@ -66,6 +67,17 @@ struct Cli {
     base_url: Option<String>,
     #[arg(long, global = true)]
     verbose: bool,
+    /// Auto-approve all tool permission requests (dangerous!)
+    #[arg(
+        long = "yes",
+        alias = "yolo",
+        alias = "dangerously-skip-permissions",
+        global = true
+    )]
+    yes: bool,
+    /// Plan mode: read-only analysis, no writes or executions
+    #[arg(long = "read-only", alias = "plan", global = true)]
+    read_only: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -82,6 +94,10 @@ enum Command {
     Skills(SkillsArgs),
     Secrets(SecretsArgs),
     Init(InitArgs),
+    /// Manage configuration (get/set/edit/validate/path)
+    Config(ConfigArgs),
+    /// Generate shell completion scripts
+    Completion(CompletionArgs),
     Tui,
 }
 
@@ -243,6 +259,50 @@ struct InitArgs {
     no_validate: bool,
 }
 
+#[derive(Debug, Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print a config value
+    Get(ConfigGetArgs),
+    /// Set a config value
+    Set(ConfigSetArgs),
+    /// Open config in $EDITOR
+    Edit,
+    /// Validate the config file
+    Validate,
+    /// Print config file path
+    Path,
+}
+
+#[derive(Debug, Args)]
+struct ConfigGetArgs {
+    /// Dotted key path (e.g. provider.model)
+    #[arg(value_name = "KEY")]
+    key: String,
+}
+
+#[derive(Debug, Args)]
+struct ConfigSetArgs {
+    /// Dotted key path (e.g. provider.model)
+    #[arg(value_name = "KEY")]
+    key: String,
+    /// New value
+    #[arg(value_name = "VALUE")]
+    value: String,
+}
+
+#[derive(Debug, Args)]
+struct CompletionArgs {
+    /// Shell to generate completions for
+    #[arg(value_enum)]
+    shell: Shell,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum ProviderChoice {
@@ -262,6 +322,7 @@ enum ProviderChoice {
 struct FileConfig {
     provider: Option<FileProviderConfig>,
     security: Option<FileSecurityConfig>,
+    telemetry: Option<FileTelemetryConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -276,6 +337,11 @@ struct FileProviderConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileSecurityConfig {
     tui_paste_key_modal: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileTelemetryConfig {
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +417,11 @@ async fn run() -> Result<()> {
     init_tracing(cli.verbose, tui_log_path.as_deref())?;
     let config_path = default_config_path()?;
     let config = load_config(&config_path)?;
+    let _telemetry_enabled = config
+        .as_ref()
+        .and_then(|config| config.telemetry.as_ref())
+        .and_then(|telemetry| telemetry.enabled)
+        .unwrap_or(false);
     let provider_settings = resolve_provider_settings(
         config.as_ref(),
         cli.provider,
@@ -375,6 +446,12 @@ async fn run() -> Result<()> {
                 eprintln!("Run `helm init` to choose a provider and set your API key.");
                 return Ok(());
             }
+            if cli.yes {
+                eprintln!("warning: --yes mode active — all tool permissions auto-approved");
+            }
+            if cli.read_only {
+                eprintln!("info: --read-only mode — write/exec operations will be denied");
+            }
             let provider_choice = resolve_provider_choice(provider_settings.choice);
             let (provider, model) = build_provider(
                 &provider_settings.with_choice(provider_choice),
@@ -384,6 +461,8 @@ async fn run() -> Result<()> {
             if let Some(max_iterations) = cli.max_iterations {
                 budget.max_iterations = max_iterations;
             }
+            budget.auto_approve = cli.yes;
+            budget.read_only = cli.read_only;
             let agent = ReactAgent::new(provider, ToolRegistry::default(), memory, budget, model)?;
             let result = agent.run(&args.task).await?;
             print_run_result(&result);
@@ -499,6 +578,13 @@ async fn run() -> Result<()> {
             )
             .await?;
         }
+        Command::Config(args) => {
+            run_config_command(args, &config_path)?;
+        }
+        Command::Completion(args) => {
+            let mut cmd = Cli::command();
+            generate(args.shell, &mut cmd, "helm", &mut io::stdout());
+        }
         Command::Tui => {
             tui::run_tui(tui::TuiRuntime {
                 provider_settings,
@@ -512,6 +598,8 @@ async fn run() -> Result<()> {
                     .and_then(|config| config.security.as_ref())
                     .and_then(|security| security.tui_paste_key_modal)
                     .unwrap_or(true),
+                auto_approve: cli.yes,
+                read_only: cli.read_only,
             })
             .await?;
         }
@@ -603,6 +691,106 @@ fn run_secrets_command(args: SecretsArgs, store: &SecretsStore) -> Result<()> {
                 }
             }
             println!("imported {imported} secret(s)");
+        }
+    }
+    Ok(())
+}
+
+fn run_config_command(args: ConfigArgs, config_path: &Path) -> Result<()> {
+    match args.command {
+        ConfigCommand::Get(args) => {
+            let config_text = fs::read_to_string(config_path)
+                .with_context(|| format!("failed to read config from {}", config_path.display()))?;
+            let value = config_text.parse::<toml::Value>()?;
+            let mut current = &value;
+            for part in args.key.split('.') {
+                current = current
+                    .get(part)
+                    .ok_or_else(|| anyhow!("Key not found: {}", args.key))?;
+            }
+            if let Some(s) = current.as_str() {
+                println!("{}", s);
+            } else if let Some(i) = current.as_integer() {
+                println!("{}", i);
+            } else if let Some(b) = current.as_bool() {
+                println!("{}", b);
+            } else if let Some(f) = current.as_float() {
+                println!("{}", f);
+            } else {
+                println!("{}", current);
+            }
+        }
+        ConfigCommand::Set(args) => {
+            let config_text = if config_path.exists() {
+                fs::read_to_string(config_path).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let mut value: toml::Value = config_text
+                .parse()
+                .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+
+            let parts: Vec<&str> = args.key.split('.').collect();
+            if parts.is_empty() {
+                return Err(anyhow!("Invalid key"));
+            }
+
+            let parsed_val = if args.value == "true" {
+                toml::Value::Boolean(true)
+            } else if args.value == "false" {
+                toml::Value::Boolean(false)
+            } else if let Ok(i) = args.value.parse::<i64>() {
+                toml::Value::Integer(i)
+            } else if let Ok(f) = args.value.parse::<f64>() {
+                toml::Value::Float(f)
+            } else {
+                toml::Value::String(args.value.clone())
+            };
+
+            set_toml_path(&mut value, &parts, parsed_val)?;
+            let new_text = toml::to_string_pretty(&value)?;
+            ensure_parent_dir(config_path)?;
+            fs::write(config_path, new_text)
+                .with_context(|| format!("failed to write config to {}", config_path.display()))?;
+            println!("Set {} = {}", args.key, args.value);
+        }
+        ConfigCommand::Edit => {
+            let editor = env::var("EDITOR").unwrap_or_else(|_| "nano".to_owned());
+            ensure_parent_dir(config_path)?;
+            if !config_path.exists() {
+                fs::write(config_path, "")?;
+            }
+            let status = std::process::Command::new(editor)
+                .arg(config_path)
+                .status()
+                .with_context(|| "Failed to open editor")?;
+            if !status.success() {
+                return Err(anyhow!("Editor exited with non-zero status"));
+            }
+        }
+        ConfigCommand::Validate => {
+            if !config_path.exists() {
+                println!("Config file does not exist at {}", config_path.display());
+                return Ok(());
+            }
+            let config_text = fs::read_to_string(config_path)?;
+            match toml::from_str::<FileConfig>(&config_text) {
+                Ok(config) => {
+                    resolve_provider_settings_with_env(
+                        Some(&config),
+                        None,
+                        None,
+                        None,
+                        None,
+                        |_| None,
+                    )?;
+                    println!("Config is valid.");
+                }
+                Err(e) => println!("Config is invalid: {}", e),
+            }
+        }
+        ConfigCommand::Path => {
+            println!("{}", config_path.display());
         }
     }
     Ok(())
@@ -844,6 +1032,8 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "skills"
                 | "secrets"
                 | "init"
+                | "config"
+                | "completion"
                 | "help"
                 | "tui"
         )
@@ -1070,6 +1260,42 @@ async fn render_audit_events(memory: &MemoryStore, episode: Option<&str>) -> Res
     Ok(format_audit_events(&events))
 }
 
+fn set_toml_path(root: &mut toml::Value, parts: &[&str], value: toml::Value) -> Result<()> {
+    if parts.is_empty() {
+        return Err(anyhow!("invalid empty key path"));
+    }
+    if !root.is_table() {
+        *root = toml::Value::Table(toml::map::Map::new());
+    }
+    let mut current = root;
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        let Some(table) = current.as_table_mut() else {
+            return Err(anyhow!("cannot descend into non-table for key `{part}`"));
+        };
+        if !table.contains_key(*part) {
+            table.insert(
+                (*part).to_owned(),
+                toml::Value::Table(toml::map::Map::new()),
+            );
+        }
+        let Some(next) = table.get_mut(*part) else {
+            return Err(anyhow!("failed to create key path `{part}`"));
+        };
+        if !next.is_table() {
+            *next = toml::Value::Table(toml::map::Map::new());
+        }
+        current = next;
+    }
+    let Some(last) = parts.last() else {
+        return Err(anyhow!("invalid key path"));
+    };
+    let Some(table) = current.as_table_mut() else {
+        return Err(anyhow!("cannot write into non-table at `{last}`"));
+    };
+    table.insert((*last).to_owned(), value);
+    Ok(())
+}
+
 pub(crate) fn write_helm_config(
     config_path: &Path,
     db_path: &Path,
@@ -1101,6 +1327,12 @@ pub(crate) fn write_helm_config(
     }
     let mut root = toml::map::Map::new();
     root.insert("provider".to_owned(), toml::Value::Table(provider_table));
+    let mut security_table = toml::map::Map::new();
+    security_table.insert("tui_paste_key_modal".to_owned(), toml::Value::Boolean(true));
+    root.insert("security".to_owned(), toml::Value::Table(security_table));
+    let mut telemetry_table = toml::map::Map::new();
+    telemetry_table.insert("enabled".to_owned(), toml::Value::Boolean(false));
+    root.insert("telemetry".to_owned(), toml::Value::Table(telemetry_table));
     let config_text = toml::to_string_pretty(&toml::Value::Table(root))?;
     fs::write(config_path, &config_text)
         .with_context(|| format!("failed to write {}", config_path.display()))?;
@@ -1124,6 +1356,65 @@ fn provider_key_url(choice: ProviderChoice) -> Option<&'static str> {
         ProviderChoice::NvidiaNim => Some("https://build.nvidia.com/"),
         _ => None,
     }
+}
+
+pub(crate) fn generate_agents_md_for_dir(dir: &Path) -> Result<Option<PathBuf>> {
+    let target = dir.join("AGENTS.md");
+    if target.exists() {
+        return Ok(Some(target));
+    }
+
+    let mut entries = fs::read_dir(dir)
+        .with_context(|| format!("failed to read {}", dir.display()))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            !matches!(name.as_ref(), ".git" | "target" | "node_modules")
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    let has_project_shape = entries.iter().any(|entry| {
+        matches!(
+            entry.file_name().to_string_lossy().as_ref(),
+            ".git"
+                | "Cargo.toml"
+                | "package.json"
+                | "pyproject.toml"
+                | "go.mod"
+                | "src"
+                | "crates"
+                | "app"
+                | "lib"
+        )
+    });
+    if !has_project_shape {
+        return Ok(None);
+    }
+
+    let mut body =
+        String::from("# AGENTS.md\n\nProject context for HELM.\n\n## Top-level entries\n\n");
+    for entry in entries.iter().take(32) {
+        let path = entry.path();
+        let kind = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => "dir",
+            Ok(_) => "file",
+            Err(_) => "entry",
+        };
+        body.push_str(&format!(
+            "- `{}` ({kind})\n",
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "?".to_owned())
+        ));
+    }
+    body.push_str(
+        "\n## Notes\n\n- Add architecture, conventions, and workflow rules here.\n- HELM reads this file automatically at run start.\n",
+    );
+
+    fs::write(&target, body).with_context(|| format!("failed to write {}", target.display()))?;
+    Ok(Some(target))
 }
 
 async fn interactive_init(
@@ -1264,6 +1555,9 @@ async fn interactive_init(
         model_input
     };
 
+    let telemetry_enabled =
+        prompt("\nAllow anonymous crash reports? [y/N] ")?.eq_ignore_ascii_case("y");
+
     let kind = provider_choice_name(choice);
     // Write config without the plain-text key (key lives in secrets.toml).
     write_helm_config(
@@ -1275,6 +1569,26 @@ async fn interactive_init(
         default_api_key_env(choice),
         None,
     )?;
+    if telemetry_enabled {
+        let mut value: toml::Value = fs::read_to_string(config_path)?
+            .parse()
+            .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+        set_toml_path(
+            &mut value,
+            &["telemetry", "enabled"],
+            toml::Value::Boolean(true),
+        )?;
+        fs::write(config_path, toml::to_string_pretty(&value)?)?;
+    }
+
+    if let Ok(cwd) = env::current_dir() {
+        let answer = prompt("Generate AGENTS.md for this project? [Y/n] ")?;
+        if !answer.eq_ignore_ascii_case("n")
+            && let Some(path) = generate_agents_md_for_dir(&cwd)?
+        {
+            println!("  agents   : wrote {}", path.display());
+        }
+    }
 
     println!("\nConfig written: {}", config_path.display());
     println!("  provider : {kind}");
@@ -2420,6 +2734,7 @@ mod tests {
                 api_key: None,
             }),
             security: None,
+            telemetry: None,
         };
 
         let settings = resolve_provider_settings_with_env(
@@ -2466,6 +2781,7 @@ mod tests {
                 api_key: None,
             }),
             security: None,
+            telemetry: None,
         };
         let settings =
             resolve_provider_settings_with_env(Some(&config), None, None, None, None, |name| {
@@ -2488,6 +2804,7 @@ mod tests {
                 api_key: None,
             }),
             security: None,
+            telemetry: None,
         };
         let settings =
             resolve_provider_settings_with_env(Some(&config), None, None, None, None, |name| {
@@ -2509,6 +2826,7 @@ mod tests {
                 api_key: None,
             }),
             security: None,
+            telemetry: None,
         };
         let settings =
             resolve_provider_settings_with_env(Some(&config), None, None, None, None, |name| {
@@ -2638,6 +2956,35 @@ mod tests {
     }
 
     #[test]
+    fn config_subcommands_parse_happy_path() {
+        for args in [
+            vec!["helm", "config", "get", "provider.kind"],
+            vec!["helm", "config", "set", "provider.model", "qwen3:4b"],
+            vec!["helm", "config", "edit"],
+            vec!["helm", "config", "validate"],
+            vec!["helm", "config", "path"],
+        ] {
+            let parsed = parse_cli_from(args).unwrap();
+            assert!(matches!(parsed.command, super::Command::Config(_)));
+        }
+    }
+
+    #[test]
+    fn completion_subcommand_parses_all_shells() {
+        for shell in ["bash", "zsh", "fish"] {
+            let parsed = parse_cli_from(["helm", "completion", shell]).unwrap();
+            assert!(matches!(parsed.command, super::Command::Completion(_)));
+        }
+    }
+
+    #[test]
+    fn global_yes_and_read_only_flags_parse() {
+        let parsed = parse_cli_from(["helm", "--yes", "--read-only", "run", "list files"]).unwrap();
+        assert!(parsed.yes);
+        assert!(parsed.read_only);
+    }
+
+    #[test]
     fn init_subcommand_writes_config_happy_path() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -2658,6 +3005,8 @@ mod tests {
         assert!(config.contains("kind = \"groq\""));
         assert!(config.contains("api_key_env = \"GROQ_API_KEY\""));
         assert!(config.contains("api_key = \"gsk_test\""));
+        assert!(config.contains("[security]"));
+        assert!(config.contains("[telemetry]"));
     }
 
     #[test]
@@ -2681,6 +3030,19 @@ mod tests {
         assert!(config.contains("kind = \"ollama\""));
         assert!(config.contains("base_url"));
         assert!(!config.contains("api_key"));
+    }
+
+    #[test]
+    fn generates_agents_file_for_project_dir() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"demo\"\n").unwrap();
+
+        let path = super::generate_agents_md_for_dir(dir.path()).unwrap();
+
+        assert_eq!(path, Some(dir.path().join("AGENTS.md")));
+        let body = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(body.contains("Top-level entries"));
+        assert!(body.contains("Cargo.toml"));
     }
 
     #[test]
