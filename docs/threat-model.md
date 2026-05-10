@@ -39,6 +39,11 @@ string at the HTTP boundary or explicit `helm secrets get` output.
 
 Resolution order: CLI `--api-key` flag → `~/.helm/secrets.toml` → environment variable.
 
+Environment variables are not silently imported into the secrets store by the
+TUI. They remain session-scoped unless you explicitly save them with
+`helm secrets set`, `helm secrets import-env`, `helm init`, or the
+authentication modal after a provider failure.
+
 HELM v1.0 does not encrypt secrets at rest. For a Linux user home, 0600 file
 mode plus a 0700 parent directory is the v1.0 security boundary.
 

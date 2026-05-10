@@ -1,12 +1,11 @@
 #!/usr/bin/env sh
 set -eu
 
-repo="${HELM_REPO:-https://github.com/white-phantom/helm}"
+repo="${HELM_REPO:-https://github.com/Jatin-Mali/helm}"
 version="${HELM_VERSION:-latest}"
 install_dir="${HELM_INSTALL_DIR:-$HOME/.local/bin}"
-state_dir="${HELM_STATE_DIR:-$HOME/.helm}"
 
-mkdir -p "$install_dir" "$state_dir"
+mkdir -p "$install_dir"
 
 arch="$(uname -m)"
 case "$arch" in
@@ -21,12 +20,31 @@ else
   url="$repo/releases/download/$version/helm-$target"
 fi
 
+print_source_build_help() {
+  cat >&2 <<EOF
+release asset unavailable for $repo ($version, $target)
+
+build from source instead:
+  git clone https://github.com/Jatin-Mali/helm.git
+  cd helm
+  cargo build --release -p helm-cli
+  ./target/release/helm init
+  ./target/release/helm doctor
+
+if this fork starts publishing release assets for your architecture later, this
+installer will work without changes.
+EOF
+}
+
 tmp="$(mktemp)"
 cleanup() { rm -f "$tmp"; }
 trap cleanup EXIT
 
 echo "downloading $url"
-curl -fsSL "$url" -o "$tmp"
+if ! curl -fsSL "$url" -o "$tmp"; then
+  print_source_build_help
+  exit 1
+fi
 chmod +x "$tmp"
 mv "$tmp" "$install_dir/helm"
 echo "installed $install_dir/helm"
@@ -43,9 +61,14 @@ add_to_path() {
 
 case "${SHELL:-}" in
   */zsh)  add_to_path "$HOME/.zshrc" ;;
-  */fish) mkdir -p "$HOME/.config/fish" && \
-          printf '\nfish_add_path "%s"\n' "$install_dir" >> "$HOME/.config/fish/config.fish" && \
-          echo "added $install_dir to PATH in ~/.config/fish/config.fish" ;;
+  */fish)
+          mkdir -p "$HOME/.config/fish"
+          fish_rc="$HOME/.config/fish/config.fish"
+          if [ ! -f "$fish_rc" ] || ! grep -qF "$install_dir" "$fish_rc" 2>/dev/null; then
+            printf '\nfish_add_path "%s"\n' "$install_dir" >> "$fish_rc"
+            echo "added $install_dir to PATH in ~/.config/fish/config.fish"
+          fi
+          ;;
   *)      add_to_path "$HOME/.bashrc" ;;
 esac
 

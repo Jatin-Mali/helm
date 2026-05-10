@@ -73,7 +73,7 @@ impl OpenAiCompatProvider {
             .default_model(OPENROUTER_DEFAULT_MODEL)
             .label("openrouter")
             .build()?;
-        provider.add_header("HTTP-Referer", "https://github.com/helm")?;
+        provider.add_header("HTTP-Referer", "https://github.com/Jatin-Mali/helm")?;
         provider.add_header("X-Title", "HELM")?;
         Ok(provider)
     }

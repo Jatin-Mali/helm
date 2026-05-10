@@ -238,7 +238,7 @@ impl MemoryStore {
     /// Starts a new episode for `goal` and returns its UUID.
     pub async fn start_episode(&self, goal: &str) -> Result<EpisodeId, MemoryError> {
         let conn = Arc::clone(&self.conn);
-        let goal = goal.to_owned();
+        let goal = helm_core::redact_secrets(goal);
         tokio::task::spawn_blocking(move || {
             let id = Uuid::new_v4().to_string();
             let started_at = now_ms();
@@ -342,7 +342,7 @@ impl MemoryStore {
     ) -> Result<(), MemoryError> {
         let conn = Arc::clone(&self.conn);
         let episode_id = episode_id.to_owned();
-        let warning = warning.to_owned();
+        let warning = helm_core::redact_secrets(warning);
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
             guard
@@ -680,6 +680,8 @@ impl MemoryStore {
         let conn = Arc::clone(&self.conn);
         input.input_hash = helm_core::redact_secrets(&input.input_hash);
         input.output_hash = helm_core::redact_secrets(&input.output_hash);
+        input.cwd = helm_core::redact_secrets(&input.cwd);
+        input.decision = helm_core::redact_secrets(&input.decision);
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
             let previous_hash = latest_audit_hash(&guard)?;
@@ -1245,6 +1247,47 @@ mod tests {
             episode.model_capability_warning,
             Some("model emitted tool-shaped text".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn secrets_are_redacted_before_persistence() {
+        let (_dir, store) = store().await;
+        let id = store
+            .start_episode(
+                "inspect /home/test/.helm/secrets.toml with sk-or-abcdefghijklmnopqrstuvwxyz123456",
+            )
+            .await
+            .unwrap();
+        store
+            .set_model_capability_warning(
+                &id,
+                "warning for /home/test/.helm/helm.db and sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456",
+            )
+            .await
+            .unwrap();
+        store
+            .finish_episode(
+                &id,
+                EpisodeOutcome::Failure,
+                Some("see ~/.helm/helm.log"),
+                Some("gsk_abcdefghijklmnopqrstuvwxyz123456"),
+            )
+            .await
+            .unwrap();
+
+        let episode = store.get_episode(&id).await.unwrap().unwrap();
+        assert!(!episode.goal.contains(".helm/secrets.toml"));
+        assert!(!episode.goal.contains("abcdefghijklmnopqrstuvwxyz123456"));
+        assert_eq!(episode.goal.matches("[REDACTED_PATH]").count(), 1);
+        assert_eq!(
+            episode.model_capability_warning,
+            Some("warning for [REDACTED_PATH] and ***REDACTED***".to_owned())
+        );
+        assert_eq!(
+            episode.final_message,
+            Some("see [REDACTED_PATH]".to_owned())
+        );
+        assert_eq!(episode.error, Some("***REDACTED***".to_owned()));
     }
 
     #[tokio::test]

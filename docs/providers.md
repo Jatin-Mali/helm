@@ -3,6 +3,9 @@
 HELM resolves providers in this order: CLI flags, `HELM_PROVIDER`, config file,
 environment auto-detection, then Ollama fallback.
 
+If you built HELM from source, replace `helm` below with
+`./target/release/helm`.
+
 ## Groq
 
 ```sh

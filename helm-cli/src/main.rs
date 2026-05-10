@@ -331,7 +331,6 @@ struct FileProviderConfig {
     base_url: Option<String>,
     model: Option<String>,
     api_key_env: Option<String>,
-    api_key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -877,8 +876,7 @@ where
         provider_config.and_then(|provider| provider.model.as_ref().map(ToOwned::to_owned))
     });
     let api_key_env = provider_config.and_then(|provider| provider.api_key_env.clone());
-    let stored_api_key =
-        cli_api_key.or_else(|| provider_config.and_then(|provider| provider.api_key.clone()));
+    let stored_api_key = cli_api_key;
 
     let selected = if let Some(choice) = cli_provider {
         Some((choice, ProviderSource::Cli))
@@ -1303,7 +1301,6 @@ pub(crate) fn write_helm_config(
     model: &str,
     base_url: Option<&str>,
     api_key_env: Option<&str>,
-    api_key: Option<&str>,
 ) -> Result<()> {
     ensure_parent_dir(config_path)?;
     if let Some(parent) = db_path.parent() {
@@ -1321,9 +1318,6 @@ pub(crate) fn write_helm_config(
             "api_key_env".to_owned(),
             toml::Value::String(env_name.to_owned()),
         );
-    }
-    if let Some(key) = api_key {
-        provider_table.insert("api_key".to_owned(), toml::Value::String(key.to_owned()));
     }
     let mut root = toml::map::Map::new();
     root.insert("provider".to_owned(), toml::Value::Table(provider_table));
@@ -1567,7 +1561,6 @@ async fn interactive_init(
         &model,
         base_url.as_deref(),
         default_api_key_env(choice),
-        None,
     )?;
     if telemetry_enabled {
         let mut value: toml::Value = fs::read_to_string(config_path)?
@@ -2731,7 +2724,6 @@ mod tests {
                 base_url: Some("http://config:11434".to_owned()),
                 model: Some("qwen3:4b".to_owned()),
                 api_key_env: None,
-                api_key: None,
             }),
             security: None,
             telemetry: None,
@@ -2778,7 +2770,6 @@ mod tests {
                 base_url: None,
                 model: None,
                 api_key_env: None,
-                api_key: None,
             }),
             security: None,
             telemetry: None,
@@ -2801,7 +2792,6 @@ mod tests {
                 base_url: None,
                 model: Some("config-model".to_owned()),
                 api_key_env: None,
-                api_key: None,
             }),
             security: None,
             telemetry: None,
@@ -2823,7 +2813,6 @@ mod tests {
                 base_url: None,
                 model: None,
                 api_key_env: None,
-                api_key: None,
             }),
             security: None,
             telemetry: None,
@@ -2997,14 +2986,13 @@ mod tests {
             "llama-3.3-70b-versatile",
             None,
             Some("GROQ_API_KEY"),
-            Some("gsk_test"),
         )
         .unwrap();
         let config = fs::read_to_string(&config_path).unwrap();
 
         assert!(config.contains("kind = \"groq\""));
         assert!(config.contains("api_key_env = \"GROQ_API_KEY\""));
-        assert!(config.contains("api_key = \"gsk_test\""));
+        assert!(!config.contains("api_key ="));
         assert!(config.contains("[security]"));
         assert!(config.contains("[telemetry]"));
     }
@@ -3021,7 +3009,6 @@ mod tests {
             "ollama",
             "qwen3:4b",
             Some("http://localhost:11434"),
-            None,
             None,
         )
         .unwrap();

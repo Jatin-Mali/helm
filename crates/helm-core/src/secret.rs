@@ -45,14 +45,28 @@ impl From<&str> for Secret {
 /// Redacts known API key patterns from a string.
 pub fn redact_secrets(input: &str) -> String {
     use std::sync::OnceLock;
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
+    static KEY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static PATH_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let key_re = KEY_RE.get_or_init(|| {
         regex::Regex::new(
-            r"(?i)(sk-[a-zA-Z0-9_-]{20,}|gsk_[a-zA-Z0-9_-]{20,}|nvapi-[a-zA-Z0-9_-]{20,}|AIza[0-9A-Za-z-_]{35})",
+            r"(?i)(sk-[a-zA-Z0-9_-]{20,}|gsk_[a-zA-Z0-9_-]{20,}|nvapi-[a-zA-Z0-9_-]{20,}|key-[a-zA-Z0-9_-]{20,}|AIza[0-9A-Za-z-_]{35})",
         )
         .unwrap_or_else(|error| panic!("invalid built-in secret redaction regex: {error}"))
     });
-    re.replace_all(input, "***REDACTED***").into_owned()
+    let path_re = PATH_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?x)
+            (?:~|(?:/[^\s"'`]+)+)
+            /\.helm/
+            (?:secrets\.toml|\.secrets\.toml\.lock|helm\.db|helm\.log)
+            "#,
+        )
+        .unwrap_or_else(|error| panic!("invalid built-in path redaction regex: {error}"))
+    });
+    let redacted_keys = key_re.replace_all(input, "***REDACTED***").into_owned();
+    path_re
+        .replace_all(&redacted_keys, "[REDACTED_PATH]")
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -92,5 +106,22 @@ mod tests {
         let s2: Secret = "from_string".to_owned().into();
         assert_eq!(s1.expose(), "from_str");
         assert_eq!(s2.expose(), "from_string");
+    }
+
+    #[test]
+    fn redacts_provider_keys() {
+        let text = "Bearer sk-or-v1-abcdefghijklmnopqrstuvwxyz123456";
+        let redacted = redact_secrets(text);
+        assert!(!redacted.contains("abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(redacted.contains("***REDACTED***"));
+    }
+
+    #[test]
+    fn redacts_local_helm_state_paths() {
+        let text = "read /home/test/.helm/secrets.toml and ~/.helm/helm.db";
+        let redacted = redact_secrets(text);
+        assert!(!redacted.contains(".helm/secrets.toml"));
+        assert!(!redacted.contains(".helm/helm.db"));
+        assert_eq!(redacted.matches("[REDACTED_PATH]").count(), 2);
     }
 }

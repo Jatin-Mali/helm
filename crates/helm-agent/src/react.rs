@@ -1182,6 +1182,7 @@ fn log_provider_response(iteration: u32, response: &ChatResponse) {
     );
     for (block_index, block) in response.content.iter().enumerate() {
         let (block_type, content) = summarize_block(block);
+        let content = helm_core::redact_secrets(&content);
         trace!(
             iteration,
             block_index,

@@ -279,6 +279,16 @@ fn validate_denylist(path: &Path) -> Result<(), ToolError> {
         .collect::<Vec<_>>();
     for index in 0..components.len() {
         let component = &components[index];
+        if component == ".helm" {
+            if let Some(next) = components.get(index + 1) {
+                if matches!(
+                    next.as_str(),
+                    "secrets.toml" | ".secrets.toml.lock" | "helm.db" | "helm.log"
+                ) {
+                    return Err(ToolError::PathDenied(path.to_path_buf()));
+                }
+            }
+        }
         if component == ".gnupg" || component == ".aws" || component == "credentials" {
             return Err(ToolError::PathDenied(path.to_path_buf()));
         }
@@ -492,5 +502,19 @@ mod tests {
 
         assert_eq!(selected, "");
         assert!(truncated);
+    }
+
+    #[test]
+    fn denylist_blocks_helm_local_state_files() {
+        let dir = tempdir().unwrap();
+        let helm_dir = dir.path().join(".helm");
+        fs::create_dir_all(&helm_dir).unwrap();
+
+        for name in ["secrets.toml", ".secrets.toml.lock", "helm.db", "helm.log"] {
+            let path = helm_dir.join(name);
+            fs::write(&path, "secret").unwrap();
+            let error = validate_existing_path(&path, &ctx_at(&dir)).unwrap_err();
+            assert!(matches!(error, ToolError::PathDenied(_)), "{path:?}");
+        }
     }
 }

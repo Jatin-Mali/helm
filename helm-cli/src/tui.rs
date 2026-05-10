@@ -529,15 +529,14 @@ impl TuiApp {
         let config_path = runtime.config_path.clone();
         let mut active_settings = runtime.provider_settings.clone();
 
-        // Auto-populate API key from env var if not in secrets store, then persist it there.
+        // Allow env-only sessions without silently importing keys into the
+        // persistent secrets store.
         if active_settings.api_key.is_none() {
             if let Some(env_name) = default_api_key_env(active_settings.choice) {
                 let in_store = runtime.secrets.get(env_name).ok().flatten().is_some();
                 if !in_store {
                     if let Ok(key) = std::env::var(env_name) {
-                        active_settings.api_key = Some(key.clone());
-                        // Persist to 0600 secrets store — never write key to config.toml.
-                        let _ = runtime.secrets.set(env_name, helm_core::Secret::new(key));
+                        active_settings.api_key = Some(key);
                     }
                 }
             }
@@ -1028,7 +1027,7 @@ impl TuiApp {
                                 "API key cannot be empty. Press Esc to cancel.",
                             );
                         } else {
-                            self.apply_provider_with_key(choice, key);
+                            self.apply_provider_with_key(choice, key, true);
                         }
                     }
                 }
@@ -1461,7 +1460,7 @@ impl TuiApp {
 
         if choice == ProviderChoice::Ollama || env_key.is_some() {
             let key = env_key.as_deref();
-            self.apply_provider_with_key(choice, key.unwrap_or("").to_owned());
+            self.apply_provider_with_key(choice, key.unwrap_or("").to_owned(), false);
         } else {
             // No key available — prompt the user
             let mut s = self.active_settings.with_choice(choice);
@@ -1476,7 +1475,21 @@ impl TuiApp {
         }
     }
 
-    fn apply_provider_with_key(&mut self, choice: ProviderChoice, key: String) {
+    fn apply_provider_with_key(&mut self, choice: ProviderChoice, key: String, persist_key: bool) {
+        if persist_key {
+            if let Some(env_name) = default_api_key_env(choice) {
+                if let Err(error) = self
+                    .runtime
+                    .secrets
+                    .set(env_name, helm_core::Secret::new(key.clone()))
+                {
+                    self.push_chat(
+                        MessageRole::Error,
+                        format!("failed to save key to secrets store: {error}"),
+                    );
+                }
+            }
+        }
         let mut s = self.active_settings.with_choice(choice);
         s.api_key_env = default_api_key_env(choice).map(str::to_owned);
         s.api_key = if key.is_empty() {
@@ -1496,7 +1509,7 @@ impl TuiApp {
                 provider_choice_name(choice)
             ),
         );
-        self.save_provider_to_config(choice, if key.is_empty() { None } else { Some(&key) });
+        self.save_provider_to_config(choice);
     }
 
     fn apply_model_entry(&mut self, entry: ModelCatalogEntry) {
@@ -1517,7 +1530,7 @@ impl TuiApp {
                 entry.label, entry.model, self.provider_name
             ),
         );
-        self.save_provider_to_config(entry.provider, None);
+        self.save_provider_to_config(entry.provider);
     }
 
     fn apply_manual_model(&mut self, model: String) {
@@ -1528,10 +1541,10 @@ impl TuiApp {
             MessageRole::System,
             format!("Model set to {model}. Type a task to begin."),
         );
-        self.save_provider_to_config(self.active_settings.choice, None);
+        self.save_provider_to_config(self.active_settings.choice);
     }
 
-    fn save_provider_to_config(&self, choice: ProviderChoice, key: Option<&str>) {
+    fn save_provider_to_config(&self, choice: ProviderChoice) {
         let model = self
             .active_settings
             .model
@@ -1544,7 +1557,6 @@ impl TuiApp {
             model,
             self.active_settings.base_url.as_deref(),
             default_api_key_env(choice),
-            key,
         );
     }
 
@@ -2932,9 +2944,9 @@ fn friendly_error(error: &str) -> String {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use std::sync::{Mutex, OnceLock};
 
-    fn app() -> TuiApp {
-        let dir = tempfile::tempdir().unwrap();
+    fn app_in_dir(dir: &tempfile::TempDir, choice: crate::ProviderChoice) -> TuiApp {
         let db = dir.path().join("helm.db");
         let memory = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -2947,15 +2959,29 @@ mod tests {
         let secrets = SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap();
         TuiApp::new(TuiRuntime {
             provider_settings: ProviderSettings {
-                choice: crate::ProviderChoice::Ollama,
-                base_url: Some("http://localhost:11434".to_owned()),
-                model: Some("qwen3:4b".to_owned()),
-                api_key_env: None,
+                choice,
+                base_url: if choice == crate::ProviderChoice::Ollama {
+                    Some("http://localhost:11434".to_owned())
+                } else {
+                    Some("https://api.example.com/v1".to_owned())
+                },
+                model: Some(
+                    match choice {
+                        crate::ProviderChoice::Groq => "llama-3.3-70b-versatile",
+                        _ => "qwen3:4b",
+                    }
+                    .to_owned(),
+                ),
+                api_key_env: default_api_key_env(choice).map(str::to_owned),
                 api_key: None,
-                source: crate::ProviderSource::Fallback,
+                source: if choice == crate::ProviderChoice::Ollama {
+                    crate::ProviderSource::Fallback
+                } else {
+                    crate::ProviderSource::Cli
+                },
             },
             db_path: db,
-            config_path: PathBuf::from("/tmp/helm-test-config.toml"),
+            config_path: dir.path().join("config.toml"),
             memory,
             max_iterations: Some(2),
             secrets,
@@ -2963,6 +2989,16 @@ mod tests {
             auto_approve: false,
             read_only: false,
         })
+    }
+
+    fn app() -> TuiApp {
+        let dir = tempfile::tempdir().unwrap();
+        app_in_dir(&dir, crate::ProviderChoice::Ollama)
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn render_to_buffer(mut app: TuiApp, width: u16, height: u16) -> Buffer {
@@ -3312,5 +3348,47 @@ mod tests {
         app.push_chat(MessageRole::Assistant, "done");
         assert!(app.chat_ends_with(MessageRole::Assistant, "done"));
         assert!(!app.chat_ends_with(MessageRole::Assistant, "other"));
+    }
+
+    #[test]
+    fn startup_env_key_is_not_persisted_to_secrets_store() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: this test serializes process-global env mutation with a mutex.
+        unsafe {
+            std::env::set_var("GROQ_API_KEY", "gsk_abcdefghijklmnopqrstuvwxyz123456");
+        }
+
+        let app = app_in_dir(&dir, crate::ProviderChoice::Groq);
+        assert_eq!(
+            app.active_settings.api_key.as_deref(),
+            Some("gsk_abcdefghijklmnopqrstuvwxyz123456")
+        );
+        assert!(app.runtime.secrets.get("GROQ_API_KEY").unwrap().is_none());
+
+        // SAFETY: paired with the guarded set_var above.
+        unsafe {
+            std::env::remove_var("GROQ_API_KEY");
+        }
+    }
+
+    #[test]
+    fn manual_provider_key_persists_without_plaintext_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in_dir(&dir, crate::ProviderChoice::Groq);
+
+        app.apply_provider_with_key(
+            crate::ProviderChoice::Groq,
+            "gsk_abcdefghijklmnopqrstuvwxyz123456".to_owned(),
+            true,
+        );
+
+        let stored = app.runtime.secrets.get("GROQ_API_KEY").unwrap().unwrap();
+        assert_eq!(stored.expose(), "gsk_abcdefghijklmnopqrstuvwxyz123456");
+
+        let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(config.contains("api_key_env = \"GROQ_API_KEY\""));
+        assert!(!config.contains("api_key ="));
+        assert!(!config.contains("gsk_abcdefghijklmnopqrstuvwxyz123456"));
     }
 }
