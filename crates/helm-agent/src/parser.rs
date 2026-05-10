@@ -226,11 +226,8 @@ fn extract_xml_tags(text: &str) -> (Vec<ParsedToolCall>, String, Vec<String>) {
     let mut warnings = Vec::new();
     let mut residual = text.to_string();
 
-    loop {
+    while let Some(open_start) = residual.find('<') {
         // Find an opening tag `<identifier` that is not a closing tag or HTML boilerplate.
-        let Some(open_start) = residual.find('<') else {
-            break;
-        };
         let after_open = &residual[open_start + 1..];
 
         // Must start with an ASCII letter (not `/`, `!`, `?`).
@@ -342,10 +339,7 @@ fn extract_function_tags(text: &str) -> (Vec<ParsedToolCall>, String, Vec<String
     let mut warnings = Vec::new();
     let mut residual = text.to_string();
 
-    loop {
-        let Some(pos) = residual.find("<function=") else {
-            break;
-        };
+    while let Some(pos) = residual.find("<function=") {
         let Some(close_abs) = residual[pos..]
             .find("</function>")
             .map(|offset| pos + offset)
@@ -385,11 +379,8 @@ fn extract_pythonic(text: &str) -> (Vec<ParsedToolCall>, String, Vec<String>) {
     let mut warnings = Vec::new();
     let mut residual = text.to_string();
 
-    loop {
+    while let Some(bracket_pos) = residual.find('[') {
         // Find `[<identifier>(`.
-        let Some(bracket_pos) = residual.find('[') else {
-            break;
-        };
         let after_bracket = &residual[bracket_pos + 1..];
         // Must start with identifier char.
         if !after_bracket.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
@@ -466,10 +457,7 @@ fn extract_bare_json(text: &str) -> (Vec<ParsedToolCall>, String, Vec<String>) {
     let mut residual = text.to_string();
 
     let mut search_from = 0usize;
-    loop {
-        let Some(rel_brace) = residual[search_from..].find('{') else {
-            break;
-        };
+    while let Some(rel_brace) = residual[search_from..].find('{') {
         let brace_pos = search_from + rel_brace;
         let slice = &residual[brace_pos..];
         // Try to parse the longest JSON object starting here.
