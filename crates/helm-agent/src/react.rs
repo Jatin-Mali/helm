@@ -2,7 +2,7 @@
 
 use std::{env, path::Path, sync::Arc};
 
-use helm_core::{Capability, ContentBlock, HelmError, ProviderError, Taint};
+use helm_core::{Capability, ContentBlock, HelmError, ProviderError, Taint, redact_text};
 use helm_memory::{AuditEventInput, EpisodeOutcome, MemoryStore, StepRole, stable_hash_hex};
 use helm_providers::{ChatRequest, ChatResponse, Provider, ProviderQuirks, StopReason, quirks_for};
 use helm_tools::{ToolContext, ToolRegistry};
@@ -1160,13 +1160,13 @@ fn tool_use_count(content: &[ContentBlock]) -> usize {
 
 fn summarize_block(block: &ContentBlock) -> (&'static str, String) {
     match block {
-        ContentBlock::Text(text) => ("text", truncate_for_trace(text)),
+        ContentBlock::Text(text) => ("text", truncate_for_trace(&redact_text(text))),
         ContentBlock::ToolUse { name, input, .. } => {
             let input_text = serde_json::to_string(input)
                 .unwrap_or_else(|error| format!("invalid json input: {error}"));
             (
                 "tool_use",
-                truncate_for_trace(&format!("{name}: {input_text}")),
+                truncate_for_trace(&format!("{name}: {}", redact_text(&input_text))),
             )
         }
         ContentBlock::ToolResult {
@@ -1175,7 +1175,10 @@ fn summarize_block(block: &ContentBlock) -> (&'static str, String) {
             is_error,
         } => (
             "tool_result",
-            truncate_for_trace(&format!("{tool_use_id} error={is_error}: {content}")),
+            truncate_for_trace(&format!(
+                "{tool_use_id} error={is_error}: {}",
+                redact_text(content)
+            )),
         ),
     }
 }

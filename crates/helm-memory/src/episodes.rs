@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::Utc;
-use helm_core::{Capability, ContentBlock, GrantScope, MemoryError, Taint};
+use helm_core::{Capability, ContentBlock, GrantScope, MemoryError, Taint, redact_content_blocks, redact_text};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -238,7 +238,7 @@ impl MemoryStore {
     /// Starts a new episode for `goal` and returns its UUID.
     pub async fn start_episode(&self, goal: &str) -> Result<EpisodeId, MemoryError> {
         let conn = Arc::clone(&self.conn);
-        let goal = goal.to_owned();
+        let goal = redact_text(goal);
         tokio::task::spawn_blocking(move || {
             let id = Uuid::new_v4().to_string();
             let started_at = now_ms();
@@ -267,7 +267,8 @@ impl MemoryStore {
     ) -> Result<(), MemoryError> {
         let conn = Arc::clone(&self.conn);
         let episode_id = episode_id.to_owned();
-        let content_json = serde_json::to_string(content)?;
+        let redacted_content = redact_content_blocks(content);
+        let content_json = serde_json::to_string(&redacted_content)?;
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
             guard
@@ -311,8 +312,8 @@ impl MemoryStore {
     ) -> Result<(), MemoryError> {
         let conn = Arc::clone(&self.conn);
         let episode_id = episode_id.to_owned();
-        let final_message = final_message.map(str::to_owned);
-        let error = error.map(str::to_owned);
+        let final_message = final_message.map(redact_text);
+        let error = error.map(redact_text);
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
             guard
@@ -341,7 +342,7 @@ impl MemoryStore {
     ) -> Result<(), MemoryError> {
         let conn = Arc::clone(&self.conn);
         let episode_id = episode_id.to_owned();
-        let warning = warning.to_owned();
+        let warning = redact_text(warning);
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
             guard
@@ -1239,6 +1240,51 @@ mod tests {
             episode.model_capability_warning,
             Some("model emitted tool-shaped text".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn secrets_are_redacted_before_persistence() {
+        let (_dir, store) = store().await;
+        let id = store
+            .start_episode("use key sk-or-test123 and cat /home/rick/.helm/secrets.toml")
+            .await
+            .unwrap();
+        store
+            .log_step(
+                &id,
+                0,
+                StepRole::Tool,
+                &[ContentBlock::ToolResult {
+                    tool_use_id: "toolu".to_owned(),
+                    content: "OPENROUTER_API_KEY=sk-or-test123".to_owned(),
+                    is_error: false,
+                }],
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .finish_episode(
+                &id,
+                EpisodeOutcome::Failure,
+                Some("saved sk-or-test123"),
+                Some("read /home/rick/.helm/secrets.toml"),
+            )
+            .await
+            .unwrap();
+
+        let episode = store.get_episode(&id).await.unwrap().unwrap();
+        assert!(!episode.goal.contains("test123"));
+        assert!(episode.goal.contains("[REDACTED]"));
+        assert!(!episode.goal.contains(".helm/secrets.toml"));
+        assert_eq!(episode.final_message, Some("saved sk-or-[REDACTED]".to_owned()));
+        assert_eq!(episode.error, Some("read [REDACTED_PATH]".to_owned()));
+
+        let steps = store.get_steps(&id).await.unwrap();
+        let rendered = serde_json::to_string(&steps[0].content).unwrap();
+        assert!(!rendered.contains("test123"));
+        assert!(rendered.contains("[REDACTED]"));
     }
 
     #[tokio::test]
