@@ -1414,6 +1414,24 @@ impl TuiApp {
                 self.push_chat(MessageRole::Error, warning.clone());
                 self.record_tool_event("warn", "verify", warning);
             }
+            AgentEvent::SkillSuggested {
+                skill_id,
+                skill_name,
+                confidence,
+                ..
+            } => {
+                let msg = format!(
+                    "[skill] Suggested: {} (confidence: {:.0}%)",
+                    skill_name,
+                    confidence * 100.0
+                );
+                self.push_chat(MessageRole::Activity, msg.clone());
+                self.record_tool_event(
+                    "skill",
+                    skill_id,
+                    format!("{} ({})", skill_name, confidence),
+                );
+            }
             AgentEvent::RunFinished { .. }
             | AgentEvent::RunFailed { .. }
             | AgentEvent::TextDelta { .. }

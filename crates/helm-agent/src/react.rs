@@ -61,7 +61,7 @@ pub struct ReactAgent {
 }
 
 /// Live event emitted while an agent run is executing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     /// A new run was created in memory.
     RunStarted {
@@ -175,6 +175,17 @@ pub enum AgentEvent {
     PostconditionWarning {
         /// Warning text.
         warning: String,
+    },
+    /// A skill was suggested for the current goal.
+    SkillSuggested {
+        /// Skill identifier.
+        skill_id: String,
+        /// Skill name.
+        skill_name: String,
+        /// Tool sequence for the skill.
+        tool_sequence: Vec<String>,
+        /// Confidence score (0.0-1.0).
+        confidence: f32,
     },
     /// The run finished successfully or partially.
     RunFinished {

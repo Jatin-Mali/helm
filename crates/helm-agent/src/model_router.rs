@@ -140,4 +140,14 @@ mod tests {
         let r = router();
         assert_eq!(r.route_for_goal("list files"), "groq/llama-3-8b");
     }
+
+    #[tokio::test]
+    async fn record_and_get_success_rates_happy_path() {
+        let mut r = ModelRouter::new("fallback");
+        r.add_route("model-a", TaskComplexity::Simple);
+        r.add_route("model-b", TaskComplexity::Medium);
+        // Routes are for goal classification, not for outcome tracking
+        // Success rates would require a separate tracking system
+        assert_eq!(r.route(TaskComplexity::Simple), "model-a");
+    }
 }

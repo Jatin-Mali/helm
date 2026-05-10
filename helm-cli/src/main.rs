@@ -22,6 +22,7 @@ use helm_agent::{AgentEvent, AgentEventSink, Budget, CancellationToken, ReactAge
 use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError, Secret};
 use helm_memory::{
     AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, StepRecord,
+    UserProfileStore,
 };
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
@@ -111,6 +112,8 @@ enum Command {
     Stats(StatsArgs),
     /// Manage knowledge graph and memory
     Memory(MemoryArgs),
+    /// Manage user profile and preferences
+    Profile(ProfileArgs),
 }
 
 #[derive(Debug, Args)]
@@ -245,6 +248,24 @@ enum MemoryCommand {
         #[arg(long, default_value = "0.1")]
         min_confidence: f32,
     },
+}
+
+#[derive(Debug, Args)]
+struct ProfileArgs {
+    #[command(subcommand)]
+    command: ProfileCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// Show top preferred tools and preferences
+    Show,
+    /// Set a preference key=value
+    Set { key: String, value: String },
+    /// Get a preference value
+    Get { key: String },
+    /// Show model routing success rates
+    Routes,
 }
 
 #[derive(Debug, Args)]
@@ -915,6 +936,9 @@ async fn run() -> Result<()> {
         }
         Command::Memory(args) => {
             run_memory_command(args, &memory).await?;
+        }
+        Command::Profile(args) => {
+            run_profile_command(args, &db_path).await?;
         }
     }
     Ok(())
@@ -3154,6 +3178,44 @@ async fn run_memory_command(args: MemoryArgs, _memory: &Arc<MemoryStore>) -> Res
                 .prune_stale_relations(age_days, min_confidence)
                 .map_err(|e| anyhow!("gc error: {}", e))?;
             println!("Pruned {} relations", pruned);
+        }
+    }
+    Ok(())
+}
+
+async fn run_profile_command(args: ProfileArgs, db_path: &Path) -> Result<()> {
+    let profile_path = db_path.parent().map(|p| p.join("profile.db")).ok_or_else(|| anyhow!("invalid db path"))?;
+    let profile = UserProfileStore::open(&profile_path).map_err(|e| anyhow!("profile error: {}", e))?;
+
+    match args.command {
+        ProfileCommand::Show => {
+            let prefs = profile.get().map_err(|e| anyhow!("profile error: {}", e))?;
+            println!("User Preferences:");
+            println!("  Preferred Model: {:?}", prefs.preferred_model);
+            println!("  Verbosity: {:?}", prefs.verbosity);
+            println!("  Timezone: {:?}", prefs.timezone);
+            println!("  Corrections: {}", prefs.correction_count);
+            println!("  Last Goal: {:?}", prefs.last_goal);
+        }
+        ProfileCommand::Set { key, value } => {
+            profile
+                .set_preference(&key, &value)
+                .await
+                .map_err(|e| anyhow!("profile error: {}", e))?;
+            println!("Set {}: {}", key, value);
+        }
+        ProfileCommand::Get { key } => {
+            let val = profile
+                .get_preference(&key)
+                .await
+                .map_err(|e| anyhow!("profile error: {}", e))?;
+            match val {
+                Some(v) => println!("{}: {}", key, v),
+                None => println!("{}: (not set)", key),
+            }
+        }
+        ProfileCommand::Routes => {
+            println!("Model routing success rates not yet implemented");
         }
     }
     Ok(())

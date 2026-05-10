@@ -5,9 +5,10 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -153,6 +154,92 @@ impl UserProfileStore {
         )?;
         Ok(())
     }
+
+    pub async fn record_tool_outcome(
+        &self,
+        tool_name: &str,
+        success: bool,
+    ) -> Result<(), UserProfileError> {
+        let conn = lock(&self.conn)?;
+        let id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO tool_outcomes (id, tool_name, success, recorded_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &id,
+                tool_name,
+                if success { 1 } else { 0 },
+                chrono::Utc::now().timestamp()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn get_tool_preference(&self, tool_name: &str) -> Result<f32, UserProfileError> {
+        let conn = lock(&self.conn)?;
+        let result: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT COUNT(*) as total, SUM(success) as successes
+                 FROM tool_outcomes WHERE tool_name = ?1",
+                params![tool_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        match result {
+            Some((total, successes)) if total > 0 => Ok((successes as f32) / (total as f32)),
+            _ => Ok(0.0),
+        }
+    }
+
+    pub async fn get_preferred_tools(
+        &self,
+        top_n: u32,
+    ) -> Result<Vec<(String, f32)>, UserProfileError> {
+        let conn = lock(&self.conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT tool_name, COUNT(*) as total, SUM(success) as successes
+             FROM tool_outcomes
+             GROUP BY tool_name
+             HAVING total >= 3
+             ORDER BY (successes / CAST(total AS REAL)) DESC
+             LIMIT ?1",
+        )?;
+        let tools = stmt
+            .query_map(params![top_n], |row| {
+                let total: i64 = row.get(1)?;
+                let successes: i64 = row.get(2)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (successes as f32) / (total as f32),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tools)
+    }
+
+    pub async fn set_preference(&self, key: &str, value: &str) -> Result<(), UserProfileError> {
+        let conn = lock(&self.conn)?;
+        conn.execute(
+            "INSERT INTO user_preferences (key, value, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, value, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub async fn get_preference(&self, key: &str) -> Result<Option<String>, UserProfileError> {
+        let conn = lock(&self.conn)?;
+        let result = conn
+            .query_row(
+                "SELECT value FROM user_preferences WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -171,6 +258,17 @@ fn run_migrations(conn: &Connection) -> Result<(), UserProfileError> {
             correction_count INTEGER NOT NULL DEFAULT 0,
             last_goal        TEXT,
             updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        );
+        CREATE TABLE IF NOT EXISTS tool_outcomes (
+            id           TEXT PRIMARY KEY,
+            tool_name    TEXT NOT NULL,
+            success      INTEGER NOT NULL,
+            recorded_at  INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
         );",
     )
     .map_err(UserProfileError::Sqlite)
@@ -234,5 +332,37 @@ mod tests {
         let s = store();
         s.set_timezone("America/New_York").unwrap();
         assert_eq!(s.get().unwrap().timezone.unwrap(), "America/New_York");
+    }
+
+    #[tokio::test]
+    async fn record_and_get_tool_preference_happy_path() {
+        let s = store();
+        s.record_tool_outcome("shell", true).await.unwrap();
+        s.record_tool_outcome("shell", true).await.unwrap();
+        s.record_tool_outcome("shell", false).await.unwrap();
+        let pref = s.get_tool_preference("shell").await.unwrap();
+        assert!((pref - 2.0 / 3.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn set_and_get_preference_happy_path() {
+        let s = store();
+        s.set_preference("theme", "dark").await.unwrap();
+        let val = s.get_preference("theme").await.unwrap();
+        assert_eq!(val, Some("dark".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_preferred_tools_filters_by_minimum_uses() {
+        let s = store();
+        s.record_tool_outcome("shell", true).await.unwrap();
+        s.record_tool_outcome("shell", true).await.unwrap();
+        s.record_tool_outcome("fs_read", true).await.unwrap();
+        let tools = s.get_preferred_tools(10).await.unwrap();
+        assert!(tools.is_empty());
+        s.record_tool_outcome("shell", true).await.unwrap();
+        let tools = s.get_preferred_tools(10).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "shell");
     }
 }

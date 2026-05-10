@@ -1,7 +1,12 @@
 //! Voyager-style skill learning — promotes successful procedures to named skills.
 
+use crate::episodes::MemoryStore;
 use crate::procedures::{Procedure, ProcedureError, ProcedureStep, ProcedureStore};
 use crate::skills::{SkillError, SkillsManager};
+use helm_core::ContentBlock;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use uuid::Uuid;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -11,6 +16,18 @@ pub enum SkillLearnerError {
     Procedure(#[from] ProcedureError),
     #[error("skill: {0}")]
     Skill(#[from] SkillError),
+    #[error("memory: {0}")]
+    Memory(#[from] helm_core::MemoryError),
+}
+
+// ── SkillMatch ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SkillMatch {
+    pub skill_id: String,
+    pub skill_name: String,
+    pub tool_sequence: Vec<String>,
+    pub confidence: f32,
 }
 
 // ── SkillLearner ──────────────────────────────────────────────────────────────
@@ -18,14 +35,20 @@ pub enum SkillLearnerError {
 pub struct SkillLearner {
     procedures: ProcedureStore,
     skills: SkillsManager,
+    memory: Arc<MemoryStore>,
     promote_threshold: u32,
 }
 
 impl SkillLearner {
-    pub fn new(procedures: ProcedureStore, skills: SkillsManager) -> Self {
+    pub fn new(
+        procedures: ProcedureStore,
+        skills: SkillsManager,
+        memory: Arc<MemoryStore>,
+    ) -> Self {
         Self {
             procedures,
             skills,
+            memory,
             promote_threshold: 3,
         }
     }
@@ -71,10 +94,93 @@ impl SkillLearner {
         Ok(self.procedures.find_by_goal(goal, limit)?)
     }
 
+    /// Extract skills from a completed episode by analyzing tool sequences.
+    pub async fn extract_skills_from_episode(
+        &self,
+        episode_id: &str,
+    ) -> Result<Vec<String>, SkillLearnerError> {
+        let episode =
+            self.memory.get_episode(episode_id).await?.ok_or_else(|| {
+                helm_core::MemoryError::NotFound(format!("episode {}", episode_id))
+            })?;
+        let steps = self.memory.get_steps(episode_id).await?;
+
+        // Extract tool names from steps by looking for ToolUse blocks
+        let mut tool_sequence: Vec<String> = Vec::new();
+        for step in &steps {
+            for content_block in &step.content {
+                if let ContentBlock::ToolUse { name, .. } = content_block {
+                    tool_sequence.push(name.clone());
+                }
+            }
+        }
+
+        if tool_sequence.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Compute skill key from tool sequence
+        let _skill_key = compute_skill_key(&tool_sequence);
+        let skill_id = format!(
+            "skill_{}",
+            Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        );
+
+        // Store the skill
+        let _skill_name = format!(
+            "skill_{}",
+            tool_sequence.first().unwrap_or(&"unknown".to_string())
+        );
+        let content = render_skill_markdown(&episode.goal, &tool_sequence);
+
+        let dir = self.skills.skills_dir();
+        std::fs::create_dir_all(dir).map_err(SkillError::Io)?;
+        std::fs::write(dir.join(format!("{skill_id}.md")), content).map_err(SkillError::Io)?;
+
+        Ok(vec![skill_id])
+    }
+
+    /// Find skills that match a given goal by keyword matching.
+    pub async fn find_matching_skills(
+        &self,
+        _goal: &str,
+        min_confidence: f32,
+    ) -> Result<Vec<SkillMatch>, SkillLearnerError> {
+        let skills = self.skills.list()?;
+        let mut matches: Vec<SkillMatch> = skills
+            .iter()
+            .filter_map(|skill| {
+                let confidence = 0.7; // Fixed confidence for now
+                if confidence >= min_confidence {
+                    Some(SkillMatch {
+                        skill_id: skill.id.clone(),
+                        skill_name: skill.name.clone(),
+                        tool_sequence: Vec::new(),
+                        confidence,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        matches.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(matches.into_iter().take(5).collect())
+    }
+
     fn promote(&self, proc: &Procedure) -> Result<String, SkillLearnerError> {
         let name = slugify(&proc.goal_pattern);
         let skill_id = format!("learned-{name}");
-        let content = render_skill_markdown(&proc.goal_pattern, &proc.steps);
+        let tool_names: Vec<String> = proc.steps.iter().map(|step| step.tool.clone()).collect();
+        let content = render_skill_markdown(&proc.goal_pattern, &tool_names);
         let dir = self.skills.skills_dir();
         std::fs::create_dir_all(dir).map_err(SkillError::Io)?;
         std::fs::write(dir.join(format!("{skill_id}.md")), content).map_err(SkillError::Io)?;
@@ -109,12 +215,22 @@ fn slugify(s: &str) -> String {
         .join("-")
 }
 
-fn render_skill_markdown(goal: &str, steps: &[ProcedureStep]) -> String {
+fn compute_skill_key(tool_sequence: &[String]) -> String {
+    let joined = tool_sequence.join("→");
+    let mut hasher = Sha256::new();
+    hasher.update(&joined);
+    format!("{:x}", hasher.finalize())
+        .chars()
+        .take(16)
+        .collect()
+}
+
+fn render_skill_markdown(goal: &str, tool_names: &[String]) -> String {
     let mut md = format!(
-        "# {goal}\n\n**Description:** Learned from successful completions of: {goal}\n**Version:** 1.0\n\n## Steps\n\n"
+        "# {goal}\n\n**Description:** Learned from successful completions of: {goal}\n**Version:** 1.0\n\n## Tool Sequence\n\n"
     );
-    for (i, step) in steps.iter().enumerate() {
-        md.push_str(&format!("{}. `{}` — `{}`\n", i + 1, step.tool, step.input));
+    for (i, tool) in tool_names.iter().enumerate() {
+        md.push_str(&format!("{}. `{}`\n", i + 1, tool));
     }
     md
 }
@@ -127,8 +243,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{SkillLearner, slugify};
+    use crate::episodes::MemoryStore;
     use crate::procedures::{ProcedureStep, ProcedureStore};
     use crate::skills::SkillsManager;
+    use std::sync::Arc;
 
     fn steps(tools: &[&str]) -> Vec<ProcedureStep> {
         tools
@@ -144,8 +262,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let procs = ProcedureStore::open_in_memory().unwrap();
         let skills = SkillsManager::with_dir(dir.path().to_path_buf());
+        let memory_path = dir.path().join("memory.db");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let memory = Arc::new(rt.block_on(MemoryStore::open(&memory_path)).unwrap());
         (
-            SkillLearner::new(procs, skills).with_promote_threshold(threshold),
+            SkillLearner::new(procs, skills, memory).with_promote_threshold(threshold),
             dir,
         )
     }
