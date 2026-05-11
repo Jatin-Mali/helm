@@ -5,6 +5,7 @@ mod custom_commands;
 mod hooks;
 mod keybindings;
 mod remote;
+mod sandbox;
 mod secrets;
 mod serve;
 mod snapshot_sink;
@@ -689,6 +690,14 @@ fn apply_sandbox(enabled: bool, sandbox_dir: Option<&PathBuf>) -> Result<Option<
     if !enabled {
         return Ok(None);
     }
+
+    // Check if bubblewrap is available (future: use real sandboxing).
+    if sandbox::is_bubblewrap_available() {
+        eprintln!("[sandbox] bwrap available - future: true sandboxing");
+    } else {
+        eprintln!("[sandbox] bwrap not available - using directory-based isolation");
+    }
+
     let path = match sandbox_dir {
         Some(p) => {
             std::fs::create_dir_all(p)
