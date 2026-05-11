@@ -7,7 +7,9 @@ use helm_core::{
     Capability, ContentBlock, HelmError, ProviderError, Taint, ValidationError, Validator,
 };
 use helm_memory::{AuditEventInput, EpisodeOutcome, MemoryStore, StepRole, stable_hash_hex};
-use helm_providers::{ChatRequest, ChatResponse, Provider, ProviderQuirks, pricing_for, StopReason, quirks_for};
+use helm_providers::{
+    ChatRequest, ChatResponse, Provider, ProviderQuirks, StopReason, pricing_for, quirks_for,
+};
 use helm_tools::{ToolContext, ToolRegistry};
 use serde_json::Value;
 use tracing::{debug, info, instrument, trace, warn};
@@ -588,8 +590,10 @@ impl ReactAgent {
             // Persist a routing outcome so `helm profile routes` reflects observed behavior.
             let cost_usd = if self.budget.max_cost_usd.is_some() {
                 let pricing = pricing_for(self.provider.name(), &self.model);
-                let input_cost = (response.usage.input_tokens as f64) * pricing.input_rate / 1_000_000.0;
-                let output_cost = (response.usage.output_tokens as f64) * pricing.output_rate / 1_000_000.0;
+                let input_cost =
+                    (response.usage.input_tokens as f64) * pricing.input_rate / 1_000_000.0;
+                let output_cost =
+                    (response.usage.output_tokens as f64) * pricing.output_rate / 1_000_000.0;
                 input_cost + output_cost
             } else {
                 0.0

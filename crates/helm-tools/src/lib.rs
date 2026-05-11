@@ -7,6 +7,7 @@ pub mod fs_read;
 pub mod fs_write;
 pub mod git;
 pub mod http;
+pub mod ignore;
 pub mod logs;
 pub mod mcp;
 pub mod network;

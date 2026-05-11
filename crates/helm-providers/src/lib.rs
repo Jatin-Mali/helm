@@ -14,6 +14,6 @@ pub use gemini::GeminiProvider;
 pub use mock::MockProvider;
 pub use ollama::OllamaProvider;
 pub use openai_compat::{OpenAiCompatProvider, OpenAiCompatProviderBuilder};
-pub use pricing::{pricing_for, Pricing, DEFAULT_PRICING};
+pub use pricing::{DEFAULT_PRICING, Pricing, pricing_for};
 pub use provider::{ChatRequest, ChatResponse, Provider, StopReason, ToolSchema, Usage};
 pub use quirks::{ExpectedFormat, ProviderQuirks, quirks_for};
