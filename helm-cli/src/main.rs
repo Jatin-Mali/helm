@@ -1,6 +1,8 @@
 //! Command-line entry point for HELM.
 
+mod remote;
 mod secrets;
+mod serve;
 mod tui;
 
 use std::{
@@ -82,6 +84,15 @@ struct Cli {
     /// Plan mode: read-only analysis, no writes or executions
     #[arg(long = "read-only", alias = "plan", global = true)]
     read_only: bool,
+    /// Confine tool execution to a fresh sandbox directory (writes outside it are denied).
+    #[arg(long, global = true)]
+    sandbox: bool,
+    /// Use this directory as the sandbox root (default: fresh temp dir).
+    #[arg(long, value_name = "PATH", global = true)]
+    sandbox_dir: Option<PathBuf>,
+    /// Execute shell-style tool calls on the named remote host (registered via `helm remote add`).
+    #[arg(long, value_name = "NAME", global = true)]
+    remote: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -104,9 +115,13 @@ enum Command {
     Completion(CompletionArgs),
     /// Manage MCP server configurations
     Mcp(McpArgs),
-    Tui,
+    Tui(TuiArgs),
     /// Manage sessions (list/delete/export/resume)
     Sessions(SessionsArgs),
+    /// Manage remote target hosts (SSH)
+    Remote(RemoteArgs),
+    /// Run a bearer-auth HTTP server that accepts agent tasks
+    Serve(ServeArgs),
     /// Export episode to file
     Export(ExportArgs),
     /// Manage file snapshots and undo/redo
@@ -183,6 +198,66 @@ struct PermissionGrantArgs {
 struct PermissionRevokeArgs {
     #[arg(value_name = "CAPABILITY")]
     capability: String,
+}
+
+#[derive(Debug, Args)]
+struct TuiArgs {
+    /// Attach to a running `helm serve` instance instead of running locally.
+    /// Format: HOST:PORT (token provided via --token or HELM_REMOTE_TOKEN env).
+    #[arg(long, value_name = "HOST:PORT")]
+    attach: Option<String>,
+    /// Bearer token used when --attach is supplied.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RemoteArgs {
+    #[command(subcommand)]
+    command: RemoteCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RemoteCommand {
+    /// Register a new SSH-reachable remote target.
+    Add(RemoteAddArgs),
+    /// List registered remotes.
+    List,
+    /// Test that the remote is reachable (`ssh remote true`).
+    Test {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Remove a registered remote.
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct RemoteAddArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(long, value_name = "HOST")]
+    host: String,
+    #[arg(long, value_name = "USER")]
+    user: Option<String>,
+    #[arg(long, default_value_t = 22)]
+    port: u16,
+    /// Optional inline SSH options (e.g. "-i ~/.ssh/id_ed25519").
+    #[arg(long)]
+    ssh_opts: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// Address to bind on (default 127.0.0.1:8765).
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8765")]
+    bind: String,
+    /// Required bearer token. If omitted a random token is generated and printed once.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -605,9 +680,39 @@ async fn main() -> ExitCode {
     }
 }
 
+fn apply_sandbox(enabled: bool, sandbox_dir: Option<&PathBuf>) -> Result<Option<PathBuf>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let path = match sandbox_dir {
+        Some(p) => {
+            std::fs::create_dir_all(p)
+                .with_context(|| format!("creating sandbox dir {}", p.display()))?;
+            p.clone()
+        }
+        None => tempfile::Builder::new()
+            .prefix("helm-sandbox-")
+            .tempdir()?
+            .keep(),
+    };
+    env::set_current_dir(&path).with_context(|| format!("cd into sandbox {}", path.display()))?;
+    eprintln!("[sandbox] working dir set to {}", path.display());
+    Ok(Some(path))
+}
+
+fn wrap_for_remote(task: &str, remote: Option<&String>) -> String {
+    match remote {
+        Some(name) => format!(
+            "[Operating against remote target `{name}`. Use the `ssh`, `scp`, and `rsync` tools and always pass `\"remote\": \"{name}\"` in their inputs. Do NOT use the local `shell` tool for anything that should run on the remote.]\n\n{task}"
+        ),
+        None => task.to_owned(),
+    }
+}
+
 async fn run() -> Result<()> {
     let cli = parse_cli_from(env::args_os())?;
-    let tui_log_path = if matches!(cli.command, Command::Tui) {
+    let _sandbox_path = apply_sandbox(cli.sandbox, cli.sandbox_dir.as_ref())?;
+    let tui_log_path = if matches!(cli.command, Command::Tui(_)) {
         Some(default_log_path()?)
     } else {
         None
@@ -672,7 +777,10 @@ async fn run() -> Result<()> {
                 tokio::signal::ctrl_c().await.ok();
                 signal_cancel.cancel();
             });
-            let result = agent.run_with_events(&args.task, &CliProgressSink).await?;
+            let effective_task = wrap_for_remote(&args.task, cli.remote.as_ref());
+            let result = agent
+                .run_with_events(&effective_task, &CliProgressSink)
+                .await?;
             print_run_result(&result);
         }
         Command::Replay(args) => {
@@ -852,6 +960,7 @@ async fn run() -> Result<()> {
                         .unwrap_or("(in progress)"),
                     task
                 );
+                let continuation = wrap_for_remote(&continuation, cli.remote.as_ref());
                 let result = agent
                     .run_with_events(&continuation, &CliProgressSink)
                     .await?;
@@ -917,9 +1026,7 @@ async fn run() -> Result<()> {
                     let idx = (args.n.saturating_sub(1) as usize).min(snapshots.len() - 1);
                     let snap = &snapshots[idx];
                     if args.apply {
-                        let written = store
-                            .apply_snapshot(&snap.id, args.to.clone())
-                            .await?;
+                        let written = store.apply_snapshot(&snap.id, args.to.clone()).await?;
                         println!(
                             "restored snapshot {} (step {}) to {}",
                             snap.id,
@@ -1005,29 +1112,55 @@ async fn run() -> Result<()> {
             let mut cmd = Cli::command();
             generate(args.shell, &mut cmd, "helm", &mut io::stdout());
         }
-        Command::Tui => {
-            tui::run_tui(tui::TuiRuntime {
-                provider_settings,
-                db_path,
-                memory,
-                max_iterations: cli.max_iterations,
-                config_path,
-                secrets: secrets_store,
-                tui_paste_key_modal: config
-                    .as_ref()
-                    .and_then(|config| config.security.as_ref())
-                    .and_then(|security| security.tui_paste_key_modal)
-                    .unwrap_or(true),
-                auto_approve: cli.yes,
-                read_only: cli.read_only,
-            })
-            .await?;
+        Command::Tui(args) => {
+            if let Some(target) = args.attach.as_deref() {
+                let token = args
+                    .token
+                    .clone()
+                    .or_else(|| env::var("HELM_REMOTE_TOKEN").ok())
+                    .ok_or_else(|| {
+                        anyhow!("--attach requires --token or HELM_REMOTE_TOKEN env var")
+                    })?;
+                run_attach_session(target, &token).await?;
+            } else {
+                tui::run_tui(tui::TuiRuntime {
+                    provider_settings,
+                    db_path,
+                    memory,
+                    max_iterations: cli.max_iterations,
+                    config_path,
+                    secrets: secrets_store,
+                    tui_paste_key_modal: config
+                        .as_ref()
+                        .and_then(|config| config.security.as_ref())
+                        .and_then(|security| security.tui_paste_key_modal)
+                        .unwrap_or(true),
+                    auto_approve: cli.yes,
+                    read_only: cli.read_only,
+                })
+                .await?;
+            }
         }
         Command::Memory(args) => {
             run_memory_command(args, &memory).await?;
         }
         Command::Profile(args) => {
             run_profile_command(args, &db_path, &memory).await?;
+        }
+        Command::Remote(args) => {
+            run_remote_command(args).await?;
+        }
+        Command::Serve(args) => {
+            run_serve_command(
+                args,
+                provider_settings,
+                memory,
+                cli.max_iterations,
+                cli.yes,
+                cli.read_only,
+                &secrets_store,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1596,6 +1729,14 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "mcp"
                 | "help"
                 | "tui"
+                | "sessions"
+                | "export"
+                | "undo"
+                | "stats"
+                | "memory"
+                | "profile"
+                | "remote"
+                | "serve"
         )
     )
 }
@@ -1610,7 +1751,9 @@ fn is_value_taking_flag(arg: &OsString) -> bool {
                 | "--provider"
                 | "--api-key"
                 | "--base-url"
-                | "--ollama-url",
+                | "--ollama-url"
+                | "--sandbox-dir"
+                | "--remote",
         )
     )
 }
@@ -3296,6 +3439,90 @@ async fn run_memory_command(args: MemoryArgs, _memory: &Arc<MemoryStore>) -> Res
     Ok(())
 }
 
+async fn run_remote_command(args: RemoteArgs) -> Result<()> {
+    use remote::{RemoteEntry, RemoteRegistry};
+    let mut registry = RemoteRegistry::load()?;
+    match args.command {
+        RemoteCommand::Add(a) => {
+            let entry = RemoteEntry {
+                name: a.name.clone(),
+                host: a.host,
+                port: a.port,
+                user: a.user,
+                ssh_opts: a.ssh_opts,
+            };
+            registry.upsert(entry);
+            registry.save()?;
+            println!("added remote: {}", a.name);
+        }
+        RemoteCommand::List => {
+            if registry.remotes.is_empty() {
+                println!("no remotes registered. Use `helm remote add NAME --host ...`.");
+            }
+            for r in &registry.remotes {
+                let user = r.user.as_deref().unwrap_or("(default user)");
+                println!("{:<20} {}@{}:{}", r.name, user, r.host, r.port);
+            }
+        }
+        RemoteCommand::Test { name } => {
+            let entry = registry
+                .get(&name)
+                .ok_or_else(|| anyhow!("unknown remote: {name}"))?;
+            match entry.ping().await {
+                Ok(true) => println!("remote {name} reachable."),
+                Ok(false) => println!("remote {name} unreachable (ssh exited non-zero)."),
+                Err(error) => println!("remote {name} probe failed: {error}"),
+            }
+        }
+        RemoteCommand::Remove { name } => {
+            let removed = registry.remove(&name);
+            registry.save()?;
+            if removed {
+                println!("removed remote: {name}");
+            } else {
+                println!("no remote named {name}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_serve_command(
+    args: ServeArgs,
+    provider_settings: ProviderSettings,
+    memory: Arc<MemoryStore>,
+    max_iterations: Option<u32>,
+    auto_approve: bool,
+    read_only: bool,
+    secrets: &SecretsStore,
+) -> Result<()> {
+    let token = match args.token {
+        Some(t) => t,
+        None => {
+            let generated = serve::generate_token();
+            eprintln!(
+                "[helm serve] no --token supplied; generated one for this session:\n  {generated}"
+            );
+            generated
+        }
+    };
+    serve::serve(serve::ServeConfig {
+        bind: args.bind,
+        token,
+        provider_settings,
+        memory,
+        max_iterations,
+        auto_approve,
+        read_only,
+        secrets: secrets.clone(),
+    })
+    .await
+}
+
+async fn run_attach_session(target: &str, token: &str) -> Result<()> {
+    serve::attach(target, token).await
+}
+
 async fn run_profile_command(
     args: ProfileArgs,
     db_path: &Path,
@@ -3351,8 +3578,7 @@ async fn run_profile_command(
                     "MODEL", "RUNS", "OK%", "AVG_MS", "COST_USD"
                 );
                 for s in stats {
-                    let model_label: String =
-                        s.model.chars().take(32).collect();
+                    let model_label: String = s.model.chars().take(32).collect();
                     println!(
                         "{:<32} {:>7} {:>6.1}% {:>9.0} {:>10.4}",
                         model_label,
@@ -3635,7 +3861,7 @@ mod tests {
     #[test]
     fn no_args_opens_tui() {
         let parsed = parse_cli_from(["helm"]).unwrap();
-        assert!(matches!(parsed.command, super::Command::Tui));
+        assert!(matches!(parsed.command, super::Command::Tui(_)));
     }
 
     #[test]

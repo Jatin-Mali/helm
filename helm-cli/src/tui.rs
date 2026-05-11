@@ -1816,13 +1816,45 @@ impl TuiApp {
                     format!("failed to generate AGENTS.md: {error}"),
                 ),
             },
-            CommandAction::Sessions => self.push_chat(
-                MessageRole::System,
-                "Sessions are not resumable yet. Use `helm episodes` and `helm replay <id>`.",
-            ),
+            CommandAction::Sessions => {
+                let db_path = self.runtime.db_path.clone();
+                let body = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        let sessions_dir = db_path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        match helm_memory::SessionStore::open(
+                            &db_path,
+                            sessions_dir.join("snapshots"),
+                        )
+                        .await
+                        {
+                            Ok(store) => match store.list_sessions(20).await {
+                                Ok(list) if list.is_empty() => "(no sessions yet)".to_owned(),
+                                Ok(list) => list
+                                    .into_iter()
+                                    .map(|s| {
+                                        format!(
+                                            "[{}] {} — {}",
+                                            s.id,
+                                            s.name,
+                                            s.goal.chars().take(60).collect::<String>()
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                Err(e) => format!("error listing sessions: {e}"),
+                            },
+                            Err(e) => format!("error opening session store: {e}"),
+                        }
+                    })
+                });
+                self.push_chat(MessageRole::System, format!("Sessions (recent 20):\n{body}\nUse `/resume <id> <new task>` from the CLI: `helm sessions resume <id> --task '...'`."));
+            }
             CommandAction::Resume => self.push_chat(
                 MessageRole::System,
-                "Resume is not implemented yet. Use `helm episodes` and `helm replay <id>`.",
+                "Resume from the CLI: `helm sessions resume <id> --task '<new task>'`. Run `/sessions` here to see ids.",
             ),
             CommandAction::Quit => self.shutdown = true,
             CommandAction::Help => self.modal = Some(ModalState::Help),

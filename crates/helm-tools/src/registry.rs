@@ -21,6 +21,7 @@ use crate::{
     search::SearchTool,
     service::ServiceTool,
     shell::ShellTool,
+    ssh::{RsyncTool, ScpTool, SshTool},
     tool::{Tool, ToolContext, ToolError, ToolOutput},
     validator::InputValidator,
 };
@@ -66,6 +67,9 @@ impl ToolRegistry {
         registry.register(Box::<McpTool>::default());
         registry.register(Box::<HttpTool>::default());
         registry.register(Box::<SearchTool>::default());
+        registry.register(Box::<SshTool>::default());
+        registry.register(Box::<ScpTool>::default());
+        registry.register(Box::<RsyncTool>::default());
         registry
     }
 
@@ -203,6 +207,7 @@ pub fn required_capability_for_tool(name: &str, input: &Value) -> Capability {
         "logs" => Capability::ShellExec,
         "git" => Capability::ShellExec,
         "mcp" => Capability::ShellExec,
+        "ssh" | "scp" | "rsync" => Capability::NetworkOut,
         name if name.contains("delete") => Capability::FsDelete,
         _ => Capability::ShellShell,
     }
@@ -272,7 +277,10 @@ mod tests {
             .into_iter()
             .map(|schema| schema.name)
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 17);
+        assert!(names.iter().any(|name| name == "ssh"));
+        assert!(names.iter().any(|name| name == "scp"));
+        assert!(names.iter().any(|name| name == "rsync"));
         assert!(names.iter().any(|name| name == "shell"));
         assert!(names.iter().any(|name| name == "browser"));
         assert!(names.iter().any(|name| name == "git"));

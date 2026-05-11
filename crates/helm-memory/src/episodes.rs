@@ -820,6 +820,7 @@ impl MemoryStore {
     }
 
     /// Record a single routing outcome for `model` (and optionally `provider`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_routing_outcome(
         &self,
         model: &str,
@@ -1434,7 +1435,7 @@ mod tests {
     async fn schema_version_reports_current_version_edge_case() {
         let (_dir, store) = store().await;
 
-        assert_eq!(store.schema_version().await.unwrap(), 7);
+        assert_eq!(store.schema_version().await.unwrap(), 8);
     }
 
     #[tokio::test]
@@ -1507,7 +1508,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert_eq!(has_column, 1);
     }
 

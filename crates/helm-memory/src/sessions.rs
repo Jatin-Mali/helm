@@ -334,12 +334,8 @@ impl SessionStore {
             {
                 fs::create_dir_all(parent).map_err(|e| MemoryError::Other(e.to_string()))?;
             }
-            let tmp = target.with_extension(format!(
-                "helm-snap-{}.tmp",
-                std::process::id()
-            ));
-            fs::write(&tmp, content.as_bytes())
-                .map_err(|e| MemoryError::Other(e.to_string()))?;
+            let tmp = target.with_extension(format!("helm-snap-{}.tmp", std::process::id()));
+            fs::write(&tmp, content.as_bytes()).map_err(|e| MemoryError::Other(e.to_string()))?;
             fs::rename(&tmp, &target).map_err(|e| MemoryError::Other(e.to_string()))?;
             Ok::<PathBuf, MemoryError>(target)
         })

@@ -16,6 +16,7 @@ pub mod registry;
 pub mod search;
 pub mod service;
 pub mod shell;
+pub mod ssh;
 pub mod tool;
 pub mod validator;
 
