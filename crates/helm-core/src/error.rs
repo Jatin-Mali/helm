@@ -131,6 +131,9 @@ pub enum BudgetError {
     /// The run exceeded its wall-clock deadline.
     #[error("wall-clock timeout reached")]
     WallTimeout,
+    /// The run exceeded its cost limit in USD.
+    #[error("cost limit exceeded")]
+    CostLimitExceeded,
 }
 
 #[cfg(test)]

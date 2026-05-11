@@ -7,7 +7,7 @@ use helm_core::{
     Capability, ContentBlock, HelmError, ProviderError, Taint, ValidationError, Validator,
 };
 use helm_memory::{AuditEventInput, EpisodeOutcome, MemoryStore, StepRole, stable_hash_hex};
-use helm_providers::{ChatRequest, ChatResponse, Provider, ProviderQuirks, StopReason, quirks_for};
+use helm_providers::{ChatRequest, ChatResponse, Provider, ProviderQuirks, pricing_for, StopReason, quirks_for};
 use helm_tools::{ToolContext, ToolRegistry};
 use serde_json::Value;
 use tracing::{debug, info, instrument, trace, warn};
@@ -586,6 +586,14 @@ impl ReactAgent {
                 tokens_out: response.usage.output_tokens,
             });
             // Persist a routing outcome so `helm profile routes` reflects observed behavior.
+            let cost_usd = if self.budget.max_cost_usd.is_some() {
+                let pricing = pricing_for(self.provider.name(), &self.model);
+                let input_cost = (response.usage.input_tokens as f64) * pricing.input_rate / 1_000_000.0;
+                let output_cost = (response.usage.output_tokens as f64) * pricing.output_rate / 1_000_000.0;
+                input_cost + output_cost
+            } else {
+                0.0
+            };
             let _ = self
                 .memory
                 .record_routing_outcome(
@@ -595,13 +603,25 @@ impl ReactAgent {
                     0,
                     response.usage.input_tokens,
                     response.usage.output_tokens,
-                    0.0,
+                    cost_usd,
                     Some(&episode_id),
                 )
                 .await;
 
             tracker.record_iteration();
             tracker.record_tokens(response.usage.input_tokens, response.usage.output_tokens);
+
+            // Record cost based on provider pricing.
+            if self.budget.max_cost_usd.is_some() {
+                let pricing = pricing_for(self.provider.name(), &self.model);
+                tracker.record_cost(
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                    pricing.input_rate,
+                    pricing.output_rate,
+                );
+            }
+
             let mut assistant_content = response.content.clone();
 
             // Layer 3 / format recovery: if provider returned only text with no native

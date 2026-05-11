@@ -66,7 +66,7 @@ pub enum BudgetStatus {
 }
 
 /// Hard limits applied to a single HELM ReAct run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Budget {
     /// Maximum provider turns allowed before the run stops partially.
     pub max_iterations: u32,
@@ -76,6 +76,8 @@ pub struct Budget {
     pub max_output_tokens: u32,
     /// Maximum wall-clock runtime allowed.
     pub max_wall_time: Duration,
+    /// Maximum total cost allowed in USD.
+    pub max_cost_usd: Option<f64>,
     /// Whether to auto-approve all capability requests (dangerously skip permissions).
     pub auto_approve: bool,
     /// Whether to permanently deny all write capabilities (plan mode).
@@ -89,13 +91,14 @@ impl Default for Budget {
             max_input_tokens: 200_000,
             max_output_tokens: 50_000,
             max_wall_time: Duration::from_secs(5 * 60),
+            max_cost_usd: None,
             auto_approve: false,
             read_only: false,
         }
     }
 }
 
-/// Mutable budget accounting for one active ReAct run.
+/// Mutable budget accounting for one active HELM ReAct run.
 #[derive(Debug, Clone)]
 pub struct BudgetTracker {
     budget: Budget,
@@ -103,6 +106,7 @@ pub struct BudgetTracker {
     iterations: u32,
     input_tokens: u32,
     output_tokens: u32,
+    cost_usd: f64,
 }
 
 impl BudgetTracker {
@@ -114,6 +118,7 @@ impl BudgetTracker {
             iterations: 0,
             input_tokens: 0,
             output_tokens: 0,
+            cost_usd: 0.0,
         }
     }
 
@@ -131,7 +136,32 @@ impl BudgetTracker {
         if self.started_at.elapsed() >= self.budget.max_wall_time {
             return Err(BudgetError::WallTimeout);
         }
+        if let Some(max_cost) = self.budget.max_cost_usd {
+            if self.cost_usd >= max_cost {
+                return Err(BudgetError::CostLimitExceeded);
+            }
+        }
         Ok(())
+    }
+
+    /// Checks cost status and returns warning if near limit.
+    pub fn cost_status(&self) -> BudgetStatus {
+        if let Some(max_cost) = self.budget.max_cost_usd {
+            if max_cost > 0.0 {
+                let pct = (self.cost_usd / max_cost * 100.0).round() as u32;
+                if self.cost_usd >= max_cost {
+                    BudgetStatus::Exceeded
+                } else if pct >= 80 {
+                    BudgetStatus::Warning { pct }
+                } else {
+                    BudgetStatus::Ok
+                }
+            } else {
+                BudgetStatus::Ok
+            }
+        } else {
+            BudgetStatus::Ok
+        }
     }
 
     /// Records one provider turn.
@@ -143,6 +173,19 @@ impl BudgetTracker {
     pub fn record_tokens(&mut self, input_tokens: u32, output_tokens: u32) {
         self.input_tokens = self.input_tokens.saturating_add(input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+    }
+
+    /// Records cost in USD based on token usage and pricing model.
+    pub fn record_cost(
+        &mut self,
+        input_tokens: u32,
+        output_tokens: u32,
+        input_rate: f64,
+        output_rate: f64,
+    ) {
+        let input_cost = (input_tokens as f64) * input_rate / 1_000_000.0;
+        let output_cost = (output_tokens as f64) * output_rate / 1_000_000.0;
+        self.cost_usd += input_cost + output_cost;
     }
 
     /// Returns recorded provider iterations.
@@ -158,6 +201,11 @@ impl BudgetTracker {
     /// Returns recorded provider output tokens.
     pub fn output_tokens(&self) -> u32 {
         self.output_tokens
+    }
+
+    /// Returns recorded cost in USD.
+    pub fn cost_usd(&self) -> f64 {
+        self.cost_usd
     }
 }
 
