@@ -28,7 +28,7 @@ use clap_complete::{Shell, generate};
 use helm_agent::{AgentEvent, AgentEventSink, Budget, CancellationToken, ReactAgent, RunResult};
 use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError, Secret};
 use helm_memory::{
-    AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, StepRecord,
+    AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, SessionStore, StepRecord,
     UserProfileStore,
 };
 use helm_providers::{
@@ -778,6 +778,36 @@ async fn run() -> Result<()> {
             }
             budget.auto_approve = cli.yes;
             budget.read_only = cli.read_only;
+
+            // Open session store for snapshotting (U5, U7).
+            let sessions_dir = dirs::data_local_dir()
+                .ok_or_else(|| anyhow!("could not resolve data directory"))?
+                .join("helm");
+            let snapshots_dir = sessions_dir.join("snapshots");
+            let session_store = Arc::new(
+                SessionStore::open(&db_path, snapshots_dir)
+                    .await
+                    .context("opening session store")?,
+            );
+
+            // Create session before run start (U7).
+            let session_name = format!("run-{}", chrono::Utc::now().format("%Y%m%d-%H%M"));
+            let working_dir = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
+            let session_id = session_store
+                .create_session(
+                    &session_name,
+                    &args.task,
+                    "".to_string(),
+                    Some(model.clone()),
+                    None,
+                    working_dir,
+                )
+                .await
+                .context("creating session")?;
+            eprintln!("[session] created session {} for run", session_id);
+
             let hooks = hooks::load(
                 args.pre_run.clone(),
                 args.post_run.clone(),
@@ -800,7 +830,18 @@ async fn run() -> Result<()> {
             let hooks_ref = hooks.clone();
             let effective_task = wrap_for_remote(&args.task, cli.remote.as_ref());
             hooks::fire_pre_run(&hooks, &effective_task, cli.remote.as_deref()).await?;
-            let sink = hooks::HookEventSink::new(CliProgressSink, &hooks_ref, cli.remote.clone());
+
+            // Wrap sink for snapshots (U5).
+            let base_sink =
+                hooks::HookEventSink::new(CliProgressSink, &hooks_ref, cli.remote.clone());
+            let working_dir = std::env::current_dir().unwrap_or_default();
+            let sink = snapshot_sink::SnapshotSink::new(
+                base_sink,
+                session_store.clone(),
+                Some(session_id.clone()),
+                working_dir,
+            );
+
             let result = agent.run_with_events(&effective_task, &sink).await?;
             hooks::fire_post_run(
                 &hooks,
@@ -819,17 +860,20 @@ async fn run() -> Result<()> {
                 ProviderChoice::NvidiaNim => "nvidia-nim",
                 ProviderChoice::OpenaiCompat => "openai-compat",
             };
-            if let Err(e) = create_session_for_run(
-                &db_path,
-                &result.episode_id,
-                &args.task,
-                None,
-                Some(provider_name),
-            )
-            .await
+
+            // Update session metadata on completion (U7).
+            if let Err(e) = session_store
+                .update_session(
+                    &session_id,
+                    Some(&result.episode_id),
+                    Some(provider_name),
+                    None,
+                )
+                .await
             {
-                tracing::warn!("session creation failed: {}", e);
+                tracing::warn!("session update failed: {}", e);
             }
+
             print_run_result(&result);
         }
         Command::Replay(args) => {
@@ -1938,6 +1982,7 @@ async fn render_replay(memory: &MemoryStore, episode_id: &str) -> Result<String>
     Ok(format_transcript(&episode, &steps))
 }
 
+#[allow(dead_code)]
 async fn create_session_for_run(
     db_path: &Path,
     episode_id: &str,

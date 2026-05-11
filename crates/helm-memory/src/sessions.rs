@@ -83,6 +83,15 @@ pub struct SessionStore {
     snapshots_dir: PathBuf,
 }
 
+impl Clone for SessionStore {
+    fn clone(&self) -> Self {
+        Self {
+            conn: Arc::clone(&self.conn),
+            snapshots_dir: self.snapshots_dir.clone(),
+        }
+    }
+}
+
 impl SessionStore {
     pub async fn open(db_path: &Path, snapshots_dir: PathBuf) -> Result<Self, MemoryError> {
         let conn = Connection::open(db_path).map_err(sqlite_error)?;
@@ -125,6 +134,29 @@ impl SessionStore {
             Ok::<(), MemoryError>(())
         }).await.map_err(|e| MemoryError::Join(e.to_string()))??;
         Ok(id)
+    }
+
+    pub async fn update_session(
+        &self,
+        session_id: &str,
+        episode_id: Option<&str>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<(), MemoryError> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_owned();
+        let episode_id = episode_id.map(|s| s.to_owned());
+        let provider = provider.map(|s| s.to_owned());
+        let model = model.map(|s| s.to_owned());
+        let now = now_ms();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_conn(&conn)?;
+            guard.execute(
+                "UPDATE sessions SET episode_id = COALESCE(?1, episode_id), provider = COALESCE(?2, provider), model = COALESCE(?3, model), updated_at = ?4 WHERE id = ?5",
+                params![episode_id, provider, model, now, session_id],
+            ).map_err(sqlite_error)?;
+            Ok::<(), MemoryError>(())
+        }).await.map_err(|e| MemoryError::Join(e.to_string()))?
     }
 
     pub async fn list_sessions(&self, limit: u32) -> Result<Vec<SessionRecord>, MemoryError> {
