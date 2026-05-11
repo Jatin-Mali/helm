@@ -764,10 +764,64 @@ async fn run() -> Result<()> {
                 eprintln!("info: --read-only mode — write/exec operations will be denied");
             }
             let provider_choice = resolve_provider_choice(provider_settings.choice);
-            let (provider, model) = build_provider(
-                &provider_settings.with_choice(provider_choice),
-                &secrets_store,
-            )?;
+
+            // Parse fallback chain from --fallback arg.
+            let fallback_chain = args
+                .fallback
+                .as_ref()
+                .map(|f| parse_fallback_chain(f))
+                .unwrap_or_default();
+
+            // Build provider, trying fallback chain on failure.
+            let mut last_error = None;
+            let mut built_provider: Option<Box<dyn Provider>> = None;
+            let mut built_model: Option<String> = None;
+            let has_fallback = !fallback_chain.is_empty();
+
+            // Try primary provider first, then fallback chain.
+            let providers_to_try: Vec<ProviderChoice> = if has_fallback {
+                let mut chain = vec![provider_choice];
+                chain.extend(fallback_chain);
+                chain
+            } else {
+                vec![provider_choice]
+            };
+
+            for choice in &providers_to_try {
+                match build_provider(&provider_settings.with_choice(*choice), &secrets_store) {
+                    Ok((p, m)) => {
+                        built_provider = Some(p);
+                        built_model = Some(m);
+                        if has_fallback && choice != &provider_choice {
+                            eprintln!(
+                                "[fallback] primary failed, using {} as fallback",
+                                provider_choice_name(*choice)
+                            );
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        last_error = Some(e);
+                        eprintln!(
+                            "[fallback] {} failed: {}, trying next...",
+                            provider_choice_name(*choice),
+                            err_msg
+                        );
+                    }
+                }
+            }
+
+            let (provider, model) = match (built_provider, built_model) {
+                (Some(p), Some(m)) => (p, m),
+                _ => {
+                    if let Some(e) = last_error {
+                        return Err(e).context("all providers in fallback chain failed");
+                    } else {
+                        return Err(anyhow!("no providers configured"));
+                    }
+                }
+            };
             let mut budget = Budget::default();
             if let Some(max_iterations) = cli.max_iterations {
                 budget.max_iterations = max_iterations;
@@ -3350,6 +3404,29 @@ fn lookup_provider_key(
 
 fn resolve_provider_choice(choice: ProviderChoice) -> ProviderChoice {
     choice
+}
+
+/// Parse a comma-separated fallback chain (e.g., "groq,anthropic,openrouter").
+fn parse_fallback_chain(chain: &str) -> Vec<ProviderChoice> {
+    chain
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .filter_map(|name| match name.as_str() {
+            "groq" => Some(ProviderChoice::Groq),
+            "anthropic" => Some(ProviderChoice::Anthropic),
+            "ollama" => Some(ProviderChoice::Ollama),
+            "gemini" => Some(ProviderChoice::Gemini),
+            "openrouter" => Some(ProviderChoice::Openrouter),
+            "nvidia-nim" | "nvidia" => Some(ProviderChoice::NvidiaNim),
+            "openai-compat" | "openai" => Some(ProviderChoice::OpenaiCompat),
+            "auto" => Some(ProviderChoice::Auto),
+            _ => {
+                eprintln!("warning: unknown provider in fallback chain: {}", name);
+                None
+            }
+        })
+        .collect()
 }
 
 impl ProviderSource {
