@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -33,12 +33,13 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, ListItem, Paragraph, Wrap},
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use serde::Deserialize;
+use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
 
 use crate::secrets::SecretsStore;
 use crate::{
-    ProviderChoice, ProviderSettings, build_provider, default_api_key_env, default_model_name,
-    provider_choice_name, write_helm_config,
+    ProviderChoice, ProviderSettings, build_provider, custom_commands, default_api_key_env,
+    default_model_name, keybindings::KeyMap, provider_choice_name, write_helm_config,
 };
 
 const APP_BG: Color = Color::Rgb(11, 19, 30);
@@ -353,6 +354,7 @@ enum ModalState {
     ModelSelector {
         query: String,
         selected: usize,
+        entries: Vec<ModelCatalogEntry>,
     },
     ApiKeyInput {
         choice: ProviderChoice,
@@ -391,23 +393,42 @@ impl CommandPaletteState {
             selected: 0,
         }
     }
+}
 
-    fn filtered(&self) -> Vec<CommandAction> {
-        let query = self.query.to_ascii_lowercase();
-        CommandAction::all()
-            .into_iter()
-            .filter(|action| action.label().to_ascii_lowercase().contains(&query))
-            .collect()
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelCatalogEntry {
+    group: String,
+    label: String,
+    provider: ProviderChoice,
+    model: String,
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedModelCatalog {
+    fetched_at: Instant,
+    entries: Vec<ModelCatalogEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ModelCatalogEntry {
-    group: &'static str,
-    label: &'static str,
-    provider: ProviderChoice,
-    model: &'static str,
-    note: Option<&'static str>,
+enum ProviderKeyStatus {
+    NoKeyNeeded,
+    Env,
+    Stored,
+    Session,
+    Unset,
+}
+
+impl ProviderKeyStatus {
+    fn label(self, env_name: Option<&str>) -> String {
+        match self {
+            Self::NoKeyNeeded => "no key needed".to_owned(),
+            Self::Env => format!("{} via env", env_name.unwrap_or("API_KEY")),
+            Self::Stored => format!("{} stored", env_name.unwrap_or("API_KEY")),
+            Self::Session => "session override".to_owned(),
+            Self::Unset => format!("{} unset", env_name.unwrap_or("API_KEY")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,6 +448,74 @@ enum CommandAction {
     Resume,
     Quit,
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaletteItem {
+    BuiltIn(CommandAction),
+    Custom(custom_commands::CustomCommand),
+}
+
+impl PaletteItem {
+    fn label(&self) -> String {
+        match self {
+            Self::BuiltIn(action) => action.label().to_owned(),
+            Self::Custom(command) => format!("Custom: {}", command.name),
+        }
+    }
+
+    fn slug(&self) -> String {
+        match self {
+            Self::BuiltIn(action) => action.slug().to_owned(),
+            Self::Custom(command) => command.name.clone(),
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::BuiltIn(action) => action.description().to_owned(),
+            Self::Custom(command) => command.description.clone(),
+        }
+    }
+
+    fn matches_query(&self, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let query = query.to_ascii_lowercase();
+        self.label().to_ascii_lowercase().contains(&query)
+            || self.slug().to_ascii_lowercase().contains(&query)
+            || self.description().to_ascii_lowercase().contains(&query)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlashItem {
+    BuiltIn(CommandAction),
+    Custom(custom_commands::CustomCommand),
+}
+
+impl SlashItem {
+    fn slug(&self) -> &str {
+        match self {
+            Self::BuiltIn(action) => action.slug(),
+            Self::Custom(command) => &command.name,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::BuiltIn(action) => action.label().to_owned(),
+            Self::Custom(command) => format!("Custom: {}", command.name),
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::BuiltIn(action) => action.description().to_owned(),
+            Self::Custom(command) => command.description.clone(),
+        }
+    }
 }
 
 impl CommandAction {
@@ -571,6 +660,8 @@ pub struct TuiApp {
     modal: Option<ModalState>,
     slash_popup: Option<usize>,
     command_palette: CommandPaletteState,
+    custom_commands: Vec<custom_commands::CustomCommand>,
+    keymap: KeyMap,
     running: bool,
     shutdown: bool,
     mode: AgentMode,
@@ -579,6 +670,7 @@ pub struct TuiApp {
     provider_name: String,
     model: String,
     status_note: String,
+    catalog_cache: HashMap<ProviderChoice, CachedModelCatalog>,
     pending_tool_summaries: HashMap<String, String>,
     active_tool_cells: HashMap<String, usize>,
     toast: Option<ToastState>,
@@ -654,6 +746,8 @@ impl TuiApp {
             modal: None,
             slash_popup: None,
             command_palette: CommandPaletteState::new(),
+            custom_commands: custom_commands::load_all(),
+            keymap: KeyMap::load(),
             running: false,
             shutdown: false,
             mode,
@@ -662,6 +756,7 @@ impl TuiApp {
             provider_name,
             model,
             status_note: "ready".to_owned(),
+            catalog_cache: HashMap::new(),
             pending_tool_summaries: HashMap::new(),
             active_tool_cells: HashMap::new(),
             toast: None,
@@ -834,7 +929,7 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.execute_slash_from_popup();
+                    self.execute_slash_from_popup(tx).await?;
                     return Ok(self.shutdown);
                 }
                 KeyCode::Tab => {
@@ -853,27 +948,52 @@ impl TuiApp {
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.key_matches(&key, "cancel", KeyCode::Char('c'), KeyModifiers::CONTROL) {
+                if self.running {
+                    self.cancel_running_task();
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+            if self.key_matches(&key, "quit", KeyCode::Char('d'), KeyModifiers::CONTROL)
+                && self.input.text.is_empty()
+            {
+                return Ok(true);
+            }
+            if self.key_matches(&key, "newline", KeyCode::Char('j'), KeyModifiers::CONTROL) {
+                self.input.insert_newline();
+                return Ok(false);
+            }
+            if self.key_matches(&key, "palette", KeyCode::Char('p'), KeyModifiers::CONTROL) {
+                self.open_palette();
+                return Ok(false);
+            }
+            if self.key_matches(
+                &key,
+                "tool_sidebar",
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL,
+            ) {
+                self.show_sidebar = !self.show_sidebar;
+                self.toast(if self.show_sidebar {
+                    "Sidebar visible"
+                } else {
+                    "Sidebar hidden"
+                });
+                return Ok(false);
+            }
+            if self.key_matches(&key, "history", KeyCode::Char('h'), KeyModifiers::CONTROL) {
+                self.modal = Some(ModalState::Help);
+                return Ok(false);
+            }
+            if self.key_matches(&key, "clear", KeyCode::Char('l'), KeyModifiers::CONTROL) {
+                self.clear_transcript();
+                return Ok(false);
+            }
+
             match key.code {
-                KeyCode::Char('c') => {
-                    if self.running {
-                        self.cancel_running_task();
-                        return Ok(false);
-                    }
-                    return Ok(true);
-                }
-                KeyCode::Char('d') if self.input.text.is_empty() => return Ok(true),
-                KeyCode::Char('j') => self.input.insert_newline(),
                 KeyCode::Char('n') => self.new_session(),
-                KeyCode::Char('p') => self.open_palette(),
                 KeyCode::Char('r') => self.push_chat(MessageRole::System, self.replay_hint()),
-                KeyCode::Char('t') => {
-                    self.show_sidebar = !self.show_sidebar;
-                    self.toast(if self.show_sidebar {
-                        "Sidebar visible"
-                    } else {
-                        "Sidebar hidden"
-                    });
-                }
                 KeyCode::Char('a') => {
                     self.modal = Some(ModalState::Permission {
                         capability: Capability::ShellShell,
@@ -882,15 +1002,28 @@ impl TuiApp {
                         detail: "No pending permission request.".to_owned(),
                     });
                 }
-                KeyCode::Char('h') => {
-                    self.modal = Some(ModalState::Help);
-                }
-                KeyCode::Char('l') => self.clear_transcript(),
                 KeyCode::Home => self.session.transcript_scroll = usize::MAX / 2,
                 KeyCode::End => self.session.transcript_scroll = 0,
                 KeyCode::Char('u') => self.input.clear(),
                 _ => {}
             }
+            return Ok(false);
+        }
+
+        if !key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+            && self.key_matches(&key, "send", KeyCode::Enter, KeyModifiers::NONE)
+        {
+            self.submit(tx).await?;
+            if self.shutdown {
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if self.input.text.is_empty()
+            && self.key_matches(&key, "help", KeyCode::Char('?'), KeyModifiers::NONE)
+        {
+            self.modal = Some(ModalState::Help);
             return Ok(false);
         }
 
@@ -900,12 +1033,6 @@ impl TuiApp {
                     || key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 self.input.insert_newline()
-            }
-            KeyCode::Enter => {
-                self.submit(tx).await?;
-                if self.shutdown {
-                    return Ok(true);
-                }
             }
             KeyCode::Char('?') if self.input.text.is_empty() => {
                 self.modal = Some(ModalState::Help);
@@ -960,9 +1087,9 @@ impl TuiApp {
             Some(ModalState::CommandPalette) => match key.code {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Enter => {
-                    let commands = self.command_palette.filtered();
-                    if let Some(command) = commands.get(self.command_palette.selected).copied() {
-                        self.execute_command(command);
+                    let commands = self.filtered_palette_items();
+                    if let Some(command) = commands.get(self.command_palette.selected).cloned() {
+                        self.execute_palette_item(command, tx).await?;
                         return Ok(self.shutdown);
                     }
                 }
@@ -978,7 +1105,7 @@ impl TuiApp {
                     self.command_palette.selected = self.command_palette.selected.saturating_sub(1)
                 }
                 KeyCode::Down => {
-                    let max = self.command_palette.filtered().len().saturating_sub(1);
+                    let max = self.filtered_palette_items().len().saturating_sub(1);
                     self.command_palette.selected = (self.command_palette.selected + 1).min(max);
                 }
                 _ => {}
@@ -1065,10 +1192,14 @@ impl TuiApp {
             Some(ModalState::ModelSelector { .. }) => match key.code {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Enter => {
-                    if let Some(ModalState::ModelSelector { query, selected }) = self.modal.clone()
+                    if let Some(ModalState::ModelSelector {
+                        query,
+                        selected,
+                        entries,
+                    }) = self.modal.clone()
                     {
-                        let entries = filtered_model_catalog(&query);
-                        if let Some(entry) = entries.get(selected).copied() {
+                        let filtered = filtered_model_catalog(&entries, &query);
+                        if let Some(entry) = filtered.get(selected).cloned() {
                             self.apply_model_entry(entry);
                         } else if !query.trim().is_empty() {
                             self.apply_manual_model(query.trim().to_owned());
@@ -1081,19 +1212,32 @@ impl TuiApp {
                     }
                 }
                 KeyCode::Down => {
-                    if let Some(ModalState::ModelSelector { query, selected }) = &mut self.modal {
-                        let max = filtered_model_catalog(query).len().saturating_sub(1);
+                    if let Some(ModalState::ModelSelector {
+                        query,
+                        selected,
+                        entries,
+                    }) = &mut self.modal
+                    {
+                        let max = filtered_model_catalog(entries, query)
+                            .len()
+                            .saturating_sub(1);
                         *selected = (*selected + 1).min(max);
                     }
                 }
                 KeyCode::Backspace => {
-                    if let Some(ModalState::ModelSelector { query, selected }) = &mut self.modal {
+                    if let Some(ModalState::ModelSelector {
+                        query, selected, ..
+                    }) = &mut self.modal
+                    {
                         query.pop();
                         *selected = 0;
                     }
                 }
                 KeyCode::Char(ch) => {
-                    if let Some(ModalState::ModelSelector { query, selected }) = &mut self.modal {
+                    if let Some(ModalState::ModelSelector {
+                        query, selected, ..
+                    }) = &mut self.modal
+                    {
                         query.push(ch);
                         *selected = 0;
                     }
@@ -1209,6 +1353,17 @@ impl TuiApp {
         Ok(false)
     }
 
+    fn key_matches(
+        &self,
+        key: &KeyEvent,
+        action: &str,
+        default_code: KeyCode,
+        default_modifiers: KeyModifiers,
+    ) -> bool {
+        self.keymap.matches(action, key.code, key.modifiers)
+            || (key.code == default_code && key.modifiers == default_modifiers)
+    }
+
     async fn submit(&mut self, tx: mpsc::UnboundedSender<UiEvent>) -> Result<()> {
         if self.running {
             return Ok(());
@@ -1217,9 +1372,18 @@ impl TuiApp {
             return Ok(());
         };
         if let Some(command_text) = task.trim().strip_prefix('/') {
-            let slug = command_text.split_whitespace().next().unwrap_or("");
+            let mut parts = command_text.trim().splitn(2, char::is_whitespace);
+            let slug = parts.next().unwrap_or("");
+            let args = parts.next().unwrap_or("").trim();
             if let Some(command) = CommandAction::from_slug(slug) {
                 self.execute_command(command);
+            } else if let Some(command) = self
+                .custom_commands
+                .iter()
+                .find(|command| command.name == slug)
+                .cloned()
+            {
+                self.execute_custom_command(command, args, tx).await?;
             } else {
                 self.push_chat(
                     MessageRole::Error,
@@ -1613,13 +1777,127 @@ impl TuiApp {
         self.push_chat(MessageRole::System, "Transcript cleared.");
     }
 
-    fn apply_provider_choice(&mut self, choice: ProviderChoice) {
-        // Check env var for this provider (don't carry over key from previous provider)
-        let env_key = default_api_key_env(choice).and_then(|env_name| std::env::var(env_name).ok());
+    fn env_candidates_for(&self, choice: ProviderChoice) -> Vec<String> {
+        match choice {
+            ProviderChoice::Gemini => {
+                let mut names = Vec::new();
+                let primary = if choice == self.active_settings.choice {
+                    self.active_settings
+                        .api_key_env
+                        .clone()
+                        .unwrap_or_else(|| "GOOGLE_API_KEY".to_owned())
+                } else {
+                    "GOOGLE_API_KEY".to_owned()
+                };
+                names.push(primary);
+                if !names.iter().any(|name| name == "GEMINI_API_KEY") {
+                    names.push("GEMINI_API_KEY".to_owned());
+                }
+                names
+            }
+            _ => default_api_key_env(choice)
+                .map(|name| vec![name.to_owned()])
+                .unwrap_or_default(),
+        }
+    }
 
-        if choice == ProviderChoice::Ollama || env_key.is_some() {
-            let key = env_key.as_deref();
-            self.apply_provider_with_key(choice, key.unwrap_or("").to_owned(), false);
+    fn provider_key_status(&self, choice: ProviderChoice) -> ProviderKeyStatus {
+        if choice == ProviderChoice::Ollama {
+            return ProviderKeyStatus::NoKeyNeeded;
+        }
+        let env_names = self.env_candidates_for(choice);
+        let has_env = env_names.iter().any(|name| std::env::var(name).is_ok());
+        let has_stored = env_names
+            .iter()
+            .any(|name| self.runtime.secrets.get(name).ok().flatten().is_some());
+        let has_session = choice == self.active_settings.choice
+            && self
+                .active_settings
+                .api_key
+                .as_ref()
+                .is_some_and(|key| !key.trim().is_empty());
+
+        if has_stored {
+            return ProviderKeyStatus::Stored;
+        }
+        if has_env {
+            return ProviderKeyStatus::Env;
+        }
+        if has_session {
+            return ProviderKeyStatus::Session;
+        }
+        ProviderKeyStatus::Unset
+    }
+
+    fn resolved_provider_key(&self, choice: ProviderChoice) -> Option<String> {
+        if choice == self.active_settings.choice
+            && let Some(key) = self.active_settings.api_key.as_ref()
+            && !key.trim().is_empty()
+        {
+            return Some(key.clone());
+        }
+        for env_name in self.env_candidates_for(choice) {
+            if let Ok(Some(secret)) = self.runtime.secrets.get(&env_name) {
+                return Some(secret.expose().to_owned());
+            }
+        }
+        for env_name in self.env_candidates_for(choice) {
+            if let Ok(value) = std::env::var(&env_name)
+                && !value.trim().is_empty()
+            {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn model_catalog_entries(&mut self) -> Vec<ModelCatalogEntry> {
+        let now = Instant::now();
+        let mut all = Vec::new();
+        for (choice, _) in provider_selector_list() {
+            let entries = if let Some(cached) = self.catalog_cache.get(&choice) {
+                if now.duration_since(cached.fetched_at) <= Duration::from_secs(5 * 60) {
+                    cached.entries.clone()
+                } else {
+                    self.refresh_catalog_for(choice)
+                }
+            } else {
+                self.refresh_catalog_for(choice)
+            };
+            all.extend(entries);
+        }
+        all.sort_by(|left, right| {
+            left.group
+                .cmp(&right.group)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        all
+    }
+
+    fn refresh_catalog_for(&mut self, choice: ProviderChoice) -> Vec<ModelCatalogEntry> {
+        let entries = tokio::task::block_in_place(|| {
+            Handle::current().block_on(fetch_model_catalog_for_provider(
+                choice,
+                &self.active_settings,
+                self.resolved_provider_key(choice),
+            ))
+        })
+        .unwrap_or_else(|_| static_model_catalog_for(choice));
+        self.catalog_cache.insert(
+            choice,
+            CachedModelCatalog {
+                fetched_at: Instant::now(),
+                entries: entries.clone(),
+            },
+        );
+        entries
+    }
+
+    fn apply_provider_choice(&mut self, choice: ProviderChoice) {
+        let resolved_key = self.resolved_provider_key(choice);
+
+        if choice == ProviderChoice::Ollama || resolved_key.is_some() {
+            self.apply_provider_with_key(choice, resolved_key.unwrap_or_default(), false);
         } else {
             // No key available — prompt the user
             let mut s = self.active_settings.with_choice(choice);
@@ -1674,13 +1952,13 @@ impl TuiApp {
     fn apply_model_entry(&mut self, entry: ModelCatalogEntry) {
         let mut settings = self.active_settings.with_choice(entry.provider);
         settings.api_key_env = default_api_key_env(entry.provider).map(str::to_owned);
-        settings.model = Some(entry.model.to_owned());
+        settings.model = Some(entry.model.clone());
         if settings.choice != self.active_settings.choice {
             settings.api_key = None;
         }
         self.active_settings = settings;
         self.provider_name = provider_choice_name(entry.provider).to_owned();
-        self.model = entry.model.to_owned();
+        self.model = entry.model.clone();
         self.modal = None;
         self.push_chat(
             MessageRole::System,
@@ -1719,13 +1997,63 @@ impl TuiApp {
         );
     }
 
-    fn slash_filtered(&self) -> Vec<CommandAction> {
+    fn slash_filtered(&self) -> Vec<SlashItem> {
         let raw = self.input.text.trim_start_matches('/').to_ascii_lowercase();
         let query = raw.split_whitespace().next().unwrap_or("");
-        CommandAction::all()
+        let mut items = CommandAction::all()
             .into_iter()
-            .filter(|a| a.slug().starts_with(query) || a.matches_slug(query))
+            .filter(|action| action.slug().starts_with(query) || action.matches_slug(query))
+            .map(SlashItem::BuiltIn)
+            .collect::<Vec<_>>();
+        items.extend(self.custom_commands.iter().cloned().map(SlashItem::Custom));
+        items
+            .into_iter()
+            .filter(|item| item.slug().starts_with(query))
             .collect()
+    }
+
+    fn filtered_palette_items(&self) -> Vec<PaletteItem> {
+        let query = self.command_palette.query.as_str();
+        let mut items = CommandAction::all()
+            .into_iter()
+            .map(PaletteItem::BuiltIn)
+            .collect::<Vec<_>>();
+        items.extend(
+            self.custom_commands
+                .iter()
+                .cloned()
+                .map(PaletteItem::Custom),
+        );
+        items
+            .into_iter()
+            .filter(|item| item.matches_query(query))
+            .collect()
+    }
+
+    async fn execute_palette_item(
+        &mut self,
+        item: PaletteItem,
+        tx: mpsc::UnboundedSender<UiEvent>,
+    ) -> Result<()> {
+        match item {
+            PaletteItem::BuiltIn(command) => self.execute_command(command),
+            PaletteItem::Custom(command) => {
+                let expanded = custom_commands::expand(&command, "");
+                self.modal = None;
+                self.start_task(expanded, tx, true).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_custom_command(
+        &mut self,
+        command: custom_commands::CustomCommand,
+        args: &str,
+        tx: mpsc::UnboundedSender<UiEvent>,
+    ) -> Result<()> {
+        let expanded = custom_commands::expand(&command, args);
+        self.start_task(expanded, tx, true).await
     }
 
     fn update_slash_popup(&mut self) {
@@ -1742,15 +2070,21 @@ impl TuiApp {
         }
     }
 
-    fn execute_slash_from_popup(&mut self) {
+    async fn execute_slash_from_popup(&mut self, tx: mpsc::UnboundedSender<UiEvent>) -> Result<()> {
         let filtered = self.slash_filtered();
         if let Some(sel) = self.slash_popup {
-            if let Some(cmd) = filtered.get(sel).copied() {
+            if let Some(cmd) = filtered.get(sel).cloned() {
                 self.input.clear();
                 self.slash_popup = None;
-                self.execute_command(cmd);
+                match cmd {
+                    SlashItem::BuiltIn(command) => self.execute_command(command),
+                    SlashItem::Custom(command) => {
+                        self.execute_custom_command(command, "", tx).await?
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     fn open_palette(&mut self) {
@@ -1773,15 +2107,17 @@ impl TuiApp {
                 self.modal = Some(ModalState::ProviderSelector { selected: current });
             }
             CommandAction::Model => {
+                let entries = self.model_catalog_entries();
                 self.modal = Some(ModalState::ModelSelector {
                     query: String::new(),
-                    selected: model_catalog()
+                    selected: entries
                         .iter()
                         .position(|entry| {
                             entry.provider == self.active_settings.choice
                                 && entry.model == self.model.as_str()
                         })
                         .unwrap_or(0),
+                    entries,
                 });
             }
             CommandAction::Permissions => {
@@ -2119,9 +2455,9 @@ fn render_slash_popup(app: &TuiApp, input_area: Rect, buf: &mut Buffer) {
     let filtered = {
         let raw = app.input.text.trim_start_matches('/').to_ascii_lowercase();
         let query = raw.split_whitespace().next().unwrap_or("").to_owned();
-        CommandAction::all()
+        app.slash_filtered()
             .into_iter()
-            .filter(|a| a.slug().starts_with(query.as_str()))
+            .filter(|item| item.slug().starts_with(query.as_str()))
             .collect::<Vec<_>>()
     };
     if filtered.is_empty() {
@@ -2314,16 +2650,7 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
             ];
             for (i, (choice, env_key)) in choices.iter().enumerate() {
                 let name = provider_choice_name(*choice);
-                let key_status = match env_key {
-                    Some(k) => {
-                        if std::env::var(k).is_ok() {
-                            format!("{k} ✓")
-                        } else {
-                            format!("{k} (unset)")
-                        }
-                    }
-                    None => "no key needed".to_owned(),
-                };
+                let key_status = app.provider_key_status(*choice).label(*env_key);
                 let label = format!("[{}] {:<16} {}", i + 1, name, key_status);
                 let style = if i == *selected {
                     Style::default()
@@ -2344,8 +2671,12 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
-        ModalState::ModelSelector { query, selected } => {
-            let entries = filtered_model_catalog(query);
+        ModalState::ModelSelector {
+            query,
+            selected,
+            entries,
+        } => {
+            let entries = filtered_model_catalog(entries, query);
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled("Search ", Style::default().fg(Color::Gray)),
@@ -2362,19 +2693,19 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 0
             };
             for (index, entry) in entries.iter().enumerate().skip(start).take(visible_rows) {
-                if entry.group != last_group {
+                if entry.group.as_str() != last_group {
                     if !last_group.is_empty() {
                         lines.push(Line::from(""));
                     }
                     lines.push(Line::styled(
-                        entry.group,
+                        entry.group.as_str(),
                         Style::default()
                             .fg(Color::LightMagenta)
                             .add_modifier(Modifier::BOLD),
                     ));
-                    last_group = entry.group;
+                    last_group = entry.group.as_str();
                 }
-                let note = entry.note.unwrap_or("");
+                let note = entry.note.as_deref().unwrap_or("");
                 let row = format!(
                     "{:<34} {:<14} {}",
                     entry.label,
@@ -2519,7 +2850,7 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
 }
 
 fn render_palette(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let commands = app.command_palette.filtered();
+    let commands = app.filtered_palette_items();
     let mut lines = vec![Line::from(vec![
         Span::styled("query: ", Style::default().fg(Color::Gray)),
         Span::raw(app.command_palette.query.as_str()),
@@ -2944,191 +3275,152 @@ fn provider_selector_list() -> Vec<(ProviderChoice, Option<&'static str>)> {
     ]
 }
 
-fn model_catalog() -> &'static [ModelCatalogEntry] {
-    &[
-        ModelCatalogEntry {
-            group: "Recent",
-            label: "Groq Llama 3.3 70B",
-            provider: ProviderChoice::Groq,
-            model: "llama-3.3-70b-versatile",
-            note: Some("tools"),
-        },
-        ModelCatalogEntry {
-            group: "Recent",
-            label: "Kimi K2.6",
-            provider: ProviderChoice::NvidiaNim,
-            model: "moonshotai/kimi-k2.6",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "Recent",
-            label: "GLM 5.1",
-            provider: ProviderChoice::NvidiaNim,
-            model: "z-ai/glm-5.1",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "Recent",
-            label: "DeepSeek V4 Pro",
-            provider: ProviderChoice::NvidiaNim,
-            model: "deepseek-ai/deepseek-v4-pro",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "Groq",
-            label: "Llama 3.3 70B Versatile",
-            provider: ProviderChoice::Groq,
-            model: "llama-3.3-70b-versatile",
-            note: Some("tools"),
-        },
-        ModelCatalogEntry {
-            group: "Groq",
-            label: "Llama 3.1 8B Instant",
-            provider: ProviderChoice::Groq,
-            model: "llama-3.1-8b-instant",
-            note: Some("fast"),
-        },
-        ModelCatalogEntry {
-            group: "Groq",
-            label: "GPT OSS 120B",
-            provider: ProviderChoice::Groq,
-            model: "openai/gpt-oss-120b",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "Groq",
-            label: "GPT OSS 20B",
-            provider: ProviderChoice::Groq,
-            model: "openai/gpt-oss-20b",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "Google",
-            label: "Gemini 2.5 Flash",
-            provider: ProviderChoice::Gemini,
-            model: "gemini-2.5-flash",
-            note: Some("free"),
-        },
-        ModelCatalogEntry {
-            group: "Google",
-            label: "Gemini 2.5 Flash Lite",
-            provider: ProviderChoice::Gemini,
-            model: "gemini-2.5-flash-lite",
-            note: Some("free"),
-        },
-        ModelCatalogEntry {
-            group: "Google",
-            label: "Gemini 2.5 Pro",
-            provider: ProviderChoice::Gemini,
-            model: "gemini-2.5-pro",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "Google",
-            label: "Gemini 2.0 Flash",
-            provider: ProviderChoice::Gemini,
-            model: "gemini-2.0-flash",
-            note: Some("free"),
-        },
-        ModelCatalogEntry {
-            group: "Google",
-            label: "Gemini 3 Pro Preview",
-            provider: ProviderChoice::Gemini,
-            model: "gemini-3-pro-preview",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "NVIDIA",
-            label: "Kimi K2.6",
-            provider: ProviderChoice::NvidiaNim,
-            model: "moonshotai/kimi-k2.6",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "NVIDIA",
-            label: "GLM 5.1",
-            provider: ProviderChoice::NvidiaNim,
-            model: "z-ai/glm-5.1",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "NVIDIA",
-            label: "DeepSeek V4 Pro",
-            provider: ProviderChoice::NvidiaNim,
-            model: "deepseek-ai/deepseek-v4-pro",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "NVIDIA",
-            label: "Nemotron 3 Super 120B",
-            provider: ProviderChoice::NvidiaNim,
-            model: "nvidia/nemotron-3-super-120b",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "OpenRouter",
-            label: "Kimi K2.6",
-            provider: ProviderChoice::Openrouter,
-            model: "moonshotai/kimi-k2.6",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "OpenRouter",
-            label: "DeepSeek Chat",
-            provider: ProviderChoice::Openrouter,
-            model: "deepseek/deepseek-chat",
-            note: Some("free"),
-        },
-        ModelCatalogEntry {
-            group: "OpenRouter",
-            label: "DeepSeek Reasoner",
-            provider: ProviderChoice::Openrouter,
-            model: "deepseek/deepseek-r1",
-            note: Some("free"),
-        },
-        ModelCatalogEntry {
-            group: "OpenRouter",
-            label: "Qwen 3 Coder",
-            provider: ProviderChoice::Openrouter,
-            model: "qwen/qwen3-coder",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "OpenRouter",
-            label: "Gemma 3 31B Free",
-            provider: ProviderChoice::Openrouter,
-            model: "google/gemma-3-31b-it:free",
-            note: Some("free"),
-        },
-        ModelCatalogEntry {
-            group: "Anthropic",
-            label: "Claude Opus 4.1",
-            provider: ProviderChoice::Anthropic,
-            model: "claude-opus-4-1-20250805",
-            note: None,
-        },
-        ModelCatalogEntry {
-            group: "Anthropic",
-            label: "Claude 3.5 Haiku",
-            provider: ProviderChoice::Anthropic,
-            model: "claude-3-5-haiku-20241022",
-            note: Some("fast"),
-        },
-        ModelCatalogEntry {
-            group: "Local",
-            label: "Qwen3 4B",
-            provider: ProviderChoice::Ollama,
-            model: "qwen3:4b",
-            note: Some("local"),
-        },
-    ]
+fn catalog_entry(
+    group: &str,
+    label: &str,
+    provider: ProviderChoice,
+    model: &str,
+    note: Option<&str>,
+) -> ModelCatalogEntry {
+    ModelCatalogEntry {
+        group: group.to_owned(),
+        label: label.to_owned(),
+        provider,
+        model: model.to_owned(),
+        note: note.map(str::to_owned),
+    }
 }
 
-fn filtered_model_catalog(query: &str) -> Vec<ModelCatalogEntry> {
+fn static_model_catalog_for(choice: ProviderChoice) -> Vec<ModelCatalogEntry> {
+    match choice {
+        ProviderChoice::Groq => vec![
+            catalog_entry(
+                "Groq",
+                "Llama 3.3 70B Versatile",
+                choice,
+                "llama-3.3-70b-versatile",
+                Some("default"),
+            ),
+            catalog_entry(
+                "Groq",
+                "Llama 3.1 8B Instant",
+                choice,
+                "llama-3.1-8b-instant",
+                Some("fast"),
+            ),
+            catalog_entry("Groq", "GPT OSS 120B", choice, "openai/gpt-oss-120b", None),
+            catalog_entry("Groq", "GPT OSS 20B", choice, "openai/gpt-oss-20b", None),
+        ],
+        ProviderChoice::Anthropic => vec![
+            catalog_entry(
+                "Anthropic",
+                "Claude Opus 4.1",
+                choice,
+                "claude-opus-4-1-20250805",
+                Some("default"),
+            ),
+            catalog_entry(
+                "Anthropic",
+                "Claude 3.5 Haiku",
+                choice,
+                "claude-3-5-haiku-20241022",
+                Some("fast"),
+            ),
+        ],
+        ProviderChoice::Ollama => vec![catalog_entry(
+            "Ollama",
+            "Qwen3 4B",
+            choice,
+            "qwen3:4b",
+            Some("local"),
+        )],
+        ProviderChoice::Gemini => vec![
+            catalog_entry(
+                "Google",
+                "Gemini 2.5 Flash",
+                choice,
+                "gemini-2.5-flash",
+                Some("default"),
+            ),
+            catalog_entry(
+                "Google",
+                "Gemini 2.5 Flash Lite",
+                choice,
+                "gemini-2.5-flash-lite",
+                Some("fast"),
+            ),
+            catalog_entry("Google", "Gemini 2.5 Pro", choice, "gemini-2.5-pro", None),
+            catalog_entry(
+                "Google",
+                "Gemini 2.0 Flash",
+                choice,
+                "gemini-2.0-flash",
+                None,
+            ),
+        ],
+        ProviderChoice::Openrouter => vec![
+            catalog_entry(
+                "OpenRouter",
+                "Kimi K2.6",
+                choice,
+                "moonshotai/kimi-k2.6",
+                None,
+            ),
+            catalog_entry(
+                "OpenRouter",
+                "DeepSeek Chat",
+                choice,
+                "deepseek/deepseek-chat",
+                Some("free"),
+            ),
+            catalog_entry(
+                "OpenRouter",
+                "DeepSeek Reasoner",
+                choice,
+                "deepseek/deepseek-r1",
+                Some("free"),
+            ),
+            catalog_entry(
+                "OpenRouter",
+                "Qwen 3 Coder",
+                choice,
+                "qwen/qwen3-coder",
+                None,
+            ),
+        ],
+        ProviderChoice::NvidiaNim => vec![
+            catalog_entry("NVIDIA", "Kimi K2.6", choice, "moonshotai/kimi-k2.6", None),
+            catalog_entry("NVIDIA", "GLM 5.1", choice, "z-ai/glm-5.1", None),
+            catalog_entry(
+                "NVIDIA",
+                "DeepSeek V4 Pro",
+                choice,
+                "deepseek-ai/deepseek-v4-pro",
+                None,
+            ),
+            catalog_entry(
+                "NVIDIA",
+                "Nemotron 3 Super 120B",
+                choice,
+                "nvidia/nemotron-3-super-120b",
+                None,
+            ),
+        ],
+        ProviderChoice::OpenaiCompat => vec![catalog_entry(
+            "OpenAI-Compatible",
+            "GPT-4o Mini",
+            choice,
+            "gpt-4o-mini",
+            Some("default"),
+        )],
+        ProviderChoice::Auto => Vec::new(),
+    }
+}
+
+fn filtered_model_catalog(entries: &[ModelCatalogEntry], query: &str) -> Vec<ModelCatalogEntry> {
     let query = query.trim().to_ascii_lowercase();
-    model_catalog()
+    entries
         .iter()
-        .copied()
         .filter(|entry| {
             query.is_empty()
                 || entry.label.to_ascii_lowercase().contains(&query)
@@ -3138,7 +3430,271 @@ fn filtered_model_catalog(query: &str) -> Vec<ModelCatalogEntry> {
                     .to_ascii_lowercase()
                     .contains(&query)
         })
+        .cloned()
         .collect()
+}
+
+fn live_catalog_group(choice: ProviderChoice) -> &'static str {
+    match choice {
+        ProviderChoice::Groq => "Groq",
+        ProviderChoice::Anthropic => "Anthropic",
+        ProviderChoice::Ollama => "Ollama",
+        ProviderChoice::Gemini => "Google",
+        ProviderChoice::Openrouter => "OpenRouter",
+        ProviderChoice::NvidiaNim => "NVIDIA",
+        ProviderChoice::OpenaiCompat => "OpenAI-Compatible",
+        ProviderChoice::Auto => "Auto",
+    }
+}
+
+fn base_url_for_provider(choice: ProviderChoice, settings: &ProviderSettings) -> String {
+    match choice {
+        ProviderChoice::Groq => "https://api.groq.com/openai/v1".to_owned(),
+        ProviderChoice::Anthropic => "https://api.anthropic.com".to_owned(),
+        ProviderChoice::Ollama => settings
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "http://localhost:11434".to_owned()),
+        ProviderChoice::Gemini => settings
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_owned()),
+        ProviderChoice::Openrouter => "https://openrouter.ai/api/v1".to_owned(),
+        ProviderChoice::NvidiaNim => "https://integrate.api.nvidia.com/v1".to_owned(),
+        ProviderChoice::OpenaiCompat => settings
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_owned()),
+        ProviderChoice::Auto => settings
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "http://localhost:11434".to_owned()),
+    }
+}
+
+fn model_note_for(choice: ProviderChoice, model: &str, live: bool) -> Option<String> {
+    if model == default_model_name(choice) {
+        Some("default".to_owned())
+    } else if choice == ProviderChoice::Ollama && model.ends_with(":cloud") {
+        Some("cloud".to_owned())
+    } else if choice == ProviderChoice::Ollama {
+        Some("local".to_owned())
+    } else if live {
+        Some("live".to_owned())
+    } else {
+        None
+    }
+}
+
+async fn fetch_model_catalog_for_provider(
+    choice: ProviderChoice,
+    settings: &ProviderSettings,
+    resolved_key: Option<String>,
+) -> Result<Vec<ModelCatalogEntry>> {
+    let base_url = base_url_for_provider(choice, settings);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .context("building model catalog client")?;
+    let models = match choice {
+        ProviderChoice::Ollama => fetch_ollama_catalog(&client, &base_url).await?,
+        ProviderChoice::Gemini => {
+            let key = resolved_key.ok_or_else(|| anyhow!("missing Gemini API key"))?;
+            fetch_gemini_catalog(&client, &base_url, &key).await?
+        }
+        ProviderChoice::Anthropic => {
+            let key = resolved_key.ok_or_else(|| anyhow!("missing Anthropic API key"))?;
+            fetch_anthropic_catalog(&client, &base_url, &key).await?
+        }
+        ProviderChoice::Groq
+        | ProviderChoice::Openrouter
+        | ProviderChoice::NvidiaNim
+        | ProviderChoice::OpenaiCompat => {
+            fetch_openai_style_catalog(&client, choice, &base_url, resolved_key.as_deref()).await?
+        }
+        ProviderChoice::Auto => Vec::new(),
+    };
+
+    if models.is_empty() {
+        return Ok(static_model_catalog_for(choice));
+    }
+
+    Ok(models)
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelsResponse {
+    #[serde(default)]
+    data: Vec<OpenAiModelRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelRecord {
+    id: String,
+}
+
+async fn fetch_openai_style_catalog(
+    client: &reqwest::Client,
+    choice: ProviderChoice,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<ModelCatalogEntry>> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut request = client.get(url);
+    if let Some(key) = api_key
+        && !key.trim().is_empty()
+    {
+        request = request.bearer_auth(key);
+    }
+    if choice == ProviderChoice::Openrouter {
+        request = request
+            .header("HTTP-Referer", "https://github.com/Jatin-Mali/helm")
+            .header("X-Title", "HELM");
+    }
+    let response = request.send().await?.error_for_status()?;
+    let parsed: OpenAiModelsResponse = response.json().await?;
+    let group = live_catalog_group(choice);
+    let mut entries = parsed
+        .data
+        .into_iter()
+        .map(|record| {
+            let note = model_note_for(choice, &record.id, true);
+            ModelCatalogEntry {
+                group: group.to_owned(),
+                label: record.id.clone(),
+                provider: choice,
+                model: record.id,
+                note,
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.label.cmp(&right.label));
+    Ok(entries)
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTagsResponse {
+    #[serde(default)]
+    models: Vec<OllamaTagRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTagRecord {
+    name: String,
+}
+
+async fn fetch_ollama_catalog(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<Vec<ModelCatalogEntry>> {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let response = client.get(url).send().await?.error_for_status()?;
+    let parsed: OllamaTagsResponse = response.json().await?;
+    let mut entries = parsed
+        .models
+        .into_iter()
+        .map(|record| ModelCatalogEntry {
+            group: "Ollama".to_owned(),
+            label: record.name.clone(),
+            provider: ProviderChoice::Ollama,
+            model: record.name.clone(),
+            note: model_note_for(ProviderChoice::Ollama, &record.name, true),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.label.cmp(&right.label));
+    Ok(entries)
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiModelsResponse {
+    #[serde(default)]
+    models: Vec<GeminiModelRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiModelRecord {
+    name: String,
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+    #[serde(rename = "supportedGenerationMethods")]
+    supported_generation_methods: Option<Vec<String>>,
+}
+
+async fn fetch_gemini_catalog(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<ModelCatalogEntry>> {
+    let url = format!(
+        "{}/v1beta/models?key={api_key}",
+        base_url.trim_end_matches('/')
+    );
+    let response = client.get(url).send().await?.error_for_status()?;
+    let parsed: GeminiModelsResponse = response.json().await?;
+    let mut entries = parsed
+        .models
+        .into_iter()
+        .filter(|record| {
+            record
+                .supported_generation_methods
+                .as_ref()
+                .is_none_or(|methods| methods.iter().any(|method| method == "generateContent"))
+        })
+        .map(|record| {
+            let model_id = record.name.trim_start_matches("models/").to_owned();
+            ModelCatalogEntry {
+                group: "Google".to_owned(),
+                label: record.display_name.unwrap_or_else(|| model_id.clone()),
+                provider: ProviderChoice::Gemini,
+                note: model_note_for(ProviderChoice::Gemini, &model_id, true),
+                model: model_id,
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.label.cmp(&right.label));
+    Ok(entries)
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicModelsResponse {
+    #[serde(default)]
+    data: Vec<AnthropicModelRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicModelRecord {
+    id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+async fn fetch_anthropic_catalog(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<ModelCatalogEntry>> {
+    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let response = client
+        .get(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await?
+        .error_for_status()?;
+    let parsed: AnthropicModelsResponse = response.json().await?;
+    let mut entries = parsed
+        .data
+        .into_iter()
+        .map(|record| ModelCatalogEntry {
+            group: "Anthropic".to_owned(),
+            label: record.display_name.unwrap_or_else(|| record.id.clone()),
+            provider: ProviderChoice::Anthropic,
+            note: model_note_for(ProviderChoice::Anthropic, &record.id, true),
+            model: record.id,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.label.cmp(&right.label));
+    Ok(entries)
 }
 
 fn is_auth_error(error: &str) -> bool {
@@ -3230,6 +3786,18 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn test_catalog() -> Vec<ModelCatalogEntry> {
+        let mut entries = Vec::new();
+        for choice in [
+            ProviderChoice::Groq,
+            ProviderChoice::Gemini,
+            ProviderChoice::NvidiaNim,
+        ] {
+            entries.extend(static_model_catalog_for(choice));
+        }
+        entries
+    }
+
     fn render_to_buffer(mut app: TuiApp, width: u16, height: u16) -> Buffer {
         app.push_chat(MessageRole::User, "hello from user");
         app.push_chat(
@@ -3272,10 +3840,50 @@ mod tests {
 
     #[test]
     fn command_palette_filters_commands() {
-        let mut palette = CommandPaletteState::new();
-        palette.query = "doctor".to_owned();
-        let filtered = palette.filtered();
-        assert_eq!(filtered, vec![CommandAction::Doctor]);
+        let mut app = app();
+        app.command_palette.query = "doctor".to_owned();
+        let filtered = app.filtered_palette_items();
+        assert_eq!(filtered, vec![PaletteItem::BuiltIn(CommandAction::Doctor)]);
+    }
+
+    #[test]
+    fn command_palette_includes_custom_commands() {
+        let mut app = app();
+        app.custom_commands.push(custom_commands::CustomCommand {
+            name: "triage".to_owned(),
+            description: "Quick incident triage helper".to_owned(),
+            body: "Investigate alerts for {{args}}".to_owned(),
+        });
+        app.command_palette.query = "triage".to_owned();
+
+        let filtered = app.filtered_palette_items();
+
+        assert_eq!(
+            filtered,
+            vec![PaletteItem::Custom(custom_commands::CustomCommand {
+                name: "triage".to_owned(),
+                description: "Quick incident triage helper".to_owned(),
+                body: "Investigate alerts for {{args}}".to_owned(),
+            })]
+        );
+    }
+
+    #[test]
+    fn slash_popup_includes_custom_commands() {
+        let mut app = app();
+        app.custom_commands.push(custom_commands::CustomCommand {
+            name: "triage".to_owned(),
+            description: "Quick incident triage helper".to_owned(),
+            body: "Investigate alerts for {{args}}".to_owned(),
+        });
+        app.input.text = "/tri".to_owned();
+
+        let filtered = app.slash_filtered();
+
+        assert!(matches!(
+            filtered.first(),
+            Some(SlashItem::Custom(command)) if command.name == "triage"
+        ));
     }
 
     #[test]
@@ -3502,12 +4110,13 @@ mod tests {
 
     #[test]
     fn model_catalog_filters_across_providers() {
-        let models = filtered_model_catalog("gemini 2.5 flash");
+        let catalog = test_catalog();
+        let models = filtered_model_catalog(&catalog, "gemini 2.5 flash");
         assert!(models.iter().any(|entry| {
             entry.provider == ProviderChoice::Gemini && entry.model == "gemini-2.5-flash"
         }));
 
-        let models = filtered_model_catalog("kimi");
+        let models = filtered_model_catalog(&catalog, "kimi");
         assert!(models.iter().any(|entry| {
             entry.provider == ProviderChoice::NvidiaNim && entry.model == "moonshotai/kimi-k2.6"
         }));
@@ -3516,7 +4125,8 @@ mod tests {
     #[test]
     fn applying_catalog_model_switches_provider_and_model() {
         let mut app = app();
-        let entry = filtered_model_catalog("deepseek v4")
+        let catalog = test_catalog();
+        let entry = filtered_model_catalog(&catalog, "deepseek v4")
             .into_iter()
             .find(|entry| entry.provider == ProviderChoice::NvidiaNim)
             .unwrap();
@@ -3529,6 +4139,41 @@ mod tests {
             Some("deepseek-ai/deepseek-v4-pro".to_owned())
         );
         assert_eq!(app.provider_name, "nvidia-nim");
+    }
+
+    #[test]
+    fn provider_selector_reads_secret_store_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+        app.runtime
+            .secrets
+            .set(
+                "GROQ_API_KEY",
+                helm_core::Secret::new("gsk_abcdefghijklmnopqrstuvwxyz123456".to_owned()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            app.provider_key_status(ProviderChoice::Groq),
+            ProviderKeyStatus::Stored
+        );
+    }
+
+    #[test]
+    fn provider_selector_reads_session_override_status() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: guarded by env_lock for this test.
+        unsafe {
+            std::env::remove_var("GROQ_API_KEY");
+        }
+        let mut app = app_in_dir(&dir, crate::ProviderChoice::Groq);
+        app.active_settings.api_key = Some("gsk_session_key_abcdefghijklmnopqrstuvwxyz".to_owned());
+
+        assert_eq!(
+            app.provider_key_status(ProviderChoice::Groq),
+            ProviderKeyStatus::Session
+        );
     }
 
     #[test]
@@ -3619,5 +4264,44 @@ mod tests {
         assert!(config.contains("api_key_env = \"GROQ_API_KEY\""));
         assert!(!config.contains("api_key ="));
         assert!(!config.contains("gsk_abcdefghijklmnopqrstuvwxyz123456"));
+    }
+
+    #[test]
+    fn live_ollama_catalog_parses_mocked_tags() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let maybe_server = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async { mockito::Server::new_async().await })
+        }));
+        let Ok(mut server) = maybe_server else {
+            eprintln!("skipping mockito-backed catalog test: mock server unavailable");
+            return;
+        };
+
+        runtime.block_on(async {
+            let mock = server
+                .mock("GET", "/api/tags")
+                .with_status(200)
+                .with_body(
+                    serde_json::json!({
+                        "models": [
+                            {"name": "qwen3:4b"},
+                            {"name": "llama3.3:70b"}
+                        ]
+                    })
+                    .to_string(),
+                )
+                .create_async()
+                .await;
+            let client = reqwest::Client::builder().build().unwrap();
+
+            let entries = fetch_ollama_catalog(&client, &server.url()).await.unwrap();
+
+            assert!(entries.iter().any(|entry| entry.model == "qwen3:4b"));
+            assert!(entries.iter().any(|entry| entry.model == "llama3.3:70b"));
+            mock.assert_async().await;
+        });
     }
 }

@@ -492,3 +492,56 @@ fn truncate(input: &str, max_bytes: usize) -> (String, bool) {
     out.push_str(&format!("\n[output truncated; {omitted} bytes omitted]"));
     (out, true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_endpoint_resolves_inline_host() {
+        let input = serde_json::json!({
+            "host": "prod.example.com",
+            "user": "ubuntu",
+            "port": 2222,
+            "ssh_opts": "-i ~/.ssh/prod"
+        });
+        let endpoint = RemoteEndpoint::resolve(input.as_object().unwrap()).unwrap();
+
+        assert_eq!(endpoint.target(), "ubuntu@prod.example.com");
+        assert_eq!(
+            endpoint.ssh_argv(),
+            vec![
+                "ssh",
+                "-i",
+                "~/.ssh/prod",
+                "-p",
+                "2222",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "ubuntu@prod.example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn truncate_preserves_utf8_boundaries() {
+        let input = "alpha beta gamma delta 😀";
+        let (output, truncated) = truncate(input, 10);
+
+        assert!(truncated);
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+        assert!(output.contains("[output truncated;"));
+    }
+
+    #[test]
+    fn timed_out_output_marks_failure() {
+        let output = timed_out_output("ssh", b"hello", b"world", Duration::from_millis(125), 64);
+
+        assert!(!output.success);
+        assert!(output.content.contains("[timed out]"));
+        assert_eq!(output.metadata.get("tool"), Some(&json!("ssh")));
+        assert_eq!(output.metadata.get("timed_out"), Some(&Value::Bool(true)));
+    }
+}

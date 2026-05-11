@@ -119,3 +119,69 @@ impl RemoteEntry {
         Ok(output.status.success())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn registry_load_from_missing_file_returns_default() {
+        let dir = tempdir().unwrap();
+        let registry = RemoteRegistry::load_from(&dir.path().join("missing.toml")).unwrap();
+
+        assert!(registry.remotes.is_empty());
+    }
+
+    #[test]
+    fn registry_upsert_replaces_existing_entry() {
+        let mut registry = RemoteRegistry::default();
+        registry.upsert(RemoteEntry {
+            name: "prod".to_owned(),
+            host: "prod-1.example.com".to_owned(),
+            port: 22,
+            user: Some("root".to_owned()),
+            ssh_opts: None,
+        });
+        registry.upsert(RemoteEntry {
+            name: "prod".to_owned(),
+            host: "prod-2.example.com".to_owned(),
+            port: 2222,
+            user: Some("ubuntu".to_owned()),
+            ssh_opts: Some("-i ~/.ssh/prod".to_owned()),
+        });
+
+        assert_eq!(registry.remotes.len(), 1);
+        assert_eq!(registry.get("prod").unwrap().host, "prod-2.example.com");
+        assert_eq!(registry.get("prod").unwrap().port, 2222);
+    }
+
+    #[test]
+    fn remote_entry_ssh_argv_includes_port_user_and_opts() {
+        let entry = RemoteEntry {
+            name: "prod".to_owned(),
+            host: "prod.example.com".to_owned(),
+            port: 2222,
+            user: Some("ubuntu".to_owned()),
+            ssh_opts: Some("-i ~/.ssh/prod -o StrictHostKeyChecking=no".to_owned()),
+        };
+
+        assert_eq!(
+            entry.ssh_argv(),
+            vec![
+                "ssh",
+                "-i",
+                "~/.ssh/prod",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-p",
+                "2222",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "ubuntu@prod.example.com"
+            ]
+        );
+    }
+}

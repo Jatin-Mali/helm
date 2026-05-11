@@ -324,3 +324,64 @@ pub async fn attach(target: &str, token: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helm_agent::RunResult;
+
+    #[test]
+    fn generated_tokens_are_hexish_and_unique() {
+        let left = generate_token();
+        let right = generate_token();
+
+        assert_ne!(left, right);
+        assert!(left.len() > 32);
+        assert!(left.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn write_response_formats_http_status_and_body() {
+        let mut out = Vec::new();
+        write_response(&mut out, 401, "{\"ok\":false}\n")
+            .await
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+        assert!(text.contains("Content-Type: application/json\r\n"));
+        assert!(text.ends_with("{\"ok\":false}\n"));
+    }
+
+    #[test]
+    fn channel_sink_maps_text_delta_and_completion_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = ChannelSink { tx };
+        sink.emit(AgentEvent::TextDelta {
+            chunk: "hello".to_owned(),
+        });
+        sink.emit(AgentEvent::RunFinished {
+            result: RunResult {
+                episode_id: "ep_123".to_owned(),
+                final_message: "done".to_owned(),
+                iterations: 1,
+                tokens_in: 10,
+                tokens_out: 5,
+                last_assistant_text: Some("done".to_owned()),
+                model_capability_warning: None,
+                corrections_used: 0,
+                format_recovery_used: false,
+                total_turns_summarized: 0,
+            },
+        });
+
+        let first = rx.blocking_recv().unwrap();
+        let second = rx.blocking_recv().unwrap();
+
+        assert_eq!(first.event, "text_delta");
+        assert_eq!(first.data, json!({"chunk": "hello"}));
+        assert_eq!(second.event, "run_finished");
+        assert_eq!(second.data["episode_id"], "ep_123");
+        assert_eq!(second.data["final"], "done");
+    }
+}

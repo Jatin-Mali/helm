@@ -157,6 +157,7 @@ impl Default for HttpTool {
 mod tests {
     use serde_json::json;
     use tempfile::tempdir;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     use crate::tool::{Tool, ToolContext};
 
@@ -172,14 +173,29 @@ mod tests {
 
     #[tokio::test]
     async fn empty_body_is_ok() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(_) => {
+                eprintln!("skipping http local-server test: listener unavailable");
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(response).await;
+            }
+        });
         let dir = tempdir().unwrap();
         let tool = HttpTool::default();
         let result = tool
             .execute(
-                json!({"action": "get", "url": "https://httpbin.org/get"}),
+                json!({"action": "get", "url": format!("http://{addr}/ping")}),
                 &ToolContext::new(dir.path().into()),
             )
             .await;
+        server.await.unwrap();
         assert!(result.is_ok());
     }
 }
