@@ -9,9 +9,9 @@ pub mod plan_cache;
 pub mod react;
 pub mod supervisor;
 
-pub use budget::{Budget, BudgetError, BudgetTracker};
+pub use budget::{Budget, BudgetError, BudgetStatus, BudgetTracker, CostBudget};
 pub use cancel::CancellationToken;
-pub use model_router::{ModelRoute, ModelRouter, TaskComplexity};
+pub use model_router::{FallbackChain, ModelRoute, ModelRouter, RouterError, TaskComplexity};
 pub use react::{AgentEvent, AgentEventSink, NoopAgentEventSink, ReactAgent, RunResult};
 pub use supervisor::{
     Evidence, EvidenceRequest, EvidenceVerifier, Plan, PlanStep, StepStatus, Supervisor,

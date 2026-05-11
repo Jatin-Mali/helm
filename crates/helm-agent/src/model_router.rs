@@ -1,6 +1,8 @@
 //! Model router — classifies task complexity and selects the best available model.
+//! Also provides provider fallback chain support for resilience.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 // ── TaskComplexity ────────────────────────────────────────────────────────────
 
@@ -9,6 +11,27 @@ pub enum TaskComplexity {
     Simple,
     Medium,
     Complex,
+}
+
+// ── RouterError ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Error)]
+pub enum RouterError {
+    #[error("All providers in fallback chain exhausted: {reason}")]
+    AllProvidersFailed { reason: String },
+    #[error("No providers configured in fallback chain")]
+    EmptyFallbackChain,
+}
+
+// ── FallbackChain ─────────────────────────────────────────────────────────────
+
+/// Configuration for provider fallback chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FallbackChain {
+    /// Ordered list of provider names (e.g., ["anthropic", "openai", "groq", "ollama"])
+    pub providers: Vec<String>,
+    /// Maximum retry attempts per provider before moving to the next
+    pub max_retries: u32,
 }
 
 // ── ModelRouter ───────────────────────────────────────────────────────────────

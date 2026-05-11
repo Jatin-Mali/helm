@@ -120,6 +120,21 @@ enum Command {
 struct RunArgs {
     #[arg(value_name = "TASK")]
     task: String,
+    /// Comma-separated fallback chain (e.g. "anthropic,openai,groq")
+    #[arg(long, value_name = "PROVIDERS")]
+    fallback: Option<String>,
+    /// Maximum cost in USD; stop if exceeded
+    #[arg(long, value_name = "USD")]
+    budget: Option<f64>,
+    /// Shell command to run before agent starts
+    #[arg(long, value_name = "CMD")]
+    pre_run: Option<String>,
+    /// Shell command to run after agent finishes
+    #[arg(long, value_name = "CMD")]
+    post_run: Option<String>,
+    /// Shell command run before each tool call (env: HELM_TOOL_NAME, HELM_TOOL_INPUT)
+    #[arg(long, value_name = "CMD")]
+    on_tool_call: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -212,8 +227,9 @@ struct UndoArgs {
 
 #[derive(Debug, Args)]
 struct StatsArgs {
-    #[arg(long)]
-    since: Option<String>,
+    /// Time range: "7d" (default), "30d", or "all"
+    #[arg(long, default_value = "7d", value_name = "RANGE")]
+    time_range: String,
 }
 
 #[derive(Debug, Args)]
@@ -3184,8 +3200,12 @@ async fn run_memory_command(args: MemoryArgs, _memory: &Arc<MemoryStore>) -> Res
 }
 
 async fn run_profile_command(args: ProfileArgs, db_path: &Path) -> Result<()> {
-    let profile_path = db_path.parent().map(|p| p.join("profile.db")).ok_or_else(|| anyhow!("invalid db path"))?;
-    let profile = UserProfileStore::open(&profile_path).map_err(|e| anyhow!("profile error: {}", e))?;
+    let profile_path = db_path
+        .parent()
+        .map(|p| p.join("profile.db"))
+        .ok_or_else(|| anyhow!("invalid db path"))?;
+    let profile =
+        UserProfileStore::open(&profile_path).map_err(|e| anyhow!("profile error: {}", e))?;
 
     match args.command {
         ProfileCommand::Show => {

@@ -29,6 +29,8 @@ pub enum EpisodeOutcome {
     Failure,
     /// The task was cancelled by the user (Ctrl+C or token).
     Cancelled,
+    /// The task exceeded the cost budget limit.
+    BudgetExceeded,
 }
 
 impl EpisodeOutcome {
@@ -39,6 +41,7 @@ impl EpisodeOutcome {
             Self::Partial => "partial",
             Self::Failure => "failure",
             Self::Cancelled => "cancelled",
+            Self::BudgetExceeded => "budget_exceeded",
         }
     }
 }

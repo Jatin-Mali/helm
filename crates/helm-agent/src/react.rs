@@ -199,6 +199,34 @@ pub enum AgentEvent {
         /// Failure message.
         error: String,
     },
+    /// Provider failover occurred during fallback chain execution.
+    ProviderFailover {
+        /// Provider being switched from.
+        from: String,
+        /// Provider being switched to.
+        to: String,
+        /// Reason for the failover.
+        reason: String,
+    },
+    /// Budget warning threshold reached.
+    BudgetWarning {
+        /// Amount spent in USD.
+        spent_usd: f64,
+        /// Total budget limit in USD.
+        limit_usd: f64,
+    },
+    /// Budget limit has been exceeded.
+    BudgetExceeded {
+        /// Amount spent in USD.
+        spent_usd: f64,
+        /// Total budget limit in USD.
+        limit_usd: f64,
+    },
+    /// Prompt cache hit on system prompt.
+    PromptCacheHit {
+        /// Number of tokens saved by cache reuse.
+        tokens_saved: u32,
+    },
 }
 
 /// Receives live events from a running agent.

@@ -4,6 +4,67 @@ use std::time::{Duration, Instant};
 
 pub use helm_core::BudgetError;
 
+/// Tracks cost in USD with warning threshold.
+#[derive(Debug, Clone, Copy)]
+pub struct CostBudget {
+    /// Maximum cost in USD for this run.
+    pub limit_usd: f64,
+    /// Warning threshold (0.0-1.0, e.g., 0.8 = warn at 80% of limit).
+    pub warn_threshold: f64,
+    /// Amount spent so far in USD.
+    pub spent_usd: f64,
+}
+
+impl CostBudget {
+    /// Creates a new cost budget with default 80% warning threshold.
+    pub fn new(limit_usd: f64) -> Self {
+        Self {
+            limit_usd,
+            warn_threshold: 0.8,
+            spent_usd: 0.0,
+        }
+    }
+
+    /// Records a cost transaction.
+    pub fn record_cost(&mut self, cost_usd: f64) {
+        self.spent_usd = (self.spent_usd + cost_usd).min(f64::MAX);
+    }
+
+    /// Remaining budget.
+    pub fn remaining(&self) -> f64 {
+        (self.limit_usd - self.spent_usd).max(0.0)
+    }
+
+    /// Current spending as a fraction of the limit (0.0-1.0+).
+    pub fn utilization(&self) -> f64 {
+        self.spent_usd / self.limit_usd.max(0.01)
+    }
+
+    /// Status of the budget.
+    pub fn status(&self) -> BudgetStatus {
+        if self.spent_usd >= self.limit_usd {
+            BudgetStatus::Exceeded
+        } else if self.utilization() >= self.warn_threshold {
+            BudgetStatus::Warning {
+                pct: (self.utilization() * 100.0).round() as u32,
+            }
+        } else {
+            BudgetStatus::Ok
+        }
+    }
+}
+
+/// Status of a cost budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetStatus {
+    /// Normal operation.
+    Ok,
+    /// Warning threshold reached (e.g., 80% of limit).
+    Warning { pct: u32 },
+    /// Budget limit exceeded.
+    Exceeded,
+}
+
 /// Hard limits applied to a single HELM ReAct run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
@@ -104,7 +165,7 @@ impl BudgetTracker {
 mod tests {
     use std::time::Duration;
 
-    use super::{Budget, BudgetError, BudgetTracker};
+    use super::{Budget, BudgetError, BudgetStatus, BudgetTracker, CostBudget};
 
     #[test]
     fn default_budget_happy_path() {
@@ -145,5 +206,44 @@ mod tests {
         let tracker = BudgetTracker::new(budget);
 
         assert_eq!(tracker.check().unwrap_err(), BudgetError::WallTimeout);
+    }
+
+    // ── Cost budget tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn cost_budget_ok_status() {
+        let budget = CostBudget::new(10.0);
+        assert_eq!(budget.status(), BudgetStatus::Ok);
+    }
+
+    #[test]
+    fn cost_budget_warn_at_threshold() {
+        let mut budget = CostBudget::new(10.0);
+        budget.record_cost(8.5);
+        match budget.status() {
+            BudgetStatus::Warning { pct } => assert!(pct >= 85),
+            _ => panic!("Expected warning status"),
+        }
+    }
+
+    #[test]
+    fn cost_budget_exceeded_stops() {
+        let mut budget = CostBudget::new(10.0);
+        budget.record_cost(11.0);
+        assert_eq!(budget.status(), BudgetStatus::Exceeded);
+    }
+
+    #[test]
+    fn cost_budget_remaining_calculation() {
+        let mut budget = CostBudget::new(10.0);
+        budget.record_cost(3.0);
+        assert!((budget.remaining() - 7.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn cost_budget_utilization_ratio() {
+        let mut budget = CostBudget::new(10.0);
+        budget.record_cost(2.5);
+        assert!((budget.utilization() - 0.25).abs() < 0.01);
     }
 }

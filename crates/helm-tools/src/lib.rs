@@ -29,4 +29,4 @@ pub use registry::ToolRegistry;
 pub use search::SearchTool;
 pub use shell::ShellTool;
 pub use tool::{Tool, ToolContext, ToolError, ToolOutput};
-pub use validator::InputValidator;
+pub use validator::{AllowlistConfig, InputValidator};
