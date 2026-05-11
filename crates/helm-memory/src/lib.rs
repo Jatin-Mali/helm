@@ -11,8 +11,8 @@ pub mod user_profile;
 
 pub use episodes::{
     AuditEventInput, AuditEventRecord, AuditVerification, CapabilityGrantRecord, EpisodeId,
-    EpisodeOutcome, EpisodeOutcomeCounts, EpisodeRecord, MemoryStore, StepRecord, StepRole,
-    stable_hash_hex,
+    EpisodeOutcome, EpisodeOutcomeCounts, EpisodeRecord, MemoryStore, RoutingStat, StepRecord,
+    StepRole, stable_hash_hex,
 };
 pub use graph::{Entity, EntityGraph, GraphError, Relation};
 pub use helm_core::MemoryError;

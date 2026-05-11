@@ -818,6 +818,112 @@ impl MemoryStore {
             reason: None,
         })
     }
+
+    /// Record a single routing outcome for `model` (and optionally `provider`).
+    pub async fn record_routing_outcome(
+        &self,
+        model: &str,
+        provider: Option<&str>,
+        success: bool,
+        latency_ms: u64,
+        tokens_in: u32,
+        tokens_out: u32,
+        cost_usd: f64,
+        episode_id: Option<&str>,
+    ) -> Result<(), MemoryError> {
+        let conn = Arc::clone(&self.conn);
+        let model = model.to_owned();
+        let provider = provider.map(str::to_owned);
+        let episode_id = episode_id.map(str::to_owned);
+        let now = chrono::Utc::now().timestamp_millis();
+        tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|e| MemoryError::Sqlite(e.to_string()))?;
+            guard
+                .execute(
+                    "INSERT INTO router_outcomes \
+                     (model, provider, success, latency_ms, tokens_in, tokens_out, cost_usd, episode_id, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        model,
+                        provider,
+                        success as i64,
+                        latency_ms as i64,
+                        tokens_in as i64,
+                        tokens_out as i64,
+                        cost_usd,
+                        episode_id,
+                        now,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            Ok::<(), MemoryError>(())
+        })
+        .await
+        .map_err(|e| MemoryError::Join(e.to_string()))?
+    }
+
+    /// Aggregate routing stats grouped by model.
+    pub async fn routing_stats(&self) -> Result<Vec<RoutingStat>, MemoryError> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|e| MemoryError::Sqlite(e.to_string()))?;
+            let mut stmt = guard
+                .prepare(
+                    "SELECT model, \
+                            COUNT(*) AS total, \
+                            SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS ok, \
+                            AVG(latency_ms) AS avg_latency, \
+                            SUM(cost_usd) AS total_cost \
+                     FROM router_outcomes GROUP BY model ORDER BY total DESC",
+                )
+                .map_err(sqlite_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let total: i64 = row.get(1)?;
+                    let ok: i64 = row.get(2)?;
+                    let avg_latency: Option<f64> = row.get(3)?;
+                    let total_cost: Option<f64> = row.get(4)?;
+                    Ok(RoutingStat {
+                        model: row.get(0)?,
+                        total: total as u64,
+                        successes: ok as u64,
+                        avg_latency_ms: avg_latency.unwrap_or(0.0),
+                        total_cost_usd: total_cost.unwrap_or(0.0),
+                    })
+                })
+                .map_err(sqlite_error)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(sqlite_error)?);
+            }
+            Ok::<Vec<RoutingStat>, MemoryError>(out)
+        })
+        .await
+        .map_err(|e| MemoryError::Join(e.to_string()))?
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoutingStat {
+    pub model: String,
+    pub total: u64,
+    pub successes: u64,
+    pub avg_latency_ms: f64,
+    pub total_cost_usd: f64,
+}
+
+impl RoutingStat {
+    pub fn success_rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.successes as f64) / (self.total as f64)
+        }
+    }
 }
 
 fn count_outcome(conn: &Connection, outcome: &str) -> Result<u32, MemoryError> {
@@ -850,7 +956,8 @@ fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
         4 => apply_0005(conn),
         5 => apply_0006(conn),
         6 => apply_0007(conn),
-        7 => conn
+        7 => apply_0008(conn),
+        8 => conn
             .execute_batch("PRAGMA foreign_keys = ON")
             .map_err(sqlite_error),
         other => Err(MemoryError::Migration(format!(
@@ -943,6 +1050,33 @@ fn apply_0007(conn: &Connection) -> Result<(), MemoryError> {
     )
     .map_err(sqlite_error)?;
     conn.execute_batch("PRAGMA user_version = 7")
+        .map_err(sqlite_error)?;
+    apply_0008(conn)?;
+    Ok(())
+}
+
+fn apply_0008(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .map_err(sqlite_error)?;
+    if !table_exists(conn, "router_outcomes")? {
+        conn.execute_batch(
+            "CREATE TABLE router_outcomes (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                 model TEXT NOT NULL,\
+                 provider TEXT,\
+                 success INTEGER NOT NULL,\
+                 latency_ms INTEGER NOT NULL DEFAULT 0,\
+                 tokens_in INTEGER NOT NULL DEFAULT 0,\
+                 tokens_out INTEGER NOT NULL DEFAULT 0,\
+                 cost_usd REAL NOT NULL DEFAULT 0.0,\
+                 episode_id TEXT,\
+                 created_at INTEGER NOT NULL\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_router_outcomes_model ON router_outcomes(model);",
+        )
+        .map_err(sqlite_error)?;
+    }
+    conn.execute_batch("PRAGMA user_version = 8")
         .map_err(sqlite_error)?;
     Ok(())
 }

@@ -585,6 +585,20 @@ impl ReactAgent {
                 tokens_in: response.usage.input_tokens,
                 tokens_out: response.usage.output_tokens,
             });
+            // Persist a routing outcome so `helm profile routes` reflects observed behavior.
+            let _ = self
+                .memory
+                .record_routing_outcome(
+                    &self.model,
+                    Some(self.provider.name()),
+                    !matches!(response.stop_reason, StopReason::MaxTokens),
+                    0,
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                    0.0,
+                    Some(&episode_id),
+                )
+                .await;
 
             tracker.record_iteration();
             tracker.record_tokens(response.usage.input_tokens, response.usage.output_tokens);

@@ -296,18 +296,63 @@ impl SessionStore {
         let snapshot_id = snapshot_id.to_owned();
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
-            let file_path: String = guard
+            let content: String = guard
                 .query_row(
-                    "SELECT file_path FROM session_snapshots WHERE id = ?1",
+                    "SELECT content_json FROM session_snapshots WHERE id = ?1",
                     params![snapshot_id],
                     |row| row.get(0),
                 )
                 .map_err(sqlite_error)?;
-            let content =
-                fs::read_to_string(&file_path).map_err(|e| MemoryError::Other(e.to_string()))?;
             Ok::<String, MemoryError>(content)
         })
         .await
         .map_err(|e| MemoryError::Join(e.to_string()))?
+    }
+
+    /// Write the snapshot's saved content back to the recorded `file_path`
+    /// (or to `override_path` when supplied). Creates parent dirs and is atomic.
+    pub async fn apply_snapshot(
+        &self,
+        snapshot_id: &str,
+        override_path: Option<PathBuf>,
+    ) -> Result<PathBuf, MemoryError> {
+        let conn = Arc::clone(&self.conn);
+        let snapshot_id = snapshot_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let guard = lock_conn(&conn)?;
+            let (file_path, content): (String, String) = guard
+                .query_row(
+                    "SELECT file_path, content_json FROM session_snapshots WHERE id = ?1",
+                    params![snapshot_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(sqlite_error)?;
+            let target = override_path.unwrap_or_else(|| PathBuf::from(&file_path));
+            if let Some(parent) = target.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.exists()
+            {
+                fs::create_dir_all(parent).map_err(|e| MemoryError::Other(e.to_string()))?;
+            }
+            let tmp = target.with_extension(format!(
+                "helm-snap-{}.tmp",
+                std::process::id()
+            ));
+            fs::write(&tmp, content.as_bytes())
+                .map_err(|e| MemoryError::Other(e.to_string()))?;
+            fs::rename(&tmp, &target).map_err(|e| MemoryError::Other(e.to_string()))?;
+            Ok::<PathBuf, MemoryError>(target)
+        })
+        .await
+        .map_err(|e| MemoryError::Join(e.to_string()))?
+    }
+
+    /// Find the most recent snapshot for a session id.
+    pub async fn latest_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SnapshotRecord>, MemoryError> {
+        let mut snaps = self.list_snapshots(session_id).await?;
+        Ok(snaps.drain(..).next())
     }
 }

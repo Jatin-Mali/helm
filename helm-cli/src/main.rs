@@ -207,6 +207,12 @@ enum SessionsCommand {
     },
     Resume {
         id: String,
+        /// Continue the session by handing this task to the agent with prior conversation context.
+        #[arg(long, value_name = "TASK")]
+        task: Option<String>,
+        /// Print transcript and exit without running a follow-up task.
+        #[arg(long)]
+        show: bool,
     },
 }
 
@@ -226,6 +232,12 @@ struct UndoArgs {
     n: u32,
     #[arg(long)]
     session_id: Option<String>,
+    /// Actually write the snapshot content back to disk (otherwise dry-run prints diff).
+    #[arg(long)]
+    apply: bool,
+    /// Write to this path instead of the recorded file_path.
+    #[arg(long, value_name = "PATH")]
+    to: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -781,25 +793,69 @@ async fn run() -> Result<()> {
                 let content = store.export_session(&id, &format).await?;
                 println!("{content}");
             }
-            SessionsCommand::Resume { id } => {
+            SessionsCommand::Resume { id, task, show } => {
                 let sessions_dir = dirs::data_local_dir()
                     .unwrap_or_else(|| PathBuf::from("~/.local/share"))
                     .join("helm");
-                let db_path = cli
+                let session_db = cli
                     .db_path
                     .clone()
                     .unwrap_or_else(|| sessions_dir.join("helm.db"));
                 let store =
-                    helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots"))
+                    helm_memory::SessionStore::open(&session_db, sessions_dir.join("snapshots"))
                         .await?;
                 let session = store
                     .get_session(&id)
                     .await?
                     .ok_or_else(|| anyhow!("session not found: {}", id))?;
-                println!(
-                    "resuming session: {}\ngoal: {}\nepisode: {}",
-                    session.name, session.goal, session.episode_id
+                let prior_steps = memory.get_steps(&session.episode_id).await?;
+                let prior_episode = memory.episode_by_id(&session.episode_id).await?;
+                let recap = build_session_recap(&session, prior_episode.as_ref(), &prior_steps);
+                println!("{recap}");
+                if show || task.is_none() {
+                    return Ok(());
+                }
+                let task = task.expect("checked is_none above");
+                let provider_choice = resolve_provider_choice(provider_settings.choice);
+                let (provider, model) = build_provider(
+                    &provider_settings.with_choice(provider_choice),
+                    &secrets_store,
+                )?;
+                let mut budget = Budget::default();
+                if let Some(max_iterations) = cli.max_iterations {
+                    budget.max_iterations = max_iterations;
+                }
+                budget.auto_approve = cli.yes;
+                budget.read_only = cli.read_only;
+                let cancel = CancellationToken::new();
+                let agent = ReactAgent::new(
+                    provider,
+                    ToolRegistry::default(),
+                    memory.clone(),
+                    budget,
+                    model,
+                )?
+                .with_cancel_token(cancel.child());
+                let signal_cancel = cancel.child();
+                tokio::spawn(async move {
+                    tokio::signal::ctrl_c().await.ok();
+                    signal_cancel.cancel();
+                });
+                let continuation = format!(
+                    "[Resumed from session {} ({})]\nPrior goal: {}\nPrior outcome: {}\n\nUser asks now: {}",
+                    session.id,
+                    session.name,
+                    session.goal,
+                    prior_episode
+                        .as_ref()
+                        .and_then(|e| e.outcome.as_deref())
+                        .unwrap_or("(in progress)"),
+                    task
                 );
+                let result = agent
+                    .run_with_events(&continuation, &CliProgressSink)
+                    .await?;
+                print_run_result(&result);
             }
         },
         Command::Export(args) => {
@@ -858,12 +914,26 @@ async fn run() -> Result<()> {
                 if snapshots.is_empty() {
                     println!("no snapshots for session {}", sid);
                 } else {
-                    let target = snapshots.get((args.n as usize - 1).min(snapshots.len() - 1));
-                    if let Some(snap) = target {
+                    let idx = (args.n.saturating_sub(1) as usize).min(snapshots.len() - 1);
+                    let snap = &snapshots[idx];
+                    if args.apply {
+                        let written = store
+                            .apply_snapshot(&snap.id, args.to.clone())
+                            .await?;
+                        println!(
+                            "restored snapshot {} (step {}) to {}",
+                            snap.id,
+                            snap.step_index,
+                            written.display()
+                        );
+                    } else {
                         let content = store.restore_snapshot(&snap.id).await?;
                         println!(
-                            "snapshot {} (step {}):\n{}",
-                            snap.id, snap.step_index, content
+                            "snapshot {} (step {}, file {}):\n{}\n[dry-run; pass --apply to write to disk]",
+                            snap.id,
+                            snap.step_index,
+                            snap.file_path.display(),
+                            content
                         );
                     }
                 }
@@ -957,7 +1027,7 @@ async fn run() -> Result<()> {
             run_memory_command(args, &memory).await?;
         }
         Command::Profile(args) => {
-            run_profile_command(args, &db_path).await?;
+            run_profile_command(args, &db_path, &memory).await?;
         }
     }
     Ok(())
@@ -1641,6 +1711,30 @@ fn model_capability_warning_text() -> &'static str {
     "warning: the model emitted tool-shaped JSON in plain text. this usually means\n\
 the model does not support native tool calling. try a tools-capable model:\n\
   qwen3:4b, qwen3:8b, llama3.3:8b, hermes4:8b, mistral-small3:24b"
+}
+
+fn build_session_recap(
+    session: &helm_memory::SessionRecord,
+    episode: Option<&EpisodeRecord>,
+    steps: &[StepRecord],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "resuming session {} ({})\nepisode: {}\ngoal: {}\n",
+        session.id, session.name, session.episode_id, session.goal,
+    ));
+    if let Some(ep) = episode {
+        out.push_str(&format!(
+            "started: {}\nprior outcome: {} ({} iters, {}/{} tokens)\n",
+            format_timestamp(ep.started_at),
+            ep.outcome.as_deref().unwrap_or("running"),
+            ep.iterations,
+            ep.tokens_in,
+            ep.tokens_out,
+        ));
+    }
+    out.push_str(&format!("prior steps: {}\n", steps.len()));
+    out
 }
 
 async fn render_replay(memory: &MemoryStore, episode_id: &str) -> Result<String> {
@@ -3202,7 +3296,11 @@ async fn run_memory_command(args: MemoryArgs, _memory: &Arc<MemoryStore>) -> Res
     Ok(())
 }
 
-async fn run_profile_command(args: ProfileArgs, db_path: &Path) -> Result<()> {
+async fn run_profile_command(
+    args: ProfileArgs,
+    db_path: &Path,
+    memory: &Arc<MemoryStore>,
+) -> Result<()> {
     let profile_path = db_path
         .parent()
         .map(|p| p.join("profile.db"))
@@ -3238,7 +3336,33 @@ async fn run_profile_command(args: ProfileArgs, db_path: &Path) -> Result<()> {
             }
         }
         ProfileCommand::Routes => {
-            println!("Model routing success rates not yet implemented");
+            let stats = memory
+                .routing_stats()
+                .await
+                .map_err(|e| anyhow!("routing stats: {}", e))?;
+            if stats.is_empty() {
+                println!("No routing outcomes recorded yet.");
+                println!(
+                    "Run agents with multiple providers (e.g. `helm run --fallback ...`) to populate routing data."
+                );
+            } else {
+                println!(
+                    "{:<32} {:>7} {:>7} {:>9} {:>10}",
+                    "MODEL", "RUNS", "OK%", "AVG_MS", "COST_USD"
+                );
+                for s in stats {
+                    let model_label: String =
+                        s.model.chars().take(32).collect();
+                    println!(
+                        "{:<32} {:>7} {:>6.1}% {:>9.0} {:>10.4}",
+                        model_label,
+                        s.total,
+                        s.success_rate() * 100.0,
+                        s.avg_latency_ms,
+                        s.total_cost_usd,
+                    );
+                }
+            }
         }
     }
     Ok(())
