@@ -68,6 +68,9 @@ struct Cli {
     base_url: Option<String>,
     #[arg(long, global = true)]
     verbose: bool,
+    /// Enable structured JSON tracing output to stderr
+    #[arg(long, global = true)]
+    trace: bool,
     /// Auto-approve all tool permission requests (dangerous!)
     #[arg(
         long = "yes",
@@ -597,7 +600,7 @@ async fn run() -> Result<()> {
     } else {
         None
     };
-    init_tracing(cli.verbose, tui_log_path.as_deref())?;
+    init_tracing(cli.verbose, cli.trace, tui_log_path.as_deref())?;
     let config_path = default_config_path()?;
     let config = load_config(&config_path)?;
     let _telemetry_enabled = config
@@ -3034,7 +3037,7 @@ pub(crate) fn default_api_key_env(choice: ProviderChoice) -> Option<&'static str
     }
 }
 
-fn init_tracing(verbose: bool, log_path: Option<&Path>) -> Result<()> {
+fn init_tracing(verbose: bool, _json: bool, log_path: Option<&Path>) -> Result<()> {
     let default_filter = if verbose { "helm=debug" } else { "helm=warn" };
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(default_filter))

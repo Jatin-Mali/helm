@@ -3,12 +3,14 @@
 use std::{env, path::Path, sync::Arc};
 
 use futures::future::join_all;
-use helm_core::{Capability, ContentBlock, HelmError, ProviderError, Taint};
+use helm_core::{
+    Capability, ContentBlock, HelmError, ProviderError, Taint, ValidationError, Validator,
+};
 use helm_memory::{AuditEventInput, EpisodeOutcome, MemoryStore, StepRole, stable_hash_hex};
 use helm_providers::{ChatRequest, ChatResponse, Provider, ProviderQuirks, StopReason, quirks_for};
 use helm_tools::{ToolContext, ToolRegistry};
 use serde_json::Value;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
     budget::{Budget, BudgetTracker},
@@ -227,6 +229,29 @@ pub enum AgentEvent {
         /// Number of tokens saved by cache reuse.
         tokens_saved: u32,
     },
+    /// Permission denied due to role-based access control.
+    PermissionDenied {
+        /// Tool name that was denied.
+        tool_name: String,
+        /// User role that attempted the tool.
+        role: String,
+        /// Reason for denial.
+        reason: String,
+    },
+    /// Input validation failed (injection detection).
+    ValidationFailed {
+        /// User input that failed validation.
+        input: String,
+        /// Validation error reason.
+        reason: String,
+    },
+    /// Breakpoint hit during episode replay.
+    BreakpointHit {
+        /// Step index where breakpoint triggered.
+        step_index: u32,
+        /// Tool name at breakpoint.
+        tool_name: String,
+    },
 }
 
 /// Receives live events from a running agent.
@@ -331,6 +356,7 @@ impl ReactAgent {
     }
 
     /// Runs one ReAct episode and emits live progress events to `sink`.
+    #[instrument(skip(self, sink), fields(goal = %goal, provider = %self.provider.name(), model = %self.model))]
     pub async fn run_with_events(
         &self,
         goal: &str,
@@ -341,6 +367,24 @@ impl ReactAgent {
             episode_id: episode_id.clone(),
             goal: goal.to_owned(),
         });
+
+        // Validate prompt for injection attacks.
+        if let Err(e) = Validator::validate_prompt(goal) {
+            let reason = match e {
+                ValidationError::PromptInjection(_) => {
+                    "Prompt injection pattern detected".to_string()
+                }
+                ValidationError::ShellInjection(_) => {
+                    "Shell injection pattern detected".to_string()
+                }
+                ValidationError::BlockedUrl(_) => "Blocked URL detected".to_string(),
+            };
+            sink.emit(AgentEvent::ValidationFailed {
+                input: goal.to_owned(),
+                reason: reason.clone(),
+            });
+            return Err(HelmError::ValidationFailed(reason));
+        }
 
         // Check plan cache for exact goal match before planning.
         if let Some(ref cache) = self.plan_cache {

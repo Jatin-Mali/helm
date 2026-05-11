@@ -2,6 +2,7 @@
 
 pub mod episodes;
 pub mod graph;
+pub mod merge_episodes;
 pub mod procedures;
 pub mod sessions;
 pub mod skill_learner;
@@ -15,8 +16,9 @@ pub use episodes::{
 };
 pub use graph::{Entity, EntityGraph, GraphError, Relation};
 pub use helm_core::MemoryError;
+pub use merge_episodes::{ConflictResolution, MergeConflict, MergeResult};
 pub use procedures::{Procedure, ProcedureError, ProcedureStep, ProcedureStore};
 pub use sessions::{SessionRecord, SessionStore, SnapshotRecord};
 pub use skill_learner::{LearnResult, SkillLearner, SkillLearnerError};
 pub use skills::{Skill, SkillError, SkillsManager};
-pub use user_profile::{UserPreferences, UserProfileError, UserProfileStore, Verbosity};
+pub use user_profile::{Role, UserPreferences, UserProfileError, UserProfileStore, Verbosity};

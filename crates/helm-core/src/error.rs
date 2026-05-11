@@ -25,6 +25,9 @@ pub enum HelmError {
     /// The run budget was exhausted.
     #[error("budget error: {0}")]
     Budget(#[from] BudgetError),
+    /// Input validation failed (e.g., injection attacks detected).
+    #[error("validation error: {0}")]
+    ValidationFailed(String),
 }
 
 /// Error type returned by language model providers.

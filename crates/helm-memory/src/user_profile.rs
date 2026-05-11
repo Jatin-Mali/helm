@@ -22,6 +22,48 @@ pub enum UserProfileError {
 
 // ── Domain types ──────────────────────────────────────────────────────────────
 
+/// Role-based access control for HELM operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// All capabilities granted.
+    Admin,
+    /// Read, shell, tools — no config changes or secrets delete.
+    #[default]
+    User,
+    /// Read-only operations only.
+    Viewer,
+}
+
+impl Role {
+    /// Returns the stable string representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::User => "user",
+            Role::Viewer => "viewer",
+        }
+    }
+
+    /// Parse from string.
+    fn from_str(s: &str) -> Self {
+        match s {
+            "admin" => Role::Admin,
+            "viewer" => Role::Viewer,
+            _ => Role::User,
+        }
+    }
+
+    /// Returns true if this role is allowed to use the given capability.
+    pub fn allows(&self, cap: &str) -> bool {
+        match self {
+            Role::Admin => true,
+            Role::User => !matches!(cap, "secrets.delete" | "config.write" | "audit.delete"),
+            Role::Viewer => matches!(cap, "read" | "list" | "view" | "fs.read" | "network.out"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Verbosity {
@@ -56,6 +98,7 @@ pub struct UserPreferences {
     pub timezone: Option<String>,
     pub correction_count: u32,
     pub last_goal: Option<String>,
+    pub current_role: Role,
 }
 
 // ── UserProfileStore ──────────────────────────────────────────────────────────
@@ -84,17 +127,19 @@ impl UserProfileStore {
     pub fn get(&self) -> Result<UserPreferences, UserProfileError> {
         let conn = lock(&self.conn)?;
         let result = conn.query_row(
-            "SELECT preferred_model, verbosity, timezone, correction_count, last_goal
+            "SELECT preferred_model, verbosity, timezone, correction_count, last_goal, current_role
              FROM user_profile WHERE id = 1",
             [],
             |row| {
                 let verbosity_str: String = row.get(1)?;
+                let role_str: String = row.get(5)?;
                 Ok(UserPreferences {
                     preferred_model: row.get(0)?,
                     verbosity: Verbosity::from_str(&verbosity_str),
                     timezone: row.get(2)?,
                     correction_count: row.get::<_, i64>(3)? as u32,
                     last_goal: row.get(4)?,
+                    current_role: Role::from_str(&role_str),
                 })
             },
         );
@@ -240,6 +285,31 @@ impl UserProfileStore {
             .optional()?;
         Ok(result)
     }
+
+    pub fn set_role(&self, role: Role) -> Result<(), UserProfileError> {
+        let conn = lock(&self.conn)?;
+        conn.execute(
+            "INSERT INTO user_profile (id, current_role) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET current_role = excluded.current_role",
+            params![role.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_role(&self) -> Result<Role, UserProfileError> {
+        let conn = lock(&self.conn)?;
+        let result = conn
+            .query_row(
+                "SELECT current_role FROM user_profile WHERE id = 1",
+                [],
+                |row| {
+                    let role_str: String = row.get(0)?;
+                    Ok(Role::from_str(&role_str))
+                },
+            )
+            .optional()?;
+        Ok(result.unwrap_or_default())
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -257,6 +327,7 @@ fn run_migrations(conn: &Connection) -> Result<(), UserProfileError> {
             timezone         TEXT,
             correction_count INTEGER NOT NULL DEFAULT 0,
             last_goal        TEXT,
+            current_role     TEXT NOT NULL DEFAULT 'user',
             updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         );
         CREATE TABLE IF NOT EXISTS tool_outcomes (
@@ -278,7 +349,7 @@ fn run_migrations(conn: &Connection) -> Result<(), UserProfileError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{UserProfileStore, Verbosity};
+    use super::{Role, UserProfileStore, Verbosity};
 
     fn store() -> UserProfileStore {
         UserProfileStore::open_in_memory().unwrap()
@@ -364,5 +435,26 @@ mod tests {
         let tools = s.get_preferred_tools(10).await.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].0, "shell");
+    }
+
+    #[test]
+    fn role_allows_checks_capabilities() {
+        assert!(Role::Admin.allows("anything"));
+        assert!(Role::User.allows("shell.exec"));
+        assert!(!Role::User.allows("secrets.delete"));
+        assert!(!Role::User.allows("config.write"));
+        assert!(Role::Viewer.allows("fs.read"));
+        assert!(Role::Viewer.allows("network.out"));
+        assert!(!Role::Viewer.allows("shell.exec"));
+    }
+
+    #[test]
+    fn set_and_get_role_happy_path() {
+        let s = store();
+        assert_eq!(s.get_role().unwrap(), Role::User);
+        s.set_role(Role::Admin).unwrap();
+        assert_eq!(s.get_role().unwrap(), Role::Admin);
+        s.set_role(Role::Viewer).unwrap();
+        assert_eq!(s.get_role().unwrap(), Role::Viewer);
     }
 }

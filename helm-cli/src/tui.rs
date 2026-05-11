@@ -1437,7 +1437,10 @@ impl TuiApp {
                 self.push_chat(MessageRole::Activity, msg.clone());
                 self.record_tool_event("failover", format!("{}->{}", from, to), reason);
             }
-            AgentEvent::BudgetWarning { spent_usd, limit_usd } => {
+            AgentEvent::BudgetWarning {
+                spent_usd,
+                limit_usd,
+            } => {
                 let pct = ((spent_usd / limit_usd) * 100.0).round() as u32;
                 let msg = format!(
                     "[budget warning] ${:.2} spent of ${:.2} ({pct}%)",
@@ -1446,7 +1449,10 @@ impl TuiApp {
                 self.push_chat(MessageRole::Error, msg.clone());
                 self.record_tool_event("budget", "warning", msg);
             }
-            AgentEvent::BudgetExceeded { spent_usd, limit_usd } => {
+            AgentEvent::BudgetExceeded {
+                spent_usd,
+                limit_usd,
+            } => {
                 let msg = format!(
                     "[budget exceeded] ${:.2} spent exceeds limit ${:.2}",
                     spent_usd, limit_usd
@@ -1457,6 +1463,28 @@ impl TuiApp {
             AgentEvent::PromptCacheHit { tokens_saved } => {
                 let msg = format!("[cache hit] {} tokens saved", tokens_saved);
                 self.record_tool_event("cache", "prompt", msg);
+            }
+            AgentEvent::PermissionDenied {
+                tool_name,
+                role,
+                reason,
+            } => {
+                let msg = format!("[DENIED] {} ({}) — {}", tool_name, role, reason);
+                self.push_chat(MessageRole::Error, msg.clone());
+                self.record_tool_event("permission", "denied", msg);
+            }
+            AgentEvent::ValidationFailed { input: _, reason } => {
+                let msg = format!("[VALIDATION ERROR] {}", reason);
+                self.push_chat(MessageRole::Error, msg.clone());
+                self.record_tool_event("validation", "failed", msg);
+            }
+            AgentEvent::BreakpointHit {
+                step_index,
+                tool_name,
+            } => {
+                let msg = format!("[BREAKPOINT] step {} — {}", step_index, tool_name);
+                self.push_chat(MessageRole::Activity, msg.clone());
+                self.record_tool_event("breakpoint", "hit", msg);
             }
             AgentEvent::RunFinished { .. }
             | AgentEvent::RunFailed { .. }
