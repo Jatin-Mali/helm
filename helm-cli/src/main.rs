@@ -1,9 +1,13 @@
 //! Command-line entry point for HELM.
 
+mod agent_remote;
 mod attach_tui;
+mod bootstrap;
 mod custom_commands;
 mod hooks;
 mod keybindings;
+mod ndjson_sink;
+mod paths;
 mod remote;
 mod sandbox;
 mod secrets;
@@ -90,15 +94,21 @@ struct Cli {
     /// Plan mode: read-only analysis, no writes or executions
     #[arg(long = "read-only", alias = "plan", global = true)]
     read_only: bool,
-    /// Confine tool execution to a fresh sandbox directory (writes outside it are denied).
+    /// Confine local tool execution with Bubblewrap. Default root is the current working directory.
     #[arg(long, global = true)]
     sandbox: bool,
-    /// Use this directory as the sandbox root (default: fresh temp dir).
+    /// Use this directory as the Bubblewrap sandbox root instead of the current directory.
     #[arg(long, value_name = "PATH", global = true)]
     sandbox_dir: Option<PathBuf>,
     /// Execute shell-style tool calls on the named remote host (registered via `helm remote add`).
     #[arg(long, value_name = "NAME", global = true)]
     remote: Option<String>,
+    /// Resume a specific session id for the next `run`.
+    #[arg(long, value_name = "ID", global = true)]
+    resume: Option<String>,
+    /// Resume the latest session when running a new task.
+    #[arg(long = "continue", global = true)]
+    continue_last: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -132,12 +142,16 @@ enum Command {
     Export(ExportArgs),
     /// Manage file snapshots and undo/redo
     Undo(UndoArgs),
+    /// Re-apply the last undone file snapshot for a session
+    Redo(UndoArgs),
     /// Show cost and usage statistics
     Stats(StatsArgs),
     /// Manage knowledge graph and memory
     Memory(MemoryArgs),
     /// Manage user profile and preferences
     Profile(ProfileArgs),
+    /// Bootstrap HELM onto a reachable Linux host over SSH
+    Bootstrap(BootstrapArgs),
 }
 
 #[derive(Debug, Args)]
@@ -159,6 +173,12 @@ struct RunArgs {
     /// Shell command run before each tool call (env: HELM_TOOL_NAME, HELM_TOOL_INPUT)
     #[arg(long, value_name = "CMD")]
     on_tool_call: Option<String>,
+    /// Emit each agent event as a newline-delimited JSON line on stdout (used by `--remote`).
+    #[arg(long)]
+    emit_events: bool,
+    /// When combined with --remote, force agent-on-remote execution via SSH (NDJSON stream).
+    #[arg(long)]
+    agent_on_remote: bool,
 }
 
 #[derive(Debug, Args)]
@@ -254,6 +274,28 @@ struct RemoteAddArgs {
     /// Optional inline SSH options (e.g. "-i ~/.ssh/id_ed25519").
     #[arg(long)]
     ssh_opts: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct BootstrapArgs {
+    /// Hostname or `user@host` to bootstrap.
+    #[arg(value_name = "HOST")]
+    host: String,
+    /// SSH user override (use this if HOST is bare).
+    #[arg(long, value_name = "USER")]
+    user: Option<String>,
+    /// SSH port; default 22.
+    #[arg(long, default_value_t = 22)]
+    port: u16,
+    /// Download the helm binary on the remote from this URL instead of uploading the local one.
+    #[arg(long, value_name = "URL")]
+    release_url: Option<String>,
+    /// Register the bootstrapped target in ~/.helm/remotes.toml under this name.
+    #[arg(long, value_name = "NAME")]
+    register_as: Option<String>,
+    /// Path to a local helm binary to upload. Defaults to the currently running binary.
+    #[arg(long, value_name = "PATH")]
+    local_binary: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -388,14 +430,22 @@ struct AuditArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuditCommand {
-    Verify,
+    Verify(AuditVerifyArgs),
     Show(AuditShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct AuditVerifyArgs {
+    #[arg(long, value_name = "TARGET")]
+    target: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct AuditShowArgs {
     #[arg(long, value_name = "EPISODE_ID")]
     episode: Option<String>,
+    #[arg(long, value_name = "TARGET")]
+    target: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -686,35 +736,21 @@ async fn main() -> ExitCode {
     }
 }
 
-fn apply_sandbox(enabled: bool, sandbox_dir: Option<&PathBuf>) -> Result<Option<PathBuf>> {
-    if !enabled {
-        return Ok(None);
+fn apply_sandbox(
+    enabled: bool,
+    sandbox_dir: Option<&PathBuf>,
+) -> Result<Option<sandbox::ResolvedSandbox>> {
+    let resolved = sandbox::resolve(enabled, sandbox_dir)?;
+    if let Some(policy) = &resolved {
+        eprintln!(
+            "[sandbox] bubblewrap enabled with root {}",
+            policy.display_root().display()
+        );
     }
-
-    // Check if bubblewrap is available (future: use real sandboxing).
-    if sandbox::is_bubblewrap_available() {
-        eprintln!("[sandbox] bwrap available - future: true sandboxing");
-    } else {
-        eprintln!("[sandbox] bwrap not available - using directory-based isolation");
-    }
-
-    let path = match sandbox_dir {
-        Some(p) => {
-            std::fs::create_dir_all(p)
-                .with_context(|| format!("creating sandbox dir {}", p.display()))?;
-            p.clone()
-        }
-        None => tempfile::Builder::new()
-            .prefix("helm-sandbox-")
-            .tempdir()?
-            .keep(),
-    };
-    env::set_current_dir(&path).with_context(|| format!("cd into sandbox {}", path.display()))?;
-    eprintln!("[sandbox] working dir set to {}", path.display());
-    Ok(Some(path))
+    Ok(resolved)
 }
 
-fn wrap_for_remote(task: &str, remote: Option<&String>) -> String {
+pub(crate) fn wrap_for_remote(task: &str, remote: Option<&String>) -> String {
     match remote {
         Some(name) => format!(
             "[Operating against remote target `{name}`. Use the `ssh`, `scp`, and `rsync` tools and always pass `\"remote\": \"{name}\"` in their inputs. Do NOT use the local `shell` tool for anything that should run on the remote.]\n\n{task}"
@@ -725,7 +761,7 @@ fn wrap_for_remote(task: &str, remote: Option<&String>) -> String {
 
 async fn run() -> Result<()> {
     let cli = parse_cli_from(env::args_os())?;
-    let _sandbox_path = apply_sandbox(cli.sandbox, cli.sandbox_dir.as_ref())?;
+    let sandbox = apply_sandbox(cli.sandbox, cli.sandbox_dir.as_ref())?;
     let tui_log_path = if matches!(cli.command, Command::Tui(_)) {
         Some(default_log_path()?)
     } else {
@@ -761,6 +797,35 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Command::Run(args) => {
+            if args.agent_on_remote {
+                let remote_name = cli.remote.as_deref().ok_or_else(|| {
+                    anyhow!("--agent-on-remote requires --remote <name> to be set")
+                })?;
+                let registry = remote::RemoteRegistry::load()?;
+                let entry = registry.get(remote_name).cloned().ok_or_else(|| {
+                    anyhow!(
+                        "remote target `{remote_name}` not in registry — register it via `helm remote add` or `helm bootstrap --register-as {remote_name}`"
+                    )
+                })?;
+                let sink = CliProgressSink;
+                let outcome = agent_remote::run_on_remote(&entry, &args.task, &sink, &[]).await?;
+                if let Some(message) = outcome.final_message.as_deref() {
+                    println!("{message}");
+                } else if let Some(err) = outcome.error.as_deref() {
+                    eprintln!("[remote] error: {err}");
+                }
+                eprintln!(
+                    "[remote] tokens in {} · tokens out {} · iterations {}",
+                    outcome.tokens_in, outcome.tokens_out, outcome.iterations
+                );
+                return if outcome.ok() {
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        outcome.error.unwrap_or_else(|| "remote run failed".into())
+                    ))
+                };
+            }
             if config.is_none() && provider_settings.source == ProviderSource::Fallback {
                 eprintln!("HELM is not configured yet.");
                 eprintln!("Run `helm init` to choose a provider and set your API key.");
@@ -773,6 +838,8 @@ async fn run() -> Result<()> {
                 eprintln!("info: --read-only mode — write/exec operations will be denied");
             }
             let provider_choice = resolve_provider_choice(provider_settings.choice);
+
+            let resume_target = resolve_resume_target(cli.resume.as_deref(), cli.continue_last);
 
             // Parse fallback chain from --fallback arg.
             let fallback_chain = args
@@ -803,10 +870,8 @@ async fn run() -> Result<()> {
             budget.read_only = cli.read_only;
 
             // Open session store for snapshotting (U5, U7).
-            let sessions_dir = dirs::data_local_dir()
-                .ok_or_else(|| anyhow!("could not resolve data directory"))?
-                .join("helm");
-            let snapshots_dir = sessions_dir.join("snapshots");
+            let sessions_dir = paths::default_snapshots_path();
+            let snapshots_dir = sessions_dir;
             let session_store = Arc::new(
                 SessionStore::open(&db_path, snapshots_dir)
                     .await
@@ -814,25 +879,47 @@ async fn run() -> Result<()> {
             );
 
             // Create session before run start (U7).
-            let session_name = format!("run-{}", chrono::Utc::now().format("%Y%m%d-%H%M"));
-            let working_dir = std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned());
-            let session_id = session_store
-                .create_session(
-                    &session_name,
-                    &args.task,
-                    "".to_string(),
-                    provider_settings
-                        .model
-                        .clone()
-                        .or_else(|| Some(default_model_name(provider_choice).to_owned())),
-                    None,
-                    working_dir,
-                )
-                .await
-                .context("creating session")?;
-            eprintln!("[session] created session {} for run", session_id);
+            let resumed_session = match resume_target {
+                Some(target) => Some(
+                    resolve_session_for_resume(&session_store, target)
+                        .await
+                        .context("resolving session to resume")?,
+                ),
+                None => None,
+            };
+            let tool_working_dir = sandbox
+                .as_ref()
+                .map(|resolved| resolved.root_dir.clone())
+                .or_else(|| {
+                    resumed_session
+                        .as_ref()
+                        .and_then(|session| session.working_dir.as_deref())
+                        .map(PathBuf::from)
+                })
+                .unwrap_or(std::env::current_dir().unwrap_or_default());
+            let working_dir = Some(tool_working_dir.to_string_lossy().into_owned());
+            let (session_id, session_label) = if let Some(session) = resumed_session.as_ref() {
+                eprintln!("[session] resuming {} ({})", session.id, session.name);
+                (session.id.clone(), session.name.clone())
+            } else {
+                let session_name = derive_session_name(&args.task);
+                let session_id = session_store
+                    .create_session(
+                        &session_name,
+                        &args.task,
+                        "".to_string(),
+                        provider_settings
+                            .model
+                            .clone()
+                            .or_else(|| Some(default_model_name(provider_choice).to_owned())),
+                        None,
+                        working_dir,
+                    )
+                    .await
+                    .context("creating session")?;
+                eprintln!("[session] created session {} for run", session_id);
+                (session_id, session_name)
+            };
 
             let hooks = hooks::load(
                 args.pre_run.clone(),
@@ -846,18 +933,36 @@ async fn run() -> Result<()> {
                 signal_cancel.cancel();
             });
             let hooks_ref = hooks.clone();
-            let effective_task = wrap_for_remote(&args.task, cli.remote.as_ref());
+            let resumed_task = if let Some(session) = resumed_session.as_ref() {
+                let prior_steps = memory.get_steps(&session.episode_id).await?;
+                let prior_episode = memory.episode_by_id(&session.episode_id).await?;
+                let continuation = format!(
+                    "{}\n\nUser asks now: {}",
+                    build_session_recap(session, prior_episode.as_ref(), &prior_steps),
+                    args.task
+                );
+                continuation
+            } else {
+                args.task.clone()
+            };
+            let effective_task = wrap_for_remote(&resumed_task, cli.remote.as_ref());
             hooks::fire_pre_run(&hooks, &effective_task, cli.remote.as_deref()).await?;
 
             // Wrap sink for snapshots (U5).
-            let base_sink =
-                hooks::HookEventSink::new(CliProgressSink, &hooks_ref, cli.remote.clone());
-            let working_dir = std::env::current_dir().unwrap_or_default();
+            let base: ndjson_sink::DynSink = if args.emit_events {
+                ndjson_sink::DynSink::new(ndjson_sink::TeeSink::new(
+                    CliProgressSink,
+                    ndjson_sink::NdjsonSink::new(),
+                ))
+            } else {
+                ndjson_sink::DynSink::new(CliProgressSink)
+            };
+            let base_sink = hooks::HookEventSink::new(base, &hooks_ref, cli.remote.clone());
             let sink = snapshot_sink::SnapshotSink::new(
                 base_sink,
                 session_store.clone(),
                 Some(session_id.clone()),
-                working_dir,
+                tool_working_dir.clone(),
             );
             let mut last_error: Option<anyhow::Error> = None;
             let mut actual_provider_choice = provider_choice;
@@ -895,13 +1000,21 @@ async fn run() -> Result<()> {
                         model
                     );
                 }
-                let agent = ReactAgent::new(
+                let mut tool_context = ToolContext::new(tool_working_dir.clone());
+                if let Some(policy) = sandbox.as_ref() {
+                    tool_context = tool_context.with_sandbox(policy.policy());
+                }
+                if let Some(remote_target) = cli.remote.as_deref() {
+                    tool_context = tool_context.with_remote_target(remote_target.to_owned());
+                }
+                let agent = ReactAgent::with_tool_context(
                     provider,
                     ToolRegistry::default(),
                     memory.clone(),
                     budget,
                     model.clone(),
-                )?
+                    tool_context,
+                )
                 .with_cancel_token(cancel.child());
                 match agent.run_with_events(&effective_task, &sink).await {
                     Ok(run_result) => {
@@ -970,6 +1083,7 @@ async fn run() -> Result<()> {
                 tracing::warn!("session update failed: {}", e);
             }
 
+            eprintln!("[session] updated {} ({session_label})", session_id);
             print_run_result(&result);
         }
         Command::Replay(args) => {
@@ -1017,10 +1131,20 @@ async fn run() -> Result<()> {
             }
         },
         Command::Audit(args) => match args.command {
-            AuditCommand::Verify => {
-                let verification = memory.verify_audit_chain().await?;
+            AuditCommand::Verify(args) => {
+                let verification = memory
+                    .verify_audit_chain_for_target(args.target.as_deref())
+                    .await?;
                 if verification.ok {
-                    println!("audit ok: checked {} event(s)", verification.checked);
+                    match args.target.as_deref() {
+                        Some(target) => {
+                            println!(
+                                "audit ok for {target}: checked {} event(s)",
+                                verification.checked
+                            )
+                        }
+                        None => println!("audit ok: checked {} event(s)", verification.checked),
+                    }
                 } else {
                     println!(
                         "audit FAILED at event {}: {}",
@@ -1033,7 +1157,9 @@ async fn run() -> Result<()> {
                 }
             }
             AuditCommand::Show(args) => {
-                let report = render_audit_events(&memory, args.episode.as_deref()).await?;
+                let report =
+                    render_audit_events(&memory, args.episode.as_deref(), args.target.as_deref())
+                        .await?;
                 print!("{report}");
             }
         },
@@ -1198,44 +1324,10 @@ async fn run() -> Result<()> {
             }
         }
         Command::Undo(args) => {
-            let sessions_dir = dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-                .join("helm");
-            let db_path = cli
-                .db_path
-                .clone()
-                .unwrap_or_else(|| sessions_dir.join("helm.db"));
-            let store =
-                helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots")).await?;
-            if let Some(sid) = args.session_id {
-                let snapshots = store.list_snapshots(&sid).await?;
-                if snapshots.is_empty() {
-                    println!("no snapshots for session {}", sid);
-                } else {
-                    let idx = (args.n.saturating_sub(1) as usize).min(snapshots.len() - 1);
-                    let snap = &snapshots[idx];
-                    if args.apply {
-                        let written = store.apply_snapshot(&snap.id, args.to.clone()).await?;
-                        println!(
-                            "restored snapshot {} (step {}) to {}",
-                            snap.id,
-                            snap.step_index,
-                            written.display()
-                        );
-                    } else {
-                        let content = store.restore_snapshot(&snap.id).await?;
-                        println!(
-                            "snapshot {} (step {}, file {}):\n{}\n[dry-run; pass --apply to write to disk]",
-                            snap.id,
-                            snap.step_index,
-                            snap.file_path.display(),
-                            content
-                        );
-                    }
-                }
-            } else {
-                println!("use --session-id to specify a session for undo");
-            }
+            run_snapshot_command(cli.db_path.clone(), args, false).await?;
+        }
+        Command::Redo(args) => {
+            run_snapshot_command(cli.db_path.clone(), args, true).await?;
         }
         Command::Stats(_args) => {
             let counts = memory.episode_outcome_counts().await?;
@@ -1326,6 +1418,8 @@ async fn run() -> Result<()> {
                         .unwrap_or(true),
                     auto_approve: cli.yes,
                     read_only: cli.read_only,
+                    sandbox: sandbox.clone(),
+                    remote_target: cli.remote.clone(),
                 })
                 .await?;
             }
@@ -1351,6 +1445,41 @@ async fn run() -> Result<()> {
             )
             .await?;
         }
+        Command::Bootstrap(args) => {
+            run_bootstrap_command(args).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_bootstrap_command(args: BootstrapArgs) -> Result<()> {
+    let (parsed_user, host) = match args.host.split_once('@') {
+        Some((u, h)) => (Some(u.to_owned()), h.to_owned()),
+        None => (None, args.host.clone()),
+    };
+    let user = args.user.or(parsed_user);
+    let plan = bootstrap::BootstrapPlan {
+        host,
+        user,
+        port: args.port,
+        release_url: args.release_url.clone(),
+        register_as: args.register_as.clone(),
+    };
+    let local_binary = match args.local_binary {
+        Some(p) => p,
+        None => env::current_exe().context("locating local helm binary")?,
+    };
+    let report = bootstrap::run(plan, local_binary).await?;
+    println!("[bootstrap] host: {}", report.host);
+    println!("[bootstrap] remote uname: {}", report.remote_uname);
+    println!("[bootstrap] helm version: {}", report.remote_helm_version);
+    println!("[bootstrap] installed at: {}", report.installed_path);
+    if let Some(name) = report.registered_as.as_deref() {
+        println!("[bootstrap] registered as `{name}` in ~/.helm/remotes.toml");
+    } else {
+        println!(
+            "[bootstrap] (target not registered. Pass --register-as <name> to add to remotes registry.)"
+        );
     }
     Ok(())
 }
@@ -1921,6 +2050,7 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "sessions"
                 | "export"
                 | "undo"
+                | "redo"
                 | "stats"
                 | "memory"
                 | "profile"
@@ -1942,7 +2072,8 @@ fn is_value_taking_flag(arg: &OsString) -> bool {
                 | "--base-url"
                 | "--ollama-url"
                 | "--sandbox-dir"
-                | "--remote",
+                | "--remote"
+                | "--resume",
         )
     )
 }
@@ -2045,7 +2176,7 @@ the model does not support native tool calling. try a tools-capable model:\n\
   qwen3:4b, qwen3:8b, llama3.3:8b, hermes4:8b, mistral-small3:24b"
 }
 
-fn build_session_recap(
+pub(crate) fn build_session_recap(
     session: &helm_memory::SessionRecord,
     episode: Option<&EpisodeRecord>,
     steps: &[StepRecord],
@@ -2078,6 +2209,124 @@ async fn render_replay(memory: &MemoryStore, episode_id: &str) -> Result<String>
     Ok(format_transcript(&episode, &steps))
 }
 
+fn resolve_resume_target(resume: Option<&str>, continue_last: bool) -> Option<&str> {
+    if let Some(resume) = resume {
+        Some(resume)
+    } else if continue_last {
+        Some("latest")
+    } else {
+        None
+    }
+}
+
+async fn resolve_session_for_resume(
+    store: &SessionStore,
+    target: &str,
+) -> Result<helm_memory::SessionRecord> {
+    if target == "latest" {
+        return store
+            .latest_session()
+            .await?
+            .ok_or_else(|| anyhow!("no sessions available to resume"));
+    }
+    store
+        .get_session(target)
+        .await?
+        .ok_or_else(|| anyhow!("session not found: {target}"))
+}
+
+fn derive_session_name(goal: &str) -> String {
+    let mut parts = Vec::new();
+    for word in goal.split_whitespace() {
+        let clean: String = word
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect();
+        if !clean.is_empty() {
+            parts.push(clean);
+        }
+        if parts.len() >= 6 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        format!("run-{}", chrono::Utc::now().format("%Y%m%d-%H%M"))
+    } else {
+        parts.join("-")
+    }
+}
+
+async fn run_snapshot_command(
+    db_override: Option<PathBuf>,
+    args: UndoArgs,
+    redo: bool,
+) -> Result<()> {
+    let sessions_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+        .join("helm");
+    let db_path = db_override.unwrap_or_else(|| sessions_dir.join("helm.db"));
+    let store = helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots")).await?;
+    let Some(session_id) = args.session_id.as_deref() else {
+        let verb = if redo { "redo" } else { "undo" };
+        println!("use --session-id to specify a session for {verb}");
+        return Ok(());
+    };
+    let snapshots = if redo {
+        store.list_redo_snapshots(session_id).await?
+    } else {
+        store.list_snapshots(session_id).await?
+    };
+    if snapshots.is_empty() {
+        let verb = if redo { "redo" } else { "undo" };
+        println!("no {verb} snapshots for session {}", session_id);
+        return Ok(());
+    }
+    let idx = (args.n.saturating_sub(1) as usize).min(snapshots.len() - 1);
+    let snap = &snapshots[idx];
+    if args.apply {
+        if !redo {
+            let current_content = fs::read_to_string(&snap.file_path)
+                .with_context(|| format!("reading {}", snap.file_path.display()))?;
+            store
+                .take_redo_snapshot(
+                    session_id,
+                    snap.step_index,
+                    &current_content,
+                    &snap.file_path,
+                )
+                .await?;
+        }
+        let written = if redo {
+            store.apply_redo_snapshot(&snap.id, args.to.clone()).await?
+        } else {
+            store.apply_snapshot(&snap.id, args.to.clone()).await?
+        };
+        let verb = if redo { "reapplied" } else { "restored" };
+        println!(
+            "{verb} snapshot {} (step {}) to {}",
+            snap.id,
+            snap.step_index,
+            written.display()
+        );
+    } else {
+        let content = if redo {
+            store.restore_redo_snapshot(&snap.id).await?
+        } else {
+            store.restore_snapshot(&snap.id).await?
+        };
+        let label = if redo { "redo snapshot" } else { "snapshot" };
+        println!(
+            "{label} {} (step {}, file {}):\n{}\n[dry-run; pass --apply to write to disk]",
+            snap.id,
+            snap.step_index,
+            snap.file_path.display(),
+            content
+        );
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 async fn create_session_for_run(
     db_path: &Path,
@@ -2091,7 +2340,7 @@ async fn create_session_for_run(
         .join("helm");
     let snapshots_dir = sessions_dir.join("snapshots");
     let store = helm_memory::SessionStore::open(db_path, snapshots_dir).await?;
-    let session_name = format!("run-{}", chrono::Utc::now().format("%Y%m%d-%H%M"));
+    let session_name = derive_session_name(goal);
     store
         .create_session(
             &session_name,
@@ -2235,12 +2484,20 @@ fn grant_status(grant: &CapabilityGrantRecord) -> &'static str {
     }
 }
 
-async fn render_audit_events(memory: &MemoryStore, episode: Option<&str>) -> Result<String> {
-    let events = memory.audit_events(episode).await?;
+async fn render_audit_events(
+    memory: &MemoryStore,
+    episode: Option<&str>,
+    target: Option<&str>,
+) -> Result<String> {
+    let events = memory.audit_events(episode, target).await?;
     Ok(format_audit_events(&events))
 }
 
-fn set_toml_path(root: &mut toml::Value, parts: &[&str], value: toml::Value) -> Result<()> {
+pub(crate) fn set_toml_path(
+    root: &mut toml::Value,
+    parts: &[&str],
+    value: toml::Value,
+) -> Result<()> {
     if parts.is_empty() {
         return Err(anyhow!("invalid empty key path"));
     }
@@ -2582,16 +2839,18 @@ async fn interactive_init(
 }
 
 fn format_audit_events(events: &[AuditEventRecord]) -> String {
-    let mut output =
-        String::from("ID  DECISION CAPABILITY      TAINT              TOOL       EPISODE\n");
+    let mut output = String::from(
+        "ID  DECISION CAPABILITY      TAINT              TOOL       TARGET           EPISODE\n",
+    );
     for event in events {
         output.push_str(&format!(
-            "{:<3} {:<8} {:<15} {:<18} {:<10} {}\n",
+            "{:<3} {:<8} {:<15} {:<18} {:<10} {:<16} {}\n",
             event.id,
             event.decision,
             event.capability,
             event.taint,
             event.tool_name,
+            event.target.as_deref().unwrap_or("-"),
             event.episode_id.as_deref().unwrap_or("-")
         ));
     }
@@ -3584,18 +3843,15 @@ impl Write for LogFileWriter {
 }
 
 fn default_db_path() -> Result<PathBuf> {
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".helm").join("helm.db"))
+    Ok(paths::default_db_path())
 }
 
 fn default_log_path() -> Result<PathBuf> {
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".helm").join("helm.log"))
+    Ok(paths::default_log_path())
 }
 
 fn default_config_path() -> Result<PathBuf> {
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".helm").join("config.toml"))
+    Ok(paths::default_config_path())
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -3632,10 +3888,7 @@ async fn run_memory_command(args: MemoryArgs, _memory: &Arc<MemoryStore>) -> Res
     use helm_memory::EntityGraph;
 
     // Get or create graph at a standard location
-    let graph_path = dirs::data_local_dir()
-        .ok_or_else(|| anyhow!("could not determine data directory"))?
-        .join("helm")
-        .join("graph.db");
+    let graph_path = paths::default_graph_path();
 
     if let Some(parent) = graph_path.parent() {
         fs::create_dir_all(parent).context("failed to create graph directory")?;
@@ -4148,6 +4401,14 @@ mod tests {
                 command: super::AuditCommand::Show(_)
             })
         ));
+
+        let verify = parse_cli_from(["helm", "audit", "verify", "--target", "prod-1"]).unwrap();
+        assert!(matches!(
+            verify.command,
+            super::Command::Audit(super::AuditArgs {
+                command: super::AuditCommand::Verify(_)
+            })
+        ));
     }
 
     #[test]
@@ -4223,6 +4484,37 @@ mod tests {
         let parsed = parse_cli_from(["helm", "--yes", "--read-only", "run", "list files"]).unwrap();
         assert!(parsed.yes);
         assert!(parsed.read_only);
+    }
+
+    #[test]
+    fn continue_flag_parses_with_bare_task() {
+        let parsed = parse_cli_from(["helm", "--continue", "investigate nginx"]).unwrap();
+        assert!(parsed.continue_last);
+        assert!(matches!(parsed.command, super::Command::Run(_)));
+    }
+
+    #[test]
+    fn resume_flag_parses_with_specific_session_id() {
+        let parsed =
+            parse_cli_from(["helm", "--resume", "sess-123", "run", "continue work"]).unwrap();
+        assert_eq!(parsed.resume.as_deref(), Some("sess-123"));
+        assert!(matches!(parsed.command, super::Command::Run(_)));
+    }
+
+    #[test]
+    fn redo_command_parses() {
+        let parsed =
+            parse_cli_from(["helm", "redo", "--session-id", "sess-123", "--apply"]).unwrap();
+        assert!(matches!(parsed.command, super::Command::Redo(_)));
+    }
+
+    #[test]
+    fn derive_session_name_prefers_goal_words() {
+        assert_eq!(
+            super::derive_session_name("Find why nginx leaks memory and patch it"),
+            "find-why-nginx-leaks-memory-and"
+        );
+        assert!(super::derive_session_name("!!!").starts_with("run-"));
     }
 
     #[test]

@@ -10,7 +10,10 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{
+    fs_read::validate_canonical_path,
+    tool::{Tool, ToolContext, ToolError, ToolOutput},
+};
 
 pub struct SearchTool;
 
@@ -38,6 +41,7 @@ impl SearchTool {
             .hidden(true)
             .ignore(true)
             .git_ignore(true)
+            .add_custom_ignore_filename(".helmignore")
             .build();
 
         let mut results = Vec::new();
@@ -110,6 +114,7 @@ impl SearchTool {
             .hidden(true)
             .ignore(true)
             .git_ignore(true)
+            .add_custom_ignore_filename(".helmignore")
             .build();
 
         let globber = Glob::new(pattern)
@@ -166,6 +171,13 @@ impl Tool for SearchTool {
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .unwrap_or_else(|| ctx.working_dir.clone());
+        let search_root = if path.is_absolute() {
+            path
+        } else {
+            ctx.working_dir.join(path)
+        };
+        let canonical_root = search_root.canonicalize().map_err(ToolError::IoError)?;
+        validate_canonical_path(&canonical_root, ctx)?;
 
         let pattern = input
             .get("pattern")
@@ -180,8 +192,8 @@ impl Tool for SearchTool {
         let file_pattern = input.get("file_pattern").and_then(Value::as_str);
 
         let content = match action {
-            "grep" => self.run_grep(&path, pattern, file_pattern, max)?,
-            "glob" => self.run_glob(&path, pattern, max)?,
+            "grep" => self.run_grep(&canonical_root, pattern, file_pattern, max)?,
+            "glob" => self.run_glob(&canonical_root, pattern, max)?,
             _ => {
                 return Err(ToolError::InvalidInput(format!(
                     "unsupported action: {action}"
@@ -190,7 +202,7 @@ impl Tool for SearchTool {
         };
 
         let mut metadata = Map::new();
-        metadata.insert("path".into(), json!(path.to_string_lossy()));
+        metadata.insert("path".into(), json!(canonical_root.to_string_lossy()));
         metadata.insert("matches".into(), json!(content.lines().count()));
 
         Ok(ToolOutput {

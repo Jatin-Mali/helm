@@ -7,11 +7,16 @@
 
 #![allow(dead_code)]
 
-use std::{collections::HashMap, env, path::PathBuf, process::Stdio, sync::Arc};
+use crate::paths::config_dir;
 
 use anyhow::{Context, Result};
 use helm_agent::{AgentEvent, AgentEventSink};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::env;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -36,9 +41,7 @@ pub struct ToolHook {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?;
-    Ok(home.join(".helm").join("hooks.toml"))
+    Ok(config_dir().join("hooks.toml"))
 }
 
 pub fn load_global() -> HooksConfig {

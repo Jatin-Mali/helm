@@ -39,6 +39,12 @@ pub struct Skill {
     pub approved: bool,
     /// Filesystem path containing the skill markdown.
     pub source_path: PathBuf,
+    /// Whether this is a formal skill (skill.toml + SKILL.md bundle).
+    #[serde(default)]
+    pub is_formal: bool,
+    /// Prerequisites for this skill (formal skills only).
+    #[serde(default)]
+    pub prerequisites: Option<crate::Prerequisites>,
 }
 
 /// Skills manager backed by markdown files under a configured directory.
@@ -48,12 +54,17 @@ pub struct SkillsManager {
 }
 
 impl SkillsManager {
-    /// Creates a skills manager rooted at `~/.helm/skills`.
+    /// Creates a skills manager rooted at `$XDG_DATA_HOME/helm/skills` (or fallback).
     pub fn new() -> Self {
-        let home = std::env::var_os("HOME")
+        let skills_dir = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        Self::with_dir(home.join(".helm").join("skills"))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+            })
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("helm")
+            .join("skills");
+        Self::with_dir(skills_dir)
     }
 
     /// Creates a skills manager for an explicit directory.
@@ -148,7 +159,54 @@ impl SkillsManager {
         if !skill_file.exists() {
             return Ok(None);
         }
-        self.load_skill_from_file(&skill_file)
+        let skill_id = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_owned();
+
+        if let Some(toml_path) = dir
+            .join("skill.toml")
+            .exists()
+            .then_some(dir.join("skill.toml"))
+        {
+            if let Ok(toml_content) = std::fs::read_to_string(&toml_path) {
+                if let Ok(formal) = crate::formal_skill::parse_skill_toml(&toml_content) {
+                    let skill_md = if skill_file.exists() {
+                        std::fs::read_to_string(&skill_file)?
+                    } else {
+                        String::new()
+                    };
+                    return Ok(Some(Skill {
+                        id: formal.skill.id.clone(),
+                        name: formal.skill.name.clone(),
+                        description: formal.skill.description.short(),
+                        version: formal.skill.resolved_version(),
+                        content: skill_md,
+                        approved: false,
+                        source_path: dir.to_path_buf(),
+                        is_formal: true,
+                        prerequisites: Some(formal.prerequisites),
+                    }));
+                }
+            }
+        }
+
+        if let Some(inner) = self.load_skill_from_file(&skill_file)? {
+            Ok(Some(Skill {
+                id: skill_id,
+                name: inner.name,
+                description: inner.description,
+                version: inner.version,
+                content: inner.content,
+                approved: inner.approved,
+                source_path: inner.source_path,
+                is_formal: false,
+                prerequisites: None,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     fn load_skill_from_file(&self, path: &Path) -> Result<Option<Skill>, SkillError> {
@@ -173,6 +231,8 @@ impl SkillsManager {
             content,
             approved,
             source_path: path.to_path_buf(),
+            is_formal: false,
+            prerequisites: None,
         }))
     }
 

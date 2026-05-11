@@ -3,12 +3,23 @@
 use jsonschema::Validator;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::tool::ToolError;
 
-// dirs is already in workspace.dependencies
-use dirs;
 use toml;
+
+fn xdg_config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("helm")
+}
+
+fn allowlist_path() -> std::path::PathBuf {
+    xdg_config_dir().join("allowlist.toml")
+}
 
 // ── AllowlistConfig ───────────────────────────────────────────────────────────
 
@@ -16,21 +27,24 @@ use toml;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllowlistConfig {
     /// Shell command glob patterns (allow list). Empty = allow all.
+    #[serde(default)]
     pub shell_patterns: Vec<String>,
+    /// Domains explicitly allowed for HTTP/network tools. Empty = allow all.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
     /// Domains to block in HTTP/network tools.
+    #[serde(default)]
     pub blocked_domains: Vec<String>,
     /// File path glob patterns to ignore (like .gitignore).
+    #[serde(default)]
     pub helmignore_patterns: Vec<String>,
 }
 
 impl AllowlistConfig {
-    /// Load from ~/.helm/allowlist.toml if it exists.
+    /// Load from `$XDG_CONFIG_HOME/helm/allowlist.toml` if it exists.
     /// Returns permissive defaults if file doesn't exist.
     pub fn load() -> Result<Self, ToolError> {
-        let allowlist_path = dirs::home_dir()
-            .ok_or_else(|| ToolError::InvalidInput("No home directory".to_string()))?
-            .join(".helm")
-            .join("allowlist.toml");
+        let allowlist_path = allowlist_path();
 
         if !allowlist_path.exists() {
             return Ok(Self::permissive());
@@ -46,6 +60,7 @@ impl AllowlistConfig {
     pub fn permissive() -> Self {
         Self {
             shell_patterns: Vec::new(),
+            allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             helmignore_patterns: Vec::new(),
         }
@@ -246,6 +261,7 @@ mod tests {
     fn shell_allowlist_blocks_disallowed() {
         let config = AllowlistConfig {
             shell_patterns: vec!["ls".to_string(), "cat".to_string()],
+            allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             helmignore_patterns: Vec::new(),
         };
@@ -259,6 +275,7 @@ mod tests {
     fn domain_blocklist_blocks_domain() {
         let config = AllowlistConfig {
             shell_patterns: Vec::new(),
+            allowed_domains: Vec::new(),
             blocked_domains: vec!["evil.com".to_string(), "malware.io".to_string()],
             helmignore_patterns: Vec::new(),
         };
@@ -271,6 +288,7 @@ mod tests {
     fn helmignore_blocks_matched_path() {
         let config = AllowlistConfig {
             shell_patterns: Vec::new(),
+            allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             helmignore_patterns: vec!["*.log".to_string(), ".env".to_string()],
         };

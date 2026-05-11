@@ -117,7 +117,10 @@ async fn browser_origin_prompt_injection_cannot_trigger_shell_shell() {
         .await
         .unwrap();
     let steps = memory.get_steps(&result.episode_id).await.unwrap();
-    let audit = memory.audit_events(Some(&result.episode_id)).await.unwrap();
+    let audit = memory
+        .audit_events(Some(&result.episode_id), None)
+        .await
+        .unwrap();
 
     assert!(steps.iter().any(|step| {
         step.content.iter().any(|block| {

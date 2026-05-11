@@ -32,6 +32,19 @@ pub struct ToolContext {
     pub timeout: Duration,
     /// Maximum output bytes before tool output is truncated.
     pub max_output_bytes: usize,
+    /// Bubblewrap-based filesystem confinement, when enabled.
+    pub sandbox: Option<SandboxPolicy>,
+    /// Named remote target associated with this run, if any.
+    pub remote_target: Option<String>,
+}
+
+/// Bubblewrap-based confinement settings for local tool execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPolicy {
+    /// Writable root exposed inside the sandbox.
+    pub root_dir: PathBuf,
+    /// Absolute path to the `bwrap` executable.
+    pub bwrap_program: PathBuf,
 }
 
 impl ToolContext {
@@ -41,7 +54,21 @@ impl ToolContext {
             working_dir,
             timeout: Duration::from_secs(120),
             max_output_bytes: 1024 * 1024,
+            sandbox: None,
+            remote_target: None,
         }
+    }
+
+    /// Returns a copy of the context with Bubblewrap confinement enabled.
+    pub fn with_sandbox(mut self, policy: SandboxPolicy) -> Self {
+        self.sandbox = Some(policy);
+        self
+    }
+
+    /// Returns a copy of the context tagged with a remote target name.
+    pub fn with_remote_target(mut self, target: impl Into<String>) -> Self {
+        self.remote_target = Some(target.into());
+        self
     }
 }
 
@@ -62,7 +89,7 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{ToolContext, ToolOutput};
+    use super::{SandboxPolicy, ToolContext, ToolOutput};
 
     #[test]
     fn context_defaults_happy_path() {
@@ -71,6 +98,8 @@ mod tests {
         assert_eq!(ctx.working_dir, PathBuf::from("/tmp"));
         assert_eq!(ctx.timeout, Duration::from_secs(120));
         assert_eq!(ctx.max_output_bytes, 1024 * 1024);
+        assert!(ctx.sandbox.is_none());
+        assert!(ctx.remote_target.is_none());
     }
 
     #[test]
@@ -95,5 +124,24 @@ mod tests {
         };
 
         assert_eq!(output.metadata.get("truncated"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn context_can_enable_sandbox_and_remote_target() {
+        let ctx = ToolContext::new(PathBuf::from("/work"))
+            .with_sandbox(SandboxPolicy {
+                root_dir: PathBuf::from("/work"),
+                bwrap_program: PathBuf::from("/usr/bin/bwrap"),
+            })
+            .with_remote_target("prod-1");
+
+        assert_eq!(
+            ctx.sandbox,
+            Some(SandboxPolicy {
+                root_dir: PathBuf::from("/work"),
+                bwrap_program: PathBuf::from("/usr/bin/bwrap"),
+            })
+        );
+        assert_eq!(ctx.remote_target.as_deref(), Some("prod-1"));
     }
 }

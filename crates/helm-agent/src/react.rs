@@ -21,6 +21,7 @@ use crate::{
     plan_cache::PlanCache,
     supervisor::EvidenceVerifier,
 };
+use helm_memory::SkillLearner;
 
 const DEFAULT_SYSTEM_PROMPT: &str = r#"You are HELM, a Linux operations agent. The user has given you a task.
 
@@ -62,6 +63,7 @@ pub struct ReactAgent {
     forced_initial_taint: Option<Taint>,
     cancel_token: Option<crate::cancel::CancellationToken>,
     plan_cache: Option<Arc<PlanCache>>,
+    skill_learner: Option<Arc<SkillLearner>>,
 }
 
 /// Live event emitted while an agent run is executing.
@@ -321,6 +323,7 @@ impl ReactAgent {
             forced_initial_taint: None,
             cancel_token: None,
             plan_cache: None,
+            skill_learner: None,
         }
     }
 
@@ -334,6 +337,12 @@ impl ReactAgent {
     /// Attaches a plan cache for goal-hash-based plan reuse.
     pub fn with_plan_cache(mut self, cache: Arc<PlanCache>) -> Self {
         self.plan_cache = Some(cache);
+        self
+    }
+
+    /// Attaches a skill learner for skill suggestion and learning.
+    pub fn with_skill_learner(mut self, learner: Arc<SkillLearner>) -> Self {
+        self.skill_learner = Some(learner);
         self
     }
 
@@ -798,6 +807,25 @@ impl ReactAgent {
                             None,
                         )
                         .await?;
+
+                    // Emit skill suggestions for successful episodes.
+                    if let Some(ref learner) = self.skill_learner {
+                        if let Ok(matches) = learner.find_matching_skills(goal, 0.6).await {
+                            for m in matches.into_iter().take(3) {
+                                sink.emit(AgentEvent::SkillSuggested {
+                                    skill_id: m.skill_id,
+                                    skill_name: m.skill_name,
+                                    tool_sequence: m.tool_sequence,
+                                    confidence: m.confidence,
+                                });
+                            }
+                        }
+                        // Also learn from this successful episode.
+                        if let Err(e) = learner.extract_skills_from_episode(&episode_id).await {
+                            trace!(error = %e, "skill learning failed");
+                        }
+                    }
+
                     let result = RunResult::from_parts(
                         RunResultParts {
                             episode_id,
@@ -1128,6 +1156,7 @@ impl ReactAgent {
             serde_json::to_string(audit.input).unwrap_or_else(|_| "<invalid-json>".to_owned());
         let event = AuditEventInput {
             episode_id: Some(audit.episode_id.to_owned()),
+            target: self.tool_context.remote_target.clone(),
             tool_name: audit.tool_name.to_owned(),
             input_hash: stable_hash_hex(&input_text),
             output_hash: audit.output_hash.to_owned(),
@@ -1948,7 +1977,10 @@ mod tests {
 
         let result = agent.run("external tried shell").await.unwrap();
         let steps = memory.get_steps(&result.episode_id).await.unwrap();
-        let audit = memory.audit_events(Some(&result.episode_id)).await.unwrap();
+        let audit = memory
+            .audit_events(Some(&result.episode_id), None)
+            .await
+            .unwrap();
 
         assert_eq!(result.final_message, "denied safely");
         assert!(steps.iter().any(|step| {
@@ -1996,7 +2028,10 @@ mod tests {
         });
 
         let result = agent.run("external approved shell").await.unwrap();
-        let audit = memory.audit_events(Some(&result.episode_id)).await.unwrap();
+        let audit = memory
+            .audit_events(Some(&result.episode_id), None)
+            .await
+            .unwrap();
 
         assert_eq!(result.final_message, "allowed");
         assert_eq!(audit[0].decision, "allow");

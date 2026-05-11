@@ -6,15 +6,26 @@ use async_trait::async_trait;
 use reqwest::{Client, Method};
 use serde_json::{Value, json};
 
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{
+    tool::{Tool, ToolContext, ToolError, ToolOutput},
+    validator::AllowlistConfig,
+};
 
 pub struct HttpTool {
     client: Client,
     allowed_domains: HashSet<String>,
+    blocked_domains: HashSet<String>,
 }
 
 impl HttpTool {
     pub fn new(allowed_domains: HashSet<String>) -> Self {
+        Self::with_policies(allowed_domains, HashSet::new())
+    }
+
+    pub fn with_policies(
+        allowed_domains: HashSet<String>,
+        blocked_domains: HashSet<String>,
+    ) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -22,16 +33,22 @@ impl HttpTool {
         Self {
             client,
             allowed_domains,
+            blocked_domains,
         }
     }
 
     fn check_domain(&self, url: &str) -> Result<(), ToolError> {
-        if self.allowed_domains.is_empty() {
-            return Ok(());
-        }
         let parsed = url::Url::parse(url)
             .map_err(|e| ToolError::InvalidInput(format!("invalid URL: {e}")))?;
         let host = parsed.host_str().unwrap_or("");
+        if self.blocked_domains.contains(host) {
+            return Err(ToolError::InvalidInput(format!(
+                "domain '{host}' blocked by ~/.helm/allowlist.toml"
+            )));
+        }
+        if self.allowed_domains.is_empty() {
+            return Ok(());
+        }
         if !self.allowed_domains.contains(host) {
             return Err(ToolError::InvalidInput(format!(
                 "domain '{host}' not in allowlist: {:?}",
@@ -149,7 +166,11 @@ impl Tool for HttpTool {
 
 impl Default for HttpTool {
     fn default() -> Self {
-        Self::new(HashSet::new())
+        let config = AllowlistConfig::load().unwrap_or_else(|_| AllowlistConfig::permissive());
+        Self::with_policies(
+            config.allowed_domains.into_iter().collect(),
+            config.blocked_domains.into_iter().collect(),
+        )
     }
 }
 

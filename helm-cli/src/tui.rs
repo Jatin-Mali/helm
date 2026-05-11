@@ -36,11 +36,12 @@ use ratatui::{
 use serde::Deserialize;
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
 
-use crate::secrets::SecretsStore;
 use crate::{
     ProviderChoice, ProviderSettings, build_provider, custom_commands, default_api_key_env,
-    default_model_name, keybindings::KeyMap, provider_choice_name, write_helm_config,
+    default_model_name, keybindings::KeyMap, provider_choice_name, remote::RemoteRegistry,
+    wrap_for_remote, write_helm_config,
 };
+use crate::{sandbox::ResolvedSandbox, secrets::SecretsStore};
 
 const APP_BG: Color = Color::Rgb(11, 19, 30);
 const APP_FG: Color = Color::Rgb(208, 214, 224);
@@ -147,6 +148,8 @@ pub(crate) struct TuiRuntime {
     pub(crate) tui_paste_key_modal: bool,
     pub(crate) auto_approve: bool,
     pub(crate) read_only: bool,
+    pub(crate) sandbox: Option<ResolvedSandbox>,
+    pub(crate) remote_target: Option<String>,
 }
 
 /// Starts the interactive terminal UI.
@@ -368,11 +371,9 @@ enum ModalState {
     },
     Error(String),
     Help,
-    #[allow(dead_code)]
     ThemeSelector {
         selected: usize,
     },
-    #[allow(dead_code)]
     CostMeter {
         session_tokens_in: u64,
         session_tokens_out: u64,
@@ -437,6 +438,7 @@ enum CommandAction {
     Clear,
     Replay,
     Doctor,
+    Remote,
     Provider,
     Model,
     Permissions,
@@ -446,6 +448,17 @@ enum CommandAction {
     Init,
     Sessions,
     Resume,
+    Config,
+    Theme,
+    Keybindings,
+    Stats,
+    Mcp,
+    Compact,
+    Diff,
+    Tools,
+    Undo,
+    Redo,
+    Cost,
     Quit,
     Help,
 }
@@ -525,6 +538,7 @@ impl CommandAction {
             Self::Clear,
             Self::Replay,
             Self::Doctor,
+            Self::Remote,
             Self::Provider,
             Self::Model,
             Self::Permissions,
@@ -534,6 +548,17 @@ impl CommandAction {
             Self::Init,
             Self::Sessions,
             Self::Resume,
+            Self::Config,
+            Self::Theme,
+            Self::Keybindings,
+            Self::Stats,
+            Self::Mcp,
+            Self::Compact,
+            Self::Diff,
+            Self::Tools,
+            Self::Undo,
+            Self::Redo,
+            Self::Cost,
             Self::Quit,
             Self::Help,
         ]
@@ -545,6 +570,7 @@ impl CommandAction {
             Self::Clear => "Clear Transcript",
             Self::Replay => "Replay Episode",
             Self::Doctor => "Doctor",
+            Self::Remote => "Remote Target",
             Self::Provider => "Provider Selector",
             Self::Model => "Model Selector",
             Self::Permissions => "Permissions",
@@ -554,6 +580,17 @@ impl CommandAction {
             Self::Init => "Init AGENTS.md",
             Self::Sessions => "Sessions",
             Self::Resume => "Resume",
+            Self::Config => "Config Editor",
+            Self::Theme => "Theme Selector",
+            Self::Keybindings => "Keybindings",
+            Self::Stats => "Stats",
+            Self::Mcp => "MCP Servers",
+            Self::Compact => "Compact",
+            Self::Diff => "Diff Last Edit",
+            Self::Tools => "Tools",
+            Self::Undo => "Undo",
+            Self::Redo => "Redo",
+            Self::Cost => "Cost Meter",
             Self::Quit => "Quit",
             Self::Help => "Help",
         }
@@ -565,6 +602,7 @@ impl CommandAction {
             Self::Clear => "clear",
             Self::Replay => "replay",
             Self::Doctor => "doctor",
+            Self::Remote => "remote",
             Self::Provider => "provider",
             Self::Model => "model",
             Self::Permissions => "permissions",
@@ -574,6 +612,17 @@ impl CommandAction {
             Self::Init => "init",
             Self::Sessions => "sessions",
             Self::Resume => "resume",
+            Self::Config => "config",
+            Self::Theme => "theme",
+            Self::Keybindings => "keybindings",
+            Self::Stats => "stats",
+            Self::Mcp => "mcp",
+            Self::Compact => "compact",
+            Self::Diff => "diff",
+            Self::Tools => "tools",
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+            Self::Cost => "cost",
             Self::Quit => "quit",
             Self::Help => "help",
         }
@@ -585,6 +634,7 @@ impl CommandAction {
             Self::Clear => "clear the visible transcript",
             Self::Replay => "show replay command for this episode",
             Self::Doctor => "show provider and system diagnostics hint",
+            Self::Remote => "show or switch the active remote target",
             Self::Provider => "switch LLM backend",
             Self::Model => "edit active model id",
             Self::Permissions => "grant or inspect capabilities",
@@ -594,6 +644,17 @@ impl CommandAction {
             Self::Init => "generate AGENTS.md in the current project",
             Self::Sessions => "show session-resume guidance",
             Self::Resume => "show resume guidance",
+            Self::Config => "view or edit config inline (/config key=value)",
+            Self::Theme => "switch theme (/theme dracula)",
+            Self::Keybindings => "show keybinding overrides at ~/.helm/keybindings.json",
+            Self::Stats => "show token usage and cost since today",
+            Self::Mcp => "list MCP servers",
+            Self::Compact => "summarize transcript to reclaim context",
+            Self::Diff => "show diff of the last fs_write",
+            Self::Tools => "list loaded tools and capabilities",
+            Self::Undo => "undo last agent file edit",
+            Self::Redo => "redo last undone agent edit",
+            Self::Cost => "open the session cost meter",
             Self::Quit => "exit HELM",
             Self::Help => "keyboard shortcuts and commands",
         }
@@ -606,15 +667,27 @@ impl CommandAction {
             Self::Clear => slug == "clear",
             Self::Replay => slug == "replay",
             Self::Doctor => slug == "doctor",
+            Self::Remote => slug == "remote",
             Self::Provider => slug == "provider",
             Self::Model => slug == "model",
             Self::Permissions => slug == "permissions",
             Self::Audit => slug == "audit",
             Self::Skills => slug == "skills",
-            Self::Browser => matches!(slug, "browser" | "tools"),
+            Self::Browser => slug == "browser",
             Self::Init => slug == "init",
             Self::Sessions => slug == "sessions",
             Self::Resume => slug == "resume",
+            Self::Config => slug == "config",
+            Self::Theme => slug == "theme",
+            Self::Keybindings => matches!(slug, "keybindings" | "keybinds" | "keys"),
+            Self::Stats => matches!(slug, "stats" | "usage"),
+            Self::Mcp => slug == "mcp",
+            Self::Compact => slug == "compact",
+            Self::Diff => slug == "diff",
+            Self::Tools => slug == "tools",
+            Self::Undo => slug == "undo",
+            Self::Redo => slug == "redo",
+            Self::Cost => slug == "cost",
             Self::Help => slug == "help",
         }
     }
@@ -669,6 +742,7 @@ pub struct TuiApp {
     spinner: usize,
     provider_name: String,
     model: String,
+    active_remote: Option<String>,
     status_note: String,
     catalog_cache: HashMap<ProviderChoice, CachedModelCatalog>,
     pending_tool_summaries: HashMap<String, String>,
@@ -680,6 +754,7 @@ pub struct TuiApp {
     pending_auth_retry: Option<String>,
     session_tokens_in: u32,
     session_tokens_out: u32,
+    resume_context: Option<String>,
     #[allow(dead_code)]
     theme: Theme,
 }
@@ -697,6 +772,7 @@ struct TuiRuntimeInner {
     max_iterations: Option<u32>,
     secrets: SecretsStore,
     tui_paste_key_modal: bool,
+    sandbox: Option<ResolvedSandbox>,
 }
 
 impl TuiApp {
@@ -738,6 +814,7 @@ impl TuiApp {
                 max_iterations: runtime.max_iterations,
                 secrets: runtime.secrets,
                 tui_paste_key_modal: runtime.tui_paste_key_modal,
+                sandbox: runtime.sandbox,
             }),
             active_settings,
             session: SessionState::default(),
@@ -755,6 +832,7 @@ impl TuiApp {
             spinner: 0,
             provider_name,
             model,
+            active_remote: runtime.remote_target,
             status_note: "ready".to_owned(),
             catalog_cache: HashMap::new(),
             pending_tool_summaries: HashMap::new(),
@@ -766,6 +844,7 @@ impl TuiApp {
             pending_auth_retry: None,
             session_tokens_in: 0,
             session_tokens_out: 0,
+            resume_context: None,
             theme: Theme::default(),
         }
     }
@@ -1343,6 +1422,35 @@ impl TuiApp {
                 }
                 _ => {}
             },
+            Some(ModalState::ThemeSelector { .. }) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Up => {
+                    if let Some(ModalState::ThemeSelector { selected }) = &mut self.modal {
+                        *selected = selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(ModalState::ThemeSelector { selected }) = &mut self.modal {
+                        let max = Theme::all().len().saturating_sub(1);
+                        *selected = (*selected + 1).min(max);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(ModalState::ThemeSelector { selected }) = self.modal.clone() {
+                        let themes = Theme::all();
+                        if let Some(theme) = themes.get(selected).cloned() {
+                            let label = theme.name().to_owned();
+                            self.theme = theme;
+                            self.push_chat(
+                                MessageRole::System,
+                                format!("[theme] switched to {label}"),
+                            );
+                        }
+                    }
+                    self.modal = None;
+                }
+                _ => {}
+            },
             Some(_) => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     self.modal = None;
@@ -1375,8 +1483,10 @@ impl TuiApp {
             let mut parts = command_text.trim().splitn(2, char::is_whitespace);
             let slug = parts.next().unwrap_or("");
             let args = parts.next().unwrap_or("").trim();
-            if let Some(command) = CommandAction::from_slug(slug) {
-                self.execute_command(command);
+            if slug == "remote" {
+                self.apply_remote_target(args);
+            } else if let Some(command) = CommandAction::from_slug(slug) {
+                self.execute_command_with_args(command, args);
             } else if let Some(command) = self
                 .custom_commands
                 .iter()
@@ -1392,7 +1502,42 @@ impl TuiApp {
             }
             return Ok(());
         }
+        if let Some(raw_query) = task.strip_prefix('#') {
+            self.push_chat(MessageRole::User, task.clone());
+            self.push_chat(MessageRole::System, self.quick_memory_report(raw_query));
+            return Ok(());
+        }
+        if let Some(raw_shell) = task.strip_prefix('!') {
+            let command = raw_shell.trim();
+            if command.is_empty() {
+                self.push_chat(
+                    MessageRole::Error,
+                    "Shell mode expects a command after `!`.",
+                );
+                return Ok(());
+            }
+            let wrapped = format!(
+                "Run this shell command exactly once using the shell tool. \
+Do not rewrite it unless required for safety or environment compatibility.\n\n\
+Command:\n{command}\n\n\
+Report the exit status and the concise output."
+            );
+            return self.start_prepared_task(task, wrapped, tx).await;
+        }
         self.start_task(task, tx, true).await
+    }
+
+    async fn start_prepared_task(
+        &mut self,
+        display_task: String,
+        agent_task: String,
+        tx: mpsc::UnboundedSender<UiEvent>,
+    ) -> Result<()> {
+        if self.running {
+            return Ok(());
+        }
+        self.push_chat(MessageRole::User, display_task);
+        self.start_task_internal(agent_task, tx).await
     }
 
     async fn start_task(
@@ -1407,6 +1552,14 @@ impl TuiApp {
         if echo_user {
             self.push_chat(MessageRole::User, task.clone());
         }
+        self.start_task_internal(task, tx).await
+    }
+
+    async fn start_task_internal(
+        &mut self,
+        task: String,
+        tx: mpsc::UnboundedSender<UiEvent>,
+    ) -> Result<()> {
         self.record_tool_event("queued", "agent", "task submitted");
         self.running = true;
         self.status_note = "running".to_owned();
@@ -1416,10 +1569,26 @@ impl TuiApp {
 
         let runtime = Arc::clone(&self.runtime);
         let settings = self.active_settings.clone();
-        let task_for_event = task.clone();
+        let contextual_task = if let Some(context) = self.resume_context.as_deref() {
+            format!("{context}\n\nUser asks now: {task}")
+        } else {
+            task.clone()
+        };
+        let effective_task = wrap_for_remote(&contextual_task, self.active_remote.as_ref());
+        let task_for_event = effective_task.clone();
+        let remote_target = self.active_remote.clone();
         let mode = self.mode;
         self.agent_task = Some(tokio::spawn(async move {
-            let result = run_agent_task(runtime, settings, task, tx.clone(), run_id, mode).await;
+            let result = run_agent_task(
+                runtime,
+                settings,
+                effective_task,
+                tx.clone(),
+                run_id,
+                mode,
+                remote_target,
+            )
+            .await;
             tx.send(UiEvent::AgentDone {
                 run_id,
                 task: task_for_event,
@@ -1490,6 +1659,68 @@ impl TuiApp {
 
     fn browser_hint(&self) -> String {
         "Browser automation is PinchTab-backed. Browser content is external-tainted; privileged actions require fresh approval.".to_owned()
+    }
+
+    fn quick_memory_report(&self, raw_query: &str) -> String {
+        let query = raw_query.trim();
+        if query.is_empty() {
+            return "[memory] usage: `# <query>` — searches recent episodes and graph entities."
+                .to_owned();
+        }
+        let query = query.to_owned();
+        let memory = Arc::clone(&self.runtime.memory);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let query_lower = query.to_ascii_lowercase();
+                let recent = memory.recent_episodes(20).await.unwrap_or_default();
+                let episode_lines = recent
+                    .into_iter()
+                    .filter(|episode| episode.goal.to_ascii_lowercase().contains(&query_lower))
+                    .take(5)
+                    .map(|episode| {
+                        format!(
+                            "  - [{}] {}",
+                            episode.id,
+                            episode.goal.chars().take(80).collect::<String>()
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                let graph_lines = dirs::data_local_dir()
+                    .map(|root| root.join("helm").join("graph.db"))
+                    .and_then(|path| helm_memory::EntityGraph::open(&path).ok())
+                    .and_then(|graph| graph.find_entities(None, Some(&query)).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(5)
+                    .map(|entity| format!("  - {} [{}]", entity.name, entity.kind))
+                    .collect::<Vec<_>>();
+
+                let episodes = if episode_lines.is_empty() {
+                    "  - no recent episode matches".to_owned()
+                } else {
+                    episode_lines.join("\n")
+                };
+                let graph = if graph_lines.is_empty() {
+                    "  - no graph entities match".to_owned()
+                } else {
+                    graph_lines.join("\n")
+                };
+
+                format!(
+                    "[memory] query: {query}\nrecent episodes:\n{episodes}\ngraph entities:\n{graph}"
+                )
+            })
+        })
+    }
+
+    fn remote_hint(&self) -> String {
+        match self.active_remote.as_deref() {
+            Some(target) => format!(
+                "Active remote target: {target}. Use `/remote NAME` to switch or `/remote off` to return to local mode."
+            ),
+            None => "No remote target selected. Use `/remote NAME` to target a registered host or `/remote off` for local mode.".to_owned(),
+        }
     }
 
     fn apply_agent_event(&mut self, event: AgentEvent) {
@@ -1766,6 +1997,7 @@ impl TuiApp {
         self.session = SessionState::default();
         self.session_tokens_in = 0;
         self.session_tokens_out = 0;
+        self.resume_context = None;
         self.input.clear();
         self.push_chat(MessageRole::System, "New session started.");
         self.modal = None;
@@ -2099,6 +2331,7 @@ impl TuiApp {
             CommandAction::Clear => self.clear_transcript(),
             CommandAction::Replay => self.push_chat(MessageRole::System, self.replay_hint()),
             CommandAction::Doctor => self.push_chat(MessageRole::System, self.doctor_hint()),
+            CommandAction::Remote => self.push_chat(MessageRole::System, self.remote_hint()),
             CommandAction::Provider => {
                 let current = provider_selector_list()
                     .iter()
@@ -2153,48 +2386,498 @@ impl TuiApp {
                 ),
             },
             CommandAction::Sessions => {
-                let db_path = self.runtime.db_path.clone();
-                let body = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async move {
-                        let sessions_dir = db_path
-                            .parent()
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or_else(|| std::path::PathBuf::from("."));
-                        match helm_memory::SessionStore::open(
-                            &db_path,
-                            sessions_dir.join("snapshots"),
-                        )
-                        .await
-                        {
-                            Ok(store) => match store.list_sessions(20).await {
-                                Ok(list) if list.is_empty() => "(no sessions yet)".to_owned(),
-                                Ok(list) => list
-                                    .into_iter()
-                                    .map(|s| {
-                                        format!(
-                                            "[{}] {} — {}",
-                                            s.id,
-                                            s.name,
-                                            s.goal.chars().take(60).collect::<String>()
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                                Err(e) => format!("error listing sessions: {e}"),
-                            },
-                            Err(e) => format!("error opening session store: {e}"),
-                        }
-                    })
-                });
-                self.push_chat(MessageRole::System, format!("Sessions (recent 20):\n{body}\nUse `/resume <id> <new task>` from the CLI: `helm sessions resume <id> --task '...'`."));
+                let body = self.render_sessions_inline(20);
+                self.push_chat(
+                    MessageRole::System,
+                    format!("Sessions (recent 20):\n{body}"),
+                );
             }
-            CommandAction::Resume => self.push_chat(
-                MessageRole::System,
-                "Resume from the CLI: `helm sessions resume <id> --task '<new task>'`. Run `/sessions` here to see ids.",
-            ),
+            CommandAction::Resume => self.execute_resume_inline(""),
+            CommandAction::Config => self.execute_config_inline(""),
+            CommandAction::Theme => self.open_theme_selector(),
+            CommandAction::Keybindings => self.execute_keybindings_inline(),
+            CommandAction::Stats => self.execute_stats_inline(),
+            CommandAction::Mcp => self.execute_mcp_list_inline(),
+            CommandAction::Compact => self.execute_compact_inline(),
+            CommandAction::Diff => self.execute_diff_inline(""),
+            CommandAction::Tools => self.execute_tools_inline(),
+            CommandAction::Undo => self.execute_undo_inline(false),
+            CommandAction::Redo => self.execute_undo_inline(true),
+            CommandAction::Cost => self.open_cost_meter(),
             CommandAction::Quit => self.shutdown = true,
             CommandAction::Help => self.modal = Some(ModalState::Help),
         }
+    }
+
+    fn execute_command_with_args(&mut self, command: CommandAction, args: &str) {
+        self.modal = None;
+        let args = args.trim();
+        match command {
+            CommandAction::Config if !args.is_empty() => self.execute_config_inline(args),
+            CommandAction::Theme if !args.is_empty() => self.apply_theme_by_name(args),
+            CommandAction::Diff if !args.is_empty() => self.execute_diff_inline(args),
+            CommandAction::Sessions if !args.is_empty() => {
+                let limit = args.parse::<u32>().unwrap_or(20);
+                let body = self.render_sessions_inline(limit);
+                self.push_chat(
+                    MessageRole::System,
+                    format!("Sessions (recent {limit}):\n{body}"),
+                );
+            }
+            CommandAction::Resume => self.execute_resume_inline(args),
+            CommandAction::Compact if !args.is_empty() => {
+                self.push_chat(
+                    MessageRole::System,
+                    format!("[compact] hint noted: {args}. Transcript truncated to recent turns."),
+                );
+                self.execute_compact_inline();
+            }
+            _ => self.execute_command(command),
+        }
+    }
+
+    fn execute_config_inline(&mut self, raw: &str) {
+        let path = self.runtime.config_path.clone();
+        if raw.is_empty() {
+            match std::fs::read_to_string(&path) {
+                Ok(text) if text.trim().is_empty() => self.push_chat(
+                    MessageRole::System,
+                    format!("[config] {} is empty. Use `/config key.path=value` to set.", path.display()),
+                ),
+                Ok(text) => {
+                    let trimmed: String = text.lines().take(60).collect::<Vec<_>>().join("\n");
+                    self.push_chat(
+                        MessageRole::System,
+                        format!(
+                            "[config] {} (first 60 lines)\n{trimmed}\nEdit via `/config key.path=value` or run `helm config edit`.",
+                            path.display()
+                        ),
+                    );
+                }
+                Err(_) => self.push_chat(
+                    MessageRole::System,
+                    format!(
+                        "[config] {} does not exist yet. Set a value with `/config key.path=value` (file will be created).",
+                        path.display()
+                    ),
+                ),
+            }
+            return;
+        }
+        let Some(eq_idx) = raw.find('=') else {
+            self.push_chat(
+                MessageRole::Error,
+                "[config] expected `key.path=value`. Example: `/config providers.default=anthropic`",
+            );
+            return;
+        };
+        let (key, value) = raw.split_at(eq_idx);
+        let key = key.trim();
+        let value = value[1..].trim();
+        if key.is_empty() {
+            self.push_chat(MessageRole::Error, "[config] empty key");
+            return;
+        }
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut root: toml::Value = existing
+            .parse()
+            .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+        let parts: Vec<&str> = key.split('.').collect();
+        let parsed_val = if value == "true" {
+            toml::Value::Boolean(true)
+        } else if value == "false" {
+            toml::Value::Boolean(false)
+        } else if let Ok(i) = value.parse::<i64>() {
+            toml::Value::Integer(i)
+        } else if let Ok(f) = value.parse::<f64>() {
+            toml::Value::Float(f)
+        } else {
+            toml::Value::String(value.to_owned())
+        };
+        if let Err(error) = crate::set_toml_path(&mut root, &parts, parsed_val) {
+            self.push_chat(MessageRole::Error, format!("[config] {error}"));
+            return;
+        }
+        let pretty = match toml::to_string_pretty(&root) {
+            Ok(text) => text,
+            Err(error) => {
+                self.push_chat(MessageRole::Error, format!("[config] serialize: {error}"));
+                return;
+            }
+        };
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            self.push_chat(MessageRole::Error, format!("[config] create dir: {error}"));
+            return;
+        }
+        if let Err(error) = std::fs::write(&path, pretty) {
+            self.push_chat(MessageRole::Error, format!("[config] write: {error}"));
+            return;
+        }
+        self.push_chat(
+            MessageRole::System,
+            format!("[config] {key} = {value} → {}", path.display()),
+        );
+    }
+
+    fn open_theme_selector(&mut self) {
+        let themes = Theme::all();
+        let current = themes
+            .iter()
+            .position(|t| t.name() == self.theme.name())
+            .unwrap_or(0);
+        self.modal = Some(ModalState::ThemeSelector { selected: current });
+    }
+
+    fn apply_theme_by_name(&mut self, name: &str) {
+        let needle = name.trim().to_ascii_lowercase();
+        if let Some(theme) = Theme::all()
+            .into_iter()
+            .find(|t| t.name().eq_ignore_ascii_case(&needle))
+        {
+            let label = theme.name().to_owned();
+            self.theme = theme;
+            self.push_chat(
+                MessageRole::System,
+                format!("[theme] switched to {label}. Persist via `helm config set theme = \"{label}\"`."),
+            );
+        } else {
+            let names: Vec<&str> = Theme::all().iter().map(|t| t.name()).collect();
+            self.push_chat(
+                MessageRole::Error,
+                format!("[theme] unknown `{name}`. Choose: {}", names.join(", ")),
+            );
+        }
+    }
+
+    fn execute_keybindings_inline(&mut self) {
+        let path = match crate::keybindings::config_path() {
+            Ok(p) => p,
+            Err(error) => {
+                self.push_chat(MessageRole::Error, format!("[keybindings] {error}"));
+                return;
+            }
+        };
+        let exists = path.exists();
+        let count = self.keymap.map.len();
+        let actions = [
+            "send",
+            "newline",
+            "quit",
+            "palette",
+            "tool_sidebar",
+            "history",
+            "clear",
+            "cancel",
+            "help",
+            "external_editor",
+            "verbose_toggle",
+        ];
+        let known = actions.join(", ");
+        let body = if exists {
+            format!(
+                "[keybindings] {} ({} override(s) loaded)\nKnown actions: {}\nEdit via `$EDITOR {}` and reload HELM.",
+                path.display(),
+                count,
+                known,
+                path.display()
+            )
+        } else {
+            format!(
+                "[keybindings] no overrides at {}.\nKnown actions: {}\nCreate a JSON map (`{{\"send\": \"Enter\"}}`) at that path to remap.",
+                path.display(),
+                known
+            )
+        };
+        self.push_chat(MessageRole::System, body);
+    }
+
+    fn execute_stats_inline(&mut self) {
+        let memory = Arc::clone(&self.runtime.memory);
+        let summary = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let counts = match memory.episode_outcome_counts().await {
+                    Ok(c) => c,
+                    Err(error) => return format!("(stats unavailable: {error})"),
+                };
+                let recents = memory.recent_episodes(50).await.unwrap_or_default();
+                let tokens_in: u64 = recents.iter().map(|e| e.tokens_in as u64).sum();
+                let tokens_out: u64 = recents.iter().map(|e| e.tokens_out as u64).sum();
+                format!(
+                    "episodes: {} (ok {} / partial {} / fail {})\nlast {} runs · tokens in {} · tokens out {}",
+                    counts.total,
+                    counts.success,
+                    counts.partial,
+                    counts.failure,
+                    recents.len(),
+                    tokens_in,
+                    tokens_out
+                )
+            })
+        });
+        self.push_chat(
+            MessageRole::System,
+            format!("[stats]\n{summary}\nRun `helm stats` for the daemon-side rollup."),
+        );
+    }
+
+    fn execute_mcp_list_inline(&mut self) {
+        let path_label = helm_tools::mcp::default_mcp_config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(no XDG config path)".to_owned());
+        let body = match helm_tools::mcp::load_mcp_config() {
+            Ok(cfg) if cfg.servers.is_empty() => {
+                format!("no MCP servers configured at {path_label}. Run `helm mcp add`.")
+            }
+            Ok(cfg) => {
+                let lines: Vec<String> = cfg
+                    .servers
+                    .iter()
+                    .map(|s| format!("  {} → {}", s.name, s.command))
+                    .collect();
+                format!("MCP servers ({path_label}):\n{}", lines.join("\n"))
+            }
+            Err(error) => format!("(failed to load MCP config at {path_label}: {error})"),
+        };
+        self.push_chat(MessageRole::System, format!("[mcp] {body}"));
+    }
+
+    fn execute_compact_inline(&mut self) {
+        let total = self.session.chat.len();
+        const KEEP: usize = 12;
+        if total <= KEEP {
+            self.push_chat(
+                MessageRole::System,
+                format!("[compact] only {total} messages — nothing to compact."),
+            );
+            return;
+        }
+        let dropped = total - KEEP;
+        self.session.chat.drain(..dropped);
+        self.session.chat.insert(
+            0,
+            ChatMessage {
+                role: MessageRole::System,
+                text: format!("[compact] {dropped} earlier turns folded; last {KEEP} kept."),
+            },
+        );
+        self.session.transcript_scroll = 0;
+    }
+
+    fn session_store(&self) -> Result<helm_memory::SessionStore, String> {
+        let sessions_dir = self
+            .runtime
+            .db_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(helm_memory::SessionStore::open(
+                    &self.runtime.db_path,
+                    sessions_dir.join("snapshots"),
+                ))
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn render_sessions_inline(&self, limit: u32) -> String {
+        match self.session_store() {
+            Ok(store) => tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    match store.list_sessions(limit).await {
+                        Ok(list) if list.is_empty() => "(no sessions yet)".to_owned(),
+                        Ok(list) => list
+                            .into_iter()
+                            .map(|s| {
+                                format!(
+                                    "[{}] {} — {}",
+                                    s.id,
+                                    s.name,
+                                    s.goal.chars().take(60).collect::<String>()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        Err(error) => format!("error listing sessions: {error}"),
+                    }
+                })
+            }),
+            Err(error) => format!("error opening session store: {error}"),
+        }
+    }
+
+    fn execute_resume_inline(&mut self, raw: &str) {
+        let target = raw.trim();
+        let store = match self.session_store() {
+            Ok(store) => store,
+            Err(error) => {
+                self.push_chat(MessageRole::Error, format!("resume failed: {error}"));
+                return;
+            }
+        };
+        let target = target.to_owned();
+        let memory = Arc::clone(&self.runtime.memory);
+        let loaded = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let session = if target.is_empty() || target == "latest" {
+                    store.latest_session().await
+                } else {
+                    store.get_session(&target).await
+                }?;
+                let Some(session) = session else {
+                    return Ok::<
+                        Option<(
+                            helm_memory::SessionRecord,
+                            Option<helm_memory::EpisodeRecord>,
+                            Vec<helm_memory::StepRecord>,
+                        )>,
+                        helm_core::MemoryError,
+                    >(None);
+                };
+                let episode = memory.episode_by_id(&session.episode_id).await?;
+                let steps = memory.get_steps(&session.episode_id).await?;
+                Ok(Some((session, episode, steps)))
+            })
+        });
+        match loaded {
+            Ok(Some((session, episode, steps))) => {
+                let recap = crate::build_session_recap(&session, episode.as_ref(), &steps);
+                self.resume_context = Some(recap.clone());
+                self.session.episode_id = Some(session.episode_id.clone());
+                self.push_chat(
+                    MessageRole::System,
+                    format!(
+                        "{recap}\nFuture prompts will include this session context until `/new`."
+                    ),
+                );
+            }
+            Ok(None) => self.push_chat(MessageRole::System, "No sessions available to resume."),
+            Err(error) => self.push_chat(MessageRole::Error, format!("resume failed: {error}")),
+        }
+    }
+
+    fn execute_diff_inline(&mut self, path_arg: &str) {
+        let target = path_arg.trim();
+        if target.is_empty() {
+            self.push_chat(
+                MessageRole::System,
+                "[diff] usage: `/diff <path>` — prints first 80 lines of the file. \
+                 Snapshots are taken on every fs_write; restore with `helm undo`.",
+            );
+            return;
+        }
+        let target_path = std::path::PathBuf::from(target);
+        match std::fs::read_to_string(&target_path) {
+            Ok(text) => {
+                let preview: String = text.lines().take(80).collect::<Vec<_>>().join("\n");
+                self.push_chat(
+                    MessageRole::System,
+                    format!(
+                        "[diff:{}] (first 80 lines)\n{preview}",
+                        target_path.display()
+                    ),
+                );
+            }
+            Err(error) => self.push_chat(
+                MessageRole::Error,
+                format!("[diff] cannot read {}: {error}", target_path.display()),
+            ),
+        }
+    }
+
+    fn execute_tools_inline(&mut self) {
+        let registry = helm_tools::ToolRegistry::default();
+        let schemas = registry.schemas();
+        let count = schemas.len();
+        let mut names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        let body = names
+            .chunks(4)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|n| format!("{:<14}", n))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.push_chat(
+            MessageRole::System,
+            format!("[tools] {count} loaded:\n{body}"),
+        );
+    }
+
+    fn execute_undo_inline(&mut self, redo: bool) {
+        let verb = if redo { "redo" } else { "undo" };
+        self.push_chat(
+            MessageRole::System,
+            format!(
+                "[{verb}] run from CLI: `helm undo --apply` (or `--apply --to <path>`). \
+                 Each fs_write is auto-snapshot'd in the session store."
+            ),
+        );
+    }
+
+    fn open_cost_meter(&mut self) {
+        let memory = Arc::clone(&self.runtime.memory);
+        let (tokens_in, tokens_out) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let recents = memory.recent_episodes(20).await.unwrap_or_default();
+                (
+                    recents.iter().map(|e| e.tokens_in as u64).sum::<u64>(),
+                    recents.iter().map(|e| e.tokens_out as u64).sum::<u64>(),
+                )
+            })
+        });
+        // Very rough USD estimate using $5 per 1M in, $15 per 1M out (Anthropic mid-tier baseline).
+        let cost_usd =
+            (tokens_in as f64 / 1_000_000.0) * 5.0 + (tokens_out as f64 / 1_000_000.0) * 15.0;
+        self.modal = Some(ModalState::CostMeter {
+            session_tokens_in: tokens_in,
+            session_tokens_out: tokens_out,
+            session_cost_usd: cost_usd,
+        });
+    }
+
+    fn apply_remote_target(&mut self, args: &str) {
+        let target = args.trim();
+        if target.is_empty() {
+            self.push_chat(MessageRole::System, self.remote_hint());
+            return;
+        }
+        if matches!(target, "off" | "none" | "local") {
+            self.active_remote = None;
+            self.push_chat(
+                MessageRole::System,
+                "Remote target cleared. HELM will run locally.",
+            );
+            return;
+        }
+        let registry = match RemoteRegistry::load() {
+            Ok(registry) => registry,
+            Err(error) => {
+                self.push_chat(
+                    MessageRole::Error,
+                    format!("Failed to load remote registry: {error}"),
+                );
+                return;
+            }
+        };
+        if registry.get(target).is_none() {
+            self.push_chat(
+                MessageRole::Error,
+                format!("Unknown remote target `{target}`. Use `helm remote list` to inspect registered targets."),
+            );
+            return;
+        }
+        self.active_remote = Some(target.to_owned());
+        self.push_chat(
+            MessageRole::System,
+            format!("Remote target set to `{target}`. New tasks will run against that host."),
+        );
     }
 
     fn render(&self, frame: &mut Frame<'_>) {
@@ -2209,6 +2892,7 @@ async fn run_agent_task(
     tx: mpsc::UnboundedSender<UiEvent>,
     run_id: u64,
     mode: AgentMode,
+    remote_target: Option<String>,
 ) -> Result<RunResult, HelmError> {
     let (provider, model) = build_provider(&settings, &runtime.secrets)
         .map_err(|error| HelmError::Provider(helm_core::ProviderError::Other(error.to_string())))?;
@@ -2218,13 +2902,27 @@ async fn run_agent_task(
     }
     budget.read_only = mode == AgentMode::Plan;
     budget.auto_approve = mode == AgentMode::AutoAccept;
-    let agent = ReactAgent::new(
+    let mut tool_context = helm_tools::ToolContext::new(
+        runtime
+            .sandbox
+            .as_ref()
+            .map(|resolved| resolved.root_dir.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+    );
+    if let Some(policy) = runtime.sandbox.as_ref() {
+        tool_context = tool_context.with_sandbox(policy.policy());
+    }
+    if let Some(remote_target) = remote_target {
+        tool_context = tool_context.with_remote_target(remote_target);
+    }
+    let agent = ReactAgent::with_tool_context(
         provider,
         ToolRegistry::default(),
         Arc::clone(&runtime.memory),
         budget,
         model,
-    )?;
+        tool_context,
+    );
     let sink = ChannelEventSink { tx, run_id };
     agent.run_with_events(&task, &sink).await
 }
@@ -2374,6 +3072,16 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         Span::styled(
             format!(" {} / {} ", app.provider_name, truncate(&app.model, 42)),
             Style::default().fg(APP_FG).bg(HEADER_BG),
+        ),
+        Span::styled(
+            format!(
+                " {} ",
+                app.active_remote
+                    .as_deref()
+                    .map(|target| format!("remote {}", truncate(target, 16)))
+                    .unwrap_or_else(|| "local".to_owned())
+            ),
+            Style::default().fg(TOOL_FG).bg(HEADER_BG),
         ),
         Span::styled(
             format!(" episode {} ", truncate(episode, 8)),
@@ -3773,6 +4481,8 @@ mod tests {
             tui_paste_key_modal: true,
             auto_approve: false,
             read_only: false,
+            sandbox: None,
+            remote_target: None,
         })
     }
 
@@ -4174,6 +4884,43 @@ mod tests {
             app.provider_key_status(ProviderChoice::Groq),
             ProviderKeyStatus::Session
         );
+    }
+
+    #[test]
+    fn remote_command_switches_active_target() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".helm")).unwrap();
+        std::fs::write(
+            home.join(".helm").join("remotes.toml"),
+            "[[remotes]]\nname = \"prod-1\"\nhost = \"prod.example.com\"\nport = 22\n",
+        )
+        .unwrap();
+        // SAFETY: guarded by env_lock for this test.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mut app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+
+        app.apply_remote_target("prod-1");
+
+        assert_eq!(app.active_remote.as_deref(), Some("prod-1"));
+
+        // SAFETY: paired with the guarded set_var above.
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn remote_command_can_clear_target() {
+        let mut app = app();
+        app.active_remote = Some("prod-1".to_owned());
+
+        app.apply_remote_target("off");
+
+        assert!(app.active_remote.is_none());
     }
 
     #[test]

@@ -1,0 +1,15 @@
+[skill]
+id = "docker-restart"
+name = "Restart Docker"
+description = "Safely restart Docker service"
+
+[skill.description]
+short = "Restart Docker service safely"
+long = """Safely restarts the Docker daemon. Checks for running containers before restart."""
+
+[prerequisites]
+capabilities = ["ShellExec", "SystemService"]
+
+[metadata]
+tags = ["docker", "container", "devops"]
+keywords = ["docker", "restart", "container"]

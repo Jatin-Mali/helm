@@ -10,11 +10,22 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{Child, ChildStdin, ChildStdout},
     time::timeout,
 };
 
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{
+    command::build_command_in_dir,
+    tool::{Tool, ToolContext, ToolError, ToolOutput},
+};
+
+fn xdg_config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("helm")
+}
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -44,11 +55,7 @@ pub struct McpEnvEntry {
 
 /// Returns the default path for the MCP config file.
 pub fn default_mcp_config_path() -> Option<PathBuf> {
-    dirs_home().map(|h| h.join(".helm").join("mcp-servers.toml"))
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    Some(xdg_config_dir().join("mcp-servers.toml"))
 }
 
 /// Loads the MCP config file.  Returns an empty config if the file does not exist.
@@ -126,7 +133,7 @@ impl Tool for McpTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let action = input["action"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("action is required".into()))?;
@@ -136,7 +143,7 @@ impl Tool for McpTool {
 
         let config = load_mcp_config()?;
         let server = find_server(&config, server_name)?;
-        let mut client = McpClient::connect(server).await?;
+        let mut client = McpClient::connect(server, ctx).await?;
         client.initialize().await?;
 
         match action {
@@ -190,10 +197,9 @@ struct McpClient {
 }
 
 impl McpClient {
-    async fn connect(server: &McpServerConfig) -> Result<Self, ToolError> {
-        let mut cmd = Command::new(&server.command);
-        cmd.args(&server.args)
-            .stdin(Stdio::piped())
+    async fn connect(server: &McpServerConfig, ctx: &ToolContext) -> Result<Self, ToolError> {
+        let mut cmd = build_command_in_dir(&server.command, &server.args, ctx, &ctx.working_dir)?;
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 

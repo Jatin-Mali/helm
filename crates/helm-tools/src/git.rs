@@ -7,10 +7,12 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
-use tokio::process::Command;
 use tokio::time;
 
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{
+    command::build_command_in_dir,
+    tool::{Tool, ToolContext, ToolError, ToolOutput},
+};
 
 /// Tool that exposes common git operations to the agent.
 #[derive(Debug, Default)]
@@ -128,8 +130,8 @@ impl Tool for GitTool {
 /// Run a git command in the given directory and collect stdout/stderr/status.
 async fn run_git(ctx: &ToolContext, cwd: &Path, args: &[String]) -> Result<ToolOutput, ToolError> {
     let started = Instant::now();
-    let mut command = Command::new("git");
-    command.args(args).current_dir(cwd).kill_on_drop(true);
+    let mut command = build_command_in_dir("git", args, ctx, cwd)?;
+    command.kill_on_drop(true);
     let output = match time::timeout(ctx.timeout, command.output()).await {
         Ok(output) => output.map_err(|e| ToolError::Other(format!("failed to spawn git: {e}")))?,
         Err(_) => return Err(ToolError::Timeout),

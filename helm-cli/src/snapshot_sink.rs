@@ -79,6 +79,12 @@ impl<S: AgentEventSink> AgentEventSink for SnapshotSink<S> {
                 let path_for_record = resolved.clone();
                 if let Ok(handle) = Handle::try_current() {
                     handle.spawn(async move {
+                        if let Err(error) = store.clear_redo_snapshots(&session_id).await {
+                            tracing::warn!(
+                                target: "helm::snapshot",
+                                "clear_redo_snapshots failed: {error}"
+                            );
+                        }
                         if let Err(error) = store
                             .take_snapshot(&session_id, step, &content, &path_for_record)
                             .await

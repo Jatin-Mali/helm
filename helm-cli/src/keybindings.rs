@@ -27,10 +27,16 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use serde::Deserialize;
 
+fn xdg_config_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("helm")
+}
+
 pub fn config_path() -> Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?;
-    Ok(home.join(".helm").join("keybindings.json"))
+    Ok(xdg_config_dir().join("keybindings.json"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

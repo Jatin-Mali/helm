@@ -4,9 +4,9 @@ use std::{ffi::OsString, process::Stdio};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
-use tokio::{process::Command, time::timeout};
+use tokio::time::timeout;
 
-use crate::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{Tool, ToolContext, ToolError, ToolOutput, command::build_command_in_dir};
 
 /// Browser automation tool using `pinchtab` commands.
 #[derive(Debug, Clone)]
@@ -161,24 +161,26 @@ impl Tool for BrowserTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args = Self::command_args(&input)?;
-        let child = Command::new(&self.bin)
-            .args(&args)
-            .current_dir(&ctx.working_dir)
+        let mut command =
+            build_command_in_dir(&self.bin.to_string_lossy(), &args, ctx, &ctx.working_dir)
+                .map_err(|error| {
+                    ToolError::Other(format!("failed to prepare browser command: {error}"))
+                })?;
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    ToolError::Other(
-                        "pinchtab binary not found; install PinchTab or remove browser tasks"
-                            .to_owned(),
-                    )
-                } else {
-                    ToolError::IoError(error)
-                }
-            })?;
+            .kill_on_drop(true);
+        let child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ToolError::Other(
+                    "pinchtab binary not found; install PinchTab or remove browser tasks"
+                        .to_owned(),
+                )
+            } else {
+                ToolError::IoError(error)
+            }
+        })?;
         let output = timeout(ctx.timeout, child.wait_with_output())
             .await
             .map_err(|_| ToolError::Timeout)?

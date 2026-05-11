@@ -1,0 +1,15 @@
+[skill]
+id = "nginx-deploy"
+name = "Deploy NGINX"
+description = "Deploy and configure NGINX web server via shell and systemd"
+
+[skill.description]
+short = "Deploy NGINX via shell and systemd"
+long = """Deploys and configures NGINX web server. Handles package installation, configuration generation, and service activation."""
+
+[prerequisites]
+capabilities = ["ShellExec", "SystemService"]
+
+[metadata]
+tags = ["nginx", "web", "deployment", "server"]
+keywords = ["deploy", "nginx", "http", "web-server"]

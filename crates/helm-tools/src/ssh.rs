@@ -15,9 +15,12 @@ use std::{
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio::{io::AsyncReadExt, process::Command, time::timeout};
+use tokio::{io::AsyncReadExt, time::timeout};
 
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{
+    command::build_command_in_dir,
+    tool::{Tool, ToolContext, ToolError, ToolOutput},
+};
 
 #[derive(Debug, Default, Deserialize)]
 struct RemoteFile {
@@ -184,7 +187,7 @@ impl Tool for SshTool {
 
         let mut argv = endpoint.ssh_argv();
         argv.push(command.to_owned());
-        run_capture(&argv, ctx.timeout, ctx.max_output_bytes, "ssh").await
+        run_capture(&argv, ctx, "ssh").await
     }
 }
 
@@ -267,7 +270,7 @@ impl Tool for ScpTool {
                 )));
             }
         }
-        run_capture(&argv, ctx.timeout, ctx.max_output_bytes, "scp").await
+        run_capture(&argv, ctx, "scp").await
     }
 }
 
@@ -359,23 +362,21 @@ impl Tool for RsyncTool {
                 )));
             }
         }
-        run_capture(&argv, ctx.timeout, ctx.max_output_bytes, "rsync").await
+        run_capture(&argv, ctx, "rsync").await
     }
 }
 
 async fn run_capture(
     argv: &[String],
-    duration: Duration,
-    max_bytes: usize,
+    ctx: &ToolContext,
     label: &str,
 ) -> Result<ToolOutput, ToolError> {
     if argv.is_empty() {
         return Err(ToolError::Other("empty argv".to_owned()));
     }
     let started = Instant::now();
-    let mut command = Command::new(&argv[0]);
+    let mut command = build_command_in_dir(&argv[0], &argv[1..], ctx, &ctx.working_dir)?;
     command
-        .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -398,7 +399,7 @@ async fn run_capture(
         stderr.read_to_end(&mut buf).await?;
         Ok::<Vec<u8>, std::io::Error>(buf)
     });
-    let status = match timeout(duration, child.wait()).await {
+    let status = match timeout(ctx.timeout, child.wait()).await {
         Ok(r) => r?,
         Err(_) => {
             child.kill().await?;
@@ -414,7 +415,7 @@ async fn run_capture(
                 &stdout_bytes,
                 &stderr_bytes,
                 started.elapsed(),
-                max_bytes,
+                ctx.max_output_bytes,
             ));
         }
     };
@@ -433,7 +434,7 @@ async fn run_capture(
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".to_owned())
     );
-    let (content, truncated) = truncate(&full, max_bytes);
+    let (content, truncated) = truncate(&full, ctx.max_output_bytes);
     let mut metadata = Map::new();
     metadata.insert("tool".to_owned(), json!(label));
     metadata.insert(

@@ -32,9 +32,16 @@ fn default_port() -> u16 {
     22
 }
 
+fn xdg_config_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("helm")
+}
+
 pub fn registry_path() -> Result<PathBuf> {
-    let base = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
-    Ok(base.join(".helm").join("remotes.toml"))
+    Ok(xdg_config_dir().join("remotes.toml"))
 }
 
 impl RemoteRegistry {

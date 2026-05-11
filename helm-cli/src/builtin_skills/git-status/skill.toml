@@ -1,0 +1,15 @@
+[skill]
+id = "git-status"
+name = "Git Status"
+description = "Show git repository status with clean output"
+
+[skill.description]
+short = "Show clean git status output"
+long = """Displays git status with staged, modified, and untracked files in a clean format."""
+
+[prerequisites]
+capabilities = ["ShellExec"]
+
+[metadata]
+tags = ["git", "version-control", "devtools"]
+keywords = ["git", "status", "vcs"]

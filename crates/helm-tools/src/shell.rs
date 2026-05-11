@@ -13,13 +13,14 @@ use serde_json::{Map, Value, json};
 use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
     time::timeout,
 };
 
 use crate::{
+    command::build_command_in_dir,
     fs_read::validate_write_path,
     tool::{Tool, ToolContext, ToolError, ToolOutput},
+    validator::AllowlistConfig,
 };
 
 /// Tool that runs a command directly or through a shell when composition is needed.
@@ -72,6 +73,19 @@ impl Tool for ShellTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let parsed = ShellInput::parse(input, ctx)?;
+        let allowlist = AllowlistConfig::load()?;
+        let command_line = match parsed.mode {
+            ShellMode::Exec => std::iter::once(parsed.command.as_str())
+                .chain(parsed.args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" "),
+            ShellMode::Shell => parsed.command.clone(),
+        };
+        if !allowlist.is_shell_allowed(&command_line) {
+            return Err(ToolError::InvalidInput(format!(
+                "shell command not permitted by ~/.helm/allowlist.toml: {command_line}"
+            )));
+        }
         let stdout_redirect = parsed
             .redirect_stdout_to
             .as_ref()
@@ -86,20 +100,20 @@ impl Tool for ShellTool {
 
         let mut command = match parsed.mode {
             ShellMode::Exec => {
-                let mut command = Command::new(&parsed.command);
-                command.args(&parsed.args);
-                command
+                build_command_in_dir(&parsed.command, &parsed.args, ctx, &parsed.cwd)?
             }
             ShellMode::Shell => {
                 let shell = select_shell(&parsed.env)?;
-                let mut command = Command::new(shell);
-                command.arg("-c").arg(&parsed.command);
-                command
+                build_command_in_dir(
+                    &shell.to_string_lossy(),
+                    &[String::from("-c"), parsed.command.clone()],
+                    ctx,
+                    &parsed.cwd,
+                )?
             }
         };
 
         command
-            .current_dir(&parsed.cwd)
             .stdin(if parsed.stdin.is_some() {
                 Stdio::piped()
             } else {

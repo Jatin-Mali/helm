@@ -34,21 +34,21 @@ pub enum SecretsError {
 
 type SecretsFile = BTreeMap<String, String>;
 
-/// Manages `~/.helm/secrets.toml` — a 0600 flat TOML key/value store.
+/// Manages `$XDG_CONFIG_HOME/helm/secrets.toml` — a 0600 flat TOML key/value store.
 #[derive(Debug, Clone)]
 pub struct SecretsStore {
     path: PathBuf,
 }
 
 impl SecretsStore {
-    /// Opens `~/.helm/secrets.toml`, creating `~/.helm` with mode 0700 when needed.
+    /// Opens `$XDG_CONFIG_HOME/helm/secrets.toml` (or `~/.config/helm/secrets.toml`),
+    /// creating the dir with mode 0700 when needed.
     pub fn open_default() -> Result<Self, SecretsError> {
-        let dir = dirs_home().join(".helm");
+        let dir = xdg_config_dir();
         fs::create_dir_all(&dir).map_err(|e| SecretsError::Io {
             path: dir.clone(),
             source: e,
         })?;
-        set_mode_700(&dir)?;
         Self::open_at(dir.join("secrets.toml"))
     }
 
@@ -183,10 +183,12 @@ impl Drop for StoreLock {
     }
 }
 
-fn dirs_home() -> PathBuf {
-    env::var_os("HOME")
+fn xdg_config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("helm")
 }
 
 #[cfg(unix)]
@@ -239,6 +241,7 @@ fn set_mode_600(_path: &Path) -> Result<(), SecretsError> {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn set_mode_700(path: &Path) -> Result<(), SecretsError> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| SecretsError::Io {
         path: path.to_owned(),
@@ -247,6 +250,7 @@ fn set_mode_700(path: &Path) -> Result<(), SecretsError> {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 fn set_mode_700(_path: &Path) -> Result<(), SecretsError> {
     Ok(())
 }

@@ -10,7 +10,10 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
 use tokio::fs as tokio_fs;
 
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::{
+    ignore::HelmIgnore,
+    tool::{Tool, ToolContext, ToolError, ToolOutput},
+};
 
 const DEFAULT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -212,6 +215,13 @@ pub(crate) fn validate_write_path(
 
 pub(crate) fn validate_canonical_path(path: &Path, ctx: &ToolContext) -> Result<(), ToolError> {
     validate_denylist(path)?;
+    validate_helmignore(path, ctx)?;
+    if let Some(root) = sandbox_root(ctx)? {
+        if path.starts_with(&root) {
+            return Ok(());
+        }
+        return Err(ToolError::PathDenied(path.to_path_buf()));
+    }
     let working_dir = ctx.working_dir.canonicalize()?;
     if path.starts_with(&working_dir)
         || allowed_global_roots()
@@ -222,6 +232,22 @@ pub(crate) fn validate_canonical_path(path: &Path, ctx: &ToolContext) -> Result<
     } else {
         Err(ToolError::PathDenied(path.to_path_buf()))
     }
+}
+
+pub(crate) fn sandbox_root(ctx: &ToolContext) -> Result<Option<PathBuf>, ToolError> {
+    match &ctx.sandbox {
+        Some(policy) => Ok(Some(policy.root_dir.canonicalize()?)),
+        None => Ok(None),
+    }
+}
+
+fn validate_helmignore(path: &Path, ctx: &ToolContext) -> Result<(), ToolError> {
+    let root = sandbox_root(ctx)?.unwrap_or_else(|| ctx.working_dir.clone());
+    let matcher = HelmIgnore::load(&root);
+    if matcher.is_ignored(path) {
+        return Err(ToolError::PathDenied(path.to_path_buf()));
+    }
+    Ok(())
 }
 
 fn allowed_global_roots() -> Vec<PathBuf> {
@@ -356,7 +382,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use crate::tool::{Tool, ToolContext, ToolError};
+    use crate::tool::{SandboxPolicy, Tool, ToolContext, ToolError};
 
     use super::{FsReadTool, select_lines, validate_existing_path};
 
@@ -438,6 +464,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let error =
             validate_existing_path(std::path::Path::new("/etc/shadow"), &ctx_at(&dir)).unwrap_err();
+
+        assert!(matches!(error, ToolError::PathDenied(_)));
+    }
+
+    #[test]
+    fn sandbox_denies_reads_outside_root() {
+        let dir = tempdir().unwrap();
+        let sandbox_root = dir.path().join("sandbox");
+        fs::create_dir_all(&sandbox_root).unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, "nope").unwrap();
+        let ctx = ToolContext::new(sandbox_root.clone()).with_sandbox(SandboxPolicy {
+            root_dir: sandbox_root,
+            bwrap_program: std::path::PathBuf::from("/usr/bin/bwrap"),
+        });
+
+        let error = validate_existing_path(&outside, &ctx).unwrap_err();
 
         assert!(matches!(error, ToolError::PathDenied(_)));
     }

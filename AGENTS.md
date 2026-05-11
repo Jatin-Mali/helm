@@ -413,18 +413,24 @@ helm/
 
 ---
 
-## Config Files (Runtime, not in repo)
+## XDG Base Directory Compliance
 
-| Path | Purpose |
-|------|---------|
-| `~/.helm/config.toml` | Provider, model, DB path, default capabilities |
-| `~/.helm/audit.log` | HMAC-chained audit log (line-delimited JSON) |
-| `~/.helm/skills/` | Skill markdown files (versioned) |
-| `~/.helm/helm.db` | SQLite database: episodes, steps, capability grants, sessions, graph, skill_learner, user_profile, router_outcomes, plan_cache |
-| `~/.helm/secrets.json` | Secrets store with rotation policy (0o600); managed via `helm secrets {set,get,delete,list,rotate,check}` |
-| `~/.helm/mcp-servers.toml` | MCP server configs — managed via `helm mcp {list,add,remove,test,run}` |
-| `~/.helm/sessions/` | Session export files (list/delete/export/resume via `helm sessions`) |
-| `~/.helm/snapshots/` | Session snapshots for undo/redo; auto-saved every N steps by ReactAgent |
+HELM follows the [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html):
+
+| Type | Path |
+|------|------|
+| Config | `$XDG_CONFIG_HOME/helm/` (or `~/.config/helm/`) |
+| Data | `$XDG_DATA_HOME/helm/` (or `~/.local/share/helm/`) |
+| Cache | `$XDG_CACHE_HOME/helm/` (or `~/.cache/helm/`) |
+| Secrets | `$XDG_CONFIG_HOME/helm/secrets.toml` (mode 0600) |
+
+Files: `config.toml`, `hooks.toml`, `keybindings.json`, `remotes.toml`, `mcp-servers.toml`, `allowlist.toml`, `secrets.toml`
+Data: `helm.db`, `graph.db`, `skills/`, `snapshots/`
+Logs: `$XDG_DATA_HOME/helm/logs/helm.log`
+
+Grep targets for path discovery:
+- `dirs::home_dir().join(".helm"` — non-XDG-compliant paths
+- `XDG_CONFIG_HOME` — XDG resolution functions
 
 ---
 

@@ -14,6 +14,7 @@ const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_model_capability_warning.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_v3_corrections.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_security.sql");
+const MIGRATION_0009: &str = include_str!("../migrations/0005_remote_audit.sql");
 
 /// UUID string identifying an episode row.
 pub type EpisodeId = String;
@@ -160,6 +161,8 @@ pub struct CapabilityGrantRecord {
 pub struct AuditEventInput {
     /// Episode that caused this event, if any.
     pub episode_id: Option<String>,
+    /// Remote target identity, if the tool call was scoped to a named host.
+    pub target: Option<String>,
     /// Tool name that was requested.
     pub tool_name: String,
     /// Hash of the tool input JSON.
@@ -183,6 +186,8 @@ pub struct AuditEventRecord {
     pub id: i64,
     /// Episode that caused this event, if any.
     pub episode_id: Option<String>,
+    /// Remote target identity, if any.
+    pub target: Option<String>,
     /// Event timestamp in Unix milliseconds.
     pub timestamp: i64,
     /// Tool name that was requested.
@@ -688,14 +693,19 @@ impl MemoryStore {
         input.output_hash = helm_core::redact_secrets(&input.output_hash);
         input.cwd = helm_core::redact_secrets(&input.cwd);
         input.decision = helm_core::redact_secrets(&input.decision);
+        input.target = input
+            .target
+            .map(|target| helm_core::redact_secrets(&target).trim().to_owned())
+            .filter(|target| !target.is_empty());
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
-            let previous_hash = latest_audit_hash(&guard)?;
+            let previous_hash = latest_audit_hash(&guard, input.target.as_deref())?;
             let timestamp = now_ms();
             let taint = input.taint.label();
             let event_hash = audit_hash(AuditHashParts {
                 previous_hash: &previous_hash,
                 episode_id: input.episode_id.as_deref(),
+                target: input.target.as_deref(),
                 timestamp,
                 tool_name: &input.tool_name,
                 input_hash: &input.input_hash,
@@ -708,11 +718,12 @@ impl MemoryStore {
             guard
                 .execute(
                     "INSERT INTO audit_events \
-                     (episode_id, timestamp, tool_name, input_hash, output_hash, capability, \
+                     (episode_id, target, timestamp, tool_name, input_hash, output_hash, capability, \
                       taint, cwd, decision, previous_hash, event_hash) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         input.episode_id,
+                        input.target,
                         timestamp,
                         input.tool_name,
                         input.input_hash,
@@ -736,36 +747,67 @@ impl MemoryStore {
     pub async fn audit_events(
         &self,
         episode_id: Option<&str>,
+        target: Option<&str>,
     ) -> Result<Vec<AuditEventRecord>, MemoryError> {
         let conn = Arc::clone(&self.conn);
         let episode_id = episode_id.map(str::to_owned);
+        let target = target.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
-            let sql = match episode_id {
-                Some(_) => {
-                    "SELECT id, episode_id, timestamp, tool_name, input_hash, output_hash, \
+            let sql = match (episode_id.is_some(), target.is_some()) {
+                (true, true) => {
+                    "SELECT id, episode_id, target, timestamp, tool_name, input_hash, output_hash, \
+                     capability, taint, cwd, decision, previous_hash, event_hash \
+                     FROM audit_events WHERE episode_id = ?1 AND target IS ?2 ORDER BY id ASC"
+                }
+                (true, false) => {
+                    "SELECT id, episode_id, target, timestamp, tool_name, input_hash, output_hash, \
                      capability, taint, cwd, decision, previous_hash, event_hash \
                      FROM audit_events WHERE episode_id = ?1 ORDER BY id ASC"
                 }
-                None => {
-                    "SELECT id, episode_id, timestamp, tool_name, input_hash, output_hash, \
+                (false, true) => {
+                    "SELECT id, episode_id, target, timestamp, tool_name, input_hash, output_hash, \
+                     capability, taint, cwd, decision, previous_hash, event_hash \
+                     FROM audit_events WHERE target IS ?1 ORDER BY id ASC"
+                }
+                (false, false) => {
+                    "SELECT id, episode_id, target, timestamp, tool_name, input_hash, output_hash, \
                      capability, taint, cwd, decision, previous_hash, event_hash \
                      FROM audit_events ORDER BY id ASC"
                 }
             };
             let mut stmt = guard.prepare(sql).map_err(sqlite_error)?;
             let mut records = Vec::new();
-            if let Some(id) = episode_id {
-                let rows = stmt
-                    .query_map(params![id], row_to_audit)
-                    .map_err(sqlite_error)?;
-                for row in rows {
-                    records.push(row.map_err(sqlite_error)?);
+            match (episode_id.as_deref(), target.as_deref()) {
+                (Some(id), Some(target_name)) => {
+                    let rows = stmt
+                        .query_map(params![id, target_name], row_to_audit)
+                        .map_err(sqlite_error)?;
+                    for row in rows {
+                        records.push(row.map_err(sqlite_error)?);
+                    }
                 }
-            } else {
-                let rows = stmt.query_map([], row_to_audit).map_err(sqlite_error)?;
-                for row in rows {
-                    records.push(row.map_err(sqlite_error)?);
+                (Some(id), None) => {
+                    let rows = stmt
+                        .query_map(params![id], row_to_audit)
+                        .map_err(sqlite_error)?;
+                    for row in rows {
+                        records.push(row.map_err(sqlite_error)?);
+                    }
+                }
+                (None, Some(target_name)) => {
+                    let rows = stmt
+                        .query_map(params![target_name], row_to_audit)
+                        .map_err(sqlite_error)?;
+                    for row in rows {
+                        records.push(row.map_err(sqlite_error)?);
+                    }
+                }
+                (None, None) => {
+                    let rows = stmt.query_map([], row_to_audit).map_err(sqlite_error)?;
+                    for row in rows {
+                        records.push(row.map_err(sqlite_error)?);
+                    }
                 }
             }
             Ok::<Vec<AuditEventRecord>, MemoryError>(records)
@@ -776,47 +818,17 @@ impl MemoryStore {
 
     /// Verifies every audit event hash against the previous row.
     pub async fn verify_audit_chain(&self) -> Result<AuditVerification, MemoryError> {
-        let events = self.audit_events(None).await?;
-        let mut previous = "GENESIS".to_owned();
-        let mut checked = 0_u32;
-        for event in events {
-            checked = checked.saturating_add(1);
-            if event.previous_hash != previous {
-                return Ok(AuditVerification {
-                    ok: false,
-                    checked,
-                    failed_at: Some(event.id),
-                    reason: Some("previous hash mismatch".to_owned()),
-                });
-            }
-            let expected = audit_hash(AuditHashParts {
-                previous_hash: &event.previous_hash,
-                episode_id: event.episode_id.as_deref(),
-                timestamp: event.timestamp,
-                tool_name: &event.tool_name,
-                input_hash: &event.input_hash,
-                output_hash: &event.output_hash,
-                capability: event.capability.as_str(),
-                taint: &event.taint,
-                cwd: &event.cwd,
-                decision: &event.decision,
-            });
-            if expected != event.event_hash {
-                return Ok(AuditVerification {
-                    ok: false,
-                    checked,
-                    failed_at: Some(event.id),
-                    reason: Some("event hash mismatch".to_owned()),
-                });
-            }
-            previous = event.event_hash;
-        }
-        Ok(AuditVerification {
-            ok: true,
-            checked,
-            failed_at: None,
-            reason: None,
-        })
+        let events = self.audit_events(None, None).await?;
+        verify_partitioned_audit_events(events)
+    }
+
+    /// Verifies one audit partition, optionally filtered by remote target.
+    pub async fn verify_audit_chain_for_target(
+        &self,
+        target: Option<&str>,
+    ) -> Result<AuditVerification, MemoryError> {
+        let events = self.audit_events(None, target).await?;
+        verify_partitioned_audit_events(events)
     }
 
     /// Record a single routing outcome for `model` (and optionally `provider`).
@@ -908,6 +920,58 @@ impl MemoryStore {
     }
 }
 
+fn verify_partitioned_audit_events(
+    events: Vec<AuditEventRecord>,
+) -> Result<AuditVerification, MemoryError> {
+    let mut previous_by_target: std::collections::HashMap<Option<String>, String> =
+        std::collections::HashMap::new();
+    let mut checked = 0_u32;
+    for event in events {
+        checked = checked.saturating_add(1);
+        let key = event.target.clone();
+        let previous = previous_by_target
+            .entry(key.clone())
+            .or_insert_with(|| "GENESIS".to_owned())
+            .clone();
+        if event.previous_hash != previous {
+            return Ok(AuditVerification {
+                ok: false,
+                checked,
+                failed_at: Some(event.id),
+                reason: Some("previous hash mismatch".to_owned()),
+            });
+        }
+        let expected = audit_hash(AuditHashParts {
+            previous_hash: &event.previous_hash,
+            episode_id: event.episode_id.as_deref(),
+            target: event.target.as_deref(),
+            timestamp: event.timestamp,
+            tool_name: &event.tool_name,
+            input_hash: &event.input_hash,
+            output_hash: &event.output_hash,
+            capability: event.capability.as_str(),
+            taint: &event.taint,
+            cwd: &event.cwd,
+            decision: &event.decision,
+        });
+        if expected != event.event_hash {
+            return Ok(AuditVerification {
+                ok: false,
+                checked,
+                failed_at: Some(event.id),
+                reason: Some("event hash mismatch".to_owned()),
+            });
+        }
+        previous_by_target.insert(key, event.event_hash);
+    }
+    Ok(AuditVerification {
+        ok: true,
+        checked,
+        failed_at: None,
+        reason: None,
+    })
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RoutingStat {
     pub model: String,
@@ -958,13 +1022,25 @@ fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
         5 => apply_0006(conn),
         6 => apply_0007(conn),
         7 => apply_0008(conn),
-        8 => conn
+        8 => apply_0009(conn),
+        9 => conn
             .execute_batch("PRAGMA foreign_keys = ON")
             .map_err(sqlite_error),
         other => Err(MemoryError::Migration(format!(
             "unsupported schema version: {other}"
         ))),
     }
+}
+
+fn apply_0009(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .map_err(sqlite_error)?;
+    if !column_exists(conn, "audit_events", "target")? {
+        conn.execute_batch(MIGRATION_0009).map_err(sqlite_error)?;
+    }
+    conn.execute_batch("PRAGMA user_version = 9")
+        .map_err(sqlite_error)?;
+    Ok(())
 }
 
 fn apply_0002(conn: &Connection) -> Result<(), MemoryError> {
@@ -1079,6 +1155,7 @@ fn apply_0008(conn: &Connection) -> Result<(), MemoryError> {
     }
     conn.execute_batch("PRAGMA user_version = 8")
         .map_err(sqlite_error)?;
+    apply_0009(conn)?;
     Ok(())
 }
 
@@ -1166,23 +1243,24 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<CapabilityGrantReco
 }
 
 fn row_to_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEventRecord> {
-    let capability_text: String = row.get(6)?;
+    let capability_text: String = row.get(7)?;
     let capability = capability_text.parse().map_err(|error: String| {
-        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, error.into())
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, error.into())
     })?;
     Ok(AuditEventRecord {
         id: row.get(0)?,
         episode_id: row.get(1)?,
-        timestamp: row.get(2)?,
-        tool_name: row.get(3)?,
-        input_hash: row.get(4)?,
-        output_hash: row.get(5)?,
+        target: row.get(2)?,
+        timestamp: row.get(3)?,
+        tool_name: row.get(4)?,
+        input_hash: row.get(5)?,
+        output_hash: row.get(6)?,
         capability,
-        taint: row.get(7)?,
-        cwd: row.get(8)?,
-        decision: row.get(9)?,
-        previous_hash: row.get(10)?,
-        event_hash: row.get(11)?,
+        taint: row.get(8)?,
+        cwd: row.get(9)?,
+        decision: row.get(10)?,
+        previous_hash: row.get(11)?,
+        event_hash: row.get(12)?,
     })
 }
 
@@ -1214,20 +1292,18 @@ fn active_grant_locked(
     Ok(None)
 }
 
-fn latest_audit_hash(conn: &Connection) -> Result<String, MemoryError> {
-    conn.query_row(
-        "SELECT event_hash FROM audit_events ORDER BY id DESC LIMIT 1",
-        [],
-        |row| row.get(0),
-    )
-    .optional()
-    .map(|hash| hash.unwrap_or_else(|| "GENESIS".to_owned()))
-    .map_err(sqlite_error)
+fn latest_audit_hash(conn: &Connection, target: Option<&str>) -> Result<String, MemoryError> {
+    let sql = "SELECT event_hash FROM audit_events WHERE target IS ?1 ORDER BY id DESC LIMIT 1";
+    conn.query_row(sql, params![target], |row| row.get(0))
+        .optional()
+        .map(|hash| hash.unwrap_or_else(|| "GENESIS".to_owned()))
+        .map_err(sqlite_error)
 }
 
 struct AuditHashParts<'a> {
     previous_hash: &'a str,
     episode_id: Option<&'a str>,
+    target: Option<&'a str>,
     timestamp: i64,
     tool_name: &'a str,
     input_hash: &'a str,
@@ -1240,9 +1316,10 @@ struct AuditHashParts<'a> {
 
 fn audit_hash(parts: AuditHashParts<'_>) -> String {
     let payload = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         parts.previous_hash,
         parts.episode_id.unwrap_or(""),
+        parts.target.unwrap_or(""),
         parts.timestamp,
         parts.tool_name,
         parts.input_hash,
@@ -1435,7 +1512,7 @@ mod tests {
     async fn schema_version_reports_current_version_edge_case() {
         let (_dir, store) = store().await;
 
-        assert_eq!(store.schema_version().await.unwrap(), 8);
+        assert_eq!(store.schema_version().await.unwrap(), 9);
     }
 
     #[tokio::test]
@@ -1508,7 +1585,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert_eq!(has_column, 1);
     }
 
@@ -1566,6 +1643,7 @@ mod tests {
         store
             .append_audit_event(super::AuditEventInput {
                 episode_id: Some("ep".to_owned()),
+                target: None,
                 tool_name: "shell".to_owned(),
                 input_hash: super::stable_hash_hex("in"),
                 output_hash: super::stable_hash_hex("out"),
@@ -1591,6 +1669,7 @@ mod tests {
         store
             .append_audit_event(super::AuditEventInput {
                 episode_id: Some("ep".to_owned()),
+                target: None,
                 tool_name: "shell".to_owned(),
                 input_hash: super::stable_hash_hex("in"),
                 output_hash: super::stable_hash_hex("out"),
@@ -1609,6 +1688,35 @@ mod tests {
 
         assert!(!verification.ok);
         assert_eq!(verification.failed_at, Some(1));
+    }
+
+    #[tokio::test]
+    async fn audit_chain_partitions_by_target() {
+        let (_dir, store) = store().await;
+        for target in [Some("prod-1".to_owned()), Some("prod-2".to_owned())] {
+            store
+                .append_audit_event(super::AuditEventInput {
+                    episode_id: Some("ep".to_owned()),
+                    target: target.clone(),
+                    tool_name: "ssh".to_owned(),
+                    input_hash: super::stable_hash_hex("in"),
+                    output_hash: super::stable_hash_hex("out"),
+                    capability: Capability::NetworkOut,
+                    taint: helm_core::Taint::User,
+                    cwd: "/tmp".to_owned(),
+                    decision: "allow".to_owned(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let verification = store
+            .verify_audit_chain_for_target(Some("prod-1"))
+            .await
+            .unwrap();
+
+        assert!(verification.ok);
+        assert_eq!(verification.checked, 1);
     }
 
     #[tokio::test]
