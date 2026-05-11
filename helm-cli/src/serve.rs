@@ -281,6 +281,7 @@ pub fn generate_token() -> String {
     format!("{t}{ts:x}")
 }
 
+#[allow(dead_code)]
 pub async fn attach(target: &str, token: &str) -> Result<()> {
     let url = if target.starts_with("http") {
         format!("{}/v1/run", target.trim_end_matches('/'))

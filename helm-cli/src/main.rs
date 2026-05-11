@@ -1,8 +1,13 @@
 //! Command-line entry point for HELM.
 
+mod attach_tui;
+mod custom_commands;
+mod hooks;
+mod keybindings;
 mod remote;
 mod secrets;
 mod serve;
+mod snapshot_sink;
 mod tui;
 
 use std::{
@@ -767,20 +772,64 @@ async fn run() -> Result<()> {
             if let Some(max_iterations) = cli.max_iterations {
                 budget.max_iterations = max_iterations;
             }
+            if let Some(budget_usd) = args.budget {
+                budget.max_cost_usd = Some(budget_usd);
+                eprintln!("[budget] ${:.2} USD limit set", budget_usd);
+            }
             budget.auto_approve = cli.yes;
             budget.read_only = cli.read_only;
+            let hooks = hooks::load(
+                args.pre_run.clone(),
+                args.post_run.clone(),
+                args.on_tool_call.clone(),
+            );
             let cancel = CancellationToken::new();
-            let agent = ReactAgent::new(provider, ToolRegistry::default(), memory, budget, model)?
-                .with_cancel_token(cancel.child());
+            let agent = ReactAgent::new(
+                provider,
+                ToolRegistry::default(),
+                memory.clone(),
+                budget,
+                model,
+            )?
+            .with_cancel_token(cancel.child());
             let signal_cancel = cancel.child();
             tokio::spawn(async move {
                 tokio::signal::ctrl_c().await.ok();
                 signal_cancel.cancel();
             });
+            let hooks_ref = hooks.clone();
             let effective_task = wrap_for_remote(&args.task, cli.remote.as_ref());
-            let result = agent
-                .run_with_events(&effective_task, &CliProgressSink)
-                .await?;
+            hooks::fire_pre_run(&hooks, &effective_task, cli.remote.as_deref()).await?;
+            let sink = hooks::HookEventSink::new(CliProgressSink, &hooks_ref, cli.remote.clone());
+            let result = agent.run_with_events(&effective_task, &sink).await?;
+            hooks::fire_post_run(
+                &hooks,
+                &result.episode_id,
+                result.iterations > 0,
+                cli.remote.as_deref(),
+            )
+            .await?;
+            let provider_name = match provider_settings.choice {
+                ProviderChoice::Auto => "auto",
+                ProviderChoice::Groq => "groq",
+                ProviderChoice::Anthropic => "anthropic",
+                ProviderChoice::Ollama => "ollama",
+                ProviderChoice::Gemini => "gemini",
+                ProviderChoice::Openrouter => "openrouter",
+                ProviderChoice::NvidiaNim => "nvidia-nim",
+                ProviderChoice::OpenaiCompat => "openai-compat",
+            };
+            if let Err(e) = create_session_for_run(
+                &db_path,
+                &result.episode_id,
+                &args.task,
+                None,
+                Some(provider_name),
+            )
+            .await
+            {
+                tracing::warn!("session creation failed: {}", e);
+            }
             print_run_result(&result);
         }
         Command::Replay(args) => {
@@ -1887,6 +1936,38 @@ async fn render_replay(memory: &MemoryStore, episode_id: &str) -> Result<String>
         .ok_or_else(|| anyhow!("episode not found: {episode_id}"))?;
     let steps = memory.get_steps(episode_id).await?;
     Ok(format_transcript(&episode, &steps))
+}
+
+async fn create_session_for_run(
+    db_path: &Path,
+    episode_id: &str,
+    goal: &str,
+    model: Option<&str>,
+    provider: Option<&str>,
+) -> Result<()> {
+    let sessions_dir = dirs::data_local_dir()
+        .ok_or_else(|| anyhow!("could not resolve data directory"))?
+        .join("helm");
+    let snapshots_dir = sessions_dir.join("snapshots");
+    let store = helm_memory::SessionStore::open(db_path, snapshots_dir).await?;
+    let session_name = format!("run-{}", chrono::Utc::now().format("%Y%m%d-%H%M"));
+    store
+        .create_session(
+            &session_name,
+            goal,
+            episode_id.to_owned(),
+            model.map(|s| s.to_owned()),
+            provider.map(|s| s.to_owned()),
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned()),
+        )
+        .await?;
+    eprintln!(
+        "[session] created session {} for episode {}",
+        session_name, episode_id
+    );
+    Ok(())
 }
 
 fn format_transcript(episode: &EpisodeRecord, steps: &[StepRecord]) -> String {
@@ -3520,7 +3601,7 @@ async fn run_serve_command(
 }
 
 async fn run_attach_session(target: &str, token: &str) -> Result<()> {
-    serve::attach(target, token).await
+    attach_tui::run_attach_tui(target.to_string(), token.to_string()).await
 }
 
 async fn run_profile_command(
