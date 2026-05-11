@@ -72,11 +72,11 @@ These are release-blocking rules. Follow them for every change.
 helm/
 ├── Cargo.toml                   # workspace root; members listed below
 ├── crates/
-│   ├── helm-core/               # types: capability, taint, message, error
+│   ├── helm-core/               # types: capability, taint, message, error, validation, secret
 │   ├── helm-providers/          # LLM backends (7 providers)
-│   ├── helm-tools/              # tool implementations (13 tools)
-│   ├── helm-memory/             # SQLite episodes + skills library
-│   └── helm-agent/              # ReAct loop, supervisor, budget, parser
+│   ├── helm-tools/              # tool implementations (15 tools + composite registry + validator)
+│   ├── helm-memory/             # SQLite: episodes, sessions, graph, skills, user_profile, skill_learner
+│   └── helm-agent/              # ReAct loop, supervisor, budget, parser, plan_cache, model_router
 ├── helm-cli/                    # binary: main.rs (CLI) + tui.rs (TUI)
 ├── tests/                       # integration + e2e tests
 ├── docs/                        # user-facing docs
@@ -96,7 +96,8 @@ helm/
 | `src/taint.rs` | `TaintLevel` (User/Tool/External), `Tainted<T>` | External content cannot escalate to `*.write` |
 | `src/message.rs` | `Role`, `ContentBlock`, `Message` | Wire format for all LLM chat |
 | `src/error.rs` | `HelmError`, `BudgetError`, `ProviderError`, `ToolError` | All error types in one place |
-| `src/secret.rs` | `Secret`, `redact_secrets()` | Secret wrapper + persistence/log redaction |
+| `src/secret.rs` | `Secret`, `SecretStore`, `RotationPolicy`, `redact_secrets()` | Secret wrapper + `set/get/delete/list/rotate/check_rotation_needed/rotation_history`; stored at `~/.helm/secrets.json` with 0o600 mode |
+| `src/validation.rs` | `Validator`, `ValidationError` | `validate_prompt`, `validate_shell`, `validate_url`; called before every goal/tool input |
 | `src/lib.rs` | re-exports | — |
 
 **Grep targets:**
@@ -104,6 +105,7 @@ helm/
 - `TaintLevel::External` — taint escalation checks
 - `ContentBlock::ToolUse` — tool call format
 - `redact_secrets` — all mandatory redaction call sites
+- `Validator::validate_prompt` — prompt validation call sites
 
 ---
 
@@ -150,22 +152,23 @@ helm/
 | `src/logs.rs` | `logs` | `FsRead` (journalctl, tail, grep) |
 | `src/package.rs` | `package` | `PkgInstall` (apt/dnf/pacman auto-detect) |
 | `src/service.rs` | `service` | `SystemService` (systemctl + journalctl) |
+| `src/http.rs` | `http` | `NetworkOut` — GET/POST/PUT/DELETE/HEAD/PATCH; domain allowlist enforced |
+| `src/search.rs` | `search` | `FsRead` — ripgrep-backed grep/glob (falls back to std walk + regex) |
 | `src/tool.rs` | `Tool` trait, `ToolContext`, `ToolOutput` | Core abstraction |
-| `src/registry.rs` | `ToolRegistry` | Dynamic tool registration + lookup |
-| `src/validator.rs` | `InputValidator` | Path traversal checks, input sanitization |
+| `src/registry.rs` | `ToolRegistry`, `CompositeTool` | Dynamic tool registration + lookup + composite tool sequences |
+| `src/validator.rs` | `AllowlistConfig` | `is_shell_allowed`, `is_domain_blocked`, `is_ignored`; shell pattern + domain + helmignore enforcement |
 
 **Grep targets:**
 - `impl Tool for` — find all tool implementations
 - `ToolRegistry::register` — tool registration
+- `register_composite` — composite/macro-tool registration
 - `taint` in browser.rs — marks browser output as external-tainted
 - `validate_denylist` in `fs_read.rs` — protected path enforcement for HELM local state
+- `AllowlistConfig` — allowlist enforcement for http and shell
 
 **Partially implemented (not wired into runtime):**
 - `src/git.rs` — `GitTool`: 11 git actions (status, log, diff, add, commit, push, pull, branch, checkout, stash, clone) via `tokio::process::Command`. Requires `Capability::ShellExec`.
 - `src/mcp.rs` — `McpTool`: JSON-RPC 2.0 stdio bridge to external MCP servers. Config at `~/.helm/mcp-servers.toml`. Actions: `list_tools`, `call`. CLI: `helm mcp {list,add,remove,test,run}`.
-
-**v1.1 missing (see backlog.md):**
-- L14 HTTP tool, L15 grep/glob via ripgrep
 
 **v1.0.1 reliability notes:**
 - `ToolContext::new()` defaults to a 120s per-tool timeout.
@@ -184,28 +187,29 @@ helm/
 |------|-----------|-------|
 | `src/episodes.rs` | `EpisodeRecord`, `StepRecord`, `AuditEventRecord`, `CapabilityGrantRecord` | Append-only; HMAC chain in AuditEventRecord |
 | `src/skills.rs` | `Skill`, `SkillsManager` | Files in `~/.helm/skills/`; versioned markdown with metadata |
+| `src/sessions.rs` | `SessionStore`, `SessionRecord` | SQLite-backed; `list`, `delete`, `export`, `snapshot`, `resume` |
+| `src/graph.rs` | `EntityGraph` | SQLite knowledge graph; `find_entities`, `find_relations`, `semantic_search` (cosine, pure Rust), `prune_stale_relations`, `store_embedding`, `export_json`, `import_json` |
+| `src/skill_learner.rs` | `SkillLearner` | `extract_skills_from_episode` (SHA256 skill key, confidence scoring), `find_matching_skills` (top 5 by confidence) — called after successful episodes |
+| `src/user_profile.rs` | `UserProfileStore`, `Role` | `record_tool_outcome`, `get_tool_preference`, `get_preferred_tools`, `set_preference`, `get_preference`; `Role` enum (Admin/User/Viewer) with `allows(cap: &str) -> bool`, `set_role`, `get_role` |
+| `src/merge_episodes.rs` | `MergeResult`, `MergeConflict`, `ConflictResolution` | `merge_episodes`; conflict resolution: KeepFirst/KeepSecond/KeepBoth/Unresolved |
 
 **Key operations:**
 - Episode lifecycle: `insert_episode` → `append_step` → `finish_episode`
 - Audit: `append_audit_event` with prev_hash chaining → `verify_chain()`
 - Skills: `list()`, `show(name)`, `approve(name)`, `test(name)` (gold-example validation)
-- Persistence must redact secrets before writing episode goals, steps, final
-  messages, warnings, audit fields, or errors.
-
-**Partially implemented (not wired into runtime):**
-- `src/graph.rs` — `EntityGraph`: SQLite-backed knowledge graph; `upsert_entity`, `search_by_name`, `add_relation`, `neighbors`
-- `src/procedures.rs` — `ProcedureStore`: named step sequences; `insert`, `find_by_goal` (LIKE match), `record_success`
-
-**Partially implemented (not wired into runtime, v1.3):**
-- `src/skill_learner.rs` — `SkillLearner`: finds/creates procedures on success, promotes to skill file at `promote_threshold` hits; `learn(goal, steps)`, `suggest(goal, limit)`
-- `src/user_profile.rs` — `UserProfileStore`: SQLite-backed user prefs; `set_preferred_model`, `set_verbosity`, `record_correction`, `record_goal`
-
-**Note:** Roadmap says `~/.helm/user_profile.toml` but implementation is SQLite-backed store. See backlog.md.
+- Sessions: `list()` → `resume(id)` → auto-save snapshot every N steps (in ReactAgent)
+- Skill learning: after successful episode → `extract_skills_from_episode` → stored with SHA256 key
+- RBAC: `Role::allows(cap)` checked in ReactAgent before every tool call
+- Persistence must redact secrets before writing episode goals, steps, final messages, warnings, audit fields, or errors.
 
 **Grep targets:**
 - `stable_hash_hex` — audit chain hashing
 - `SkillsManager::test` — gold example validation
 - `EpisodeOutcome::` — Success/Failure/Timeout/Cancelled
+- `SessionStore::` — session management
+- `extract_skills_from_episode` — skill learning entry point
+- `Role::allows` — RBAC enforcement
+- `merge_episodes` — episode merge logic
 
 ---
 
@@ -215,11 +219,13 @@ helm/
 
 | File | Key Types | Notes |
 |------|-----------|-------|
-| `src/react.rs` | `ReactAgent`, `AgentEvent` | Main ReAct loop: observe→think→act→repeat |
+| `src/react.rs` | `ReactAgent`, `AgentEvent` | Main ReAct loop; RBAC check + input validation before every tool call; `#[instrument]` tracing spans on `run_with_events` |
 | `src/supervisor.rs` | `Supervisor`, `Plan`, `PlanStep`, `EvidenceVerifier` | DAG-based planning; FSM per step |
-| `src/budget.rs` | `BudgetTracker` | Token counting; hard limits enforced per step |
+| `src/budget.rs` | `CostBudget`, `BudgetStatus` | `warn_threshold`, `record_cost`, `remaining`; `BudgetStatus::Ok/Warning/Exceeded`; warns at 80%, stops at 100% |
 | `src/parser.rs` | `parse_tool_calls()` | Handles Native/XmlTag/FunctionTag/Pythonic/BareJson formats |
 | `src/context_window.rs` | `ContextWindow` | Rolling window; prunes oldest messages on overflow |
+| `src/plan_cache.rs` | `PlanCache` | SQLite plan cache keyed by `goal_hash()`; `lookup`, `store`, `evict_old`; wired into ReactAgent planning path |
+| `src/model_router.rs` | `ModelRouter`, `FallbackChain` | `select_for_task`, `record_outcome`, `get_success_rates`, `select_with_fallback`; routes by `TaskComplexity`; persists outcomes to `router_outcomes` table |
 
 **Supervisor step FSM:** `Pending → Running → (Complete | Retrying | Failed)`
 
@@ -231,29 +237,42 @@ helm/
 - `ServiceStatus { service, status }`
 - `HttpStatus { url, status }`
 
-**Partially implemented (not wired into runtime):**
-- `src/plan_cache.rs` — `PlanCache`: SQLite plan cache keyed by `goal_hash()` (lowercase-trim + DefaultHasher); `get` auto-increments hit_count, `put` upserts, `invalidate` removes
-- `src/model_router.rs` — `ModelRouter`: routes tasks to models by `TaskComplexity` (Simple/Medium/Complex); `classify(goal)` uses word-count + "then"/comma heuristics; `route(complexity)` picks cheapest capable model
+**AgentEvent variants** (all in `react.rs`, exhaustively matched in `tui.rs`):
+- `TextDelta { chunk }` — ≤64-byte streaming chunks
+- `ToolCall { name, input }` / `ToolResult { name, output, taint }`
+- `PlanCacheHit { goal_hash }` / `PlanCacheMiss`
+- `SkillSuggested { skill_id, skill_name, tool_sequence, confidence }`
+- `ProviderFailover { from, to, reason }`
+- `BudgetWarning { spent, limit }` / `BudgetExceeded { spent, limit }`
+- `PromptCacheHit { tokens_saved }`
+- `PermissionDenied { capability, tool }` — RBAC block (red line in TUI)
+- `ValidationFailed { field, reason }` — input validation block (red line)
+- `BreakpointHit { step }` — debug pause (yellow banner in TUI)
 
 **Done (v1.4):**
-- `src/cancel.rs` — `CancellationToken`: `Arc<AtomicBool>` shared flag; `cancel()`, `is_cancelled()`, `child()`; checked at every loop iteration in `ReactAgent`; wired to `tokio::signal::ctrl_c()` in CLI
+- `src/cancel.rs` — `CancellationToken`: `Arc<AtomicBool>`; `cancel()`, `is_cancelled()`, `child()`; checked every loop iteration; wired to `tokio::signal::ctrl_c()`
 
 **Done (v1.5):**
-- `AgentEvent::TextDelta { chunk: String }` — emitted after every `AssistantText` event, splitting text into ≤64-byte chunks for progressive rendering; consumers reconstruct full text by concatenating chunks
-- `execute_single_tool()` — extracted helper (private) that runs one tool call and returns `(ContentBlock, Taint, u32)` (result, taint_delta, corrections_delta); annotated `#[allow(clippy::too_many_arguments)]`
-- `execute_tool_uses()` — refactored to collect all `ToolUse` blocks, snapshot `current_taint` and `corrections_used`, build a Vec of `execute_single_tool` futures, run them with `futures::future::join_all`, then merge taint escalations and corrections deltas; result order preserved
+- `execute_single_tool()` — private helper returning `(ContentBlock, Taint, u32)`
+- `execute_tool_uses()` — runs all `ToolUse` blocks concurrently via `futures::future::join_all`, merges taint + corrections deltas, preserves result order
 - `futures` crate added to workspace and `helm-agent`
+
+**Lifecycle hooks** (v1.4, in ReactAgent):
+- `pre_run` — called before the loop starts
+- `post_run` — called after loop ends
+- `on_tool_call` — called before each tool execution
 
 **Missing (planned):**
 - `src/roles.rs` — sub-agent specialization (v2.0)
-- `src/plan_cache.rs` wiring into ReactAgent planning path (v1.2)
-- `src/model_router.rs` integration into provider selection (v1.3)
 
 **Grep targets:**
-- `AgentEvent::` — event sink for monitoring; `TextDelta` for streaming chunks
+- `AgentEvent::` — all event variants; match arms in tui.rs must stay exhaustive
 - `EvidenceVerifier::verify` — post-condition checks
 - `parse_tool_calls` — multi-format tool call parsing
-- `BudgetTracker::check` — budget enforcement
+- `CostBudget::record_cost` — budget enforcement
+- `PlanCache::lookup` — plan cache hit path
+- `check_capability` — RBAC enforcement in react.rs
+- `ModelRouter::select_with_fallback` — provider fallback chain
 
 **v1.0.1 execution policy:**
 - The default system prompt requires plan-first execution before tool use.
@@ -273,19 +292,31 @@ helm/
 | `src/tui.rs` | `TuiApp`, `ModalState`, `TuiRuntimeInner`, `render_modal()`, `handle_modal_key()` |
 
 **Subcommands** (all in `main.rs`):
-- `helm run <TASK>` — one-shot agent task
+- `helm run <TASK>` — one-shot agent task; `--fallback`, `--budget`, `--pre-run`, `--post-run`, `--on-tool-call`, `--trace` flags
 - `helm tui` — interactive terminal UI
 - `helm init` — interactive setup wizard → `~/.helm/config.toml`
 - `helm doctor [--json]` — health check (provider reachability, DB, quirks, tool registry)
 - `helm episodes [--limit N]` — list episode history
+- `helm episodes show <ID>` — show episode detail
+- `helm episodes merge <ID1> <ID2>` — merge two episodes (KeepFirst/KeepSecond/KeepBoth resolution)
 - `helm replay <EPISODE_ID>` — replay recorded episode
 - `helm models` — list models for active provider
 - `helm permissions` — manage capability grants
-- `helm audit` — view/verify audit log chain
+- `helm audit verify` — verify HMAC chain integrity
+- `helm audit export` — export audit log
+- `helm audit list` — list audit events
 - `helm config {get,set,edit,validate,path}` — config inspection and mutation
 - `helm completion {bash,zsh,fish}` — shell completion generation
-- `helm secrets {list,set,get,delete,path,import-env}` — persistent provider-key management
-- `helm skills {list,show,approve,test}` — skill library management
+- `helm secrets {set,get,delete,list,rotate,check}` — secrets store with rotation policy
+- `helm skills {list,show,delete,learn}` — skill library management
+- `helm sessions {list,export,delete,resume}` — session persistence management
+- `helm memory graph` — query knowledge graph entities/relations
+- `helm memory export` / `helm memory import` — graph JSON export/import
+- `helm memory gc` — prune stale graph relations
+- `helm profile show` — user profile preferences
+- `helm profile set/get` — set/get individual preferences
+- `helm profile routes` — model router success rates
+- `helm stats` — cost and usage statistics
 
 **Config/secrets rules:**
 - `write_helm_config()` must not accept or write plaintext provider keys.
@@ -321,6 +352,25 @@ helm/
 - Transcript scrolling is bottom-relative via `session.transcript_scroll` and rendered with `Paragraph::scroll`, not manual line slicing.
 - `EnableMouseCapture`/`DisableMouseCapture` are paired in `run_tui`; do not add mouse support without preserving terminal cleanup.
 - `CommandAction::from_slug()` handles slash-command aliases such as `/quit`, `/exit`, and `/q`.
+
+**TUI slash commands** (v1.1+):
+- `/new` — start a new session
+- `/resume` — resume last session
+- `/sessions` — list sessions
+- `/snapshot` — save snapshot of current session
+- `/theme <name>` — switch theme
+- `/help` — show help
+
+**TUI AgentEvent handlers** (v1.4–v1.5, in `tui.rs`):
+- `ProviderFailover` — status bar notice
+- `BudgetWarning` — yellow warning line in transcript
+- `BudgetExceeded` — red line, input blocked until acknowledged
+- `PromptCacheHit` — status bar token-savings indicator
+- `PermissionDenied` — red line with capability name
+- `ValidationFailed` — red line with field + reason
+- `BreakpointHit` — yellow pause banner; resumes on Enter
+- `PlanCacheHit` / `PlanCacheMiss` — status bar indicator
+- `SkillSuggested` — inline suggestion with confidence score
 
 **Grep targets:**
 - `ModalState::` — all modal variants
@@ -370,11 +420,11 @@ helm/
 | `~/.helm/config.toml` | Provider, model, DB path, default capabilities |
 | `~/.helm/audit.log` | HMAC-chained audit log (line-delimited JSON) |
 | `~/.helm/skills/` | Skill markdown files (versioned) |
-| `~/.helm/helm.db` | SQLite database (episodes, steps, capability grants) |
-| `~/.helm/mcp-servers.toml` | MCP server configs (v1.1) — managed via `helm mcp {list,add,remove,test,run}` |
-| `~/.helm/sessions/` | Session/conversation persistence (v1.1) — list/delete/export/resume |
-| `~/.helm/snapshots/` | File edit snapshots for undo/redo (v1.1) |
-| `~/.helm/user_profile.toml` | Planned user preferences (v1.3); current impl is SQLite at `helm.db` tables |
+| `~/.helm/helm.db` | SQLite database: episodes, steps, capability grants, sessions, graph, skill_learner, user_profile, router_outcomes, plan_cache |
+| `~/.helm/secrets.json` | Secrets store with rotation policy (0o600); managed via `helm secrets {set,get,delete,list,rotate,check}` |
+| `~/.helm/mcp-servers.toml` | MCP server configs — managed via `helm mcp {list,add,remove,test,run}` |
+| `~/.helm/sessions/` | Session export files (list/delete/export/resume via `helm sessions`) |
+| `~/.helm/snapshots/` | Session snapshots for undo/redo; auto-saved every N steps by ReactAgent |
 
 ---
 
@@ -393,4 +443,15 @@ helm/
 | Where is the Groq default model? | `crates/helm-providers/src/openai_compat.rs` → `GROQ_DEFAULT_MODEL` |
 | Where are skill gold examples? | `crates/helm-memory/src/skills.rs` → `SkillsManager::test()` |
 | Where is the Supervisor DAG? | `crates/helm-agent/src/supervisor.rs` |
-| Where is budget tracking? | `crates/helm-agent/src/budget.rs` |
+| Where is budget tracking? | `crates/helm-agent/src/budget.rs` → `CostBudget` |
+| Where is session management? | `crates/helm-memory/src/sessions.rs` → `SessionStore` |
+| Where is skill learning? | `crates/helm-memory/src/skill_learner.rs` → `extract_skills_from_episode` |
+| Where is RBAC? | `crates/helm-memory/src/user_profile.rs` → `Role::allows` + `check_capability` in react.rs |
+| Where is input validation? | `crates/helm-core/src/validation.rs` → `Validator` |
+| Where is the plan cache? | `crates/helm-agent/src/plan_cache.rs` → `PlanCache::lookup` |
+| Where is provider fallback? | `crates/helm-agent/src/model_router.rs` → `FallbackChain::select_with_fallback` |
+| Where is the HTTP tool? | `crates/helm-tools/src/http.rs` |
+| Where is the search tool? | `crates/helm-tools/src/search.rs` |
+| Where is secrets rotation? | `crates/helm-core/src/secret.rs` → `SecretStore::rotate` |
+| Where is the knowledge graph? | `crates/helm-memory/src/graph.rs` → `EntityGraph` |
+| Where is episode merging? | `crates/helm-memory/src/merge_episodes.rs` → `merge_episodes` |
