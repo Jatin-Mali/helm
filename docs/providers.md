@@ -26,9 +26,13 @@ helm doctor
 
 ```sh
 export GOOGLE_API_KEY=...
+# GEMINI_API_KEY is also accepted
 helm init --force --provider gemini --model gemini-2.5-flash
 helm doctor
 ```
+
+`helm` prefers `GOOGLE_API_KEY` as the default Gemini env var, but also accepts
+`GEMINI_API_KEY` for compatibility.
 
 ## NVIDIA NIM
 

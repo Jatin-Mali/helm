@@ -30,14 +30,15 @@ output or external content can request dangerous local actions.
 
 ## API Key Storage
 
-Provider API keys are stored locally in `~/.helm/secrets.toml` (Unix mode
-0600, parent directory 0700, atomic write via temp-file + rename). The file is
-never world-readable; HELM refuses to load it if permissions are wider than
-0600 and refuses to write below a world-writable parent. Keys are held in a
-`Secret` newtype that suppresses debug output and is only exposed as a plain
-string at the HTTP boundary or explicit `helm secrets get` output.
+Provider API keys are stored locally in `$XDG_CONFIG_HOME/helm/secrets.toml`
+(or `~/.config/helm/secrets.toml`) with Unix mode 0600, parent directory 0700,
+and atomic write via temp-file + rename. The file is never world-readable;
+HELM refuses to load it if permissions are wider than 0600 and refuses to write
+below a world-writable parent. Keys are held in a `Secret` newtype that
+suppresses debug output and is only exposed as a plain string at the HTTP
+boundary or explicit `helm secrets get` output.
 
-Resolution order: CLI `--api-key` flag → `~/.helm/secrets.toml` → environment variable.
+Resolution order: CLI `--api-key` flag → secrets store → environment variable.
 
 Environment variables are not silently imported into the secrets store by the
 TUI. They remain session-scoped unless you explicitly save them with

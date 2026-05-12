@@ -646,7 +646,7 @@ impl CommandAction {
             Self::Resume => "show resume guidance",
             Self::Config => "view or edit config inline (/config key=value)",
             Self::Theme => "switch theme (/theme dracula)",
-            Self::Keybindings => "show keybinding overrides at ~/.helm/keybindings.json",
+            Self::Keybindings => "show keybinding overrides in the HELM XDG config directory",
             Self::Stats => "show token usage and cost since today",
             Self::Mcp => "list MCP servers",
             Self::Compact => "summarize transcript to reclaim context",

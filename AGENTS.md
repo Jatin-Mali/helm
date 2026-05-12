@@ -15,7 +15,7 @@ These are release-blocking rules. Follow them for every change.
      - `rg -n "white-phantom|github.com/helm|helm.sh/install" .`
 
 2. **Never persist plaintext provider keys outside the secrets store**
-   - `~/.helm/secrets.toml` is the only persistent store for provider secrets.
+   - `$XDG_CONFIG_HOME/helm/secrets.toml` (or `~/.config/helm/secrets.toml`) is the only persistent store for provider secrets.
    - `config.toml` must never contain `provider.api_key` or any raw key value.
    - The TUI must never silently copy env keys into the secrets store on startup.
    - Resolution order remains:
@@ -23,10 +23,10 @@ These are release-blocking rules. Follow them for every change.
 
 3. **HELM local state is sensitive**
    - Treat these paths as protected local state:
-     - `~/.helm/secrets.toml`
-     - `~/.helm/.secrets.toml.lock`
-     - `~/.helm/helm.db`
-     - `~/.helm/helm.log`
+     - `$XDG_CONFIG_HOME/helm/secrets.toml`
+     - `$XDG_CONFIG_HOME/helm/.secrets.toml.lock`
+     - `$XDG_DATA_HOME/helm/helm.db`
+     - `$XDG_DATA_HOME/helm/logs/helm.log`
    - `fs_read` must deny these by default.
    - Redaction must hide both provider-style keys and these HELM paths before
      persistence and trace logging.
@@ -96,7 +96,7 @@ helm/
 | `src/taint.rs` | `TaintLevel` (User/Tool/External), `Tainted<T>` | External content cannot escalate to `*.write` |
 | `src/message.rs` | `Role`, `ContentBlock`, `Message` | Wire format for all LLM chat |
 | `src/error.rs` | `HelmError`, `BudgetError`, `ProviderError`, `ToolError` | All error types in one place |
-| `src/secret.rs` | `Secret`, `SecretStore`, `RotationPolicy`, `redact_secrets()` | Secret wrapper + `set/get/delete/list/rotate/check_rotation_needed/rotation_history`; stored at `~/.helm/secrets.json` with 0o600 mode |
+| `src/secret.rs` | `Secret`, `SecretStore`, `RotationPolicy`, `redact_secrets()` | Secret wrapper + `set/get/delete/list/rotate/check_rotation_needed/rotation_history`; stored at `$XDG_CONFIG_HOME/helm/secrets.toml` with 0o600 mode |
 | `src/validation.rs` | `Validator`, `ValidationError` | `validate_prompt`, `validate_shell`, `validate_url`; called before every goal/tool input |
 | `src/lib.rs` | re-exports | — |
 
@@ -168,7 +168,7 @@ helm/
 
 **Partially implemented (not wired into runtime):**
 - `src/git.rs` — `GitTool`: 11 git actions (status, log, diff, add, commit, push, pull, branch, checkout, stash, clone) via `tokio::process::Command`. Requires `Capability::ShellExec`.
-- `src/mcp.rs` — `McpTool`: JSON-RPC 2.0 stdio bridge to external MCP servers. Config at `~/.helm/mcp-servers.toml`. Actions: `list_tools`, `call`. CLI: `helm mcp {list,add,remove,test,run}`.
+- `src/mcp.rs` — `McpTool`: JSON-RPC 2.0 stdio bridge to external MCP servers. Config at `$XDG_CONFIG_HOME/helm/mcp-servers.toml`. Actions: `list_tools`, `call`. CLI: `helm mcp {list,add,remove,test,run}`.
 
 **v1.0.1 reliability notes:**
 - `ToolContext::new()` defaults to a 120s per-tool timeout.
@@ -186,7 +186,7 @@ helm/
 | File | Key Types | Notes |
 |------|-----------|-------|
 | `src/episodes.rs` | `EpisodeRecord`, `StepRecord`, `AuditEventRecord`, `CapabilityGrantRecord` | Append-only; HMAC chain in AuditEventRecord |
-| `src/skills.rs` | `Skill`, `SkillsManager` | Files in `~/.helm/skills/`; versioned markdown with metadata |
+| `src/skills.rs` | `Skill`, `SkillsManager` | Files in `$XDG_DATA_HOME/helm/skills/`; versioned markdown with metadata |
 | `src/sessions.rs` | `SessionStore`, `SessionRecord` | SQLite-backed; `list`, `delete`, `export`, `snapshot`, `resume` |
 | `src/graph.rs` | `EntityGraph` | SQLite knowledge graph; `find_entities`, `find_relations`, `semantic_search` (cosine, pure Rust), `prune_stale_relations`, `store_embedding`, `export_json`, `import_json` |
 | `src/skill_learner.rs` | `SkillLearner` | `extract_skills_from_episode` (SHA256 skill key, confidence scoring), `find_matching_skills` (top 5 by confidence) — called after successful episodes |
@@ -294,7 +294,7 @@ helm/
 **Subcommands** (all in `main.rs`):
 - `helm run <TASK>` — one-shot agent task; `--fallback`, `--budget`, `--pre-run`, `--post-run`, `--on-tool-call`, `--trace` flags
 - `helm tui` — interactive terminal UI
-- `helm init` — interactive setup wizard → `~/.helm/config.toml`
+- `helm init` — interactive setup wizard → `$XDG_CONFIG_HOME/helm/config.toml`
 - `helm doctor [--json]` — health check (provider reachability, DB, quirks, tool registry)
 - `helm episodes [--limit N]` — list episode history
 - `helm episodes show <ID>` — show episode detail

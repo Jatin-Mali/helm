@@ -16,14 +16,14 @@ no extra ports.
 
 ```
 local helm CLI
-  └─ SSH subprocess: ssh <host> helm run --ndjson-sink "<goal>"
+  └─ SSH subprocess: ssh <host> helm run "<goal>" --emit-events
        └─ remote helm binary
             └─ NdjsonSink → one JSON object per stdout line
   ← agent_remote::run_on_remote reads each line, parses AgentEvent, re-emits locally
 ```
 
 1. The local CLI opens an SSH subprocess (via `std::process::Command`) running
-   `helm run --ndjson-sink "<goal>"` on the remote host.
+   `helm run "<goal>" --emit-events` on the remote host.
 2. The remote `helm` binary runs the full ReAct loop with `NdjsonSink` attached,
    writing one JSON object per line to stdout (`ndjson_sink.rs:191`).
 3. The local `run_on_remote` function (`agent_remote.rs:56`) reads stdout
@@ -64,18 +64,19 @@ All event types mirror `AgentEvent` variants; the full list is in
 
 ---
 
-## Version handshake
+## Version compatibility
 
-Before launching the agent, the bootstrap sequence (`bootstrap.rs`) probes the
+The bootstrap sequence (`bootstrap.rs`) probes the
 remote binary:
 
 ```bash
 ssh <host> helm --version
 ```
 
-The version string is parsed and checked against the local version.  A minor
-version mismatch produces a warning; a major version mismatch aborts with an
-error.  This prevents silent wire-format incompatibility.
+The version string is parsed and checked during bootstrap. A minor version
+mismatch produces a warning; a major version mismatch aborts with an error.
+That keeps freshly-bootstrapped targets from silently drifting into an
+incompatible wire format.
 
 ---
 
@@ -122,6 +123,8 @@ compatible with newer remote binaries.
   user's `ssh-agent`.
 - The remote binary runs with the same capabilities as an interactive SSH session
   — no privilege elevation.
-- Audit events are written on the *remote* host into `~/.helm/audit/<local-host>.db`
+- Audit events are written on the *remote* host into the HELM audit shard
+  directory under its XDG data path, typically
+  `~/.local/share/helm/audit/<local-host>.db`
   (per-host sharding, roadmap Q6) so a compromised transport does not lose the
   remote audit trail.

@@ -2,9 +2,9 @@
 
 ## Persistent Provider Keys
 
-HELM now stores provider API keys in `~/.helm/secrets.toml` with Unix mode
-0600. This fixes the old env-only setup where a fresh terminal lost access to
-the configured provider.
+HELM now stores provider API keys in `$XDG_CONFIG_HOME/helm/secrets.toml` (or
+`~/.config/helm/secrets.toml`) with Unix mode 0600. This fixes the old env-only
+setup where a fresh terminal lost access to the configured provider.
 
 Migration for existing users:
 

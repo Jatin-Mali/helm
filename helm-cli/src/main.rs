@@ -292,7 +292,7 @@ struct BootstrapArgs {
     /// Download the helm binary on the remote from this URL instead of uploading the local one.
     #[arg(long, value_name = "URL")]
     release_url: Option<String>,
-    /// Register the bootstrapped target in ~/.helm/remotes.toml under this name.
+    /// Register the bootstrapped target in the HELM XDG config remotes registry under this name.
     #[arg(long, value_name = "NAME")]
     register_as: Option<String>,
     /// Path to a local helm binary to upload. Defaults to the currently running binary.
@@ -598,7 +598,7 @@ struct SecretsDeleteArgs {
 
 #[derive(Debug, Args)]
 struct InitArgs {
-    #[arg(long, help = "Overwrite an existing ~/.helm/config.toml")]
+    #[arg(long, help = "Overwrite an existing HELM config file")]
     force: bool,
     #[arg(long, help = "Skip API key validation")]
     no_validate: bool,

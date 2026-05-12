@@ -8,6 +8,15 @@ local audit trail of what it did.
 
 `helm` with no arguments opens the TUI.
 
+## What Ships In v1.5
+
+- Local TUI and one-shot CLI task execution
+- Provider/model switching with live provider catalogs where supported
+- Built-in Linux ops tools plus executable skills
+- Session history, snapshots, undo/redo, and audit verification
+- SSH remote targets, bootstrap, remote agent execution, and TUI attach mode
+- Optional OpenTelemetry export
+
 ## Install
 
 ### Release binary
@@ -48,8 +57,15 @@ Minimum supported Rust version: `1.85`.
 3. API key if the provider needs one
 4. optional crash-report consent
 
-Stored keys go into `~/.helm/secrets.toml` with mode `0600`. `config.toml`
-stores provider/model settings, not the raw key.
+Stored keys go into `$XDG_CONFIG_HOME/helm/secrets.toml` (or
+`~/.config/helm/secrets.toml`) with mode `0600`. `config.toml` stores
+provider/model settings, not the raw key.
+
+HELM now follows XDG paths:
+
+- Config: `$XDG_CONFIG_HOME/helm/` or `~/.config/helm/`
+- Data: `$XDG_DATA_HOME/helm/` or `~/.local/share/helm/`
+- Cache: `$XDG_CACHE_HOME/helm/` or `~/.cache/helm/`
 
 ## Provider Examples
 
@@ -58,6 +74,16 @@ stores provider/model settings, not the raw key.
 ```sh
 export OPENROUTER_API_KEY='sk-or-...'
 ./target/release/helm init --force --provider openrouter
+./target/release/helm doctor
+./target/release/helm "Reply with exactly: ok"
+```
+
+### Gemini
+
+```sh
+export GOOGLE_API_KEY='...'
+# GEMINI_API_KEY is also accepted
+./target/release/helm init --force --provider gemini --model gemini-2.5-flash
 ./target/release/helm doctor
 ./target/release/helm "Reply with exactly: ok"
 ```
@@ -85,19 +111,34 @@ helm replay <episode_id>              # replay a run
 helm audit verify                     # verify audit chain
 helm permissions list                 # current grants
 helm secrets list                     # stored provider keys
+helm skills list                      # built-in and user skills
+helm skills run git-status --dry-run  # inspect a skill before running it
+helm remote list                      # registered SSH targets
+helm bootstrap user@host --register-as prod-1
+helm run --remote prod-1 "check nginx and journal errors"
+helm serve --bind 127.0.0.1:8765
+helm tui --attach 127.0.0.1:8765 --token "$HELM_REMOTE_TOKEN"
 helm config path                      # config file location
 helm completion bash                  # shell completion
 ```
 
 ## Security Notes
 
-- Stored provider keys live in `~/.helm/secrets.toml` with mode `0600`.
+- Stored provider keys live in `$XDG_CONFIG_HOME/helm/secrets.toml` (or `~/.config/helm/secrets.toml`) with mode `0600`.
 - Environment variables stay ephemeral unless you explicitly import or save
   them. The TUI does not auto-import env keys into the secrets store anymore.
 - Dangerous tools still require capability grants unless you run with explicit
   override flags such as `--yes`.
-- HELM keeps local episode and audit state in `~/.helm/`. Treat that directory
-  as sensitive local state.
+- HELM keeps local config, audit, session, and episode state under the XDG
+  helm directories. Treat those directories as sensitive local state.
+
+## Remote Mode
+
+Remote agent execution in v1.5 uses NDJSON streamed over SSH. The local client
+starts the remote `helm` binary, then replays remote `AgentEvent`s into the
+local CLI or TUI. See:
+
+- `docs/agent-on-remote.md`
 
 ## Use HELM If / Use Something Else If
 
@@ -111,6 +152,7 @@ helm completion bash                  # shell completion
 ## Docs
 
 - `docs/providers.md`
+- `docs/agent-on-remote.md`
 - `docs/threat-model.md`
 - `docs/troubleshooting.md`
 - `docs/release-notes-v1.0.md`
