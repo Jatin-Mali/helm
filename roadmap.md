@@ -226,14 +226,14 @@ These are typed in the input, prefix /. Many duplicate top-level helm commands b
 
 | # | Feature | Details | Best-in-class reference | Ship-rank |
 |---|---|---|---|---|
-| K1 | Built-in skills bundled (~30 ops-focused: disk-cleanup, find-leaking-process, etc.) |  | Cowork built-in Skills | SHOULD (v1.0/1.1) |
-| K2 | Skill manifest format: name, description, schema, code, gold examples, capabilities, version |  | Cowork Skill format | SHOULD |
+| K1 | Built-in skills bundled (docker-restart, git-status, nginx-deploy starter set) | Loaded via include_str! at compile time; auto-registered as SkillTool at agent startup | Cowork built-in Skills | SHIPPED (v1.5) |
+| K2 | Skill manifest format: name, description, schema, code, gold examples, capabilities, version | skill.toml format with JSON Schema input validation | Cowork Skill format | SHIPPED (v1.5) |
 | K3 | Voyager-style auto-extraction from successful episodes |  | None — your moat | COULD (v1.3) |
 | K4 | Skill versioning + gold-example regression tests |  | None — novel | COULD (v1.3) |
 | K5 | Decentralized skill exchange (signed manifest URL) |  | None — your moat | COULD (v3.1) |
 | K6 | Skill review modal: full code visible, capabilities listed, signature checked |  | None — your safety story | COULD (v3.1) |
 | K7 | Skill execution sandboxed (separate Python venv per skill) |  | None | COULD |
-| K8 | helm skills run <name> --input '{…}' standalone invocation |  | None | SHOULD |
+| K8 | helm skills run <name> --input '{…}' standalone invocation | --dry-run prints resolved shell commands; live path executes via SkillTool | None | SHIPPED (v1.5) |
 | K9 | Custom user-written skills in ~/.helm/skills/<name>/ (skill.toml + script) |  | OpenClaw skills, Cowork | SHOULD |
 | K10 | Disable specific skills per project via .helmignore |  | None | NICE |
 
@@ -300,7 +300,7 @@ These are typed in the input, prefix /. Many duplicate top-level helm commands b
 |---|---|---|---|---|
 | O1 | Structured logs via tracing to ~/.helm/helm.log |  | DONE | DONE |
 | O2 | Per-iteration debug events with token counts |  | DONE | DONE |
-| O3 | OpenTelemetry exporter (OTLP) |  | Cowork OTel | SHOULD |
+| O3 | OpenTelemetry exporter (OTLP) | helm.episode/plan/provider_call/tool_call spans; otel feature flag; HELM_TELEMETRY_ENDPOINT env override | Cowork OTel | SHIPPED (v1.5) |
 | O4 | Prometheus metrics endpoint when serving |  | None — novel for our category | COULD |
 | O5 | helm doctor --json for monitoring scrape |  | DONE | DONE |
 | O6 | Token-counter heartbeat in TUI |  | Crush, Claude Code | SHOULD |
@@ -313,7 +313,7 @@ These are typed in the input, prefix /. Many duplicate top-level helm commands b
 
 | # | Feature | Details | Best-in-class reference | Ship-rank |
 |---|---|---|---|---|
-| P1 | Lifecycle hooks: PreToolUse, PostToolUse, PrePlan, PostPlan, OnEpisodeStart/End |  | Claude Code hooks, Crush hooks | SHOULD |
+| P1 | Lifecycle hooks: PreToolUse, PostToolUse, PrePlan, PostPlan, OnEpisodeStart/End | All 6 hook stages wired; shell commands fire with HELM_* env vars | Claude Code hooks, Crush hooks | SHIPPED (v1.5) |
 | P2 | Hook config in ~/.helm/hooks.toml (matchers + commands) |  | Claude Code | SHOULD |
 | P3 | Hook env vars: HELM_TOOL, HELM_INPUT, HELM_EPISODE_ID, HELM_TARGET, HELM_CWD |  | Claude Code envs | SHOULD |
 | P4 | User custom commands: ~/.helm/commands/<name>.md with frontmatter |  | Claude Code, OpenCode | SHOULD |
@@ -329,11 +329,11 @@ These are typed in the input, prefix /. Many duplicate top-level helm commands b
 | # | Feature | Details | Best-in-class reference | Ship-rank |
 |---|---|---|---|---|
 | Q1 | --remote <host> SSH-mode |  | None — your moat | SHOULD (v1.5) |
-| Q2 | --remote agent-on-remote mode (gRPC over SSH) |  | None | SHOULD (v1.5) |
+| Q2 | --remote agent-on-remote mode (NDJSON over SSH) | Line-delimited JSON event stream over SSH stdout; see docs/agent-on-remote.md | None | SHIPPED (v1.5) |
 | Q3 | helm bootstrap <host> auto-install |  | None | COULD (v1.5) |
 | Q4 | Tailscale-aware target resolution |  | None | NICE |
 | Q5 | Multi-target broadcast (run same task on N hosts) |  | None — novel | COULD (v2.0) |
-| Q6 | Per-target audit log (separate file per host) |  | None | SHOULD (v1.5) |
+| Q6 | Per-target audit log (separate file per host) | Lazily-opened per-host SQLite shards under ~/.helm/audit/<host>.db with independent HMAC chains | None | SHIPPED (v1.5) |
 | Q7 | helm tunnel reverse-tunnel daemon |  | None | COULD (v2.5) |
 | Q8 | Mobile dispatch PWA |  | Cowork Dispatch | COULD (v2.5) |
 | Q9 | Bearer token auth on serve mode |  | OpenCode OPENCODE_SERVER_PASSWORD | SHOULD |
@@ -475,7 +475,7 @@ Already partially done (DAG + supervisor + roles). The v2.0 work:
 
 ### Cluster 8 — Remote & networking (Q)
 
-**Order.** Q1 (just-shell SSH) first — biggest impact, simplest implementation. Q2 (agent-on-remote) second — needs gRPC + protobuf design + version handshake. Q3 (bootstrap) last — depends on Q2.
+**Order.** Q1 (just-shell SSH) first — biggest impact, simplest implementation. Q2 (agent-on-remote) shipped in v1.5 as NDJSON-over-SSH (line-delimited JSON over SSH stdout/stdin); gRPC remains a v2.0 follow-up. Q3 (bootstrap) last — depends on Q2.
 **Gotcha.** SSH key management. Do NOT roll your own. Read ~/.ssh/config, defer to the user's ssh-agent, never store keys in HELM's data dir.
 
 ### Cluster 9 — Notifications/scheduling/proactivity (R)
@@ -674,7 +674,7 @@ The single biggest differentiating release. **Lead the v1.5 announcement
 with this — it's the demo nobody else can match.**
 
 - Q1 (just-shell SSH mode)
-- Q2 (agent-on-remote with gRPC over SSH)
+- Q2 (agent-on-remote: NDJSON over SSH — shipped; gRPC deferred to v2.0)
 - Q3 (bootstrap install)
 - Q6 (per-target audit log)
 - B22, C5, G29 (helm remote add/list/test, --remote flag, /remote slash)

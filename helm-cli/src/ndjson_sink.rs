@@ -179,6 +179,12 @@ impl AgentEventSink for NdjsonSink {
                 "breakpoint_hit",
                 json!({ "step_index": step_index, "tool": tool_name }),
             ),
+            AgentEvent::PlanStarted { iteration } => {
+                ("plan_started", json!({ "iteration": iteration }))
+            }
+            AgentEvent::PlanFinished { iteration } => {
+                ("plan_finished", json!({ "iteration": iteration }))
+            }
         };
         let line = json!({ "event": name, "data": data });
         let _guard = self.writer.lock().ok();

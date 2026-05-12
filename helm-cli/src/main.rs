@@ -3,6 +3,7 @@
 mod agent_remote;
 mod attach_tui;
 mod bootstrap;
+mod builtin_skills;
 mod custom_commands;
 mod hooks;
 mod keybindings;
@@ -13,6 +14,7 @@ mod sandbox;
 mod secrets;
 mod serve;
 mod snapshot_sink;
+mod telemetry;
 mod tui;
 
 use std::{
@@ -40,7 +42,7 @@ use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
     OpenAiCompatProvider, Provider, StopReason, ToolSchema, quirks_for,
 };
-use helm_tools::{Tool, ToolContext, ToolRegistry};
+use helm_tools::{SkillTool, Tool, ToolContext, ToolRegistry};
 use secrets::SecretsStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -461,6 +463,7 @@ enum SkillsCommand {
     Approve(SkillApproveArgs),
     Disable(SkillDisableArgs),
     Test(SkillTestArgs),
+    Run(SkillRunArgs),
 }
 
 #[derive(Debug, Args)]
@@ -485,6 +488,18 @@ struct SkillDisableArgs {
 struct SkillTestArgs {
     #[arg(value_name = "ID")]
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct SkillRunArgs {
+    #[arg(value_name = "ID")]
+    id: String,
+    /// JSON object of input values for `{{key}}` substitution (e.g. '{"branch":"main"}').
+    #[arg(long, value_name = "JSON")]
+    input: Option<String>,
+    /// Print resolved commands without executing them.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -671,6 +686,8 @@ struct FileSecurityConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileTelemetryConfig {
     enabled: Option<bool>,
+    endpoint: Option<String>,
+    service_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -767,14 +784,26 @@ async fn run() -> Result<()> {
     } else {
         None
     };
-    init_tracing(cli.verbose, cli.trace, tui_log_path.as_deref())?;
     let config_path = default_config_path()?;
     let config = load_config(&config_path)?;
-    let _telemetry_enabled = config
-        .as_ref()
-        .and_then(|config| config.telemetry.as_ref())
-        .and_then(|telemetry| telemetry.enabled)
-        .unwrap_or(false);
+    let telemetry_config = {
+        let t = config.as_ref().and_then(|c| c.telemetry.as_ref());
+        telemetry::TelemetryConfig {
+            enabled: t.and_then(|t| t.enabled).unwrap_or(false),
+            endpoint: t
+                .and_then(|t| t.endpoint.clone())
+                .unwrap_or_else(|| "http://localhost:4317".to_string()),
+            service_name: t
+                .and_then(|t| t.service_name.clone())
+                .unwrap_or_else(|| "helm".to_string()),
+        }
+    };
+    init_tracing(
+        cli.verbose,
+        cli.trace,
+        tui_log_path.as_deref(),
+        &telemetry_config,
+    )?;
     let provider_settings = resolve_provider_settings(
         config.as_ref(),
         cli.provider,
@@ -1009,7 +1038,7 @@ async fn run() -> Result<()> {
                 }
                 let agent = ReactAgent::with_tool_context(
                     provider,
-                    ToolRegistry::default(),
+                    build_registry_with_skills(&builtin_skills::load_builtin_skills()),
                     memory.clone(),
                     budget,
                     model.clone(),
@@ -1253,7 +1282,7 @@ async fn run() -> Result<()> {
                 let cancel = CancellationToken::new();
                 let agent = ReactAgent::new(
                     provider,
-                    ToolRegistry::default(),
+                    build_registry_with_skills(&builtin_skills::load_builtin_skills()),
                     memory.clone(),
                     budget,
                     model,
@@ -1339,15 +1368,29 @@ async fn run() -> Result<()> {
         }
         Command::Skills(args) => match args.command {
             SkillsCommand::List => {
+                let mut skills = builtin_skills::load_builtin_skills();
                 let manager = helm_memory::SkillsManager::new();
-                let skills = manager.list()?;
-                for skill in skills {
-                    println!("{}: {} (v{})", skill.id, skill.name, skill.version);
+                for user_skill in manager.list().unwrap_or_default() {
+                    if !skills.iter().any(|s| s.id == user_skill.id) {
+                        skills.push(user_skill);
+                    }
+                }
+                for skill in &skills {
+                    let tag = if skill.source_path == std::path::Path::new("builtin") {
+                        " [builtin]"
+                    } else {
+                        ""
+                    };
+                    println!("{}: {} (v{}){tag}", skill.id, skill.name, skill.version);
                 }
             }
             SkillsCommand::Show(args) => {
-                let manager = helm_memory::SkillsManager::new();
-                let skill = manager.show(&args.id)?;
+                let builtins = builtin_skills::load_builtin_skills();
+                let skill = builtins
+                    .into_iter()
+                    .find(|s| s.id == args.id)
+                    .or_else(|| helm_memory::SkillsManager::new().show(&args.id).ok())
+                    .ok_or_else(|| anyhow!("skill not found: {}", args.id))?;
                 println!("ID: {}", skill.id);
                 println!("Name: {}", skill.name);
                 println!("Version: {}", skill.version);
@@ -1368,6 +1411,55 @@ async fn run() -> Result<()> {
                 let manager = helm_memory::SkillsManager::new();
                 let result = manager.test(&args.id)?;
                 println!("{result}");
+            }
+            SkillsCommand::Run(args) => {
+                let builtins = builtin_skills::load_builtin_skills();
+                let skill = builtins
+                    .into_iter()
+                    .find(|s| s.id == args.id)
+                    .or_else(|| helm_memory::SkillsManager::new().show(&args.id).ok())
+                    .ok_or_else(|| anyhow!("skill not found: {}", args.id))?;
+                let raw_cmds = builtin_skills::extract_bash_commands(&skill.content);
+                if raw_cmds.is_empty() {
+                    anyhow::bail!(
+                        "skill '{}' has no executable bash commands in its SKILL.md",
+                        args.id
+                    );
+                }
+                let input_val: serde_json::Value = match args.input.as_deref() {
+                    Some(s) => serde_json::from_str(s)
+                        .map_err(|e| anyhow!("--input is not valid JSON: {e}"))?,
+                    None => serde_json::Value::Object(serde_json::Map::new()),
+                };
+                if args.dry_run {
+                    for cmd in &raw_cmds {
+                        let mut resolved = cmd.clone();
+                        if let Some(obj) = input_val.as_object() {
+                            for (k, v) in obj {
+                                let ph = format!("{{{{{k}}}}}");
+                                let rep = match v {
+                                    serde_json::Value::String(sv) => sv.clone(),
+                                    other => other.to_string(),
+                                };
+                                resolved = resolved.replace(&ph, &rep);
+                            }
+                        }
+                        println!("$ {resolved}");
+                    }
+                } else {
+                    let tool = SkillTool::new(&skill.id, &skill.description, raw_cmds);
+                    let ctx = ToolContext::new(std::env::current_dir()?);
+                    let out = tool
+                        .execute(input_val, &ctx)
+                        .await
+                        .map_err(|e| anyhow!("{e}"))?;
+                    if !out.content.is_empty() {
+                        print!("{}", out.content);
+                    }
+                    if !out.success {
+                        anyhow::bail!("skill '{}' finished with errors", args.id);
+                    }
+                }
             }
         },
         Command::Mcp(args) => {
@@ -1475,7 +1567,10 @@ async fn run_bootstrap_command(args: BootstrapArgs) -> Result<()> {
     println!("[bootstrap] helm version: {}", report.remote_helm_version);
     println!("[bootstrap] installed at: {}", report.installed_path);
     if let Some(name) = report.registered_as.as_deref() {
-        println!("[bootstrap] registered as `{name}` in ~/.helm/remotes.toml");
+        println!(
+            "[bootstrap] registered as `{name}` in {}",
+            crate::remote::registry_path()?.display()
+        );
     } else {
         println!(
             "[bootstrap] (target not registered. Pass --register-as <name> to add to remotes registry.)"
@@ -3202,8 +3297,24 @@ async fn run_memory_doctor(db_path: &Path, memory: &MemoryStore) -> Result<Docto
     })
 }
 
+/// Build a `ToolRegistry` seeded with all default tools plus one `SkillTool` per skill.
+fn build_registry_with_skills(skills: &[helm_memory::Skill]) -> ToolRegistry {
+    let mut registry = ToolRegistry::with_default_tools();
+    for skill in skills {
+        let cmds = builtin_skills::extract_bash_commands(&skill.content);
+        if !cmds.is_empty() {
+            registry.register(Box::new(SkillTool::new(
+                &skill.id,
+                &skill.description,
+                cmds,
+            )));
+        }
+    }
+    registry
+}
+
 fn run_tools_doctor() -> Vec<DoctorToolReport> {
-    let mut tools = ToolRegistry::default()
+    let mut tools = build_registry_with_skills(&builtin_skills::load_builtin_skills())
         .schemas()
         .into_iter()
         .map(|schema| DoctorToolReport {
@@ -3778,11 +3889,44 @@ pub(crate) fn default_api_key_env(choice: ProviderChoice) -> Option<&'static str
     }
 }
 
-fn init_tracing(verbose: bool, _json: bool, log_path: Option<&Path>) -> Result<()> {
+fn init_tracing(
+    verbose: bool,
+    _json: bool,
+    log_path: Option<&Path>,
+    telemetry: &telemetry::TelemetryConfig,
+) -> Result<()> {
     let default_filter = if verbose { "helm=debug" } else { "helm=warn" };
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(default_filter))
         .map_err(|error| anyhow!("invalid tracing filter: {error}"))?;
+
+    #[cfg(feature = "otel")]
+    if let Some(tracer) = telemetry::build_otel_tracer(telemetry) {
+        let otel = tracing_opentelemetry::layer().with_tracer(tracer);
+        return match log_path {
+            Some(path) => {
+                ensure_parent_dir(path)?;
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(fmt::layer().with_writer(LogFileMakeWriter {
+                        path: path.to_path_buf(),
+                    }))
+                    .with(otel)
+                    .try_init()
+                    .map_err(|e| anyhow!("failed to initialize tracing: {e}"))
+            }
+            None => tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer().with_writer(std::io::stderr))
+                .with(otel)
+                .try_init()
+                .map_err(|e| anyhow!("failed to initialize tracing: {e}")),
+        };
+    }
+
+    #[cfg(not(feature = "otel"))]
+    let _ = telemetry;
+
     match log_path {
         Some(path) => {
             ensure_parent_dir(path)?;
@@ -4030,8 +4174,9 @@ async fn run_profile_command(
         .parent()
         .map(|p| p.join("profile.db"))
         .ok_or_else(|| anyhow!("invalid db path"))?;
-    let profile =
-        UserProfileStore::open(&profile_path).map_err(|e| anyhow!("profile error: {}", e))?;
+    let prefs_toml = paths::user_profile_file();
+    let profile = UserProfileStore::open_with_prefs(&profile_path, &prefs_toml)
+        .map_err(|e| anyhow!("profile error: {}", e))?;
 
     match args.command {
         ProfileCommand::Show => {

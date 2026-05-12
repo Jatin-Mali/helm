@@ -1884,7 +1884,9 @@ Report the exit status and the concise output."
             AgentEvent::RunFinished { .. }
             | AgentEvent::RunFailed { .. }
             | AgentEvent::TextDelta { .. }
-            | AgentEvent::PlanCacheHit { .. } => {}
+            | AgentEvent::PlanCacheHit { .. }
+            | AgentEvent::PlanStarted { .. }
+            | AgentEvent::PlanFinished { .. } => {}
         }
     }
 
@@ -4891,9 +4893,9 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
-        std::fs::create_dir_all(home.join(".helm")).unwrap();
+        std::fs::create_dir_all(home.join(".config").join("helm")).unwrap();
         std::fs::write(
-            home.join(".helm").join("remotes.toml"),
+            home.join(".config").join("helm").join("remotes.toml"),
             "[[remotes]]\nname = \"prod-1\"\nhost = \"prod.example.com\"\nport = 22\n",
         )
         .unwrap();

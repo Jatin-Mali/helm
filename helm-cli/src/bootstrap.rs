@@ -8,8 +8,8 @@
 //!
 //! When a `--release` URL is supplied the binary is downloaded on the remote
 //! via `curl -fsSL`; otherwise the local binary is uploaded via `scp`. After
-//! a successful bootstrap, the remote is registered in `~/.helm/remotes.toml`
-//! (if not already present).
+//! a successful bootstrap, the remote is registered in the local remotes
+//! registry under the XDG config directory (if not already present).
 //!
 //! Bootstrap intentionally does *not* mutate the local installation, does
 //! *not* read `~/.ssh/config` directly (we defer to ssh-agent + the user's

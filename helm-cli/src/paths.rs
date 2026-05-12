@@ -108,3 +108,7 @@ pub fn default_allowlist_path() -> PathBuf {
 pub fn default_mcp_servers_path() -> PathBuf {
     config_file("mcp-servers.toml")
 }
+
+pub fn user_profile_file() -> PathBuf {
+    config_file("user_profile.toml")
+}

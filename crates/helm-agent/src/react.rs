@@ -12,7 +12,7 @@ use helm_providers::{
 };
 use helm_tools::{ToolContext, ToolRegistry};
 use serde_json::Value;
-use tracing::{debug, info, instrument, trace, warn};
+use tracing::{Instrument as _, debug, info, instrument, trace, warn};
 
 use crate::{
     budget::{Budget, BudgetTracker},
@@ -164,6 +164,16 @@ pub enum AgentEvent {
         goal_hash: String,
         /// Number of steps in the cached plan.
         steps: u32,
+    },
+    /// A planning LLM call is about to be issued (OnEpisodeStart → PrePlan boundary).
+    PlanStarted {
+        /// Zero-based iteration index.
+        iteration: u32,
+    },
+    /// A planning LLM call finished and the agent has decided its next action.
+    PlanFinished {
+        /// One-based iteration index.
+        iteration: u32,
     },
     /// A text-format tool call was recovered.
     FormatRecoveryUsed {
@@ -367,7 +377,7 @@ impl ReactAgent {
     }
 
     /// Runs one ReAct episode and emits live progress events to `sink`.
-    #[instrument(skip(self, sink), fields(goal = %goal, provider = %self.provider.name(), model = %self.model))]
+    #[instrument(name = "helm.episode", skip(self, sink), fields(goal = %goal, provider = %self.provider.name(), model = %self.model))]
     pub async fn run_with_events(
         &self,
         goal: &str,
@@ -563,12 +573,27 @@ impl ReactAgent {
                 iteration = tracker.iterations(),
                 "calling provider"
             );
+            sink.emit(AgentEvent::PlanStarted {
+                iteration: tracker.iterations(),
+            });
             sink.emit(AgentEvent::ProviderCallStarted {
                 iteration: tracker.iterations(),
                 provider: self.provider.name().to_owned(),
                 model: self.model.clone(),
             });
-            let response = match self.provider.chat(request).await {
+            let provider_fut = self
+                .provider
+                .chat(request)
+                .instrument(tracing::info_span!(
+                    "helm.provider_call",
+                    provider = self.provider.name(),
+                    model = %self.model,
+                ))
+                .instrument(tracing::info_span!(
+                    "helm.plan",
+                    iteration = tracker.iterations(),
+                ));
+            let response = match provider_fut.await {
                 Ok(response) => response,
                 Err(error) => {
                     self.persist_corrections(
@@ -596,6 +621,7 @@ impl ReactAgent {
                 tokens_in: response.usage.input_tokens,
                 tokens_out: response.usage.output_tokens,
             });
+            sink.emit(AgentEvent::PlanFinished { iteration });
             // Persist a routing outcome so `helm profile routes` reflects observed behavior.
             let cost_usd = if self.budget.max_cost_usd.is_some() {
                 let pricing = pricing_for(self.provider.name(), &self.model);
@@ -1002,6 +1028,7 @@ impl ReactAgent {
                 let result = self
                     .tools
                     .execute(name, input.clone(), &self.tool_context)
+                    .instrument(tracing::info_span!("helm.tool_call", tool = name))
                     .await;
                 let (decision, output_hash) = match &result {
                     Ok(output) => ("allow", stable_hash_hex(&output.content)),

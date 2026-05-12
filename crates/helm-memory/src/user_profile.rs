@@ -1,7 +1,7 @@
 //! User preference store — persists learned preferences across sessions.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -18,6 +18,10 @@ pub enum UserProfileError {
     Sqlite(#[from] rusqlite::Error),
     #[error("lock poisoned")]
     Lock,
+    #[error("toml serialize: {0}")]
+    Toml(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -101,18 +105,70 @@ pub struct UserPreferences {
     pub current_role: Role,
 }
 
+// ── UserPreferencesFile ───────────────────────────────────────────────────────
+
+/// TOML-backed storage for `UserPreferences`. Reads on demand, writes
+/// atomically. Keeps `tool_outcomes` in SQLite (high write-rate).
+pub struct UserPreferencesFile;
+
+impl UserPreferencesFile {
+    pub fn load(path: &Path) -> UserPreferences {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(prefs: &UserPreferences, path: &Path) -> Result<(), UserProfileError> {
+        let text =
+            toml::to_string_pretty(prefs).map_err(|e| UserProfileError::Toml(e.to_string()))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, text)?;
+        Ok(())
+    }
+}
+
 // ── UserProfileStore ──────────────────────────────────────────────────────────
 
 pub struct UserProfileStore {
     conn: Arc<Mutex<Connection>>,
+    prefs: Arc<Mutex<UserPreferences>>,
+    prefs_path: Option<PathBuf>,
 }
 
 impl UserProfileStore {
     pub fn open(path: &Path) -> Result<Self, UserProfileError> {
         let conn = Connection::open(path)?;
         run_migrations(&conn)?;
+        let prefs = load_prefs_from_sqlite(&conn);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            prefs: Arc::new(Mutex::new(prefs)),
+            prefs_path: None,
+        })
+    }
+
+    /// Open with a separate TOML file for `UserPreferences`. On first open,
+    /// if the TOML file is absent, migrates the SQLite `user_profile` row.
+    pub fn open_with_prefs(
+        sqlite_path: &Path,
+        prefs_path: &Path,
+    ) -> Result<Self, UserProfileError> {
+        let conn = Connection::open(sqlite_path)?;
+        run_migrations(&conn)?;
+        let prefs = if prefs_path.exists() {
+            UserPreferencesFile::load(prefs_path)
+        } else {
+            let p = load_prefs_from_sqlite(&conn);
+            UserPreferencesFile::save(&p, prefs_path)?;
+            p
+        };
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            prefs: Arc::new(Mutex::new(prefs)),
+            prefs_path: Some(prefs_path.to_owned()),
         })
     }
 
@@ -121,82 +177,104 @@ impl UserProfileStore {
         run_migrations(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            prefs: Arc::new(Mutex::new(UserPreferences::default())),
+            prefs_path: None,
         })
     }
 
     pub fn get(&self) -> Result<UserPreferences, UserProfileError> {
-        let conn = lock(&self.conn)?;
-        let result = conn.query_row(
-            "SELECT preferred_model, verbosity, timezone, correction_count, last_goal, current_role
-             FROM user_profile WHERE id = 1",
-            [],
-            |row| {
-                let verbosity_str: String = row.get(1)?;
-                let role_str: String = row.get(5)?;
-                Ok(UserPreferences {
-                    preferred_model: row.get(0)?,
-                    verbosity: Verbosity::from_str(&verbosity_str),
-                    timezone: row.get(2)?,
-                    correction_count: row.get::<_, i64>(3)? as u32,
-                    last_goal: row.get(4)?,
-                    current_role: Role::from_str(&role_str),
-                })
-            },
-        );
-        match result {
-            Ok(p) => Ok(p),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(UserPreferences::default()),
-            Err(e) => Err(UserProfileError::Sqlite(e)),
+        self.prefs
+            .lock()
+            .map(|g| g.clone())
+            .map_err(|_| UserProfileError::Lock)
+    }
+
+    fn flush_prefs(&self) {
+        let Ok(guard) = self.prefs.lock() else { return };
+        if let Some(path) = &self.prefs_path {
+            if let Err(e) = UserPreferencesFile::save(&guard, path) {
+                eprintln!("helm: failed to save user_profile.toml: {e}");
+            }
         }
     }
 
     pub fn set_preferred_model(&self, model: &str) -> Result<(), UserProfileError> {
-        let conn = lock(&self.conn)?;
-        conn.execute(
-            "INSERT INTO user_profile (id, preferred_model) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET preferred_model = excluded.preferred_model",
-            params![model],
-        )?;
+        {
+            let conn = lock(&self.conn)?;
+            conn.execute(
+                "INSERT INTO user_profile (id, preferred_model) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET preferred_model = excluded.preferred_model",
+                params![model],
+            )?;
+        }
+        if let Ok(mut g) = self.prefs.lock() {
+            g.preferred_model = Some(model.to_owned());
+        }
+        self.flush_prefs();
         Ok(())
     }
 
     pub fn set_verbosity(&self, v: Verbosity) -> Result<(), UserProfileError> {
-        let conn = lock(&self.conn)?;
-        conn.execute(
-            "INSERT INTO user_profile (id, verbosity) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET verbosity = excluded.verbosity",
-            params![v.as_str()],
-        )?;
+        {
+            let conn = lock(&self.conn)?;
+            conn.execute(
+                "INSERT INTO user_profile (id, verbosity) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET verbosity = excluded.verbosity",
+                params![v.as_str()],
+            )?;
+        }
+        if let Ok(mut g) = self.prefs.lock() {
+            g.verbosity = v;
+        }
+        self.flush_prefs();
         Ok(())
     }
 
     pub fn set_timezone(&self, tz: &str) -> Result<(), UserProfileError> {
-        let conn = lock(&self.conn)?;
-        conn.execute(
-            "INSERT INTO user_profile (id, timezone) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET timezone = excluded.timezone",
-            params![tz],
-        )?;
+        {
+            let conn = lock(&self.conn)?;
+            conn.execute(
+                "INSERT INTO user_profile (id, timezone) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET timezone = excluded.timezone",
+                params![tz],
+            )?;
+        }
+        if let Ok(mut g) = self.prefs.lock() {
+            g.timezone = Some(tz.to_owned());
+        }
+        self.flush_prefs();
         Ok(())
     }
 
     pub fn record_correction(&self) -> Result<(), UserProfileError> {
-        let conn = lock(&self.conn)?;
-        conn.execute(
-            "INSERT INTO user_profile (id, correction_count) VALUES (1, 1)
-             ON CONFLICT(id) DO UPDATE SET correction_count = correction_count + 1",
-            [],
-        )?;
+        {
+            let conn = lock(&self.conn)?;
+            conn.execute(
+                "INSERT INTO user_profile (id, correction_count) VALUES (1, 1)
+                 ON CONFLICT(id) DO UPDATE SET correction_count = correction_count + 1",
+                [],
+            )?;
+        }
+        if let Ok(mut g) = self.prefs.lock() {
+            g.correction_count = g.correction_count.saturating_add(1);
+        }
+        self.flush_prefs();
         Ok(())
     }
 
     pub fn record_goal(&self, goal: &str) -> Result<(), UserProfileError> {
-        let conn = lock(&self.conn)?;
-        conn.execute(
-            "INSERT INTO user_profile (id, last_goal) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET last_goal = excluded.last_goal",
-            params![goal],
-        )?;
+        {
+            let conn = lock(&self.conn)?;
+            conn.execute(
+                "INSERT INTO user_profile (id, last_goal) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET last_goal = excluded.last_goal",
+                params![goal],
+            )?;
+        }
+        if let Ok(mut g) = self.prefs.lock() {
+            g.last_goal = Some(goal.to_owned());
+        }
+        self.flush_prefs();
         Ok(())
     }
 
@@ -287,28 +365,27 @@ impl UserProfileStore {
     }
 
     pub fn set_role(&self, role: Role) -> Result<(), UserProfileError> {
-        let conn = lock(&self.conn)?;
-        conn.execute(
-            "INSERT INTO user_profile (id, current_role) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET current_role = excluded.current_role",
-            params![role.as_str()],
-        )?;
+        {
+            let conn = lock(&self.conn)?;
+            conn.execute(
+                "INSERT INTO user_profile (id, current_role) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET current_role = excluded.current_role",
+                params![role.as_str()],
+            )?;
+        }
+        if let Ok(mut g) = self.prefs.lock() {
+            g.current_role = role;
+        }
+        self.flush_prefs();
         Ok(())
     }
 
     pub fn get_role(&self) -> Result<Role, UserProfileError> {
-        let conn = lock(&self.conn)?;
-        let result = conn
-            .query_row(
-                "SELECT current_role FROM user_profile WHERE id = 1",
-                [],
-                |row| {
-                    let role_str: String = row.get(0)?;
-                    Ok(Role::from_str(&role_str))
-                },
-            )
-            .optional()?;
-        Ok(result.unwrap_or_default())
+        Ok(self
+            .prefs
+            .lock()
+            .map_err(|_| UserProfileError::Lock)?
+            .current_role)
     }
 }
 
@@ -316,6 +393,27 @@ impl UserProfileStore {
 
 fn lock(conn: &Arc<Mutex<Connection>>) -> Result<MutexGuard<'_, Connection>, UserProfileError> {
     conn.lock().map_err(|_| UserProfileError::Lock)
+}
+
+fn load_prefs_from_sqlite(conn: &Connection) -> UserPreferences {
+    conn.query_row(
+        "SELECT preferred_model, verbosity, timezone, correction_count, last_goal, current_role
+         FROM user_profile WHERE id = 1",
+        [],
+        |row| {
+            let verbosity_str: String = row.get(1)?;
+            let role_str: String = row.get(5)?;
+            Ok(UserPreferences {
+                preferred_model: row.get(0)?,
+                verbosity: Verbosity::from_str(&verbosity_str),
+                timezone: row.get(2)?,
+                correction_count: row.get::<_, i64>(3)? as u32,
+                last_goal: row.get(4)?,
+                current_role: Role::from_str(&role_str),
+            })
+        },
+    )
+    .unwrap_or_default()
 }
 
 fn run_migrations(conn: &Connection) -> Result<(), UserProfileError> {
@@ -349,7 +447,7 @@ fn run_migrations(conn: &Connection) -> Result<(), UserProfileError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Role, UserProfileStore, Verbosity};
+    use super::{Role, UserPreferences, UserProfileStore, Verbosity};
 
     fn store() -> UserProfileStore {
         UserProfileStore::open_in_memory().unwrap()
@@ -456,5 +554,53 @@ mod tests {
         assert_eq!(s.get_role().unwrap(), Role::Admin);
         s.set_role(Role::Viewer).unwrap();
         assert_eq!(s.get_role().unwrap(), Role::Viewer);
+    }
+
+    #[test]
+    fn user_preferences_file_round_trip() {
+        use super::UserPreferencesFile;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user_profile.toml");
+        let prefs = UserPreferences {
+            preferred_model: Some("claude-3".to_owned()),
+            verbosity: Verbosity::Verbose,
+            timezone: Some("UTC".to_owned()),
+            correction_count: 5,
+            last_goal: Some("test goal".to_owned()),
+            current_role: Role::Admin,
+        };
+        UserPreferencesFile::save(&prefs, &path).unwrap();
+        let loaded = UserPreferencesFile::load(&path);
+        assert_eq!(loaded.preferred_model, prefs.preferred_model);
+        assert_eq!(loaded.verbosity, prefs.verbosity);
+        assert_eq!(loaded.correction_count, prefs.correction_count);
+        assert_eq!(loaded.current_role, prefs.current_role);
+    }
+
+    #[test]
+    fn open_with_prefs_migrates_sqlite_to_toml() {
+        use super::UserPreferencesFile;
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite_path = dir.path().join("profile.db");
+        let toml_path = dir.path().join("user_profile.toml");
+
+        // seed SQLite
+        let s = UserProfileStore::open(&sqlite_path).unwrap();
+        s.set_preferred_model("gpt-4").unwrap();
+        s.set_verbosity(Verbosity::Quiet).unwrap();
+        drop(s);
+
+        // open_with_prefs should migrate
+        assert!(!toml_path.exists());
+        let s2 = UserProfileStore::open_with_prefs(&sqlite_path, &toml_path).unwrap();
+        assert!(toml_path.exists());
+        let prefs = s2.get().unwrap();
+        assert_eq!(prefs.preferred_model.as_deref(), Some("gpt-4"));
+        assert_eq!(prefs.verbosity, Verbosity::Quiet);
+
+        // subsequent set should update TOML
+        s2.set_timezone("Europe/London").unwrap();
+        let loaded = UserPreferencesFile::load(&toml_path);
+        assert_eq!(loaded.timezone.as_deref(), Some("Europe/London"));
     }
 }

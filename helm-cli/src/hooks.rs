@@ -27,6 +27,18 @@ pub struct HooksConfig {
     pub post_run: Option<String>,
     #[serde(default)]
     pub on_tool_call: Option<String>,
+    /// Fired when an episode starts (RunStarted event).
+    #[serde(default)]
+    pub on_episode_start: Option<String>,
+    /// Fired when an episode ends (RunFinished or RunFailed).
+    #[serde(default)]
+    pub on_episode_end: Option<String>,
+    /// Fired before each LLM planning call.
+    #[serde(default)]
+    pub pre_plan: Option<String>,
+    /// Fired after each LLM planning call completes.
+    #[serde(default)]
+    pub post_plan: Option<String>,
     /// Optional matchers: tool name -> command (overrides on_tool_call for that tool).
     #[serde(default)]
     pub tool: HashMap<String, ToolHook>,
@@ -65,6 +77,10 @@ pub fn merge_inline(
         pre_run: pre_run.or(base.pre_run),
         post_run: post_run.or(base.post_run),
         on_tool_call: on_tool_call.or(base.on_tool_call),
+        on_episode_start: base.on_episode_start,
+        on_episode_end: base.on_episode_end,
+        pre_plan: base.pre_plan,
+        post_plan: base.post_plan,
         tool: base.tool,
     }
 }
@@ -113,11 +129,15 @@ pub fn fire_sync(stage: String, cmd: String, extra: HashMap<String, String>) {
     });
 }
 
-/// AgentEventSink wrapper that fires `on_tool_call` before each tool execution
-/// and forwards every event to the inner sink unchanged.
+/// AgentEventSink wrapper that fires lifecycle hooks on agent events and
+/// forwards every event to the inner sink unchanged.
 pub struct HookEventSink<S: AgentEventSink> {
     inner: S,
     on_tool_call: Option<String>,
+    on_episode_start: Option<String>,
+    on_episode_end: Option<String>,
+    pre_plan: Option<String>,
+    post_plan: Option<String>,
     per_tool: Arc<HashMap<String, ToolHook>>,
     episode_id: Arc<std::sync::Mutex<Option<String>>>,
     target: Option<String>,
@@ -128,6 +148,10 @@ impl<S: AgentEventSink> HookEventSink<S> {
         Self {
             inner,
             on_tool_call: hooks.on_tool_call.clone(),
+            on_episode_start: hooks.on_episode_start.clone(),
+            on_episode_end: hooks.on_episode_end.clone(),
+            pre_plan: hooks.pre_plan.clone(),
+            post_plan: hooks.post_plan.clone(),
             per_tool: Arc::new(hooks.tool.clone()),
             episode_id: Arc::new(std::sync::Mutex::new(None)),
             target,
@@ -149,9 +173,47 @@ impl<S: AgentEventSink> HookEventSink<S> {
 impl<S: AgentEventSink> AgentEventSink for HookEventSink<S> {
     fn emit(&self, event: AgentEvent) {
         match &event {
-            AgentEvent::RunStarted { episode_id, .. } => {
+            AgentEvent::RunStarted { episode_id, goal } => {
                 if let Ok(mut guard) = self.episode_id.lock() {
                     *guard = Some(episode_id.clone());
+                }
+                if let Some(cmd) = self.on_episode_start.as_ref() {
+                    let mut extra = self.base_env();
+                    extra.insert("HELM_GOAL".to_owned(), goal.clone());
+                    fire_sync("on_episode_start".to_owned(), cmd.clone(), extra);
+                }
+            }
+            AgentEvent::RunFinished { result } => {
+                if let Some(cmd) = self.on_episode_end.as_ref() {
+                    let mut extra = self.base_env();
+                    extra.insert("HELM_OUTCOME".to_owned(), "success".to_owned());
+                    extra.insert("HELM_EPISODE_ID".to_owned(), result.episode_id.clone());
+                    fire_sync("on_episode_end".to_owned(), cmd.clone(), extra);
+                }
+            }
+            AgentEvent::RunFailed { episode_id, error } => {
+                if let Some(cmd) = self.on_episode_end.as_ref() {
+                    let mut extra = self.base_env();
+                    extra.insert("HELM_OUTCOME".to_owned(), "failed".to_owned());
+                    extra.insert("HELM_ERROR".to_owned(), error.clone());
+                    if let Some(eid) = episode_id {
+                        extra.insert("HELM_EPISODE_ID".to_owned(), eid.clone());
+                    }
+                    fire_sync("on_episode_end".to_owned(), cmd.clone(), extra);
+                }
+            }
+            AgentEvent::PlanStarted { iteration } => {
+                if let Some(cmd) = self.pre_plan.as_ref() {
+                    let mut extra = self.base_env();
+                    extra.insert("HELM_ITERATION".to_owned(), iteration.to_string());
+                    fire_sync("pre_plan".to_owned(), cmd.clone(), extra);
+                }
+            }
+            AgentEvent::PlanFinished { iteration } => {
+                if let Some(cmd) = self.post_plan.as_ref() {
+                    let mut extra = self.base_env();
+                    extra.insert("HELM_ITERATION".to_owned(), iteration.to_string());
+                    fire_sync("post_plan".to_owned(), cmd.clone(), extra);
                 }
             }
             AgentEvent::ToolCallParsed { name, input, .. } => {
@@ -248,6 +310,7 @@ mod tests {
             post_run: Some("base_post".into()),
             on_tool_call: None,
             tool: HashMap::new(),
+            ..HooksConfig::default()
         };
         let merged = merge_inline(base, Some("cli_pre".into()), None, Some("cli_tool".into()));
         assert_eq!(merged.pre_run.as_deref(), Some("cli_pre"));

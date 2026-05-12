@@ -1,7 +1,8 @@
 //! Episode log API backed by SQLite.
 
 use std::{
-    path::Path,
+    collections::HashMap,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -15,6 +16,26 @@ const MIGRATION_0002: &str = include_str!("../migrations/0002_model_capability_w
 const MIGRATION_0003: &str = include_str!("../migrations/0003_v3_corrections.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_security.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0005_remote_audit.sql");
+
+/// Minimal schema for per-host audit shard DBs (audit_events only).
+const SHARD_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS audit_events (\
+    id INTEGER PRIMARY KEY,\
+    episode_id TEXT,\
+    target TEXT,\
+    timestamp INTEGER NOT NULL,\
+    tool_name TEXT NOT NULL,\
+    input_hash TEXT NOT NULL DEFAULT '',\
+    output_hash TEXT NOT NULL DEFAULT '',\
+    capability TEXT NOT NULL DEFAULT '',\
+    taint TEXT NOT NULL DEFAULT 'clean',\
+    cwd TEXT NOT NULL DEFAULT '',\
+    decision TEXT NOT NULL DEFAULT '',\
+    previous_hash TEXT NOT NULL DEFAULT '',\
+    event_hash TEXT NOT NULL\
+);\
+CREATE INDEX IF NOT EXISTS idx_audit_shard_episode ON audit_events(episode_id, id);\
+CREATE INDEX IF NOT EXISTS idx_audit_shard_target ON audit_events(target, id);";
 
 /// UUID string identifying an episode row.
 pub type EpisodeId = String;
@@ -227,12 +248,17 @@ pub struct AuditVerification {
 #[derive(Clone)]
 pub struct MemoryStore {
     conn: Arc<Mutex<Connection>>,
+    /// Directory where per-host audit shard DBs are written (sibling of main helm.db).
+    audit_dir: Option<PathBuf>,
+    /// Lazily-opened per-host shard connections keyed by sanitized host name.
+    audit_shards: Arc<Mutex<HashMap<String, Arc<Mutex<Connection>>>>>,
 }
 
 impl MemoryStore {
     /// Opens or creates a SQLite database and runs HELM migrations idempotently.
     pub async fn open(path: &Path) -> Result<Self, MemoryError> {
         let path = path.to_path_buf();
+        let audit_dir = path.parent().map(|p| p.join("audit"));
         let conn = tokio::task::spawn_blocking(move || {
             let conn = Connection::open(path).map_err(sqlite_error)?;
             run_migrations(&conn)?;
@@ -243,7 +269,42 @@ impl MemoryStore {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            audit_dir,
+            audit_shards: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Returns (opening if necessary) the audit shard connection for `host`.
+    fn get_or_open_shard(&self, host: &str) -> Option<Arc<Mutex<Connection>>> {
+        let dir = self.audit_dir.as_ref()?;
+        let safe = sanitize_host(host);
+        if safe.is_empty() {
+            return None;
+        }
+        let mut shards = self.audit_shards.lock().ok()?;
+        if let Some(conn) = shards.get(&safe) {
+            return Some(Arc::clone(conn));
+        }
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("helm: audit shard dir create failed: {e}");
+            return None;
+        }
+        let db_path = dir.join(format!("{safe}.db"));
+        match Connection::open(&db_path) {
+            Ok(conn) => {
+                if let Err(e) = conn.execute_batch(SHARD_SCHEMA) {
+                    eprintln!("helm: audit shard schema failed for {safe}: {e}");
+                    return None;
+                }
+                let arc = Arc::new(Mutex::new(conn));
+                shards.insert(safe, Arc::clone(&arc));
+                Some(arc)
+            }
+            Err(e) => {
+                eprintln!("helm: audit shard open failed for {safe}: {e}");
+                None
+            }
+        }
     }
 
     /// Starts a new episode for `goal` and returns its UUID.
@@ -697,6 +758,13 @@ impl MemoryStore {
             .target
             .map(|target| helm_core::redact_secrets(&target).trim().to_owned())
             .filter(|target| !target.is_empty());
+
+        // Grab shard connection before entering spawn_blocking.
+        let shard = input
+            .target
+            .as_deref()
+            .and_then(|h| self.get_or_open_shard(h));
+
         tokio::task::spawn_blocking(move || {
             let guard = lock_conn(&conn)?;
             let previous_hash = latest_audit_hash(&guard, input.target.as_deref())?;
@@ -715,28 +783,51 @@ impl MemoryStore {
                 cwd: &input.cwd,
                 decision: &input.decision,
             });
-            guard
-                .execute(
-                    "INSERT INTO audit_events \
+            let insert_sql = "INSERT INTO audit_events \
                      (episode_id, target, timestamp, tool_name, input_hash, output_hash, capability, \
                       taint, cwd, decision, previous_hash, event_hash) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![
-                        input.episode_id,
-                        input.target,
-                        timestamp,
-                        input.tool_name,
-                        input.input_hash,
-                        input.output_hash,
-                        input.capability.as_str(),
-                        taint,
-                        input.cwd,
-                        input.decision,
-                        previous_hash,
-                        event_hash
-                    ],
-                )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+            let insert_params = params![
+                input.episode_id,
+                input.target,
+                timestamp,
+                input.tool_name,
+                input.input_hash,
+                input.output_hash,
+                input.capability.as_str(),
+                taint,
+                input.cwd,
+                input.decision,
+                previous_hash,
+                event_hash
+            ];
+            guard
+                .execute(insert_sql, insert_params)
                 .map_err(sqlite_error)?;
+
+            // Mirror to per-host shard DB when a target is set.
+            if let Some(shard_conn) = shard {
+                if let Ok(sg) = shard_conn.lock() {
+                    let _ = sg.execute(
+                        insert_sql,
+                        params![
+                            input.episode_id,
+                            input.target,
+                            timestamp,
+                            input.tool_name,
+                            input.input_hash,
+                            input.output_hash,
+                            input.capability.as_str(),
+                            taint,
+                            input.cwd,
+                            input.decision,
+                            previous_hash,
+                            event_hash
+                        ],
+                    );
+                }
+            }
+
             Ok::<String, MemoryError>(event_hash)
         })
         .await
@@ -1361,6 +1452,19 @@ fn lock_conn(
 
 fn sqlite_error(error: rusqlite::Error) -> MemoryError {
     MemoryError::Sqlite(error.to_string())
+}
+
+/// Sanitize a remote host string so it can be used as a filename component.
+fn sanitize_host(host: &str) -> String {
+    host.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn now_ms() -> i64 {

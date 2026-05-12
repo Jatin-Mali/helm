@@ -621,7 +621,14 @@ mod tests {
         assert_eq!(outcome.tokens_in, 100);
         assert_eq!(outcome.tokens_out, 50);
         assert_eq!(outcome.iterations, 1);
-        assert!(matches!(event, AgentEvent::ProviderCallFinished { tokens_in: 100, tokens_out: 50, .. }));
+        assert!(matches!(
+            event,
+            AgentEvent::ProviderCallFinished {
+                tokens_in: 100,
+                tokens_out: 50,
+                ..
+            }
+        ));
     }
 
     #[test]

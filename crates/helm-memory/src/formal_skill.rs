@@ -200,14 +200,17 @@ capabilities = ["ShellExec", "SystemService"]
 tags = ["nginx", "web", "deployment"]
 homepage = "https://example.com"
 "#;
-let skill = parse_skill_toml(toml).unwrap();
+        let skill = parse_skill_toml(toml).unwrap();
         assert_eq!(skill.skill.version.as_deref(), Some("1.0.0"));
         assert_eq!(skill.skill.author.as_deref(), Some("community"));
         assert_eq!(
             skill.skill.description.short(),
             "Deploy nginx via shell and service"
         );
-        assert_eq!(skill.prerequisites.capabilities, vec!["ShellExec", "SystemService"]);
+        assert_eq!(
+            skill.prerequisites.capabilities,
+            vec!["ShellExec", "SystemService"]
+        );
         assert_eq!(skill.metadata.tags, vec!["nginx", "web", "deployment"]);
     }
 }

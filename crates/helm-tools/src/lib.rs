@@ -17,6 +17,7 @@ pub mod registry;
 pub mod search;
 pub mod service;
 pub mod shell;
+pub mod skill_tool;
 pub mod ssh;
 pub mod tool;
 pub mod validator;
@@ -30,5 +31,6 @@ pub use mcp::{McpConfig, McpServerConfig, McpTool, default_mcp_config_path, load
 pub use registry::ToolRegistry;
 pub use search::SearchTool;
 pub use shell::ShellTool;
+pub use skill_tool::SkillTool;
 pub use tool::{Tool, ToolContext, ToolError, ToolOutput};
 pub use validator::{AllowlistConfig, InputValidator};

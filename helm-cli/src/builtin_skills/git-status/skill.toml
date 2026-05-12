@@ -1,7 +1,6 @@
 [skill]
 id = "git-status"
 name = "Git Status"
-description = "Show git repository status with clean output"
 
 [skill.description]
 short = "Show clean git status output"

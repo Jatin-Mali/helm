@@ -1,7 +1,6 @@
 [skill]
 id = "nginx-deploy"
 name = "Deploy NGINX"
-description = "Deploy and configure NGINX web server via shell and systemd"
 
 [skill.description]
 short = "Deploy NGINX via shell and systemd"

@@ -1,7 +1,6 @@
 [skill]
 id = "docker-restart"
 name = "Restart Docker"
-description = "Safely restart Docker service"
 
 [skill.description]
 short = "Restart Docker service safely"
