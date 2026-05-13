@@ -278,7 +278,41 @@ impl TroubleshootingPlan {
 
 // ── Troubleshoot planner ────────────────────────────────────────────────────
 
-/// Generate a troubleshooting plan from a user problem.
+/// Generate a troubleshooting plan from a user problem using an explicit snapshot.
+pub async fn plan_from_problem_with_snapshot(
+    problem: &str,
+    snapshot: SystemSnapshot,
+) -> TroubleshootingPlan {
+    let source = PlanSource::UserQuestion(problem.into());
+    let sid = snapshot.id.clone();
+    let mut plan = TroubleshootingPlan::new(source, sid);
+    plan.snapshot_id = snapshot.id.clone();
+
+    let problem_lower = problem.to_lowercase();
+    let domains = detect_relevant_domains(&problem_lower, &snapshot);
+    for (domain, hypothesis, confidence) in domains {
+        let h = build_hypothesis(&snapshot, domain, hypothesis, confidence);
+        plan.hypotheses.push(h);
+    }
+
+    for h in &plan.hypotheses {
+        let steps = build_check_steps(h);
+        plan.read_only_steps.extend(steps);
+    }
+
+    if has_actionable_evidence(&plan.hypotheses) {
+        for h in &plan.hypotheses {
+            if h.confidence >= 0.6 {
+                let steps = build_fix_steps(h);
+                plan.proposed_fix_steps.extend(steps);
+            }
+        }
+    }
+
+    plan
+}
+
+/// Generate a troubleshooting plan from a user problem (auto-collects snapshot).
 pub async fn plan_from_problem(problem: &str) -> TroubleshootingPlan {
     let snapshot = collect_snapshot(MonitorProfile::Standard).await;
     let sid = snapshot.id.clone();
@@ -313,10 +347,47 @@ pub async fn plan_from_problem(problem: &str) -> TroubleshootingPlan {
 }
 
 /// Generate a troubleshooting plan from a stored finding.
-pub async fn plan_from_finding(finding_id: &str, snapshot: SystemSnapshot) -> TroubleshootingPlan {
-    let source = PlanSource::Finding(finding_id.into());
-    let mut plan = TroubleshootingPlan::new(source, snapshot.id.clone());
-    plan.snapshot_id = snapshot.id;
+pub async fn plan_from_finding(finding: &Finding) -> TroubleshootingPlan {
+    let source = PlanSource::Finding(finding.id.clone());
+    // We need a snapshot for plan construction. Since findings reference snapshot IDs,
+    // create a minimal plan that can be populated.
+    let mut plan = TroubleshootingPlan::new(source, finding.snapshot_id.clone());
+    plan.snapshot_id = finding.snapshot_id.clone();
+
+    // Build hypotheses based on the finding's domain and evidence
+    let hyp = Hypothesis {
+        id: format!("hyp-{}", uuid::Uuid::new_v4()),
+        hypothesis: finding.title.clone(),
+        evidence_for: finding
+            .evidence
+            .iter()
+            .map(|e| format!("{}: {} ({})", e.source, e.value, e.note))
+            .collect(),
+        evidence_against: Vec::new(),
+        missing_evidence: finding.missing_data.clone(),
+        confidence: match finding.confidence {
+            crate::findings::Confidence::High => 0.8,
+            crate::findings::Confidence::Medium => 0.6,
+            crate::findings::Confidence::Low => 0.3,
+        },
+        domain: finding.category,
+    };
+    plan.hypotheses.push(hyp);
+
+    // Generate check steps from the finding
+    for check in &finding.read_only_checks {
+        let step = PlanStep {
+            title: format!("Suggested check: {check}"),
+            command: CommandPreview::new(
+                "shell",
+                check,
+                "Inspection command suggested by the finding",
+            ),
+            hypothesis_id: Some(plan.hypotheses[0].id.clone()),
+        };
+        plan.read_only_steps.push(step);
+    }
+
     plan
 }
 

@@ -3,9 +3,9 @@
 use helm_monitor::{
     BlastRadius, CommandPreview, Hypothesis, PlanSource, RiskLevel, RollbackStatus,
     TroubleshootingPlan, explain_finding,
-    findings::Finding,
-    plan_from_problem,
-    snapshot::{HostIdentity, MonitorProfile, SnapshotDomains, SystemSnapshot},
+    findings::{Confidence, Finding, Severity},
+    plan_from_problem, plan_from_problem_with_snapshot,
+    snapshot::{FilesystemEntry, HostIdentity, MonitorProfile, SnapshotDomains, SystemSnapshot},
 };
 
 #[allow(dead_code)]
@@ -257,5 +257,156 @@ fn denied_approval_leaves_zero_state_changes() {
     assert!(
         plan.read_only_steps.is_empty(),
         "no execution in v1.9 — deny is the default state"
+    );
+}
+
+// ── Fixture-based e2e tests ───────────────────────────────────────────
+
+fn fixture_snapshot_with_full_disk() -> SystemSnapshot {
+    let mut snap = SystemSnapshot {
+        id: "fixture-snap-disk".into(),
+        host: HostIdentity::default(),
+        collected_at: chrono::Utc::now(),
+        profile: MonitorProfile::Standard,
+        domains: SnapshotDomains::default(),
+        collector_errors: vec![],
+        redaction_version: "0.1.0".into(),
+    };
+    snap.domains.disks.filesystems.push(FilesystemEntry {
+        device: "/dev/sda1".into(),
+        mount_point: "/".into(),
+        fs_type: "ext4".into(),
+        total_bytes: 500_000_000_000,
+        used_bytes: 475_000_000_000,
+        available_bytes: 25_000_000_000,
+    });
+    snap
+}
+
+#[test]
+fn e2e_fixture_plan_from_problem_with_snapshot_has_hypotheses() {
+    let snap = fixture_snapshot_with_full_disk();
+    let plan = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(plan_from_problem_with_snapshot("disk is full", snap));
+    assert!(!plan.hypotheses.is_empty(), "should generate hypotheses");
+    let disk_hyp = plan
+        .hypotheses
+        .iter()
+        .find(|h| h.domain == helm_monitor::MonitorDomain::Disks);
+    assert!(disk_hyp.is_some(), "disk hypothesis should exist");
+    let h = disk_hyp.unwrap();
+    assert!(
+        h.confidence >= 0.6,
+        "disk hypothesis should have high confidence with evidence, got {}",
+        h.confidence
+    );
+    assert!(
+        !h.evidence_for.is_empty(),
+        "should have evidence from snapshot"
+    );
+}
+
+#[test]
+fn e2e_fixture_plan_has_read_only_checks_for_disk_full() {
+    let snap = fixture_snapshot_with_full_disk();
+    let plan = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(plan_from_problem_with_snapshot("disk is full", snap));
+    assert!(
+        !plan.read_only_steps.is_empty(),
+        "should have read-only check steps"
+    );
+    let has_du = plan.read_only_steps.iter().any(|s| {
+        s.command
+            .command_text
+            .as_deref()
+            .unwrap_or("")
+            .contains("du -sh")
+    });
+    assert!(has_du, "should have du -sh step for disk check");
+}
+
+#[test]
+fn e2e_fixture_plan_has_fix_steps_when_evidence_present() {
+    let snap = fixture_snapshot_with_full_disk();
+    let plan = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(plan_from_problem_with_snapshot("disk is full", snap));
+    assert!(
+        !plan.proposed_fix_steps.is_empty(),
+        "95% disk should have fix steps"
+    );
+    let has_apt_clean = plan.proposed_fix_steps.iter().any(|s| {
+        s.command
+            .command_text
+            .as_deref()
+            .unwrap_or("")
+            .contains("apt-get clean")
+    });
+    assert!(has_apt_clean, "fix steps should include apt-get clean");
+}
+
+#[test]
+fn e2e_fixture_plan_from_problem_with_snapshot_has_evidence_field() {
+    let snap = fixture_snapshot_with_full_disk();
+    let plan = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(plan_from_problem_with_snapshot("disk is full", snap));
+    let disk_hyp = plan
+        .hypotheses
+        .iter()
+        .find(|h| h.domain == helm_monitor::MonitorDomain::Disks)
+        .unwrap();
+    assert!(
+        !disk_hyp.evidence_for.is_empty(),
+        "hypothesis should reference snapshot data"
+    );
+    assert!(
+        disk_hyp.evidence_for[0].contains("95%"),
+        "evidence should cite actual usage percentage"
+    );
+    assert!(
+        disk_hyp.evidence_for[0].contains("/"),
+        "evidence should cite the mount point"
+    );
+}
+
+// ── plan_from_finding ────────────────────────────────────────────────
+
+#[test]
+fn e2e_fixture_plan_from_finding_has_hypotheses() {
+    let finding = Finding::new(
+        "fixture-snap-disk",
+        "disk-usage",
+        "/",
+        "Root filesystem is 95% full",
+        Severity::Critical,
+        Confidence::High,
+        helm_monitor::MonitorDomain::Disks,
+    )
+    .with_evidence("disk.used.bytes", "475G / 500G", "95% utilization")
+    .with_impact("System may run out of disk space")
+    .with_read_only_check("du -sh /var/log/*");
+
+    let plan = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(helm_monitor::plan_from_finding(&finding));
+    assert!(
+        plan.source.to_string().contains("finding:"),
+        "source should be finding-based, got: {}",
+        plan.source
+    );
+    assert!(
+        !plan.hypotheses.is_empty(),
+        "plan_from_finding should produce hypotheses from finding data"
+    );
+    assert!(
+        !plan.hypotheses[0].evidence_for.is_empty(),
+        "finding evidence should become hypothesis evidence"
+    );
+    assert!(
+        !plan.read_only_steps.is_empty(),
+        "finding checks should become plan steps"
     );
 }

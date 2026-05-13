@@ -22,4 +22,5 @@ pub use snapshot::{
 pub use troubleshoot::{
     BlastRadius, CommandPreview, Hypothesis, PlanSource, PlanStep, RiskLevel, RollbackStatus,
     TroubleshootingPlan, explain_finding, plan_from_finding, plan_from_problem,
+    plan_from_problem_with_snapshot,
 };

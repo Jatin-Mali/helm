@@ -36,7 +36,7 @@ use helm_agent::{AgentEvent, AgentEventSink, Budget, CancellationToken, ReactAge
 use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError, Secret};
 use helm_memory::{
     AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, SessionStore,
-    SnapshotStore, StepRecord, UserProfileStore,
+    SnapshotStore, SnapshotStoreRecord, StepRecord, UserProfileStore,
 };
 use helm_monitor::{
     HostIdentity, MonitorDomain, MonitorProfile, MonitorReport, MonitorReporter, SnapshotDomains,
@@ -5180,31 +5180,23 @@ async fn run_troubleshoot_command(args: TroubleshootArgs) -> Result<()> {
         let mut found = false;
         let mut result = plan_from_problem(&args.problem).await;
         if let Ok(Some(finding_record)) = SnapshotStore::latest(&conn) {
-            let h = HostIdentity {
-                hostname: finding_record.host_hostname.clone(),
-                ..Default::default()
-            };
             let d: SnapshotDomains =
                 serde_json::from_str(&finding_record.domains_json).unwrap_or_default();
-            let snapshot = SystemSnapshot {
-                id: finding_record.id.clone(),
-                host: h,
-                collected_at: chrono::DateTime::from_timestamp(finding_record.collected_at, 0)
-                    .unwrap_or_default(),
-                profile: finding_record
-                    .profile
-                    .parse()
-                    .unwrap_or(MonitorProfile::Standard),
-                domains: d,
-                collector_errors: serde_json::from_str(&finding_record.collector_errors_json)
-                    .unwrap_or_default(),
-                redaction_version: String::new(),
-            };
-            result = plan_from_finding(finding_id, snapshot).await;
-            found = true;
+            let snapshot = reconstruct_snapshot(&finding_record, d);
+
+            // Run detectors to find matching finding
+            let reporter = MonitorReporter::new();
+            let all_findings = reporter.registry.detect(&snapshot, None, None);
+            if let Some(matched) = all_findings.into_iter().find(|f| f.id == *finding_id) {
+                result = plan_from_finding(&matched).await;
+                found = true;
+            }
         }
         if !found {
-            eprintln!("No previous snapshots found. Starting from problem description.");
+            eprintln!(
+                "Finding '{}' not found in latest snapshot. Starting from problem description.",
+                finding_id
+            );
         }
         result
     } else {
@@ -5212,9 +5204,14 @@ async fn run_troubleshoot_command(args: TroubleshootArgs) -> Result<()> {
     };
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&plan)?);
+        println!(
+            "{}",
+            helm_core::redact_secrets(&serde_json::to_string_pretty(&plan)?)
+        );
     } else {
-        print!("{}", plan.render_text());
+        let text = plan.render_text();
+        let redacted = helm_core::redact_secrets(&text);
+        print!("{redacted}");
         if plan.approval_required && !plan.proposed_fix_steps.is_empty() {
             eprintln!(
                 "\n[approval required — use 'helm apply-plan {}' to execute]",
@@ -5223,6 +5220,21 @@ async fn run_troubleshoot_command(args: TroubleshootArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn reconstruct_snapshot(record: &SnapshotStoreRecord, domains: SnapshotDomains) -> SystemSnapshot {
+    SystemSnapshot {
+        id: record.id.clone(),
+        host: HostIdentity {
+            hostname: record.host_hostname.clone(),
+            ..Default::default()
+        },
+        collected_at: chrono::DateTime::from_timestamp(record.collected_at, 0).unwrap_or_default(),
+        profile: record.profile.parse().unwrap_or(MonitorProfile::Standard),
+        domains,
+        collector_errors: serde_json::from_str(&record.collector_errors_json).unwrap_or_default(),
+        redaction_version: String::new(),
+    }
 }
 
 async fn run_explain_command(args: ExplainArgs) -> Result<()> {
@@ -5237,21 +5249,7 @@ async fn run_explain_command(args: ExplainArgs) -> Result<()> {
     if let Some(conn) = conn {
         if let Ok(Some(record)) = SnapshotStore::latest(&conn) {
             let d: SnapshotDomains = serde_json::from_str(&record.domains_json).unwrap_or_default();
-            let h = HostIdentity {
-                hostname: record.host_hostname.clone(),
-                ..Default::default()
-            };
-            let snapshot = SystemSnapshot {
-                id: record.id.clone(),
-                host: h,
-                collected_at: chrono::DateTime::from_timestamp(record.collected_at, 0)
-                    .unwrap_or_default(),
-                profile: record.profile.parse().unwrap_or(MonitorProfile::Standard),
-                domains: d,
-                collector_errors: serde_json::from_str(&record.collector_errors_json)
-                    .unwrap_or_default(),
-                redaction_version: String::new(),
-            };
+            let snapshot = reconstruct_snapshot(&record, d);
             let reporter = MonitorReporter::new();
             let findings = reporter.registry.detect(&snapshot, None, None);
             let matched: Vec<_> = findings
@@ -5272,7 +5270,8 @@ async fn run_explain_command(args: ExplainArgs) -> Result<()> {
             )?
         );
     } else {
-        print!("{output}");
+        let redacted = helm_core::redact_secrets(&output);
+        print!("{redacted}");
     }
     Ok(())
 }
