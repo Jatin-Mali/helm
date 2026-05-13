@@ -38,7 +38,9 @@ use helm_memory::{
     AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, SessionStore,
     SnapshotStore, StepRecord, UserProfileStore,
 };
-use helm_monitor::{MonitorProfile, SystemSnapshot, collect_snapshot};
+use helm_monitor::{
+    MonitorDomain, MonitorProfile, MonitorReport, MonitorReporter, SystemSnapshot, collect_snapshot,
+};
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
     OpenAiCompatProvider, Provider, StopReason, ToolSchema, quirks_for,
@@ -162,6 +164,8 @@ enum Command {
     TrustReport(TrustReportArgs),
     /// Collect a typed read-only system snapshot
     Snapshot(SnapshotArgs),
+    /// Run detectors against a system snapshot and report findings
+    Monitor(MonitorArgs),
 }
 
 #[derive(Debug, Args)]
@@ -686,6 +690,25 @@ struct SnapshotArgs {
     /// Output diff against previous snapshot
     #[arg(long)]
     diff: bool,
+}
+
+#[derive(Debug, Args)]
+struct MonitorArgs {
+    /// Output as JSON
+    #[arg(long)]
+    json: bool,
+    /// Output as Markdown
+    #[arg(long)]
+    markdown: bool,
+    /// Collection depth (quick, standard, deep)
+    #[arg(long, default_value = "standard")]
+    profile: String,
+    /// Comma-separated domains to check (e.g. "disks,services,ports")
+    #[arg(long, value_name = "DOMAINS")]
+    domain: Option<String>,
+    /// Watch mode: run repeatedly at the given interval in seconds
+    #[arg(long, value_name = "SECONDS")]
+    watch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
@@ -1641,6 +1664,9 @@ async fn run() -> Result<()> {
         }
         Command::Snapshot(args) => {
             run_collect_snapshot_command(args).await?;
+        }
+        Command::Monitor(args) => {
+            run_monitor_command(args).await?;
         }
     }
     Ok(())
@@ -5004,6 +5030,54 @@ fn render_snapshot(snapshot: &SystemSnapshot) {
             println!("  {}: {}", e.domain, e.message);
         }
     }
+}
+
+async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
+    let profile: MonitorProfile = args.profile.parse().unwrap_or(MonitorProfile::Standard);
+
+    // Parse domain filter
+    let domain_filter: Option<Vec<MonitorDomain>> = args.domain.as_ref().map(|s| {
+        s.split(',')
+            .filter_map(|d| MonitorDomain::from_domain_str(d.trim()))
+            .collect()
+    });
+
+    if let Some(interval) = args.watch {
+        // Watch mode: run repeatedly
+        loop {
+            let report = run_monitor_cycle(profile, domain_filter.as_deref()).await;
+            let output = if args.json {
+                helm_core::redact_secrets(&report.render_json())
+            } else if args.markdown {
+                report.render_markdown()
+            } else {
+                report.render_text()
+            };
+            // Clear terminal and print
+            print!("\x1B[2J\x1B[H{output}");
+            eprintln!("\n(watching every {interval}s — Ctrl+C to stop)");
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        }
+    } else {
+        let report = run_monitor_cycle(profile, domain_filter.as_deref()).await;
+        if args.json {
+            println!("{}", helm_core::redact_secrets(&report.render_json()));
+        } else if args.markdown {
+            println!("{}", report.render_markdown());
+        } else {
+            println!("{}", report.render_text());
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_monitor_cycle(
+    profile: MonitorProfile,
+    domain_filter: Option<&[MonitorDomain]>,
+) -> MonitorReport {
+    let reporter = MonitorReporter::new();
+    reporter.run(profile, domain_filter).await
 }
 
 fn human_bytes(bytes: u64) -> String {
