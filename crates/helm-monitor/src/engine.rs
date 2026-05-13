@@ -5,9 +5,9 @@ use uuid::Uuid;
 use crate::{
     collectors::{
         backups::BackupsCollector, containers::ContainersCollector, disks::DisksCollector,
-        host::HostCollector, load::LoadCollector, logs::LogsCollector, network::NetworkCollector,
-        packages::PackagesCollector, ports::PortsCollector, services::ServicesCollector,
-        timers::TimersCollector,
+        firewall::FirewallCollector, host::HostCollector, load::LoadCollector, logs::LogsCollector,
+        network::NetworkCollector, packages::PackagesCollector, ports::PortsCollector,
+        processes::ProcessCollector, services::ServicesCollector, timers::TimersCollector,
     },
     snapshot::{CollectorError, MonitorProfile, SnapshotDomains, SystemSnapshot},
 };
@@ -31,6 +31,8 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         packages_result,
         timers_result,
         network_result,
+        processes_result,
+        firewall_result,
     ) = tokio::join!(
         HostCollector.collect(profile),
         LoadCollector.collect(profile),
@@ -43,6 +45,8 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         PackagesCollector.collect(profile),
         TimersCollector.collect(profile),
         NetworkCollector.collect(profile),
+        ProcessCollector.collect(profile),
+        FirewallCollector.collect(profile),
     );
 
     let host_identity = unwrap_or_default(host_result, "host", &mut errors);
@@ -56,6 +60,8 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
     let packages_out = unwrap_or_default(packages_result, "packages", &mut errors);
     let timers_out = unwrap_or_default(timers_result, "timers", &mut errors);
     let network_out = unwrap_or_default(network_result, "network", &mut errors);
+    let processes_out = unwrap_or_default(processes_result, "processes", &mut errors);
+    let firewall_out = unwrap_or_default(firewall_result, "firewall", &mut errors);
 
     let domains = SnapshotDomains {
         host: host_identity.clone(),
@@ -69,6 +75,8 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         packages: packages_out,
         timers: timers_out,
         network: network_out,
+        processes: processes_out,
+        firewall: firewall_out,
     };
 
     SystemSnapshot {

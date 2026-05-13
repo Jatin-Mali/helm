@@ -35,8 +35,8 @@ use clap_complete::{Shell, generate};
 use helm_agent::{AgentEvent, AgentEventSink, Budget, CancellationToken, ReactAgent, RunResult};
 use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError, Secret};
 use helm_memory::{
-    AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, SessionStore, StepRecord,
-    UserProfileStore,
+    AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, SessionStore,
+    SnapshotStore, StepRecord, UserProfileStore,
 };
 use helm_monitor::{MonitorProfile, SystemSnapshot, collect_snapshot};
 use helm_providers::{
@@ -4629,21 +4629,163 @@ async fn run_collect_snapshot_command(args: SnapshotArgs) -> Result<()> {
     let profile: MonitorProfile = args.profile.parse().unwrap_or(MonitorProfile::Standard);
     let snapshot = collect_snapshot(profile).await;
 
+    // Persist the snapshot
+    let db_path = default_db_path()?;
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+    let raw_json = serde_json::to_string(&snapshot)?;
+    let redacted_json = helm_core::redact_secrets(&raw_json);
+    SnapshotStore::insert(&conn, &redacted_json).with_context(|| "failed to persist snapshot")?;
+
     if args.diff {
-        // Diff unavailable without persistence — collect and show
-        eprintln!("note: --diff requires snapshot persistence (not yet wired to MemoryStore)");
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
-        } else {
-            render_snapshot(&snapshot);
+        match SnapshotStore::latest_except(&conn, &snapshot.id) {
+            Ok(Some(prev)) => {
+                let prev_val: serde_json::Value =
+                    serde_json::from_str(&prev.domains_json).unwrap_or_default();
+                let curr_val = serde_json::to_value(&snapshot.domains).unwrap_or_default();
+                let diff = compute_diff(&prev_val, &curr_val);
+                let redacted_diff = helm_core::redact_secrets(&serde_json::to_string(&diff)?);
+                if args.json {
+                    println!("{redacted_diff}");
+                } else {
+                    println!("Diff: {} -> {}", prev.id, snapshot.id);
+                    if diff.changes.is_empty() {
+                        println!("  (no changes)");
+                    }
+                    for (path, change) in &diff.changes {
+                        println!("  {path}: {change}");
+                    }
+                }
+            }
+            Ok(None) => {
+                if args.json {
+                    println!(
+                        "{}",
+                        helm_core::redact_secrets(&serde_json::to_string(&snapshot)?)
+                    );
+                } else {
+                    println!(
+                        "No previous snapshot to diff against. Current snapshot saved as {}",
+                        snapshot.id
+                    );
+                    render_snapshot(&snapshot);
+                }
+            }
+            Err(e) => {
+                eprintln!("note: could not load previous snapshot: {e}");
+                if args.json {
+                    println!(
+                        "{}",
+                        helm_core::redact_secrets(&serde_json::to_string(&snapshot)?)
+                    );
+                } else {
+                    render_snapshot(&snapshot);
+                }
+            }
         }
     } else if args.json {
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        println!(
+            "{}",
+            helm_core::redact_secrets(&serde_json::to_string(&snapshot)?)
+        );
     } else {
         render_snapshot(&snapshot);
     }
 
     Ok(())
+}
+
+struct DiffResult {
+    changes: Vec<(String, String)>,
+}
+
+impl serde::Serialize for DiffResult {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("DiffResult", 1)?;
+        st.serialize_field("changes", &self.changes)?;
+        st.end()
+    }
+}
+
+fn compute_diff(prev: &serde_json::Value, curr: &serde_json::Value) -> DiffResult {
+    let mut changes = Vec::new();
+    diff_recursive("", prev, curr, &mut changes);
+    DiffResult { changes }
+}
+
+fn diff_recursive(
+    prefix: &str,
+    prev: &serde_json::Value,
+    curr: &serde_json::Value,
+    changes: &mut Vec<(String, String)>,
+) {
+    match (prev, curr) {
+        (serde_json::Value::Object(prev_obj), serde_json::Value::Object(curr_obj)) => {
+            for (k, v) in curr_obj {
+                let path = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                match prev_obj.get(k) {
+                    Some(pv) => diff_recursive(&path, pv, v, changes),
+                    None => changes.push((path, format!("added: {}", truncate_val(v)))),
+                }
+            }
+            for k in prev_obj.keys() {
+                if !curr_obj.contains_key(k) {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    changes.push((path, "removed".to_string()));
+                }
+            }
+        }
+        (serde_json::Value::Array(prev_arr), serde_json::Value::Array(curr_arr)) => {
+            if prev_arr.len() != curr_arr.len() {
+                changes.push((
+                    prefix.to_string(),
+                    format!("length: {} -> {}", prev_arr.len(), curr_arr.len()),
+                ));
+            } else {
+                for (i, (pv, cv)) in prev_arr.iter().zip(curr_arr.iter()).enumerate() {
+                    diff_recursive(&format!("{prefix}[{i}]"), pv, cv, changes);
+                }
+            }
+        }
+        (serde_json::Value::Number(prev_n), serde_json::Value::Number(curr_n)) => {
+            if prev_n != curr_n {
+                changes.push((prefix.to_string(), format!("{prev_n} -> {curr_n}")));
+            }
+        }
+        (serde_json::Value::String(prev_s), serde_json::Value::String(curr_s)) => {
+            if prev_s != curr_s {
+                changes.push((prefix.to_string(), format!("{prev_s} -> {curr_s}")));
+            }
+        }
+        (serde_json::Value::Bool(prev_b), serde_json::Value::Bool(curr_b)) => {
+            if prev_b != curr_b {
+                changes.push((prefix.to_string(), format!("{prev_b} -> {curr_b}")));
+            }
+        }
+        (prev, curr) => {
+            if prev != curr {
+                changes.push((prefix.to_string(), "type or null changed".to_string()));
+            }
+        }
+    }
+}
+
+fn truncate_val(v: &serde_json::Value) -> String {
+    let s = v.to_string();
+    if s.len() > 80 {
+        format!("{}...", &s[..77])
+    } else {
+        s
+    }
 }
 
 fn render_snapshot(snapshot: &SystemSnapshot) {
@@ -4740,6 +4882,33 @@ fn render_snapshot(snapshot: &SystemSnapshot) {
         snapshot.domains.services.timers.len()
     );
 
+    // ── Processes ──
+    println!("\nProcesses:");
+    println!(
+        "  Total: {}, zombies: {}",
+        snapshot.domains.processes.total_count, snapshot.domains.processes.zombie_count
+    );
+    println!(
+        "  Top by memory ({})",
+        snapshot.domains.processes.top_by_memory.len()
+    );
+    for p in snapshot.domains.processes.top_by_memory.iter().take(5) {
+        println!(
+            "    {:>6} {:<8} {:>5.1}% MEM  {}",
+            p.pid, p.user, p.mem_percent, p.command
+        );
+    }
+    println!(
+        "  Top by CPU ({})",
+        snapshot.domains.processes.top_by_cpu.len()
+    );
+    for p in snapshot.domains.processes.top_by_cpu.iter().take(5) {
+        println!(
+            "    {:>6} {:<8} {:>5.1}% CPU  {}",
+            p.pid, p.user, p.cpu_percent, p.command
+        );
+    }
+
     if let Some(rt) = &snapshot.domains.containers.runtime {
         println!(
             "\nContainers ({}): {}",
@@ -4761,6 +4930,29 @@ fn render_snapshot(snapshot: &SystemSnapshot) {
             l.local_address,
             l.local_port,
             l.process_name.as_deref().unwrap_or("?")
+        );
+    }
+
+    // ── Firewall ──
+    println!("\nFirewall:");
+    if let Some(tool) = &snapshot.domains.firewall.firewall_tool {
+        println!("  Tool: {tool}");
+        if let Some(count) = snapshot.domains.firewall.iptables_rule_count {
+            println!("  Rules: {count}");
+        }
+        if let Some(accept) = snapshot.domains.firewall.default_accept_input {
+            println!("  Default ACCEPT on INPUT: {accept}");
+        }
+    } else {
+        println!("  No iptables or nftables detected");
+    }
+    if let Some(active) = snapshot.domains.firewall.ufw_active {
+        println!("  ufw: {}", if active { "active" } else { "inactive" });
+    }
+    if let Some(active) = snapshot.domains.firewall.firewalld_active {
+        println!(
+            "  firewalld: {}",
+            if active { "running" } else { "not running" }
         );
     }
 

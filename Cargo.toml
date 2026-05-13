@@ -75,12 +75,15 @@ helm-monitor = { path = "crates/helm-monitor" }
 
 [dev-dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 helm-agent.workspace = true
 helm-core.workspace = true
 helm-memory.workspace = true
+helm-monitor.workspace = true
 helm-providers.workspace = true
 helm-tools.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

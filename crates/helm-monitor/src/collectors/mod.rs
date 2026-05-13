@@ -10,12 +10,14 @@
 pub mod backups;
 pub mod containers;
 pub mod disks;
+pub mod firewall;
 pub mod host;
 pub mod load;
 pub mod logs;
 pub mod network;
 pub mod packages;
 pub mod ports;
+pub mod processes;
 pub mod services;
 pub mod timers;
 

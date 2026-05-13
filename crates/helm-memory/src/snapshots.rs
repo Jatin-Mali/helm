@@ -119,6 +119,31 @@ impl SnapshotStore {
         Ok(result)
     }
 
+    /// Get the most recent snapshot, excluding the given ID (for diff).
+    pub fn latest_except(
+        conn: &Connection,
+        except_id: &str,
+    ) -> Result<Option<SnapshotRecord>, MemoryError> {
+        let result = conn
+            .query_row(
+                "SELECT id, host_hostname, collected_at, profile, domains_json, collector_errors_json FROM snapshots WHERE id != ?1 ORDER BY collected_at DESC LIMIT 1",
+                params![except_id],
+                |row| {
+                    Ok(SnapshotRecord {
+                        id: row.get(0)?,
+                        host_hostname: row.get(1)?,
+                        collected_at: row.get(2)?,
+                        profile: row.get(3)?,
+                        domains_json: row.get(4)?,
+                        collector_errors_json: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MemoryError::Other(e.to_string()))?;
+        Ok(result)
+    }
+
     /// Delete a snapshot by ID.
     pub fn delete(conn: &Connection, id: &str) -> Result<(), MemoryError> {
         conn.execute("DELETE FROM snapshots WHERE id = ?1", params![id])

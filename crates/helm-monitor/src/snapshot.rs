@@ -366,6 +366,45 @@ pub struct CronJob {
     pub schedule: Option<String>,
 }
 
+// ── Processes ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessSnapshot {
+    /// Top processes by RSS from ps aux --sort=-%mem (bounded to top 20).
+    pub top_by_memory: Vec<ProcessInfo>,
+    /// Top processes by CPU from ps aux --sort=-%cpu (bounded to top 10).
+    pub top_by_cpu: Vec<ProcessInfo>,
+    /// Total running process count.
+    pub total_count: u64,
+    /// Zombie process count.
+    pub zombie_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub user: String,
+    pub cpu_percent: f64,
+    pub mem_percent: f64,
+    pub command: String,
+}
+
+// ── Firewall ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirewallSnapshot {
+    /// Whether iptables or nftables is available.
+    pub firewall_tool: Option<String>,
+    /// Whether ufw is active.
+    pub ufw_active: Option<bool>,
+    /// Whether firewalld is active.
+    pub firewalld_active: Option<bool>,
+    /// iptables rule count (from iptables -L -n | wc -l).
+    pub iptables_rule_count: Option<u64>,
+    /// Whether any default ACCEPT policy is found on INPUT chain.
+    pub default_accept_input: Option<bool>,
+}
+
 // ── Root snapshot ──────────────────────────────────────────────────────────
 
 /// Root `SystemSnapshot` per TRD §4.1.
@@ -394,6 +433,8 @@ pub struct SnapshotDomains {
     pub packages: PackageSnapshot,
     pub timers: TimerSnapshot,
     pub network: NetworkSnapshot,
+    pub processes: ProcessSnapshot,
+    pub firewall: FirewallSnapshot,
 }
 
 /// Non-fatal error from one collector.
@@ -552,6 +593,29 @@ impl Default for TimerSnapshot {
     }
 }
 
+impl Default for ProcessSnapshot {
+    fn default() -> Self {
+        Self {
+            top_by_memory: Vec::new(),
+            top_by_cpu: Vec::new(),
+            total_count: 0,
+            zombie_count: 0,
+        }
+    }
+}
+
+impl Default for FirewallSnapshot {
+    fn default() -> Self {
+        Self {
+            firewall_tool: None,
+            ufw_active: None,
+            firewalld_active: None,
+            iptables_rule_count: None,
+            default_accept_input: None,
+        }
+    }
+}
+
 impl Default for SnapshotDomains {
     fn default() -> Self {
         Self {
@@ -566,6 +630,8 @@ impl Default for SnapshotDomains {
             packages: PackageSnapshot::default(),
             timers: TimerSnapshot::default(),
             network: NetworkSnapshot::default(),
+            processes: ProcessSnapshot::default(),
+            firewall: FirewallSnapshot::default(),
         }
     }
 }
