@@ -1,32 +1,49 @@
 # HELM
 
-> The Rust agent for Linux operators.
+> A read-only-first DevOps assistant for Linux operators. Finds missed
+> operational risks and guides safe troubleshooting with evidence-backed
+> commands.
 
-HELM is a local AI agent for Linux systems work. It can inspect files, run
-shell commands, manage services, look at logs, inspect disk usage, and keep a
-local audit trail of what it did.
+HELM observes your system, finds issues operators often miss, explains the
+evidence, and suggests reviewed commands. It changes nothing without your
+permission.
 
 `helm` with no arguments opens the TUI.
 
 ## What Ships In v1.6
 
-- Local TUI and one-shot CLI task execution
-- Provider/model switching with live provider catalogs where supported
-- Built-in Linux ops tools plus executable skills
-- Session history, snapshots, undo/redo, and audit verification
-- SSH remote targets, bootstrap, remote agent execution, and TUI attach mode
-- Optional OpenTelemetry export
-- Trust ladder: Diagnose → Dry-Run → Local → Remote → Governed
-- `helm diagnose` — read-only mode with 9 safe tools, enforced at registration
-- `helm run --dry-run` — prints commands, executes nothing
-- `helm trust-report` — audit chain, grants, sandbox, diagnose summary
-- TUI modes: Chat → Plan → AutoAccept → Diagnose (Shift+Tab cycles)
+- `helm diagnose` — read-only inspection with 9 typed tools, enforced at
+  registration
+- `helm run --dry-run` — prints planned commands, executes nothing
+- `helm run --evidence` — structured evidence reports before risky actions
+- `helm trust-report` — provider boundary, secrets status, permissions, audit,
+  sandbox, and diagnose safety
+- `/diagnose` and `/evidence` slash commands in the TUI
+- Local Ollama and API providers (Anthropic, Gemini, Groq, OpenRouter, Nvidia)
+- Remote SSH targets with per-target audit
+- Session history, snapshots, and audit verification
+- Skills and hooks as advanced integrations
+- TUI modes: Chat → Plan → Diagnose (Shift+Tab cycles)
+
+## First Safe Run
+
+```sh
+# Inspect the system without granting write access
+helm diagnose "why is /var/log filling up?"
+
+# See what HELM would do before executing anything
+helm run --dry-run "clean up old kernel packages"
+
+# Verify trust boundaries and active permissions
+helm trust-report
+
+# Open the TUI in read-only diagnose mode
+helm tui --mode diagnose
+```
 
 ## Install
 
 ### Release binary
-
-Current tagged releases publish an x86_64 Linux binary plus the installer.
 
 ```sh
 curl -fsSL https://github.com/Jatin-Mali/helm/releases/latest/download/install.sh | sh
@@ -35,12 +52,9 @@ helm
 ```
 
 If your architecture does not have a published release asset yet, the installer
-fails with source-build instructions instead of a silent 404.
+fails with clear source-build instructions.
 
 ### Build from source
-
-Use this path on ARM64, on forks without release assets, or if you want to test
-exact source locally.
 
 ```sh
 git clone https://github.com/Jatin-Mali/helm.git
@@ -53,7 +67,7 @@ cargo build --release -p helm-cli
 
 Minimum supported Rust version: `1.85`.
 
-## First Run
+## First Run Setup
 
 `helm init` asks for:
 
@@ -62,15 +76,17 @@ Minimum supported Rust version: `1.85`.
 3. API key if the provider needs one
 4. optional crash-report consent
 
-Stored keys go into `$XDG_CONFIG_HOME/helm/secrets.toml` (or
-`~/.config/helm/secrets.toml`) with mode `0600`. `config.toml` stores
-provider/model settings, not the raw key.
+Keys go into `$XDG_CONFIG_HOME/helm/secrets.toml` (or
+`~/.config/helm/secrets.toml`) with mode `0600`. `config.toml` stores provider
+and model settings, not the raw key.
 
-HELM now follows XDG paths:
+HELM follows XDG paths:
 
-- Config: `$XDG_CONFIG_HOME/helm/` or `~/.config/helm/`
-- Data: `$XDG_DATA_HOME/helm/` or `~/.local/share/helm/`
-- Cache: `$XDG_CACHE_HOME/helm/` or `~/.cache/helm/`
+| Type | Path |
+|------|------|
+| Config | `$XDG_CONFIG_HOME/helm/` or `~/.config/helm/` |
+| Data | `$XDG_DATA_HOME/helm/` or `~/.local/share/helm/` |
+| Cache | `$XDG_CACHE_HOME/helm/` or `~/.cache/helm/` |
 
 ## Provider Examples
 
@@ -93,7 +109,7 @@ export GOOGLE_API_KEY='...'
 ./target/release/helm "Reply with exactly: ok"
 ```
 
-### Ollama
+### Ollama (local, no API key needed)
 
 ```sh
 ollama pull qwen3:4b
@@ -106,74 +122,54 @@ ollama pull qwen3:4b
 
 ```sh
 helm                                  # open the TUI
-helm "<task>"                         # run one task
-helm run "<task>"                     # explicit one-shot mode
+helm diagnose "<question>"            # read-only system inspection
+helm run "<task>"                     # one-shot agent task
+helm run --dry-run "<task>"           # preview without execution
+helm run --evidence "<task>"          # emit evidence before risky actions
+helm trust-report                     # verify trust boundaries
 helm init                             # configure provider/model/key
-helm doctor                           # verify provider, DB, tools, secrets store
+helm doctor                           # verify provider, DB, tools, secrets
 helm models                           # list models for the active provider
 helm episodes --limit 10              # recent runs
 helm replay <episode_id>              # replay a run
-helm audit verify                     # verify audit chain
-helm permissions list                 # current grants
+helm audit verify                     # verify audit chain integrity
+helm permissions list                 # current capability grants
 helm secrets list                     # stored provider keys
 helm skills list                      # built-in and user skills
-helm skills run git-status --dry-run  # inspect a skill before running it
 helm remote list                      # registered SSH targets
 helm bootstrap user@host --register-as prod-1
 helm run --remote prod-1 "check nginx and journal errors"
-helm serve --bind 127.0.0.1:8765
-helm tui --attach 127.0.0.1:8765 --token "$HELM_REMOTE_TOKEN"
 helm config path                      # config file location
 helm completion bash                  # shell completion
 ```
 
-## Safe Examples
-
-Try HELM without granting write access:
-
-```sh
-# Diagnose mode — read-only, 9 safe tools
-helm diagnose "why is /var/log filling up?"
-
-# Dry-run — see what would happen without executing
-helm run --dry-run "clean up old kernel packages"
-
-# Trust report — verify audit chain and active grants
-helm trust-report
-
-# TUI in read-only plan mode
-helm tui --read-only
-
-# TUI with dry-run (no tool execution)
-helm tui --dry-run
-```
-
 ## Security Notes
 
-- Stored provider keys live in `$XDG_CONFIG_HOME/helm/secrets.toml` (or `~/.config/helm/secrets.toml`) with mode `0600`.
-- Environment variables stay ephemeral unless you explicitly import or save
-  them. The TUI does not auto-import env keys into the secrets store anymore.
-- Dangerous tools still require capability grants unless you run with explicit
-  override flags such as `--yes`.
-- HELM keeps local config, audit, session, and episode state under the XDG
-  helm directories. Treat those directories as sensitive local state.
+- Stored provider keys live in `$XDG_CONFIG_HOME/helm/secrets.toml` (mode
+  `0600`). Environment variables stay ephemeral unless you explicitly save them.
+- The TUI does not auto-import env keys into the secrets store.
+- Read-only diagnose mode blocks all write tools and mutating sub-actions.
+- Dangerous tools require explicit capability grants.
+- HELM keeps local config, audit, session, and episode state under XDG helm
+  directories. Treat those directories as sensitive local state.
+- API models mean prompts leave your machine. Local Ollama models mean local
+  inference. The trust-report and TUI provider display make this boundary clear.
 
 ## Remote Mode
 
-Remote agent execution in v1.5 uses NDJSON streamed over SSH. The local client
-starts the remote `helm` binary, then replays remote `AgentEvent`s into the
-local CLI or TUI. See:
+Remote targets use SSH for read-only inspection and, when explicitly approved,
+execution. The local client starts the remote `helm` binary and replays
+`AgentEvent` results into the local CLI or TUI. See `docs/agent-on-remote.md`.
 
-- `docs/agent-on-remote.md`
-
-## Use HELM If / Use Something Else If
+## Use HELM If
 
 | Use HELM if... | Use something else if... |
 |---|---|
-| You want a local Linux operations agent | You want a cloud-hosted managed agent |
-| You need shell, services, logs, packages, and disk inspection in one tool | You need team collaboration and SaaS workflows |
-| You want local audit and episode history | You do not want any local state at all |
+| You want read-only system inspection with evidence | You want a cloud-hosted managed agent |
+| You need typed disk, service, log, and process tools | You need team collaboration and SaaS workflows |
+| You want local audit, session history, and rollback data | You do not want any local state at all |
 | You prefer a terminal-first interface | You want a browser-only product |
+| You want to review every command before it runs | You want unsupervised repair |
 
 ## Docs
 

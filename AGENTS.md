@@ -332,7 +332,7 @@ helm/
 - `Ctrl+L` — clear current visible session
 - `Ctrl+D` on empty input — quit
 - `Ctrl+T` — toggle tool-history sidebar
-- `Shift+Tab` — cycle modes (`Chat` → `Plan` → `Auto-Accept`)
+- `Shift+Tab` — cycle modes (`Chat` → `Plan` → `Diagnose`)
 - `PgUp/PgDn` — scroll transcript by half a screen
 - `Ctrl+Home/Ctrl+End` — jump to transcript top/latest
 - Mouse wheel — scroll transcript

@@ -85,13 +85,8 @@ struct Cli {
     /// Enable structured JSON tracing output to stderr
     #[arg(long, global = true)]
     trace: bool,
-    /// Auto-approve all tool permission requests (dangerous!)
-    #[arg(
-        long = "yes",
-        alias = "yolo",
-        alias = "dangerously-skip-permissions",
-        global = true
-    )]
+    /// Auto-approve all tool permission requests (development only)
+    #[arg(long = "yes", global = true, hide = true)]
     yes: bool,
     /// Plan mode: read-only analysis, no writes or executions
     #[arg(long = "read-only", alias = "plan", global = true)]
