@@ -23,6 +23,7 @@ helm-agent.workspace = true
 helm-core.workspace = true
 helm-memory.workspace = true
 helm-providers.workspace = true
+helm-monitor.workspace = true
 helm-tools.workspace = true
 uuid.workspace = true
 nix.workspace = true

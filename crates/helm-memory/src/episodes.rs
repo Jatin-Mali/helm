@@ -16,6 +16,7 @@ const MIGRATION_0002: &str = include_str!("../migrations/0002_model_capability_w
 const MIGRATION_0003: &str = include_str!("../migrations/0003_v3_corrections.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_security.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0005_remote_audit.sql");
+const MIGRATION_0010: &str = include_str!("../migrations/0006_snapshots.sql");
 
 /// Minimal schema for per-host audit shard DBs (audit_events only).
 const SHARD_SCHEMA: &str = "\
@@ -1114,7 +1115,8 @@ fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
         6 => apply_0007(conn),
         7 => apply_0008(conn),
         8 => apply_0009(conn),
-        9 => conn
+        9 => apply_0010(conn),
+        10 => conn
             .execute_batch("PRAGMA foreign_keys = ON")
             .map_err(sqlite_error),
         other => Err(MemoryError::Migration(format!(
@@ -1130,6 +1132,18 @@ fn apply_0009(conn: &Connection) -> Result<(), MemoryError> {
         conn.execute_batch(MIGRATION_0009).map_err(sqlite_error)?;
     }
     conn.execute_batch("PRAGMA user_version = 9")
+        .map_err(sqlite_error)?;
+    apply_0010(conn)?;
+    Ok(())
+}
+
+fn apply_0010(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .map_err(sqlite_error)?;
+    if !table_exists(conn, "snapshots")? {
+        conn.execute_batch(MIGRATION_0010).map_err(sqlite_error)?;
+    }
+    conn.execute_batch("PRAGMA user_version = 10")
         .map_err(sqlite_error)?;
     Ok(())
 }
@@ -1616,7 +1630,7 @@ mod tests {
     async fn schema_version_reports_current_version_edge_case() {
         let (_dir, store) = store().await;
 
-        assert_eq!(store.schema_version().await.unwrap(), 9);
+        assert_eq!(store.schema_version().await.unwrap(), 10);
     }
 
     #[tokio::test]
@@ -1689,7 +1703,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         assert_eq!(has_column, 1);
     }
 

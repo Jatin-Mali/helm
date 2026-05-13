@@ -38,6 +38,7 @@ use helm_memory::{
     AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, SessionStore, StepRecord,
     UserProfileStore,
 };
+use helm_monitor::{MonitorProfile, SystemSnapshot, collect_snapshot};
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
     OpenAiCompatProvider, Provider, StopReason, ToolSchema, quirks_for,
@@ -159,6 +160,8 @@ enum Command {
     Diagnose(DiagnoseArgs),
     /// Show trust report: grants, audit, sandbox, secrets, integrity
     TrustReport(TrustReportArgs),
+    /// Collect a typed read-only system snapshot
+    Snapshot(SnapshotArgs),
 }
 
 #[derive(Debug, Args)]
@@ -670,6 +673,19 @@ struct TrustReportArgs {
     /// Verify audit chain against a specific remote target
     #[arg(long, value_name = "NAME")]
     target: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct SnapshotArgs {
+    /// Output as JSON
+    #[arg(long)]
+    json: bool,
+    /// Collection depth (quick, standard, deep)
+    #[arg(long, default_value = "standard")]
+    profile: String,
+    /// Output diff against previous snapshot
+    #[arg(long)]
+    diff: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
@@ -1622,6 +1638,9 @@ async fn run() -> Result<()> {
             } else {
                 print!("{}", render_trust_report(&report));
             }
+        }
+        Command::Snapshot(args) => {
+            run_collect_snapshot_command(args).await?;
         }
     }
     Ok(())
@@ -4604,6 +4623,207 @@ async fn run_profile_command(
         }
     }
     Ok(())
+}
+
+async fn run_collect_snapshot_command(args: SnapshotArgs) -> Result<()> {
+    let profile: MonitorProfile = args.profile.parse().unwrap_or(MonitorProfile::Standard);
+    let snapshot = collect_snapshot(profile).await;
+
+    if args.diff {
+        // Diff unavailable without persistence — collect and show
+        eprintln!("note: --diff requires snapshot persistence (not yet wired to MemoryStore)");
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        } else {
+            render_snapshot(&snapshot);
+        }
+    } else if args.json {
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    } else {
+        render_snapshot(&snapshot);
+    }
+
+    Ok(())
+}
+
+fn render_snapshot(snapshot: &SystemSnapshot) {
+    println!("Snapshot: {}", snapshot.id);
+    println!(
+        "  Host:       {} ({} {} {})",
+        snapshot.host.hostname,
+        snapshot.host.kernel_name,
+        snapshot.host.kernel_release,
+        snapshot.host.machine
+    );
+    if let Some(os) = &snapshot.host.os_pretty_name {
+        println!("  OS:         {os}");
+    }
+    println!("  Uptime:     {}s", snapshot.host.uptime_seconds);
+    println!("  Profile:    {:?}", snapshot.profile);
+    println!("  Collected:  {}", snapshot.collected_at);
+
+    println!("\nLoad:");
+    println!(
+        "  Load avg:     {:.2} {:.2} {:.2}",
+        snapshot.domains.load.load_average.one,
+        snapshot.domains.load.load_average.five,
+        snapshot.domains.load.load_average.fifteen
+    );
+    println!(
+        "  CPU cores:    {}",
+        snapshot.domains.load.cpu_logical_count
+    );
+    println!(
+        "  Memory:       {} / {} ({} available)",
+        human_bytes(snapshot.domains.load.memory.used),
+        human_bytes(snapshot.domains.load.memory.total),
+        snapshot
+            .domains
+            .load
+            .memory
+            .available
+            .map_or_else(|| "?".to_string(), human_bytes)
+    );
+    println!(
+        "  Swap:         {} / {}",
+        human_bytes(snapshot.domains.load.swap_used),
+        human_bytes(snapshot.domains.load.swap_total)
+    );
+
+    println!("\nDisks:");
+    for fs in &snapshot.domains.disks.filesystems {
+        let pct = if fs.total_bytes > 0 {
+            (fs.used_bytes as f64 / fs.total_bytes as f64 * 100.0) as u64
+        } else {
+            0
+        };
+        println!(
+            "  {} {}: {}/{} ({}%)",
+            fs.device,
+            fs.mount_point,
+            human_bytes(fs.used_bytes),
+            human_bytes(fs.total_bytes),
+            pct
+        );
+    }
+    for inode in &snapshot.domains.disks.inodes {
+        if inode.total > 0 {
+            let pct = (inode.used as f64 / inode.total as f64 * 100.0) as u64;
+            println!(
+                "  inodes {}: {}/{} ({}%)",
+                inode.mount_point, inode.used, inode.total, pct
+            );
+        }
+    }
+    if snapshot.domains.disks.smart_available {
+        println!("  SMART: available");
+    }
+    for d in &snapshot.domains.disks.smart_devices {
+        println!(
+            "  {} health: {}",
+            d.device,
+            d.health.as_deref().unwrap_or("unknown")
+        );
+    }
+
+    println!("\nServices:");
+    let failed = snapshot.domains.services.failed_units.len();
+    if failed > 0 {
+        println!("  FAILED: {failed} units");
+        for u in &snapshot.domains.services.failed_units {
+            println!("    {} ({})", u.name, u.description);
+        }
+    }
+    println!(
+        "  {} loaded units, {} timers",
+        snapshot.domains.services.units.len(),
+        snapshot.domains.services.timers.len()
+    );
+
+    if let Some(rt) = &snapshot.domains.containers.runtime {
+        println!(
+            "\nContainers ({}): {}",
+            rt,
+            snapshot.domains.containers.containers.len()
+        );
+        for c in &snapshot.domains.containers.containers {
+            println!("  {} ({}) - {}", c.name, c.image, c.status);
+        }
+    }
+
+    println!(
+        "\nPorts: {} listeners",
+        snapshot.domains.ports.listeners.len()
+    );
+    for l in &snapshot.domains.ports.listeners {
+        println!(
+            "  {}:{} ({})",
+            l.local_address,
+            l.local_port,
+            l.process_name.as_deref().unwrap_or("?")
+        );
+    }
+
+    println!("\nNetwork:");
+    println!("  Routes: {}", snapshot.domains.network.routes.len());
+    println!(
+        "  Interfaces: {}",
+        snapshot.domains.network.interfaces.len()
+    );
+    println!("  Nameservers: {:?}", snapshot.domains.network.nameservers);
+
+    println!("\nLogs:");
+    println!(
+        "  Journal errors (1h): {}",
+        snapshot.domains.logs.journal_errors_last_hour
+    );
+    if let Some(rate) = snapshot.domains.logs.error_rate_per_minute {
+        println!("  Error rate: {rate:.1}/min");
+    }
+
+    if !snapshot.domains.backups.tools_detected.is_empty() {
+        println!(
+            "\nBackups: {} tools detected",
+            snapshot.domains.backups.tools_detected.len()
+        );
+        for t in &snapshot.domains.backups.tools_detected {
+            println!("  {}", t.name);
+        }
+    }
+
+    if let Some(pm) = &snapshot.domains.packages.package_manager {
+        println!("\nPackages ({pm}):");
+        if let Some(c) = snapshot.domains.packages.upgradable_count {
+            println!("  Upgradable: {c}");
+        }
+        if let Some(c) = snapshot.domains.packages.security_count {
+            println!("  Security: {c}");
+        }
+    }
+
+    println!(
+        "\nTimers: {} cron jobs",
+        snapshot.domains.timers.cron_jobs.len()
+    );
+
+    if !snapshot.collector_errors.is_empty() {
+        println!("\nCollector errors:");
+        for e in &snapshot.collector_errors {
+            println!("  {}: {}", e.domain, e.message);
+        }
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1}G", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1}M", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 #[cfg(test)]

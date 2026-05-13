@@ -15,6 +15,7 @@ members = [
     "crates/helm-tools",
     "crates/helm-memory",
     "crates/helm-agent",
+    "crates/helm-monitor",
     "helm-cli",
 ]
 
@@ -70,6 +71,7 @@ helm-providers = { path = "crates/helm-providers" }
 helm-tools = { path = "crates/helm-tools" }
 helm-memory = { path = "crates/helm-memory" }
 helm-agent = { path = "crates/helm-agent" }
+helm-monitor = { path = "crates/helm-monitor" }
 
 [dev-dependencies]
 async-trait.workspace = true

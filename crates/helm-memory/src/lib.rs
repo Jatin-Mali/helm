@@ -8,6 +8,7 @@ pub mod procedures;
 pub mod sessions;
 pub mod skill_learner;
 pub mod skills;
+pub mod snapshots;
 pub mod user_profile;
 
 pub use episodes::{
@@ -25,4 +26,5 @@ pub use procedures::{Procedure, ProcedureError, ProcedureStep, ProcedureStore};
 pub use sessions::{SessionRecord, SessionStore, SnapshotRecord};
 pub use skill_learner::{LearnResult, SkillLearner, SkillLearnerError, SkillMatch};
 pub use skills::{Skill, SkillError, SkillsManager};
+pub use snapshots::{SnapshotRecord as SnapshotStoreRecord, SnapshotStore};
 pub use user_profile::{Role, UserPreferences, UserProfileError, UserProfileStore, Verbosity};
