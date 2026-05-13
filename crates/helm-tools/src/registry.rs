@@ -91,6 +91,15 @@ impl ToolRegistry {
         registry
     }
 
+    /// Returns true only if every tool in this registry declares that its
+    /// mutating sub-actions are runtime-gated in diagnose mode. Used by
+    /// the trust-report to verify the read-only promise is actually enforced.
+    pub fn verify_diagnose_write_gates(&self) -> bool {
+        self.tools
+            .values()
+            .all(|t| t.all_write_ops_gated_in_diagnose())
+    }
+
     /// Registers or replaces a tool by its declared name.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.insert(tool.name().to_owned(), tool);

@@ -195,16 +195,12 @@ impl AgentEventSink for NdjsonSink {
             ),
             AgentEvent::EvidenceReport {
                 tool_name,
-                system_state,
-                taint,
-                risk_level,
+                evidence,
             } => (
                 "evidence_report",
                 json!({
                     "tool": tool_name,
-                    "system_state": system_state,
-                    "taint": taint,
-                    "risk_level": risk_level,
+                    "evidence": evidence,
                 }),
             ),
         };

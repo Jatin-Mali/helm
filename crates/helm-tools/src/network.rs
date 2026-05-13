@@ -63,6 +63,10 @@ impl Tool for NetworkTool {
     fn allowed_in_diagnose(&self) -> bool {
         true
     }
+
+    fn all_write_ops_gated_in_diagnose(&self) -> bool {
+        true // network has only read-only actions (ip_addr, routes, listening_ports, curl_probe, dns_lookup)
+    }
 }
 
 #[cfg(test)]

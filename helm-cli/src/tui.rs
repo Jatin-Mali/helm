@@ -18,7 +18,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use helm_agent::{AgentEvent, AgentEventSink, Budget, ReactAgent, RunResult};
+use helm_agent::{AgentEvent, AgentEventSink, Budget, ReactAgent, RunResult, StructuredEvidence};
 use helm_core::{Capability, HelmError, Message};
 use helm_memory::MemoryStore;
 use helm_providers::ChatRequest;
@@ -803,11 +803,11 @@ struct TuiRuntimeInner {
 }
 
 /// Stored evidence snapshot for later display via /evidence.
+#[allow(dead_code)]
 struct EvidenceSnapshot {
     tool_name: String,
-    system_state: String,
-    taint: String,
-    risk_level: String,
+    evidence: StructuredEvidence,
+    formatted: String,
 }
 
 impl TuiApp {
@@ -1936,25 +1936,15 @@ Report the exit status and the concise output."
             }
             AgentEvent::EvidenceReport {
                 tool_name,
-                system_state,
-                taint,
-                risk_level,
+                evidence,
             } => {
-                // Store for /evidence retrieval
+                let formatted = format_evidence_report(&tool_name, &evidence);
                 self.last_evidence = Some(EvidenceSnapshot {
                     tool_name: tool_name.clone(),
-                    system_state: system_state.clone(),
-                    taint: taint.clone(),
-                    risk_level: risk_level.clone(),
+                    evidence: evidence.clone(),
+                    formatted: formatted.clone(),
                 });
-                let msg = format!(
-                    "[evidence] {tool} | risk: {risk} | taint: {taint}\n{state}",
-                    tool = tool_name,
-                    risk = risk_level,
-                    taint = taint,
-                    state = system_state,
-                );
-                self.push_chat(MessageRole::System, msg);
+                self.push_chat(MessageRole::System, formatted);
             }
             AgentEvent::RunFinished { .. }
             | AgentEvent::RunFailed { .. }
@@ -2505,16 +2495,10 @@ Report the exit status and the concise output."
             }
             CommandAction::Evidence => match &self.last_evidence {
                 Some(ev) => {
-                    let msg = format!(
-                        "Evidence report for {tool}:\n\
-                         risk: {risk}\ntaint: {taint}\n\n\
-                         {state}",
-                        tool = ev.tool_name,
-                        risk = ev.risk_level,
-                        taint = ev.taint,
-                        state = ev.system_state,
+                    self.push_chat(
+                        MessageRole::System,
+                        format!("Evidence report for {}:\n{}", ev.tool_name, ev.formatted),
                     );
-                    self.push_chat(MessageRole::System, msg);
                 }
                 None => {
                     self.push_chat(
@@ -3022,7 +3006,7 @@ async fn run_agent_task(
         budget.max_iterations = max;
     }
     budget.read_only = mode == AgentMode::Plan || mode == AgentMode::Diagnose;
-    budget.dry_run = mode == AgentMode::Diagnose;
+    budget.dry_run = false;
     budget.auto_approve = mode == AgentMode::AutoAccept;
     let mut tool_context = helm_tools::ToolContext::new(
         runtime
@@ -3037,9 +3021,15 @@ async fn run_agent_task(
     if let Some(remote_target) = remote_target {
         tool_context = tool_context.with_remote_target(remote_target);
     }
+    let tool_registry = if mode == AgentMode::Diagnose {
+        tool_context = tool_context.with_diagnose_mode();
+        ToolRegistry::with_diagnose_tools()
+    } else {
+        ToolRegistry::default()
+    };
     let agent = ReactAgent::with_tool_context(
         provider,
-        ToolRegistry::default(),
+        tool_registry,
         Arc::clone(&runtime.memory),
         budget,
         model,
@@ -4662,6 +4652,78 @@ fn friendly_error(error: &str) -> String {
     } else {
         error.to_owned()
     }
+}
+
+fn format_evidence_report(tool_name: &str, ev: &StructuredEvidence) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("[evidence] {tool_name}\n"));
+    out.push_str(&format!(
+        "  inspected sources: {}\n",
+        ev.inspected_sources.join(", ")
+    ));
+    if !ev.findings.is_empty() {
+        out.push_str("  findings:\n");
+        for f in &ev.findings {
+            out.push_str(&format!(
+                "    - {}: {} (source: {})\n",
+                f.label,
+                f.value.lines().next().unwrap_or(""),
+                f.source
+            ));
+        }
+    }
+    if !ev.assumptions.is_empty() {
+        out.push_str(&format!("  assumptions: {}\n", ev.assumptions.join("; ")));
+    }
+    out.push_str(&format!("  uncertainty: {:?}\n", ev.uncertainty));
+    if !ev.proposed_actions.is_empty() {
+        out.push_str("  proposed actions:\n");
+        for a in &ev.proposed_actions {
+            out.push_str(&format!(
+                "    - {} (tool: {}, input: {})\n",
+                a.description, a.tool, a.tool_input
+            ));
+        }
+    }
+    if !ev.blast_radius.paths.is_empty()
+        || !ev.blast_radius.services.is_empty()
+        || !ev.blast_radius.hosts.is_empty()
+    {
+        out.push_str("  blast radius:\n");
+        if !ev.blast_radius.paths.is_empty() {
+            out.push_str(&format!(
+                "    paths: {}\n",
+                ev.blast_radius.paths.join(", ")
+            ));
+        }
+        if !ev.blast_radius.services.is_empty() {
+            out.push_str(&format!(
+                "    services: {}\n",
+                ev.blast_radius.services.join(", ")
+            ));
+        }
+        if !ev.blast_radius.hosts.is_empty() {
+            out.push_str(&format!(
+                "    hosts: {}\n",
+                ev.blast_radius.hosts.join(", ")
+            ));
+        }
+    }
+    if ev.rollback.available {
+        out.push_str(&format!("  rollback: {}\n", ev.rollback.description));
+    } else {
+        out.push_str("  rollback: not available\n");
+    }
+    if !ev.exact_tool_calls.is_empty() {
+        out.push_str("  exact tool calls:\n");
+        for tc in &ev.exact_tool_calls {
+            out.push_str(&format!(
+                "    - {}: {}\n      input: {}\n",
+                tc.tool, tc.summary, tc.tool_input
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

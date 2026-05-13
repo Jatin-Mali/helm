@@ -27,6 +27,13 @@ pub trait Tool: Send + Sync {
     fn allowed_in_diagnose(&self) -> bool {
         false
     }
+
+    /// Whether every mutating sub-action within this tool checks `ctx.diagnose_mode`
+    /// at runtime and refuses to execute. Tools with no mutating sub-actions
+    /// return true. Default: false (conservative — must be explicitly overridden).
+    fn all_write_ops_gated_in_diagnose(&self) -> bool {
+        false
+    }
 }
 
 /// Runtime constraints and filesystem root for tool execution.

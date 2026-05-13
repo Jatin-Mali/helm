@@ -312,6 +312,10 @@ impl Tool for ShellTool {
         // state, but exec-mode-only is enforced at runtime in execute().
         true
     }
+
+    fn all_write_ops_gated_in_diagnose(&self) -> bool {
+        true // shell mode and output redirection are runtime-gated via ctx.diagnose_mode
+    }
 }
 
 #[derive(Debug)]

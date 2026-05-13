@@ -1176,7 +1176,7 @@ async fn run() -> Result<()> {
             let (provider, model_name) = build_provider(&provider_settings, &secrets_store)?;
             let budget = Budget {
                 read_only: true,
-                dry_run: true,
+                dry_run: false,
                 ..Default::default()
             };
             let tool_context =
@@ -1620,7 +1620,8 @@ async fn run() -> Result<()> {
             run_bootstrap_command(args).await?;
         }
         Command::TrustReport(args) => {
-            let report = run_trust_report(&memory, &secrets_store, &args).await?;
+            let report =
+                run_trust_report(&memory, &secrets_store, &provider_settings, &args).await?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -2238,6 +2239,9 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "profile"
                 | "remote"
                 | "serve"
+                | "bootstrap"
+                | "diagnose"
+                | "trust-report"
         )
     )
 }
@@ -3610,10 +3614,25 @@ fn render_doctor(report: &DoctorReport) -> String {
 #[derive(Debug, Serialize)]
 struct TrustReport {
     version: String,
+    provider: TrustProviderSummary,
     grants: TrustGrantsSummary,
     audit: TrustAuditSummary,
     sandbox: TrustSandboxSummary,
+    secrets: TrustSecretsSummary,
+    permissions: TrustPermissionsSummary,
     diagnose: TrustDiagnoseSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct TrustProviderSummary {
+    /// Which provider is active (e.g. "groq", "anthropic", "ollama").
+    kind: String,
+    /// Whether this is a local provider (ollama) vs a remote API.
+    is_local: bool,
+    /// The base URL being used, if configured.
+    base_url: Option<String>,
+    /// The model name being used.
+    model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3630,19 +3649,42 @@ struct TrustAuditSummary {
 
 #[derive(Debug, Serialize)]
 struct TrustSandboxSummary {
+    enabled: bool,
     bwrap_found: bool,
     bwrap_path: String,
+    root_dir: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TrustSecretsSummary {
+    /// Whether the secrets store exists and is usable.
+    store_exists: bool,
+    /// Number of stored secrets.
+    stored: usize,
+    /// Whether any keys are currently missing from the store.
+    keys_missing: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TrustPermissionsSummary {
+    /// Which capabilities require explicit grants.
+    restricted_by_default: Vec<String>,
+    /// Which capabilities are auto-granted.
+    auto_granted: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct TrustDiagnoseSummary {
     tools_available: usize,
     write_tools_blocked: usize,
+    /// Whether the diagnose registry blocks all write ops at runtime.
+    write_ops_gated: bool,
 }
 
 async fn run_trust_report(
     memory: &std::sync::Arc<MemoryStore>,
-    _secrets: &SecretsStore,
+    secrets: &SecretsStore,
+    provider_settings: &ProviderSettings,
     args: &TrustReportArgs,
 ) -> Result<TrustReport> {
     let grants = memory.list_capability_grants().await?;
@@ -3655,9 +3697,40 @@ async fn run_trust_report(
     };
     let chain_ok = memory.verify_audit_chain().await?.ok;
 
+    // Provider summary
+    let is_local = matches!(provider_settings.choice, ProviderChoice::Ollama);
+    let provider_kind = provider_choice_name(provider_settings.choice);
+
+    // Sandbox
     let bwrap_path = which::which("bwrap").unwrap_or_default();
     let bwrap_found = !bwrap_path.as_os_str().is_empty();
 
+    // Secrets
+    let stored = secrets.list_names().map(|l| l.len()).unwrap_or(0);
+    let env_key_name = default_api_key_env(provider_settings.choice);
+    let keys_missing = match env_key_name {
+        Some(name) if provider_settings.api_key.is_none() => {
+            secrets.get(name).ok().flatten().is_none()
+        }
+        _ => false,
+    };
+    let store_exists = dirs::config_dir()
+        .map(|p| p.join("helm").join("secrets.toml").exists())
+        .unwrap_or(false);
+
+    // Permissions
+    let restricted_by_default: Vec<String> = Capability::all()
+        .into_iter()
+        .filter(|c| c.requires_grant_by_default())
+        .map(|c| c.to_string())
+        .collect();
+    let auto_granted: Vec<String> = Capability::all()
+        .into_iter()
+        .filter(|c| !c.requires_grant_by_default())
+        .map(|c| c.to_string())
+        .collect();
+
+    // Diagnose
     let diagnose_registry = ToolRegistry::with_diagnose_tools();
     let full_registry = ToolRegistry::with_default_tools();
     let tools_available = diagnose_registry.schemas().len();
@@ -3665,9 +3738,18 @@ async fn run_trust_report(
         .schemas()
         .len()
         .saturating_sub(tools_available);
+    // Verify every diagnose-registry tool gates its mutating sub-actions
+    // at runtime (add/commit/push, post/put/delete/patch, kill, shell mode).
+    let write_ops_gated = diagnose_registry.verify_diagnose_write_gates();
 
     Ok(TrustReport {
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        provider: TrustProviderSummary {
+            kind: provider_kind.to_string(),
+            is_local,
+            base_url: provider_settings.base_url.clone(),
+            model: provider_settings.model.clone(),
+        },
         grants: TrustGrantsSummary {
             active,
             total: grants.len(),
@@ -3677,12 +3759,24 @@ async fn run_trust_report(
             chain_ok,
         },
         sandbox: TrustSandboxSummary {
+            enabled: false, // sandbox not enabled by default in trust-report
             bwrap_found,
             bwrap_path: bwrap_path.display().to_string(),
+            root_dir: None,
+        },
+        secrets: TrustSecretsSummary {
+            store_exists,
+            stored,
+            keys_missing,
+        },
+        permissions: TrustPermissionsSummary {
+            restricted_by_default,
+            auto_granted,
         },
         diagnose: TrustDiagnoseSummary {
             tools_available,
             write_tools_blocked,
+            write_ops_gated,
         },
     })
 }
@@ -3690,11 +3784,31 @@ async fn run_trust_report(
 fn render_trust_report(report: &TrustReport) -> String {
     let mut output = String::new();
     output.push_str(&format!("HELM v{} — Trust Report\n\n", report.version));
+
+    output.push_str("[provider]\n");
+    output.push_str(&format!("  kind: {}\n", report.provider.kind));
+    output.push_str(&format!(
+        "  boundary: {}\n",
+        if report.provider.is_local {
+            "local"
+        } else {
+            "remote API"
+        }
+    ));
+    if let Some(url) = &report.provider.base_url {
+        output.push_str(&format!("  base_url: {url}\n"));
+    }
+    if let Some(model) = &report.provider.model {
+        output.push_str(&format!("  model: {model}\n"));
+    }
+    output.push('\n');
+
     output.push_str("[grants]\n");
     output.push_str(&format!(
         "  active: {} / total: {}\n\n",
         report.grants.active, report.grants.total
     ));
+
     output.push_str("[audit]\n");
     output.push_str(&format!("  events: {}\n", report.audit.total_events));
     output.push_str(&format!(
@@ -3705,7 +3819,12 @@ fn render_trust_report(report: &TrustReport) -> String {
             "INTEGRITY BREACH"
         }
     ));
+
     output.push_str("[sandbox]\n");
+    output.push_str(&format!(
+        "  enabled: {}\n",
+        if report.sandbox.enabled { "yes" } else { "no" }
+    ));
     output.push_str(&format!(
         "  bwrap: {}\n",
         if report.sandbox.bwrap_found {
@@ -3714,7 +3833,41 @@ fn render_trust_report(report: &TrustReport) -> String {
             "not found"
         }
     ));
-    output.push_str("\n[diagnose mode]\n");
+    if let Some(root) = &report.sandbox.root_dir {
+        output.push_str(&format!("  root_dir: {root}\n"));
+    }
+    output.push('\n');
+
+    output.push_str("[secrets]\n");
+    output.push_str(&format!(
+        "  store: {}\n",
+        if report.secrets.store_exists {
+            "exists"
+        } else {
+            "missing"
+        }
+    ));
+    output.push_str(&format!("  stored: {}\n", report.secrets.stored));
+    output.push_str(&format!(
+        "  keys_missing: {}\n\n",
+        if report.secrets.keys_missing {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+
+    output.push_str("[permissions]\n");
+    output.push_str(&format!(
+        "  restricted: {}\n",
+        report.permissions.restricted_by_default.join(", ")
+    ));
+    output.push_str(&format!(
+        "  auto-granted: {}\n\n",
+        report.permissions.auto_granted.join(", ")
+    ));
+
+    output.push_str("[diagnose mode]\n");
     output.push_str(&format!(
         "  read-only tools: {}\n",
         report.diagnose.tools_available
@@ -3723,7 +3876,17 @@ fn render_trust_report(report: &TrustReport) -> String {
         "  write tools blocked: {}\n",
         report.diagnose.write_tools_blocked
     ));
-    output.push_str("\n[paths]\n");
+    output.push_str(&format!(
+        "  write sub-ops gated: {}\n",
+        if report.diagnose.write_ops_gated {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    output.push('\n');
+
+    output.push_str("[paths]\n");
     output.push_str(&format!("  config: {}\n", paths::config_dir().display()));
     output.push_str(&format!("  data: {}\n", paths::data_dir().display()));
     output
@@ -4865,6 +5028,28 @@ mod tests {
     }
 
     #[test]
+    fn diagnose_command_parses() {
+        let parsed = parse_cli_from(["helm", "diagnose", "why is disk usage spiking"]).unwrap();
+        match parsed.command {
+            super::Command::Diagnose(args) => {
+                assert_eq!(args.question, "why is disk usage spiking");
+            }
+            other => panic!("expected diagnose command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trust_report_command_parses() {
+        let parsed = parse_cli_from(["helm", "trust-report", "--json"]).unwrap();
+        match parsed.command {
+            super::Command::TrustReport(args) => {
+                assert!(args.json);
+            }
+            other => panic!("expected trust-report command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn derive_session_name_prefers_goal_words() {
         assert_eq!(
             super::derive_session_name("Find why nginx leaks memory and patch it"),
@@ -5352,5 +5537,230 @@ mod tests {
 
         assert!(reachable.ok);
         assert!(tool_calls.ok);
+    }
+
+    // ── v1.6 integration tests ──
+
+    #[test]
+    fn trust_report_struct_contains_all_v16_fields() {
+        // Verify the TrustReport struct serializes all documented fields.
+        let report = super::TrustReport {
+            version: "1.6.0".into(),
+            provider: super::TrustProviderSummary {
+                kind: "groq".into(),
+                is_local: false,
+                base_url: None,
+                model: Some("llama-3.3-70b-versatile".into()),
+            },
+            grants: super::TrustGrantsSummary {
+                active: 2,
+                total: 5,
+            },
+            audit: super::TrustAuditSummary {
+                total_events: 10,
+                chain_ok: true,
+            },
+            sandbox: super::TrustSandboxSummary {
+                enabled: false,
+                bwrap_found: true,
+                bwrap_path: "/usr/bin/bwrap".into(),
+                root_dir: None,
+            },
+            secrets: super::TrustSecretsSummary {
+                store_exists: true,
+                stored: 3,
+                keys_missing: false,
+            },
+            permissions: super::TrustPermissionsSummary {
+                restricted_by_default: vec!["fs.delete".into(), "shell.exec".into()],
+                auto_granted: vec!["fs.read".into(), "fs.write".into()],
+            },
+            diagnose: super::TrustDiagnoseSummary {
+                tools_available: 9,
+                write_tools_blocked: 8,
+                write_ops_gated: true,
+            },
+        };
+
+        let rendered = super::render_trust_report(&report);
+        assert!(rendered.contains("HELM v1.6.0"));
+        assert!(rendered.contains("[provider]"));
+        assert!(rendered.contains("boundary: remote API"));
+        assert!(rendered.contains("[secrets]"));
+        assert!(rendered.contains("store: exists"));
+        assert!(rendered.contains("stored: 3"));
+        assert!(rendered.contains("[permissions]"));
+        assert!(rendered.contains("restricted: fs.delete, shell.exec"));
+        assert!(rendered.contains("write sub-ops gated: yes"));
+
+        // JSON roundtrip
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(json.contains("\"kind\": \"groq\""));
+        assert!(json.contains("\"is_local\": false"));
+        assert!(json.contains("\"store_exists\": true"));
+        assert!(json.contains("\"write_ops_gated\": true"));
+    }
+
+    #[test]
+    fn trust_report_local_provider_shows_local_boundary() {
+        let report = super::TrustReport {
+            version: "1.6.0".into(),
+            provider: super::TrustProviderSummary {
+                kind: "ollama".into(),
+                is_local: true,
+                base_url: Some("http://localhost:11434".into()),
+                model: Some("qwen3:4b".into()),
+            },
+            grants: super::TrustGrantsSummary {
+                active: 0,
+                total: 0,
+            },
+            audit: super::TrustAuditSummary {
+                total_events: 0,
+                chain_ok: true,
+            },
+            sandbox: super::TrustSandboxSummary {
+                enabled: false,
+                bwrap_found: false,
+                bwrap_path: String::new(),
+                root_dir: None,
+            },
+            secrets: super::TrustSecretsSummary {
+                store_exists: true,
+                stored: 0,
+                keys_missing: true,
+            },
+            permissions: super::TrustPermissionsSummary {
+                restricted_by_default: vec![],
+                auto_granted: vec![],
+            },
+            diagnose: super::TrustDiagnoseSummary {
+                tools_available: 9,
+                write_tools_blocked: 8,
+                write_ops_gated: true,
+            },
+        };
+
+        let rendered = super::render_trust_report(&report);
+        assert!(rendered.contains("boundary: local"));
+        assert!(rendered.contains("kind: ollama"));
+        assert!(rendered.contains("base_url: http://localhost:11434"));
+        assert!(rendered.contains("keys_missing: yes"));
+    }
+
+    #[test]
+    fn diagnose_registry_excludes_write_tools() {
+        let diagnose = ToolRegistry::with_diagnose_tools();
+        let full = ToolRegistry::with_default_tools();
+
+        let diagnose_names: Vec<_> = diagnose.names();
+        let full_names: Vec<_> = full.names();
+
+        // Diagnose must NOT include write tools.
+        for write_tool in ["fs_write", "service", "package", "browser"] {
+            assert!(
+                !diagnose_names.contains(&write_tool.to_string()),
+                "diagnose registry must not contain {write_tool}"
+            );
+        }
+
+        // Diagnose must be a proper subset.
+        assert!(diagnose_names.len() < full_names.len());
+
+        // Diagnose-relevant read-only tools must be present.
+        for read_tool in ["fs_read", "disk", "network", "logs", "search", "process"] {
+            assert!(
+                diagnose_names.contains(&read_tool.to_string()),
+                "diagnose registry must contain {read_tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn dry_run_cli_flag_is_parsed() {
+        let parsed = parse_cli_from([
+            "helm",
+            "run",
+            "--dry-run",
+            "--read-only",
+            "check disk space",
+        ])
+        .unwrap();
+        assert!(parsed.dry_run);
+        assert!(parsed.read_only);
+        match parsed.command {
+            super::Command::Run(args) => {
+                assert_eq!(args.task, "check disk space");
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_flag_is_parsed() {
+        let parsed = parse_cli_from(["helm", "run", "--evidence", "analyze logs"]).unwrap();
+        assert!(parsed.evidence);
+        match parsed.command {
+            super::Command::Run(args) => {
+                assert_eq!(args.task, "analyze logs");
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_evidence_contains_all_required_fields() {
+        use helm_agent::{
+            BlastRadius, Finding, ProposedAction, RollbackStatus, StructuredEvidence,
+            ToolCallPreview, Uncertainty,
+        };
+        let ev = StructuredEvidence {
+            inspected_sources: vec!["df -h".into(), "free -h".into()],
+            findings: vec![Finding {
+                label: "disk usage".into(),
+                value: "85%".into(),
+                source: "df -h".into(),
+            }],
+            assumptions: vec!["system is idle".into()],
+            uncertainty: Uncertainty::Medium,
+            proposed_actions: vec![ProposedAction {
+                description: "check large files".into(),
+                tool: "disk".into(),
+                tool_input: r#"{"action":"largest_files","path":"/"}"#.into(),
+            }],
+            blast_radius: BlastRadius {
+                paths: vec!["/var/log".into()],
+                services: vec!["nginx".into()],
+                hosts: vec![],
+            },
+            rollback: RollbackStatus {
+                available: true,
+                description: "rm -f /var/log/big.log".into(),
+            },
+            exact_tool_calls: vec![ToolCallPreview {
+                tool: "disk".into(),
+                tool_input: r#"{"action":"largest_files","path":"/"}"#.into(),
+                summary: "find largest files on /".into(),
+            }],
+        };
+
+        // Serialize roundtrip
+        let json = serde_json::to_string_pretty(&ev).unwrap();
+        assert!(json.contains("inspected_sources"));
+        assert!(json.contains("df -h"));
+        assert!(json.contains("findings"));
+        assert!(json.contains("assumptions"));
+        assert!(json.contains("uncertainty"));
+        assert!(json.contains("proposed_actions"));
+        assert!(json.contains("blast_radius"));
+        assert!(json.contains("rollback"));
+        assert!(json.contains("exact_tool_calls"));
+        assert!(json.contains("largest_files"));
+
+        // Deserialize roundtrip
+        let ev2: StructuredEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev.inspected_sources, ev2.inspected_sources);
+        assert_eq!(ev.findings.len(), ev2.findings.len());
+        assert_eq!(ev.uncertainty, ev2.uncertainty);
     }
 }

@@ -39,6 +39,11 @@ impl Tool for ProcessTool {
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let action = str_field(&input, "action")?;
+        if ctx.diagnose_mode && action == "kill" {
+            return Err(ToolError::InvalidInput(
+                "process kill is a mutating action and not allowed in diagnose mode".into(),
+            ));
+        }
         match action.as_str() {
             "list" => {
                 run_ps(
@@ -103,6 +108,10 @@ impl Tool for ProcessTool {
 
     fn allowed_in_diagnose(&self) -> bool {
         true
+    }
+
+    fn all_write_ops_gated_in_diagnose(&self) -> bool {
+        true // kill is runtime-gated via ctx.diagnose_mode
     }
 }
 
@@ -170,5 +179,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("pid"));
+    }
+
+    // ── v1.6 diagnose-mode gate ──
+
+    #[tokio::test]
+    async fn diagnose_mode_blocks_kill() {
+        let dir = tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path().to_path_buf());
+        ctx.diagnose_mode = true;
+        let err = ProcessTool
+            .execute(json!({"action": "kill", "pid": 1, "confirm": true}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not allowed in diagnose mode"));
     }
 }

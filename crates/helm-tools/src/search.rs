@@ -215,6 +215,10 @@ impl Tool for SearchTool {
     fn allowed_in_diagnose(&self) -> bool {
         true
     }
+
+    fn all_write_ops_gated_in_diagnose(&self) -> bool {
+        true // search has only read-only actions (grep, glob)
+    }
 }
 
 impl Default for SearchTool {

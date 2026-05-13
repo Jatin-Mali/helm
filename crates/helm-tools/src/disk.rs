@@ -65,6 +65,10 @@ impl Tool for DiskTool {
     fn allowed_in_diagnose(&self) -> bool {
         true
     }
+
+    fn all_write_ops_gated_in_diagnose(&self) -> bool {
+        true // disk has only read-only actions (df, du, lsblk, smart, largest_files)
+    }
 }
 
 async fn disk_usage_tree(

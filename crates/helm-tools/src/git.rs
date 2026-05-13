@@ -104,6 +104,35 @@ impl Tool for GitTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("action is required".into()))?;
 
+        if ctx.diagnose_mode {
+            match action {
+                "add" | "commit" | "push" | "pull" | "checkout" | "clone" => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "git {action} is a mutating action and not allowed in diagnose mode"
+                    )));
+                }
+                "branch" => {
+                    if input["create"].as_bool().unwrap_or(false)
+                        || input["delete"].as_bool().unwrap_or(false)
+                    {
+                        return Err(ToolError::InvalidInput(
+                            "git branch create/delete is a mutating action and not allowed in diagnose mode"
+                                .into(),
+                        ));
+                    }
+                }
+                "stash" => {
+                    let sub = input["stash_action"].as_str().unwrap_or("push");
+                    if sub == "push" || sub == "pop" || sub == "drop" {
+                        return Err(ToolError::InvalidInput(format!(
+                            "git stash {sub} is a mutating action and not allowed in diagnose mode"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let cwd = if let Some(p) = input["path"].as_str() {
             PathBuf::from(p)
         } else {
@@ -128,6 +157,10 @@ impl Tool for GitTool {
 
     fn allowed_in_diagnose(&self) -> bool {
         true
+    }
+
+    fn all_write_ops_gated_in_diagnose(&self) -> bool {
+        true // add, commit, push, pull, checkout, clone, stash push/pop/drop, branch create/delete all runtime-gated
     }
 }
 
@@ -566,5 +599,125 @@ mod tests {
         assert!(output.success);
         assert!(output.content.contains("output truncated"));
         assert_eq!(output.metadata.get("truncated"), Some(&json!(true)));
+    }
+
+    // ── v1.6 diagnose-mode gates ──
+
+    #[tokio::test]
+    async fn diagnose_mode_blocks_mutating_git_actions() {
+        let (_dir, path) = temp_repo();
+        let mut context = ctx(&path);
+        context.diagnose_mode = true;
+        let tool = GitTool;
+
+        for action in ["add", "commit", "push", "pull", "checkout", "clone"] {
+            let mut input = json!({"action": action});
+            if action == "add" {
+                input = json!({"action": "add", "files": ["f.txt"]});
+            } else if action == "commit" {
+                input = json!({"action": "commit", "message": "test"});
+            } else if action == "checkout" {
+                input = json!({"action": "checkout", "branch": "main"});
+            } else if action == "clone" {
+                input = json!({"action": "clone", "url": "https://example.com/repo.git"});
+            }
+            let err = tool.execute(input, &context).await.unwrap_err();
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("not allowed in diagnose mode"),
+                "action {action}: expected diagnose rejection, got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnose_mode_allows_readonly_git_actions() {
+        let (_dir, path) = temp_repo();
+        // Create an initial commit so log and diff have something to show.
+        std::fs::write(path.join("f.txt"), "init\n").unwrap();
+        let tool = GitTool;
+        let normal_ctx = ctx(&path);
+        tool.execute(json!({"action": "add", "files": ["f.txt"]}), &normal_ctx)
+            .await
+            .unwrap();
+        tool.execute(json!({"action": "commit", "message": "init"}), &normal_ctx)
+            .await
+            .unwrap();
+
+        let mut context = ctx(&path);
+        context.diagnose_mode = true;
+
+        // These should all succeed (they have data now).
+        for action in ["status", "log", "diff"] {
+            let result = tool
+                .execute(json!({"action": action}), &context)
+                .await
+                .unwrap();
+            assert!(
+                result.success,
+                "action {action} should succeed in diagnose mode"
+            );
+        }
+
+        // branch listing (without create/delete)
+        let result = tool
+            .execute(json!({"action": "branch"}), &context)
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        // stash list (not push/pop/drop)
+        let result = tool
+            .execute(json!({"action": "stash", "stash_action": "list"}), &context)
+            .await
+            .unwrap();
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn diagnose_mode_blocks_mutating_stash_actions() {
+        let (_dir, path) = temp_repo();
+        let mut context = ctx(&path);
+        context.diagnose_mode = true;
+        let tool = GitTool;
+
+        for sub in ["push", "pop", "drop"] {
+            let err = tool
+                .execute(json!({"action": "stash", "stash_action": sub}), &context)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("not allowed in diagnose mode"),
+                "stash {sub} should be blocked in diagnose mode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnose_mode_blocks_mutating_branch_actions() {
+        let (_dir, path) = temp_repo();
+        let mut context = ctx(&path);
+        context.diagnose_mode = true;
+        let tool = GitTool;
+
+        // branch create
+        let err = tool
+            .execute(
+                json!({"action": "branch", "create": true, "branch": "new-br"}),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not allowed in diagnose mode"));
+
+        // branch delete
+        let err = tool
+            .execute(
+                json!({"action": "branch", "delete": true, "branch": "old-br"}),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not allowed in diagnose mode"));
     }
 }

@@ -67,6 +67,10 @@ impl Tool for LogsTool {
     fn allowed_in_diagnose(&self) -> bool {
         true
     }
+
+    fn all_write_ops_gated_in_diagnose(&self) -> bool {
+        true // logs has only read-only actions (journalctl, tail, grep)
+    }
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@ use tracing::{Instrument as _, debug, info, instrument, trace, warn};
 use crate::{
     budget::{Budget, BudgetTracker},
     context_window,
+    evidence::{StructuredEvidence, collect_system_evidence},
     parser::{ResponseFormat, parse_tool_calls},
     plan_cache::PlanCache,
     supervisor::EvidenceVerifier,
@@ -279,12 +280,8 @@ pub enum AgentEvent {
     EvidenceReport {
         /// Tool name about to be executed.
         tool_name: String,
-        /// Machine state snapshot (df, free, loadavg).
-        system_state: String,
-        /// Taint level at time of request.
-        taint: String,
-        /// Whether prior taint suggests caution.
-        risk_level: String,
+        /// Structured machine-state evidence (disk, memory, load, etc.).
+        evidence: StructuredEvidence,
     },
 }
 
@@ -1057,19 +1054,15 @@ impl ReactAgent {
             );
         }
 
-        // Evidence gate: emit system state snapshot before authorization.
-        if self.budget.require_evidence {
-            let system_state = collect_system_evidence().await;
-            let risk_level = if taint_snapshot.is_external() {
-                "elevated"
-            } else {
-                "normal"
-            };
+        // Evidence gate: emit structured system state snapshot before authorization.
+        // TRD: Before any action with a write capability, evidence is mandatory
+        // and cannot be bypassed. The --evidence flag extends this to read-only tools.
+        let requires_evidence = capability.is_write() || self.budget.require_evidence;
+        if requires_evidence {
+            let evidence = collect_system_evidence(name, input).await;
             sink.emit(AgentEvent::EvidenceReport {
                 tool_name: name.to_owned(),
-                system_state,
-                taint: format!("{:?}", taint_snapshot),
-                risk_level: risk_level.to_owned(),
+                evidence,
             });
         }
 
@@ -1670,35 +1663,6 @@ impl ResponseFormatExt for ResponseFormat {
             ResponseFormat::Text => "text",
         }
     }
-}
-
-/// Collects a lightweight system state snapshot for evidence display.
-async fn collect_system_evidence() -> String {
-    let mut evidence = String::new();
-    // Disk usage
-    if let Ok(output) = tokio::process::Command::new("df").arg("-h").output().await {
-        evidence.push_str("[disk]\n");
-        evidence.push_str(&String::from_utf8_lossy(&output.stdout));
-    }
-    // Memory
-    if let Ok(output) = tokio::process::Command::new("free")
-        .arg("-h")
-        .output()
-        .await
-    {
-        evidence.push_str("[memory]\n");
-        evidence.push_str(&String::from_utf8_lossy(&output.stdout));
-    }
-    // Load
-    if let Ok(output) = tokio::process::Command::new("cat")
-        .arg("/proc/loadavg")
-        .output()
-        .await
-    {
-        evidence.push_str("[load]\n");
-        evidence.push_str(&String::from_utf8_lossy(&output.stdout));
-    }
-    evidence
 }
 
 #[cfg(test)]

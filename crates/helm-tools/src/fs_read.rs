@@ -95,6 +95,10 @@ impl Tool for FsReadTool {
     fn allowed_in_diagnose(&self) -> bool {
         true
     }
+
+    fn all_write_ops_gated_in_diagnose(&self) -> bool {
+        true // fs_read has no mutating sub-actions
+    }
 }
 
 #[derive(Debug)]

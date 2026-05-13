@@ -61,6 +61,22 @@ impl Capability {
         )
     }
 
+    /// Returns all capability variants.
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::FsRead,
+            Self::FsWrite,
+            Self::FsDelete,
+            Self::ShellExec,
+            Self::ShellShell,
+            Self::SystemService,
+            Self::PkgInstall,
+            Self::BrowserControl,
+            Self::NetworkOut,
+            Self::Sudo,
+        ]
+    }
+
     /// Returns whether this capability can mutate state (used for read-only mode).
     pub fn is_write(self) -> bool {
         matches!(

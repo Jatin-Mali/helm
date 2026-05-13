@@ -95,6 +95,17 @@ impl Tool for HttpTool {
 
         self.check_domain(url)?;
 
+        if ctx.diagnose_mode {
+            match action {
+                "post" | "put" | "delete" | "patch" => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "HTTP {action} is a mutating verb and not allowed in diagnose mode"
+                    )));
+                }
+                _ => {}
+            }
+        }
+
         let method = match action {
             "get" => Method::GET,
             "post" => Method::POST,
@@ -166,6 +177,10 @@ impl Tool for HttpTool {
     fn allowed_in_diagnose(&self) -> bool {
         true
     }
+
+    fn all_write_ops_gated_in_diagnose(&self) -> bool {
+        true // POST, PUT, DELETE, PATCH are runtime-gated via ctx.diagnose_mode
+    }
 }
 
 impl Default for HttpTool {
@@ -222,5 +237,82 @@ mod tests {
             .await;
         server.await.unwrap();
         assert!(result.is_ok());
+    }
+
+    // ── v1.6 diagnose-mode gates ──
+
+    #[tokio::test]
+    async fn diagnose_mode_blocks_mutating_http_verbs() {
+        let dir = tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path().into());
+        ctx.diagnose_mode = true;
+        let tool = HttpTool::default();
+
+        for verb in ["post", "put", "delete", "patch"] {
+            let err = tool
+                .execute(
+                    json!({"action": verb, "url": "https://example.com/api"}),
+                    &ctx,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("not allowed in diagnose mode"),
+                "HTTP {verb} should be blocked in diagnose mode, got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnose_mode_allows_readonly_http_verbs() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(_) => {
+                eprintln!("skipping http diagnose test: listener unavailable");
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(response).await;
+            }
+        });
+        let dir = tempdir().unwrap();
+        let mut ctx = ToolContext::new(dir.path().into());
+        ctx.diagnose_mode = true;
+        let tool = HttpTool::default();
+
+        // GET should succeed
+        let result = tool
+            .execute(
+                json!({"action": "get", "url": format!("http://{addr}/ping")}),
+                &ctx,
+            )
+            .await;
+        assert!(result.is_ok(), "HTTP GET should succeed in diagnose mode");
+
+        // HEAD should succeed (need a separate server since first accept consumed)
+        let listener2 = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let addr2 = listener2.local_addr().unwrap();
+        let server2 = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener2.accept().await {
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(response).await;
+            }
+        });
+        let result = tool
+            .execute(
+                json!({"action": "head", "url": format!("http://{addr2}/ping")}),
+                &ctx,
+            )
+            .await;
+        server.await.unwrap();
+        server2.await.unwrap();
+        assert!(result.is_ok(), "HTTP HEAD should succeed in diagnose mode");
     }
 }
