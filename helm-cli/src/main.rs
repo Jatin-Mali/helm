@@ -40,7 +40,7 @@ use helm_memory::{
 };
 use helm_monitor::{
     HostIdentity, MonitorDomain, MonitorProfile, MonitorReport, MonitorReporter, SnapshotDomains,
-    SystemSnapshot, collect_snapshot,
+    SystemSnapshot, collect_snapshot, explain_finding, plan_from_finding, plan_from_problem,
 };
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
@@ -167,6 +167,10 @@ enum Command {
     Snapshot(SnapshotArgs),
     /// Run detectors against a system snapshot and report findings
     Monitor(MonitorArgs),
+    /// Generate a guided troubleshooting plan from a problem description
+    Troubleshoot(TroubleshootArgs),
+    /// Explain a stored finding by ID
+    Explain(ExplainArgs),
 }
 
 #[derive(Debug, Args)]
@@ -719,6 +723,24 @@ struct MonitorArgs {
     /// Output format: text, json, markdown (default: text)
     #[arg(long, default_value = "text")]
     format: String,
+}
+
+#[derive(Debug, Args)]
+struct TroubleshootArgs {
+    #[arg(value_name = "PROBLEM")]
+    problem: String,
+    #[arg(long, value_name = "FINDING_ID")]
+    from_finding: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ExplainArgs {
+    #[arg(value_name = "FINDING_ID")]
+    finding_id: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
@@ -1677,6 +1699,12 @@ async fn run() -> Result<()> {
         }
         Command::Monitor(args) => {
             run_monitor_command(args).await?;
+        }
+        Command::Troubleshoot(args) => {
+            run_troubleshoot_command(args).await?;
+        }
+        Command::Explain(args) => {
+            run_explain_command(args).await?;
         }
     }
     Ok(())
@@ -5141,6 +5169,112 @@ async fn run_monitor_cycle(
     reporter
         .run(profile, domain_filter, previous_snapshot)
         .await
+}
+
+async fn run_troubleshoot_command(args: TroubleshootArgs) -> Result<()> {
+    let db_path = default_db_path()?;
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+
+    let plan = if let Some(finding_id) = &args.from_finding {
+        let mut found = false;
+        let mut result = plan_from_problem(&args.problem).await;
+        if let Ok(Some(finding_record)) = SnapshotStore::latest(&conn) {
+            let h = HostIdentity {
+                hostname: finding_record.host_hostname.clone(),
+                ..Default::default()
+            };
+            let d: SnapshotDomains =
+                serde_json::from_str(&finding_record.domains_json).unwrap_or_default();
+            let snapshot = SystemSnapshot {
+                id: finding_record.id.clone(),
+                host: h,
+                collected_at: chrono::DateTime::from_timestamp(finding_record.collected_at, 0)
+                    .unwrap_or_default(),
+                profile: finding_record
+                    .profile
+                    .parse()
+                    .unwrap_or(MonitorProfile::Standard),
+                domains: d,
+                collector_errors: serde_json::from_str(&finding_record.collector_errors_json)
+                    .unwrap_or_default(),
+                redaction_version: String::new(),
+            };
+            result = plan_from_finding(finding_id, snapshot).await;
+            found = true;
+        }
+        if !found {
+            eprintln!("No previous snapshots found. Starting from problem description.");
+        }
+        result
+    } else {
+        plan_from_problem(&args.problem).await
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        print!("{}", plan.render_text());
+        if plan.approval_required && !plan.proposed_fix_steps.is_empty() {
+            eprintln!(
+                "\n[approval required — use 'helm apply-plan {}' to execute]",
+                plan.id
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_explain_command(args: ExplainArgs) -> Result<()> {
+    let finding_id = &args.finding_id;
+    let mut output = String::new();
+    output.push_str(&format!("Explanation for finding: {finding_id}\n"));
+    output.push_str("To examine this finding, run a monitor cycle targeting its domain:\n");
+    output.push_str("  $ helm monitor\n\n");
+
+    let db_path = default_db_path()?;
+    let conn = rusqlite::Connection::open(&db_path).ok();
+    if let Some(conn) = conn {
+        if let Ok(Some(record)) = SnapshotStore::latest(&conn) {
+            let d: SnapshotDomains = serde_json::from_str(&record.domains_json).unwrap_or_default();
+            let h = HostIdentity {
+                hostname: record.host_hostname.clone(),
+                ..Default::default()
+            };
+            let snapshot = SystemSnapshot {
+                id: record.id.clone(),
+                host: h,
+                collected_at: chrono::DateTime::from_timestamp(record.collected_at, 0)
+                    .unwrap_or_default(),
+                profile: record.profile.parse().unwrap_or(MonitorProfile::Standard),
+                domains: d,
+                collector_errors: serde_json::from_str(&record.collector_errors_json)
+                    .unwrap_or_default(),
+                redaction_version: String::new(),
+            };
+            let reporter = MonitorReporter::new();
+            let findings = reporter.registry.detect(&snapshot, None, None);
+            let matched: Vec<_> = findings
+                .into_iter()
+                .filter(|f| f.id == *finding_id)
+                .collect();
+            if !matched.is_empty() {
+                output.push_str(&explain_finding(&matched[0]));
+            }
+        }
+    }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"finding_id": finding_id, "explanation": output})
+            )?
+        );
+    } else {
+        print!("{output}");
+    }
+    Ok(())
 }
 
 fn human_bytes(bytes: u64) -> String {

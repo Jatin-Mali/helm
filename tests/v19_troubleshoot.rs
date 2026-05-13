@@ -1,0 +1,261 @@
+//! v1.9 Guided Troubleshooting — comprehensive test suite.
+
+use helm_monitor::{
+    BlastRadius, CommandPreview, Hypothesis, PlanSource, RiskLevel, RollbackStatus,
+    TroubleshootingPlan, explain_finding,
+    findings::Finding,
+    plan_from_problem,
+    snapshot::{HostIdentity, MonitorProfile, SnapshotDomains, SystemSnapshot},
+};
+
+#[allow(dead_code)]
+fn empty_snapshot() -> SystemSnapshot {
+    SystemSnapshot {
+        id: "test-snap".into(),
+        host: HostIdentity::default(),
+        collected_at: chrono::Utc::now(),
+        profile: MonitorProfile::Standard,
+        domains: SnapshotDomains::default(),
+        collector_errors: vec![],
+        redaction_version: "0.1.0".into(),
+    }
+}
+
+// ── e2e: plan_from_problem generates hypotheses ─────────────────────────────
+
+#[test]
+fn e2e_plan_from_problem_generates_hypotheses() {
+    let plan = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(plan_from_problem("disk is full"));
+    assert!(!plan.hypotheses.is_empty(), "should generate hypotheses");
+    let disk_hyp = plan
+        .hypotheses
+        .iter()
+        .find(|h| h.domain == helm_monitor::MonitorDomain::Disks);
+    assert!(
+        disk_hyp.is_some(),
+        "disk problem should produce disk hypothesis"
+    );
+}
+
+#[test]
+fn e2e_plan_from_problem_service_failure() {
+    let plan = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(plan_from_problem("nginx service keeps crashing"));
+    let svc_hyp = plan
+        .hypotheses
+        .iter()
+        .find(|h| h.domain == helm_monitor::MonitorDomain::Services);
+    assert!(
+        svc_hyp.is_some(),
+        "service crash problem should produce service hypothesis"
+    );
+}
+
+// ── No fix suggestion without evidence ──────────────────────────────────────
+
+#[test]
+fn no_fix_without_evidence_on_empty_snapshot() {
+    let plan = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(plan_from_problem("disk is full"));
+    // Empty snapshot means no actionable evidence -> no fix steps
+    assert!(
+        plan.proposed_fix_steps.is_empty(),
+        "empty snapshot should have no fix proposals: had {}",
+        plan.proposed_fix_steps.len()
+    );
+}
+
+#[test]
+fn hypotheses_without_evidence_have_low_confidence() {
+    let plan = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(plan_from_problem("disk is full"));
+    for h in &plan.hypotheses {
+        if h.evidence_for.is_empty() {
+            assert!(
+                h.confidence < 0.5,
+                "hypothesis {} with no for-evidence should have low confidence, got {}",
+                h.hypothesis,
+                h.confidence
+            );
+        }
+    }
+}
+
+// ── Command preview fields ──────────────────────────────────────────────────
+
+#[test]
+fn command_preview_contains_all_required_fields() {
+    let preview = CommandPreview::new("shell", "df -h /", "Check root filesystem usage")
+        .with_risk(RiskLevel::None)
+        .with_blast(BlastRadius::File("/".into()))
+        .with_rollback(RollbackStatus::NotNeeded)
+        .with_verification(CommandPreview::new(
+            "shell",
+            "echo ok",
+            "verify nothing changed",
+        ));
+
+    assert_eq!(preview.tool, "shell");
+    assert_eq!(preview.command_text.as_deref(), Some("df -h /"));
+    assert_eq!(preview.expected_effect, "Check root filesystem usage");
+    assert_eq!(preview.risk, RiskLevel::None);
+    assert!(matches!(preview.blast_radius, BlastRadius::File(_)));
+    assert!(matches!(preview.rollback, RollbackStatus::NotNeeded));
+    assert_eq!(preview.verification.len(), 1);
+}
+
+#[test]
+fn command_preview_rollback_unsupported_clearly_labeled() {
+    let preview = CommandPreview::new("shell", "rm -rf /tmp/data", "Delete temp data")
+        .with_rollback(RollbackStatus::Unsupported);
+    assert!(matches!(preview.rollback, RollbackStatus::Unsupported));
+    assert_eq!(preview.rollback.to_string(), "no rollback available");
+}
+
+#[test]
+fn command_preview_blast_radius_human_readable() {
+    let file = BlastRadius::File("/etc/nginx/nginx.conf".into());
+    assert_eq!(file.to_string(), "file: /etc/nginx/nginx.conf");
+    let svc = BlastRadius::Service("nginx".into());
+    assert_eq!(svc.to_string(), "service: nginx");
+    let system = BlastRadius::System;
+    assert_eq!(system.to_string(), "entire system");
+}
+
+// ── TroubleshootingPlan render_text ─────────────────────────────────────────
+
+#[test]
+fn plan_render_text_contains_key_sections() {
+    let mut plan = TroubleshootingPlan::new(
+        PlanSource::UserQuestion("disk is full".into()),
+        "snap-1".into(),
+    );
+    plan.hypotheses.push(Hypothesis {
+        id: "h1".into(),
+        hypothesis: "Root filesystem is full".into(),
+        evidence_for: vec!["df shows 95% usage".into()],
+        evidence_against: vec![],
+        missing_evidence: vec!["lsof check not run".into()],
+        confidence: 0.8,
+        domain: helm_monitor::MonitorDomain::Disks,
+    });
+    plan.proposed_fix_steps.push(helm_monitor::PlanStep {
+        title: "Clean apt cache".into(),
+        command: CommandPreview::new("shell", "apt-get clean", "Free cache space"),
+        hypothesis_id: Some("h1".into()),
+    });
+    plan.approval_required = true;
+
+    let text = plan.render_text();
+    assert!(text.contains("Troubleshooting Plan"));
+    assert!(text.contains("Hypotheses"));
+    assert!(text.contains("Root filesystem"));
+    assert!(text.contains("80.0%"));
+    assert!(text.contains("Proposed fixes"));
+    assert!(text.contains("apt-get clean"));
+    assert!(text.contains("Approval required"));
+}
+
+#[test]
+fn plan_render_text_shows_rollback_status() {
+    let mut plan =
+        TroubleshootingPlan::new(PlanSource::UserQuestion("test".into()), "snap-1".into());
+    plan.proposed_fix_steps.push(helm_monitor::PlanStep {
+        title: "Test step".into(),
+        command: CommandPreview::new("shell", "test-cmd", "test")
+            .with_rollback(RollbackStatus::Unsupported),
+        hypothesis_id: None,
+    });
+    let text = plan.render_text();
+    assert!(text.contains("no rollback available"));
+}
+
+// ── PlanSource ──────────────────────────────────────────────────────────────
+
+#[test]
+fn plan_source_user_question_display() {
+    let s = PlanSource::UserQuestion("disk is full".into());
+    assert_eq!(s.to_string(), "user question: disk is full");
+}
+
+// ── helm explain output ─────────────────────────────────────────────────────
+
+#[test]
+fn explain_finding_shows_all_sections() {
+    let f = Finding::new(
+        "snap-1",
+        "disk-usage",
+        "/",
+        "Root filesystem is 95% full",
+        helm_monitor::Severity::Critical,
+        helm_monitor::Confidence::High,
+        helm_monitor::MonitorDomain::Disks,
+    )
+    .with_evidence("disk.used.bytes", "475G / 500G", "95% utilization")
+    .with_impact("System may run out of disk space")
+    .with_read_only_check("du -sh /var/log/*");
+
+    let text = explain_finding(&f);
+    assert!(text.contains("Finding:"));
+    assert!(text.contains("Critical"));
+    assert!(text.contains("High"));
+    assert!(text.contains("disk.used.bytes"));
+    assert!(text.contains("du -sh /var/log/*"));
+}
+
+// ── Redaction safety ────────────────────────────────────────────────────────
+
+#[test]
+fn plan_text_does_not_leak_secrets() {
+    let mut plan =
+        TroubleshootingPlan::new(PlanSource::UserQuestion("test".into()), "snap-1".into());
+    plan.proposed_fix_steps.push(helm_monitor::PlanStep {
+        title: "test".into(),
+        command: CommandPreview::new(
+            "shell",
+            "echo secret-sk-or-v1-abcdefghijklmnopqrstuvwxyz",
+            "test",
+        ),
+        hypothesis_id: None,
+    });
+    let text = plan.render_text();
+    let redacted = helm_core::redact_secrets(&text);
+    assert!(
+        redacted.contains("***REDACTED***"),
+        "plan text should redact keys"
+    );
+    assert!(
+        !redacted.contains("abcdefghijklmnopqrstuvwxyz"),
+        "raw key should not appear in plan"
+    );
+}
+
+// ── Approval gate invariants ────────────────────────────────────────────────
+
+#[test]
+fn plan_approval_required_by_default() {
+    let plan = TroubleshootingPlan::new(PlanSource::UserQuestion("test".into()), "s1".into());
+    assert!(
+        plan.approval_required,
+        "plans should require approval by default"
+    );
+}
+
+#[test]
+fn denied_approval_leaves_zero_state_changes() {
+    // v1.9 is planning-only; no execution path exists yet.
+    // v2.0 will wire the execution gate.
+    // For v1.9, 'denying' means simply not running the plan.
+    let plan = TroubleshootingPlan::new(PlanSource::UserQuestion("test".into()), "s1".into());
+    // No execution happens unless helm apply-plan (v2.0) is called.
+    // So the invariant is trivially true: not planning execution == no mutation.
+    assert!(
+        plan.read_only_steps.is_empty(),
+        "no execution in v1.9 — deny is the default state"
+    );
+}

@@ -6,6 +6,7 @@ pub mod engine;
 pub mod findings;
 pub mod reporter;
 pub mod snapshot;
+pub mod troubleshoot;
 
 pub use engine::collect_snapshot;
 pub use findings::{Confidence, EvidenceRef, Finding, FindingId, MonitorDomain, PlanId, Severity};
@@ -17,4 +18,8 @@ pub use snapshot::{
     LogSnapshot, MemoryInfo, MonitorProfile, MountEntry, NetworkSnapshot, PackageSnapshot,
     PortSnapshot, PressureStall, ProcessInfo, ProcessSnapshot, RouteEntry, ServiceSnapshot,
     SmartDevice, SnapshotDomains, SystemSnapshot, SystemdTimer, SystemdUnit, TimerSnapshot,
+};
+pub use troubleshoot::{
+    BlastRadius, CommandPreview, Hypothesis, PlanSource, PlanStep, RiskLevel, RollbackStatus,
+    TroubleshootingPlan, explain_finding, plan_from_finding, plan_from_problem,
 };
