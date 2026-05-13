@@ -74,6 +74,19 @@ impl Tool for ShellTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let parsed = ShellInput::parse(input, ctx)?;
         let allowlist = AllowlistConfig::load()?;
+        // Diagnose-mode runtime gate: reject shell expansion, pipes, and output redirection.
+        if ctx.diagnose_mode {
+            if matches!(parsed.mode, ShellMode::Shell) {
+                return Err(ToolError::InvalidInput(
+                    "shell mode (pipes/redirects) not allowed in diagnose mode".into(),
+                ));
+            }
+            if parsed.redirect_stdout_to.is_some() || parsed.redirect_stderr_to.is_some() {
+                return Err(ToolError::InvalidInput(
+                    "output redirection not allowed in diagnose mode".into(),
+                ));
+            }
+        }
         let command_line = match parsed.mode {
             ShellMode::Exec => std::iter::once(parsed.command.as_str())
                 .chain(parsed.args.iter().map(String::as_str))
@@ -292,6 +305,12 @@ impl Tool for ShellTool {
             success: status.success(),
             metadata,
         })
+    }
+
+    fn allowed_in_diagnose(&self) -> bool {
+        // Shell is visible in diagnose mode so the model can inspect system
+        // state, but exec-mode-only is enforced at runtime in execute().
+        true
     }
 }
 

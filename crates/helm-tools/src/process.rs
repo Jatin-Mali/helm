@@ -100,6 +100,10 @@ impl Tool for ProcessTool {
             ))),
         }
     }
+
+    fn allowed_in_diagnose(&self) -> bool {
+        true
+    }
 }
 
 async fn run_ps(

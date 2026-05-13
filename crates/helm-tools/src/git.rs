@@ -125,6 +125,10 @@ impl Tool for GitTool {
             _ => Err(ToolError::InvalidInput(format!("unknown action: {action}"))),
         }
     }
+
+    fn allowed_in_diagnose(&self) -> bool {
+        true
+    }
 }
 
 /// Run a git command in the given directory and collect stdout/stderr/status.

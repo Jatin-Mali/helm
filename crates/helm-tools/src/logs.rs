@@ -63,6 +63,10 @@ impl Tool for LogsTool {
         }
         run_command("journalctl", &args, ctx).await
     }
+
+    fn allowed_in_diagnose(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

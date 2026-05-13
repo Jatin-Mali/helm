@@ -8,7 +8,7 @@ local audit trail of what it did.
 
 `helm` with no arguments opens the TUI.
 
-## What Ships In v1.5
+## What Ships In v1.6
 
 - Local TUI and one-shot CLI task execution
 - Provider/model switching with live provider catalogs where supported
@@ -16,6 +16,11 @@ local audit trail of what it did.
 - Session history, snapshots, undo/redo, and audit verification
 - SSH remote targets, bootstrap, remote agent execution, and TUI attach mode
 - Optional OpenTelemetry export
+- Trust ladder: Diagnose → Dry-Run → Local → Remote → Governed
+- `helm diagnose` — read-only mode with 9 safe tools, enforced at registration
+- `helm run --dry-run` — prints commands, executes nothing
+- `helm trust-report` — audit chain, grants, sandbox, diagnose summary
+- TUI modes: Chat → Plan → AutoAccept → Diagnose (Shift+Tab cycles)
 
 ## Install
 
@@ -122,6 +127,27 @@ helm config path                      # config file location
 helm completion bash                  # shell completion
 ```
 
+## Safe Examples
+
+Try HELM without granting write access:
+
+```sh
+# Diagnose mode — read-only, 9 safe tools
+helm diagnose "why is /var/log filling up?"
+
+# Dry-run — see what would happen without executing
+helm run --dry-run "clean up old kernel packages"
+
+# Trust report — verify audit chain and active grants
+helm trust-report
+
+# TUI in read-only plan mode
+helm tui --read-only
+
+# TUI with dry-run (no tool execution)
+helm tui --dry-run
+```
+
 ## Security Notes
 
 - Stored provider keys live in `$XDG_CONFIG_HOME/helm/secrets.toml` (or `~/.config/helm/secrets.toml`) with mode `0600`.
@@ -154,6 +180,8 @@ local CLI or TUI. See:
 - `docs/providers.md`
 - `docs/agent-on-remote.md`
 - `docs/threat-model.md`
+- `docs/trust-ladder.md`
+- `docs/data-boundary.md`
 - `docs/troubleshooting.md`
 - `docs/release-notes-v1.0.md`
 - `CONTRIBUTING.md`

@@ -59,6 +59,10 @@ impl Tool for NetworkTool {
             ))),
         }
     }
+
+    fn allowed_in_diagnose(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -148,6 +148,7 @@ pub(crate) struct TuiRuntime {
     pub(crate) tui_paste_key_modal: bool,
     pub(crate) auto_approve: bool,
     pub(crate) read_only: bool,
+    pub(crate) diagnose_mode: bool,
     pub(crate) sandbox: Option<ResolvedSandbox>,
     pub(crate) remote_target: Option<String>,
 }
@@ -461,6 +462,8 @@ enum CommandAction {
     Cost,
     Quit,
     Help,
+    Diagnose,
+    Evidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -561,6 +564,8 @@ impl CommandAction {
             Self::Cost,
             Self::Quit,
             Self::Help,
+            Self::Diagnose,
+            Self::Evidence,
         ]
     }
 
@@ -593,6 +598,8 @@ impl CommandAction {
             Self::Cost => "Cost Meter",
             Self::Quit => "Quit",
             Self::Help => "Help",
+            Self::Diagnose => "Diagnose Mode",
+            Self::Evidence => "Evidence Report",
         }
     }
 
@@ -625,6 +632,8 @@ impl CommandAction {
             Self::Cost => "cost",
             Self::Quit => "quit",
             Self::Help => "help",
+            Self::Diagnose => "diagnose",
+            Self::Evidence => "evidence",
         }
     }
 
@@ -657,6 +666,8 @@ impl CommandAction {
             Self::Cost => "open the session cost meter",
             Self::Quit => "exit HELM",
             Self::Help => "keyboard shortcuts and commands",
+            Self::Diagnose => "switch to diagnose mode (read-only, limited tools)",
+            Self::Evidence => "show evidence report for last tool call",
         }
     }
 
@@ -689,6 +700,8 @@ impl CommandAction {
             Self::Redo => slug == "redo",
             Self::Cost => slug == "cost",
             Self::Help => slug == "help",
+            Self::Diagnose => slug == "diagnose",
+            Self::Evidence => slug == "evidence",
         }
     }
 
@@ -704,6 +717,7 @@ pub enum AgentMode {
     Chat,
     Plan,
     AutoAccept,
+    Diagnose,
 }
 
 impl AgentMode {
@@ -711,7 +725,8 @@ impl AgentMode {
         match self {
             Self::Chat => Self::Plan,
             Self::Plan => Self::AutoAccept,
-            Self::AutoAccept => Self::Chat,
+            Self::AutoAccept => Self::Diagnose,
+            Self::Diagnose => Self::Chat,
         }
     }
 
@@ -720,6 +735,7 @@ impl AgentMode {
             Self::Chat => "Chat",
             Self::Plan => "Plan",
             Self::AutoAccept => "Auto-Accept",
+            Self::Diagnose => "Diagnose",
         }
     }
 }
@@ -752,6 +768,9 @@ pub struct TuiApp {
     active_run_id: u64,
     agent_task: Option<JoinHandle<()>>,
     pending_auth_retry: Option<String>,
+    last_evidence: Option<EvidenceSnapshot>,
+    task_started: Option<Instant>,
+    tool_start_times: HashMap<String, Instant>,
     session_tokens_in: u32,
     session_tokens_out: u32,
     resume_context: Option<String>,
@@ -759,10 +778,18 @@ pub struct TuiApp {
     theme: Theme,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastVariant {
+    Success,
+    Error,
+    Info,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToastState {
     text: String,
     created: Instant,
+    variant: ToastVariant,
 }
 
 struct TuiRuntimeInner {
@@ -773,6 +800,14 @@ struct TuiRuntimeInner {
     secrets: SecretsStore,
     tui_paste_key_modal: bool,
     sandbox: Option<ResolvedSandbox>,
+}
+
+/// Stored evidence snapshot for later display via /evidence.
+struct EvidenceSnapshot {
+    tool_name: String,
+    system_state: String,
+    taint: String,
+    risk_level: String,
 }
 
 impl TuiApp {
@@ -802,6 +837,8 @@ impl TuiApp {
             AgentMode::Plan
         } else if runtime.auto_approve {
             AgentMode::AutoAccept
+        } else if runtime.diagnose_mode {
+            AgentMode::Diagnose
         } else {
             AgentMode::Chat
         };
@@ -842,6 +879,9 @@ impl TuiApp {
             active_run_id: 0,
             agent_task: None,
             pending_auth_retry: None,
+            last_evidence: None,
+            task_started: None,
+            tool_start_times: HashMap::new(),
             session_tokens_in: 0,
             session_tokens_out: 0,
             resume_context: None,
@@ -925,6 +965,8 @@ impl TuiApp {
                     return Ok(false);
                 }
                 self.running = false;
+                self.task_started = None;
+                self.tool_start_times.clear();
                 self.agent_task = None;
                 self.pending_tool_summaries.clear();
                 self.active_tool_cells.clear();
@@ -1192,7 +1234,7 @@ impl TuiApp {
             Some(ModalState::Permission { capability, .. }) => match key.code {
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.push_chat(MessageRole::System, "Permission denied.");
-                    self.toast("Permission denied");
+                    self.toast_variant("Permission denied", ToastVariant::Error);
                     self.modal = None;
                 }
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -1204,7 +1246,7 @@ impl TuiApp {
                             .ok();
                     });
                     self.push_chat(MessageRole::System, format!("Granted {capability} once."));
-                    self.toast("Permission granted once");
+                    self.toast_variant("Permission granted once", ToastVariant::Success);
                     self.modal = None;
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -1219,7 +1261,7 @@ impl TuiApp {
                         MessageRole::System,
                         format!("Granted {capability} for session."),
                     );
-                    self.toast("Permission granted for session");
+                    self.toast_variant("Permission granted for session", ToastVariant::Success);
                     self.modal = None;
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -1231,7 +1273,7 @@ impl TuiApp {
                             .ok();
                     });
                     self.push_chat(MessageRole::System, format!("Granted {capability} always."));
-                    self.toast("Permission granted always");
+                    self.toast_variant("Permission granted always", ToastVariant::Success);
                     self.modal = None;
                 }
                 _ => {}
@@ -1562,6 +1604,7 @@ Report the exit status and the concise output."
     ) -> Result<()> {
         self.record_tool_event("queued", "agent", "task submitted");
         self.running = true;
+        self.task_started = Some(Instant::now());
         self.status_note = "running".to_owned();
         self.active_run_id = self.active_run_id.saturating_add(1);
         self.session.transcript_scroll = 0;
@@ -1881,6 +1924,38 @@ Report the exit status and the concise output."
                 self.push_chat(MessageRole::Activity, msg.clone());
                 self.record_tool_event("breakpoint", "hit", msg);
             }
+            AgentEvent::ToolDryRun {
+                id,
+                name,
+                synthetic_output,
+            } => {
+                self.push_chat(
+                    MessageRole::System,
+                    format!("[dry-run] {name} ({id}):\n{synthetic_output}"),
+                );
+            }
+            AgentEvent::EvidenceReport {
+                tool_name,
+                system_state,
+                taint,
+                risk_level,
+            } => {
+                // Store for /evidence retrieval
+                self.last_evidence = Some(EvidenceSnapshot {
+                    tool_name: tool_name.clone(),
+                    system_state: system_state.clone(),
+                    taint: taint.clone(),
+                    risk_level: risk_level.clone(),
+                });
+                let msg = format!(
+                    "[evidence] {tool} | risk: {risk} | taint: {taint}\n{state}",
+                    tool = tool_name,
+                    risk = risk_level,
+                    taint = taint,
+                    state = system_state,
+                );
+                self.push_chat(MessageRole::System, msg);
+            }
             AgentEvent::RunFinished { .. }
             | AgentEvent::RunFailed { .. }
             | AgentEvent::TextDelta { .. }
@@ -1899,9 +1974,14 @@ Report the exit status and the concise output."
     }
 
     fn toast(&mut self, text: impl Into<String>) {
+        self.toast_variant(text, ToastVariant::Info);
+    }
+
+    fn toast_variant(&mut self, text: impl Into<String>, variant: ToastVariant) {
         self.toast = Some(ToastState {
             text: sanitize_one_line(&text.into()),
             created: Instant::now(),
+            variant,
         });
     }
 
@@ -1933,7 +2013,7 @@ Report the exit status and the concise output."
             .get(id)
             .cloned()
             .unwrap_or_else(|| name.to_owned());
-        let text = format!("{name}: {summary} ...");
+        let text = format!("◷ {name}: {summary} ...");
         self.status_note = format!("running {name}");
         self.session.chat.push(ChatMessage {
             role: MessageRole::Activity,
@@ -1941,6 +2021,7 @@ Report the exit status and the concise output."
         });
         self.active_tool_cells
             .insert(id.to_owned(), self.session.chat.len().saturating_sub(1));
+        self.tool_start_times.insert(id.to_owned(), Instant::now());
         self.session.transcript_scroll = 0;
     }
 
@@ -1949,22 +2030,29 @@ Report the exit status and the concise output."
             .pending_tool_summaries
             .remove(id)
             .unwrap_or_else(|| name.to_owned());
+        let duration = self
+            .tool_start_times
+            .remove(id)
+            .map(|start| start.elapsed())
+            .map(format_duration)
+            .unwrap_or_default();
         let preview = tool_output_preview(content);
+        let icon = if success { "✓" } else { "✗" };
         let text = if success {
             if preview.is_empty() {
-                format!("{name}: {summary}")
+                format!("{icon} {name}: {summary}  {duration}")
             } else {
-                format!("{name}: {summary}\n{preview}")
+                format!("{icon} {name}: {summary}  {duration}\n{preview}")
             }
         } else if preview.is_empty() {
-            format!("{name} failed: {summary}")
+            format!("{icon} {name} failed: {summary}  {duration}")
         } else {
-            format!("{name} failed: {summary}\n{preview}")
+            format!("{icon} {name} failed: {summary}  {duration}\n{preview}")
         };
         self.status_note = if success {
-            format!("{name} ok")
+            format!("{name} ok {duration}")
         } else {
-            format!("{name} failed")
+            format!("{name} failed {duration}")
         };
         if let Some(index) = self.active_tool_cells.remove(id)
             && let Some(message) = self.session.chat.get_mut(index)
@@ -2406,6 +2494,37 @@ Report the exit status and the concise output."
             CommandAction::Undo => self.execute_undo_inline(false),
             CommandAction::Redo => self.execute_undo_inline(true),
             CommandAction::Cost => self.open_cost_meter(),
+            CommandAction::Diagnose => {
+                self.mode = AgentMode::Diagnose;
+                self.push_chat(
+                    MessageRole::System,
+                    "Diagnose mode enabled — only read-only tools available. \
+                     Run a task to begin."
+                        .to_owned(),
+                );
+            }
+            CommandAction::Evidence => match &self.last_evidence {
+                Some(ev) => {
+                    let msg = format!(
+                        "Evidence report for {tool}:\n\
+                         risk: {risk}\ntaint: {taint}\n\n\
+                         {state}",
+                        tool = ev.tool_name,
+                        risk = ev.risk_level,
+                        taint = ev.taint,
+                        state = ev.system_state,
+                    );
+                    self.push_chat(MessageRole::System, msg);
+                }
+                None => {
+                    self.push_chat(
+                        MessageRole::System,
+                        "No evidence report available yet. \
+                         Run a task with --evidence to see system state."
+                            .to_owned(),
+                    );
+                }
+            },
             CommandAction::Quit => self.shutdown = true,
             CommandAction::Help => self.modal = Some(ModalState::Help),
         }
@@ -2902,7 +3021,8 @@ async fn run_agent_task(
     if let Some(max) = runtime.max_iterations {
         budget.max_iterations = max;
     }
-    budget.read_only = mode == AgentMode::Plan;
+    budget.read_only = mode == AgentMode::Plan || mode == AgentMode::Diagnose;
+    budget.dry_run = mode == AgentMode::Diagnose;
     budget.auto_approve = mode == AgentMode::AutoAccept;
     let mut tool_context = helm_tools::ToolContext::new(
         runtime
@@ -3058,12 +3178,29 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         "H"
     };
     let episode = app.session.episode_id.as_deref().unwrap_or("-");
+    let elapsed = app
+        .task_started
+        .map(|start| format_duration(start.elapsed()))
+        .unwrap_or_default();
     let mode_style = match app.mode {
-        AgentMode::Chat => Style::default().fg(Color::White).bg(HEADER_BORDER),
-        AgentMode::Plan => Style::default().fg(Color::White).bg(INPUT_IDLE),
-        AgentMode::AutoAccept => Style::default().fg(Color::White).bg(SUCCESS_FG),
+        AgentMode::Chat => Style::default()
+            .fg(Color::White)
+            .bg(HEADER_BORDER)
+            .add_modifier(Modifier::BOLD),
+        AgentMode::Plan => Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(75, 85, 99))
+            .add_modifier(Modifier::BOLD),
+        AgentMode::AutoAccept => Style::default()
+            .fg(Color::White)
+            .bg(SUCCESS_FG)
+            .add_modifier(Modifier::BOLD),
+        AgentMode::Diagnose => Style::default()
+            .fg(Color::White)
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
     };
-    let line = Line::from(vec![
+    let mut line = Line::from(vec![
         Span::styled(
             format!(" {spinner} HELM "),
             Style::default()
@@ -3091,19 +3228,25 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         ),
         Span::styled(
             format!(" [{}] ", app.mode.as_str().to_ascii_uppercase()),
-            mode_style.add_modifier(Modifier::BOLD),
+            mode_style,
         ),
         Span::styled(
             format!(" {} ", token_status(app)),
             Style::default().fg(DIM_FG).bg(HEADER_BG),
         ),
         Span::styled(
-            format!(" {} ", truncate(&app.status_note, 36)),
+            format!(" {} ", truncate(&app.status_note, 28)),
             Style::default()
                 .fg(if app.running { SUCCESS_FG } else { APP_FG })
                 .bg(HEADER_BG),
         ),
     ]);
+    if !elapsed.is_empty() {
+        line.push_span(Span::styled(
+            format!(" ⏱ {elapsed} "),
+            Style::default().fg(TOOL_FG).bg(HEADER_BG),
+        ));
+    }
     Paragraph::new(line)
         .style(Style::default().bg(HEADER_BG))
         .render(chunks[0], buf);
@@ -3113,6 +3256,7 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_chat(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let chat_empty = app.session.chat.is_empty();
     let lines = chat_lines(&app.session.chat);
     let viewport_height = area.height.saturating_sub(2);
     app.last_chat_height.set(viewport_height);
@@ -3125,6 +3269,67 @@ fn render_chat(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     } else {
         "Transcript".to_owned()
     };
+    if chat_empty && !app.running {
+        let welcome = vec![
+            Line::from(vec![Span::styled(
+                "  HELM v1.6 — Linux Operations Agent",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "  Type a task or question to begin. Examples:",
+                Style::default().fg(DIM_FG),
+            )]),
+            Line::from(vec![Span::styled(
+                "    • \"check disk usage on /\"",
+                Style::default().fg(APP_FG),
+            )]),
+            Line::from(vec![Span::styled(
+                "    • \"what's listening on port 443?\"",
+                Style::default().fg(APP_FG),
+            )]),
+            Line::from(vec![Span::styled(
+                "    • \"show me nginx errors since last hour\"",
+                Style::default().fg(APP_FG),
+            )]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    "  /",
+                    Style::default()
+                        .fg(HEADER_BORDER)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" for commands  ", Style::default().fg(DIM_FG)),
+                Span::styled(
+                    "Shift+Tab",
+                    Style::default()
+                        .fg(HEADER_BORDER)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to change mode  ", Style::default().fg(DIM_FG)),
+                Span::styled(
+                    "Ctrl+P",
+                    Style::default()
+                        .fg(HEADER_BORDER)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" for palette", Style::default().fg(DIM_FG)),
+            ]),
+        ];
+        Paragraph::new(welcome)
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT | Borders::RIGHT)
+                    .title(" Welcome ")
+                    .border_style(Style::default().fg(HEADER_BORDER))
+                    .style(Style::default().fg(APP_FG).bg(APP_BG)),
+            )
+            .render(area, buf);
+        return;
+    }
     Paragraph::new(lines)
         .block(
             Block::default()
@@ -3231,13 +3436,19 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         }))
         .style(Style::default().fg(Color::White).bg(INPUT_BG));
     let body = if app.input.text.is_empty() {
+        let placeholder = match app.mode {
+            AgentMode::Diagnose => "Diagnose a system problem (read-only)...",
+            AgentMode::Plan => "Plan an approach (no writes yet)...",
+            AgentMode::AutoAccept => "Run with auto-approved tools...",
+            AgentMode::Chat => "Ask HELM to do something...",
+        };
         vec![Line::from(vec![
             Span::styled(
                 "❯ ",
                 Style::default().fg(USER_BAR).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "Ask HELM to do something...",
+                placeholder,
                 Style::default().fg(DIM_FG).add_modifier(Modifier::ITALIC),
             ),
         ])]
@@ -3270,11 +3481,13 @@ fn render_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
         AgentMode::Chat => "CHAT",
         AgentMode::Plan => "PLAN",
         AgentMode::AutoAccept => "AUTO",
+        AgentMode::Diagnose => "DIAGNOSE",
     };
     let mode_hint = match _app.mode {
         AgentMode::Chat => "Shift+Tab -> Plan",
         AgentMode::Plan => "READ-ONLY | Shift+Tab -> Auto",
-        AgentMode::AutoAccept => "AUTO-ACCEPT | Shift+Tab -> Chat",
+        AgentMode::AutoAccept => "AUTO-ACCEPT | Shift+Tab -> Diagnose",
+        AgentMode::Diagnose => "DIAGNOSE | Shift+Tab -> Chat",
     };
     let line = Line::from(vec![
         Span::styled(
@@ -3728,15 +3941,20 @@ fn render_toast(toast: &ToastState, area: Rect, buf: &mut Buffer) {
         height: 3.min(area.height),
     };
     Clear.render(rect, buf);
+    let (icon, border_color, bg) = match toast.variant {
+        ToastVariant::Success => ("✓", SUCCESS_FG, TOOL_BG),
+        ToastVariant::Error => ("✗", ERROR_FG, ERROR_BG),
+        ToastVariant::Info => ("i", HEADER_BORDER, TOOL_BG),
+    };
     Paragraph::new(Line::from(vec![
-        Span::styled("✓ ", Style::default().fg(SUCCESS_FG).bg(TOOL_BG)),
-        Span::styled(toast.text.clone(), Style::default().fg(APP_FG).bg(TOOL_BG)),
+        Span::styled(format!("{icon} "), Style::default().fg(border_color).bg(bg)),
+        Span::styled(toast.text.clone(), Style::default().fg(APP_FG).bg(bg)),
     ]))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(HEADER_BORDER))
-            .style(Style::default().bg(TOOL_BG)),
+            .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(bg)),
     )
     .render(rect, buf);
 }
@@ -3971,6 +4189,17 @@ fn sanitize_one_line(text: &str) -> String {
         .lines()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 fn provider_selector_list() -> Vec<(ProviderChoice, Option<&'static str>)> {
@@ -4483,6 +4712,7 @@ mod tests {
             tui_paste_key_modal: true,
             auto_approve: false,
             read_only: false,
+            diagnose_mode: false,
             sandbox: None,
             remote_target: None,
         })
@@ -4755,7 +4985,7 @@ mod tests {
         assert_eq!(app.session.chat.len(), 1);
         assert_eq!(
             app.session.chat[0].text,
-            "shell: shell `date && uname -a` -> /tmp/helm.txt ..."
+            "◷ shell: shell `date && uname -a` -> /tmp/helm.txt ..."
         );
 
         app.apply_agent_event(AgentEvent::ToolCallFinished {
@@ -4796,9 +5026,15 @@ mod tests {
 
         assert_eq!(app.session.chat.len(), 1);
         assert_eq!(app.session.chat[0].role, MessageRole::Error);
-        assert_eq!(
-            app.session.chat[0].text,
-            "fs_read failed: read /etc/shadow\npath denied: /etc/shadow"
+        assert!(
+            app.session.chat[0]
+                .text
+                .starts_with("✗ fs_read failed: read /etc/shadow")
+        );
+        assert!(
+            app.session.chat[0]
+                .text
+                .ends_with("path denied: /etc/shadow")
         );
     }
 

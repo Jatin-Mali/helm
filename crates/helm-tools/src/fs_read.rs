@@ -91,6 +91,10 @@ impl Tool for FsReadTool {
             }
         }
     }
+
+    fn allowed_in_diagnose(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug)]

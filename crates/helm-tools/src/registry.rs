@@ -73,6 +73,24 @@ impl ToolRegistry {
         registry
     }
 
+    /// Creates a registry containing only tools safe for diagnose mode.
+    /// Write/exec/remote tools are excluded; only read-only queries are allowed.
+    pub fn with_diagnose_tools() -> Self {
+        let mut registry = Self::new();
+        registry.register(Box::<FsReadTool>::default());
+        registry.register(Box::<DiskTool>::default());
+        registry.register(Box::<NetworkTool>::default());
+        registry.register(Box::<LogsTool>::default());
+        registry.register(Box::<SearchTool>::default());
+        registry.register(Box::<ProcessTool>::default());
+        registry.register(Box::<GitTool>::default());
+        registry.register(Box::<HttpTool>::default());
+        // ShellTool is included for exec-only mode; shell-mode and redirection
+        // are rejected at runtime by the diagnose_mode gate.
+        registry.register(Box::<ShellTool>::default());
+        registry
+    }
+
     /// Registers or replaces a tool by its declared name.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.insert(tool.name().to_owned(), tool);

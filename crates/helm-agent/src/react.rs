@@ -266,6 +266,26 @@ pub enum AgentEvent {
         /// Tool name at breakpoint.
         tool_name: String,
     },
+    /// Tool call intercepted by --dry-run mode; no execution occurred.
+    ToolDryRun {
+        /// Tool-use id.
+        id: String,
+        /// Tool name.
+        name: String,
+        /// Synthetic success message describing what would have happened.
+        synthetic_output: String,
+    },
+    /// System state snapshot emitted before a permission-sensitive tool call.
+    EvidenceReport {
+        /// Tool name about to be executed.
+        tool_name: String,
+        /// Machine state snapshot (df, free, loadavg).
+        system_state: String,
+        /// Taint level at time of request.
+        taint: String,
+        /// Whether prior taint suggests caution.
+        risk_level: String,
+    },
 }
 
 /// Receives live events from a running agent.
@@ -1012,6 +1032,47 @@ impl ReactAgent {
     ) -> (ContentBlock, Taint, u32) {
         debug!(tool = name, tool_use_id = id, "executing tool");
         let capability = self.tools.required_capability(name, input);
+
+        // Dry-run gate: emit synthetic success without executing the tool.
+        if self.budget.dry_run {
+            let synthetic = format!(
+                "[dry-run] would execute {name} with input: {}",
+                serde_json::to_string_pretty(input).unwrap_or_else(|_| "<invalid>".to_owned())
+            );
+            sink.emit(AgentEvent::ToolDryRun {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                synthetic_output: synthetic.clone(),
+            });
+            return (
+                ContentBlock::ToolResult {
+                    tool_use_id: id.to_owned(),
+                    content: synthetic,
+                    is_error: false,
+                },
+                Taint::Tool {
+                    name: name.to_owned(),
+                },
+                0,
+            );
+        }
+
+        // Evidence gate: emit system state snapshot before authorization.
+        if self.budget.require_evidence {
+            let system_state = collect_system_evidence().await;
+            let risk_level = if taint_snapshot.is_external() {
+                "elevated"
+            } else {
+                "normal"
+            };
+            sink.emit(AgentEvent::EvidenceReport {
+                tool_name: name.to_owned(),
+                system_state,
+                taint: format!("{:?}", taint_snapshot),
+                risk_level: risk_level.to_owned(),
+            });
+        }
+
         let authorization = self.authorize_tool_call(capability, &taint_snapshot).await;
         let mut corrections_delta: u32 = 0;
 
@@ -1609,6 +1670,35 @@ impl ResponseFormatExt for ResponseFormat {
             ResponseFormat::Text => "text",
         }
     }
+}
+
+/// Collects a lightweight system state snapshot for evidence display.
+async fn collect_system_evidence() -> String {
+    let mut evidence = String::new();
+    // Disk usage
+    if let Ok(output) = tokio::process::Command::new("df").arg("-h").output().await {
+        evidence.push_str("[disk]\n");
+        evidence.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    // Memory
+    if let Ok(output) = tokio::process::Command::new("free")
+        .arg("-h")
+        .output()
+        .await
+    {
+        evidence.push_str("[memory]\n");
+        evidence.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    // Load
+    if let Ok(output) = tokio::process::Command::new("cat")
+        .arg("/proc/loadavg")
+        .output()
+        .await
+    {
+        evidence.push_str("[load]\n");
+        evidence.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    evidence
 }
 
 #[cfg(test)]

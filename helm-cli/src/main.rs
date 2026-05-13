@@ -96,6 +96,12 @@ struct Cli {
     /// Plan mode: read-only analysis, no writes or executions
     #[arg(long = "read-only", alias = "plan", global = true)]
     read_only: bool,
+    /// Dry-run: print intended commands without executing anything
+    #[arg(long, global = true)]
+    dry_run: bool,
+    /// Show system evidence report before executing permission-sensitive tools
+    #[arg(long, global = true)]
+    evidence: bool,
     /// Confine local tool execution with Bubblewrap. Default root is the current working directory.
     #[arg(long, global = true)]
     sandbox: bool,
@@ -154,6 +160,10 @@ enum Command {
     Profile(ProfileArgs),
     /// Bootstrap HELM onto a reachable Linux host over SSH
     Bootstrap(BootstrapArgs),
+    /// Read-only diagnostic mode — cannot write or execute dangerous tools
+    Diagnose(DiagnoseArgs),
+    /// Show trust report: grants, audit, sandbox, secrets, integrity
+    TrustReport(TrustReportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -648,6 +658,25 @@ struct CompletionArgs {
     shell: Shell,
 }
 
+#[derive(Debug, Args)]
+struct DiagnoseArgs {
+    #[arg(value_name = "QUESTION")]
+    question: String,
+    /// Output result as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct TrustReportArgs {
+    /// Output as JSON
+    #[arg(long)]
+    json: bool,
+    /// Verify audit chain against a specific remote target
+    #[arg(long, value_name = "NAME")]
+    target: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum ProviderChoice {
@@ -897,6 +926,14 @@ async fn run() -> Result<()> {
             }
             budget.auto_approve = cli.yes;
             budget.read_only = cli.read_only;
+            budget.dry_run = cli.dry_run;
+            budget.require_evidence = cli.evidence;
+            if cli.dry_run {
+                eprintln!("info: --dry-run mode — tools will report synthetic success only");
+            }
+            if cli.evidence {
+                eprintln!("info: --evidence mode — system state shown before each tool call");
+            }
 
             // Open session store for snapshotting (U5, U7).
             let sessions_dir = paths::default_snapshots_path();
@@ -1133,6 +1170,47 @@ async fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", render_doctor(&report));
+            }
+        }
+        Command::Diagnose(args) => {
+            let (provider, model_name) = build_provider(&provider_settings, &secrets_store)?;
+            let budget = Budget {
+                read_only: true,
+                dry_run: true,
+                ..Default::default()
+            };
+            let tool_context =
+                ToolContext::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                    .with_diagnose_mode();
+            let agent = ReactAgent::with_tool_context(
+                provider,
+                ToolRegistry::with_diagnose_tools(),
+                memory.clone(),
+                budget,
+                model_name,
+                tool_context,
+            );
+            eprintln!(
+                "[diagnose] running in read-only mode with {} tools available",
+                ToolRegistry::with_diagnose_tools().schemas().len()
+            );
+            let question = format!(
+                "[diagnose mode — read-only, limited tools] Answer this question about the system using only available tools. Do not attempt to modify anything.\n\n{}",
+                args.question
+            );
+            let result = agent.run(&question).await?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "answer": result.final_message,
+                        "iterations": result.iterations,
+                        "tokens_in": result.tokens_in,
+                        "tokens_out": result.tokens_out
+                    }))?
+                );
+            } else {
+                println!("{}", result.final_message);
             }
         }
         Command::Episodes(args) => {
@@ -1510,6 +1588,7 @@ async fn run() -> Result<()> {
                         .unwrap_or(true),
                     auto_approve: cli.yes,
                     read_only: cli.read_only,
+                    diagnose_mode: false,
                     sandbox: sandbox.clone(),
                     remote_target: cli.remote.clone(),
                 })
@@ -1539,6 +1618,14 @@ async fn run() -> Result<()> {
         }
         Command::Bootstrap(args) => {
             run_bootstrap_command(args).await?;
+        }
+        Command::TrustReport(args) => {
+            let report = run_trust_report(&memory, &secrets_store, &args).await?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", render_trust_report(&report));
+            }
         }
     }
     Ok(())
@@ -3515,6 +3602,130 @@ fn render_doctor(report: &DoctorReport) -> String {
         ));
         output.push_str("  warning: secrets store takes precedence over env fallback\n");
     }
+    output
+}
+
+// ── TrustReport ────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct TrustReport {
+    version: String,
+    grants: TrustGrantsSummary,
+    audit: TrustAuditSummary,
+    sandbox: TrustSandboxSummary,
+    diagnose: TrustDiagnoseSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct TrustGrantsSummary {
+    active: usize,
+    total: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TrustAuditSummary {
+    total_events: usize,
+    chain_ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TrustSandboxSummary {
+    bwrap_found: bool,
+    bwrap_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TrustDiagnoseSummary {
+    tools_available: usize,
+    write_tools_blocked: usize,
+}
+
+async fn run_trust_report(
+    memory: &std::sync::Arc<MemoryStore>,
+    _secrets: &SecretsStore,
+    args: &TrustReportArgs,
+) -> Result<TrustReport> {
+    let grants = memory.list_capability_grants().await?;
+    let active = grants.iter().filter(|g| g.revoked_at.is_none()).count();
+
+    let events = if let Some(target) = &args.target {
+        memory.audit_events(None, Some(target)).await?
+    } else {
+        memory.audit_events(None, None).await?
+    };
+    let chain_ok = memory.verify_audit_chain().await?.ok;
+
+    let bwrap_path = which::which("bwrap").unwrap_or_default();
+    let bwrap_found = !bwrap_path.as_os_str().is_empty();
+
+    let diagnose_registry = ToolRegistry::with_diagnose_tools();
+    let full_registry = ToolRegistry::with_default_tools();
+    let tools_available = diagnose_registry.schemas().len();
+    let write_tools_blocked = full_registry
+        .schemas()
+        .len()
+        .saturating_sub(tools_available);
+
+    Ok(TrustReport {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        grants: TrustGrantsSummary {
+            active,
+            total: grants.len(),
+        },
+        audit: TrustAuditSummary {
+            total_events: events.len(),
+            chain_ok,
+        },
+        sandbox: TrustSandboxSummary {
+            bwrap_found,
+            bwrap_path: bwrap_path.display().to_string(),
+        },
+        diagnose: TrustDiagnoseSummary {
+            tools_available,
+            write_tools_blocked,
+        },
+    })
+}
+
+fn render_trust_report(report: &TrustReport) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("HELM v{} — Trust Report\n\n", report.version));
+    output.push_str("[grants]\n");
+    output.push_str(&format!(
+        "  active: {} / total: {}\n\n",
+        report.grants.active, report.grants.total
+    ));
+    output.push_str("[audit]\n");
+    output.push_str(&format!("  events: {}\n", report.audit.total_events));
+    output.push_str(&format!(
+        "  chain: {}\n\n",
+        if report.audit.chain_ok {
+            "valid"
+        } else {
+            "INTEGRITY BREACH"
+        }
+    ));
+    output.push_str("[sandbox]\n");
+    output.push_str(&format!(
+        "  bwrap: {}\n",
+        if report.sandbox.bwrap_found {
+            &report.sandbox.bwrap_path
+        } else {
+            "not found"
+        }
+    ));
+    output.push_str("\n[diagnose mode]\n");
+    output.push_str(&format!(
+        "  read-only tools: {}\n",
+        report.diagnose.tools_available
+    ));
+    output.push_str(&format!(
+        "  write tools blocked: {}\n",
+        report.diagnose.write_tools_blocked
+    ));
+    output.push_str("\n[paths]\n");
+    output.push_str(&format!("  config: {}\n", paths::config_dir().display()));
+    output.push_str(&format!("  data: {}\n", paths::data_dir().display()));
     output
 }
 

@@ -61,6 +61,10 @@ impl Tool for DiskTool {
             ))),
         }
     }
+
+    fn allowed_in_diagnose(&self) -> bool {
+        true
+    }
 }
 
 async fn disk_usage_tree(

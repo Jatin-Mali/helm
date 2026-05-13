@@ -82,6 +82,10 @@ pub struct Budget {
     pub auto_approve: bool,
     /// Whether to permanently deny all write capabilities (plan mode).
     pub read_only: bool,
+    /// When true, tool calls return synthetic success without executing.
+    pub dry_run: bool,
+    /// When true, emit an evidence snapshot before each permission check.
+    pub require_evidence: bool,
 }
 
 impl Default for Budget {
@@ -94,6 +98,8 @@ impl Default for Budget {
             max_cost_usd: None,
             auto_approve: false,
             read_only: false,
+            dry_run: false,
+            require_evidence: false,
         }
     }
 }

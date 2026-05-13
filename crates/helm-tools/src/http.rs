@@ -162,6 +162,10 @@ impl Tool for HttpTool {
             metadata,
         })
     }
+
+    fn allowed_in_diagnose(&self) -> bool {
+        true
+    }
 }
 
 impl Default for HttpTool {

@@ -21,6 +21,12 @@ pub trait Tool: Send + Sync {
 
     /// Executes the tool with validated JSON input and runtime context.
     async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
+
+    /// Whether this tool is safe to expose in diagnose/read-only-query mode.
+    /// Default false — each tool must opt in to diagnose safety explicitly.
+    fn allowed_in_diagnose(&self) -> bool {
+        false
+    }
 }
 
 /// Runtime constraints and filesystem root for tool execution.
@@ -36,6 +42,8 @@ pub struct ToolContext {
     pub sandbox: Option<SandboxPolicy>,
     /// Named remote target associated with this run, if any.
     pub remote_target: Option<String>,
+    /// When true, tools are restricted to diagnose-safe operations.
+    pub diagnose_mode: bool,
 }
 
 /// Bubblewrap-based confinement settings for local tool execution.
@@ -56,6 +64,7 @@ impl ToolContext {
             max_output_bytes: 1024 * 1024,
             sandbox: None,
             remote_target: None,
+            diagnose_mode: false,
         }
     }
 
@@ -68,6 +77,12 @@ impl ToolContext {
     /// Returns a copy of the context tagged with a remote target name.
     pub fn with_remote_target(mut self, target: impl Into<String>) -> Self {
         self.remote_target = Some(target.into());
+        self
+    }
+
+    /// Returns a copy of the context with diagnose-mode restrictions enabled.
+    pub fn with_diagnose_mode(mut self) -> Self {
+        self.diagnose_mode = true;
         self
     }
 }

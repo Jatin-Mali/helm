@@ -185,6 +185,28 @@ impl AgentEventSink for NdjsonSink {
             AgentEvent::PlanFinished { iteration } => {
                 ("plan_finished", json!({ "iteration": iteration }))
             }
+            AgentEvent::ToolDryRun {
+                id,
+                name,
+                synthetic_output,
+            } => (
+                "tool_dry_run",
+                json!({ "id": id, "name": name, "synthetic_output": synthetic_output }),
+            ),
+            AgentEvent::EvidenceReport {
+                tool_name,
+                system_state,
+                taint,
+                risk_level,
+            } => (
+                "evidence_report",
+                json!({
+                    "tool": tool_name,
+                    "system_state": system_state,
+                    "taint": taint,
+                    "risk_level": risk_level,
+                }),
+            ),
         };
         let line = json!({ "event": name, "data": data });
         let _guard = self.writer.lock().ok();
