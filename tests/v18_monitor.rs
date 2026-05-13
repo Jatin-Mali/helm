@@ -529,6 +529,109 @@ fn baseline_without_previous_does_not_show_baseline_line() {
     assert!(!text.contains("Baseline:"));
 }
 
+// ── Monitor snapshot persistence test ────────────────────────────────────────
+
+#[test]
+fn monitor_snapshot_is_persisted_and_reloaded_as_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("monitor-test.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS snapshots (
+            id TEXT PRIMARY KEY,
+            host_hostname TEXT NOT NULL DEFAULT 'unknown',
+            collected_at INTEGER NOT NULL,
+            profile TEXT NOT NULL DEFAULT 'standard',
+            domains_json TEXT NOT NULL DEFAULT '{}',
+            collector_errors_json TEXT NOT NULL DEFAULT '[]'
+        )",
+    )
+    .unwrap();
+
+    // First run: persist a snapshot
+    let mut snap1 = base_snapshot();
+    snap1.id = "monitor-run-1".into();
+    snap1.collected_at = chrono::DateTime::from_timestamp(100_000, 0).unwrap();
+    snap1.domains.logs.journal_errors_last_hour = 10;
+    let json1 = serde_json::to_string(&snap1).unwrap();
+    helm_memory::SnapshotStore::insert(&conn, &json1).unwrap();
+
+    // Verify it's stored
+    let latest = helm_memory::SnapshotStore::list(&conn, 10).unwrap();
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].id, "monitor-run-1");
+
+    // Second run: persist another snapshot with higher error count
+    let mut snap2 = base_snapshot();
+    snap2.id = "monitor-run-2".into();
+    snap2.collected_at = chrono::DateTime::from_timestamp(200_000, 0).unwrap();
+    snap2.domains.logs.journal_errors_last_hour = 200;
+    let json2 = serde_json::to_string(&snap2).unwrap();
+    helm_memory::SnapshotStore::insert(&conn, &json2).unwrap();
+
+    // Latest is now snap2
+    let latest2 = helm_memory::SnapshotStore::latest(&conn).unwrap().unwrap();
+    assert_eq!(latest2.id, "monitor-run-2");
+
+    // Load snap1 as previous baseline, detect using snap2
+    let reporter = MonitorReporter::new();
+    let findings = reporter
+        .registry
+        .detect(&snap2, Some(&[MonitorDomain::Logs]), Some(&snap1));
+    let crit: Vec<_> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Critical)
+        .collect();
+    assert!(
+        !crit.is_empty(),
+        "200 errors vs 10 baseline (>2x) should be critical"
+    );
+    assert!(crit[0].title.contains("previous: 10"));
+}
+
+#[test]
+fn monitor_persistence_advances_baseline_across_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("monitor-test2.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS snapshots (
+            id TEXT PRIMARY KEY,
+            host_hostname TEXT NOT NULL DEFAULT 'unknown',
+            collected_at INTEGER NOT NULL,
+            profile TEXT NOT NULL DEFAULT 'standard',
+            domains_json TEXT NOT NULL DEFAULT '{}',
+            collector_errors_json TEXT NOT NULL DEFAULT '[]'
+        )",
+    )
+    .unwrap();
+
+    // Simulate three consecutive monitor runs
+    let runs = [
+        ("run-1", 50u64, 100_000i64),
+        ("run-2", 55u64, 200_000i64),
+        ("run-3", 200u64, 300_000i64),
+    ];
+
+    for (i, (id, errors, ts)) in runs.iter().enumerate() {
+        let mut snap = base_snapshot();
+        snap.id = id.to_string();
+        snap.collected_at = chrono::DateTime::from_timestamp(*ts, 0).unwrap();
+        snap.domains.logs.journal_errors_last_hour = *errors;
+        let json = serde_json::to_string(&snap).unwrap();
+        helm_memory::SnapshotStore::insert(&conn, &json).unwrap();
+
+        let count = helm_memory::SnapshotStore::list(&conn, 10).unwrap().len();
+        assert_eq!(count, i + 1, "snapshot count should increase each run");
+    }
+
+    // After 3 runs, 3 snapshots exist
+    let list = helm_memory::SnapshotStore::list(&conn, 10).unwrap();
+    assert_eq!(list.len(), 3);
+    assert_eq!(list[0].id, "run-3"); // newest first
+    assert_eq!(list[2].id, "run-1"); // oldest last
+}
+
 // ── Watch mode remains read-only ────────────────────────────────────────────
 
 #[test]

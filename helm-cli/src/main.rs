@@ -5059,7 +5059,9 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
         loop {
             let prev = load_previous_snapshot(&conn);
             let report = run_monitor_cycle(profile, domain_filter.as_deref(), prev).await;
-            let output = format_report(&report, &args.format);
+            persist_monitor_snapshot(&conn, &report.snapshot);
+            let fmt = resolve_format(&args);
+            let output = format_report(&report, &fmt);
             let redacted = helm_core::redact_secrets(&output);
             print!("\x1B[2J\x1B[H{redacted}");
             eprintln!("\n(watching every {}s — Ctrl+C to stop)", args.interval);
@@ -5068,7 +5070,9 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
     } else {
         let prev = load_previous_snapshot(&conn);
         let report = run_monitor_cycle(profile, domain_filter.as_deref(), prev).await;
-        let output = format_report(&report, &args.format);
+        persist_monitor_snapshot(&conn, &report.snapshot);
+        let fmt = resolve_format(&args);
+        let output = format_report(&report, &fmt);
         let redacted = helm_core::redact_secrets(&output);
         if let Some(ref out_path) = args.output {
             std::fs::write(out_path, &redacted)
@@ -5080,6 +5084,25 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve the output format from args: --json/--markdown flags override --format.
+fn resolve_format(args: &MonitorArgs) -> String {
+    if args.json {
+        "json".to_string()
+    } else if args.markdown {
+        "markdown".to_string()
+    } else {
+        args.format.clone()
+    }
+}
+
+/// Persist the monitor snapshot so the next run can use it as baseline.
+fn persist_monitor_snapshot(conn: &rusqlite::Connection, snapshot: &SystemSnapshot) {
+    if let Ok(raw_json) = serde_json::to_string(snapshot) {
+        let redacted = helm_core::redact_secrets(&raw_json);
+        let _ = SnapshotStore::insert(conn, &redacted);
+    }
 }
 
 fn load_previous_snapshot(conn: &rusqlite::Connection) -> Option<SystemSnapshot> {
