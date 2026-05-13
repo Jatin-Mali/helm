@@ -311,6 +311,8 @@ pub struct BackupTool {
     pub config_path: Option<String>,
     /// Repo or snapshot root if found.
     pub repo_path: Option<String>,
+    /// Whether restore-test evidence was found (e.g. restic check cache).
+    pub restore_test_evidence: Option<String>,
 }
 
 // ── Packages ───────────────────────────────────────────────────────────────

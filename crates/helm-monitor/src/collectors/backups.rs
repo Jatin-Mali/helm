@@ -53,14 +53,46 @@ impl Collector for BackupsCollector {
                 } else {
                     None
                 };
+                // Detect restore-test evidence
+                let restore_evidence = detect_restore_evidence(n);
                 out.tools_detected.push(BackupTool {
                     name: n.to_string(),
                     binary_path: bp,
                     config_path: cp,
                     repo_path: rp,
+                    restore_test_evidence: restore_evidence,
                 });
             }
         }
         Ok(out)
+    }
+}
+
+fn detect_restore_evidence(tool: &str) -> Option<String> {
+    match tool {
+        "restic" => {
+            // restic leaves cache + check snapshots
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+            let cache = format!("{home}/.cache/restic");
+            if std::path::Path::new(&cache).exists() {
+                return Some("restic cache present".into());
+            }
+            None
+        }
+        "borg" => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+            let cache = format!("{home}/.cache/borg");
+            if std::path::Path::new(&cache).exists() {
+                return Some("borg cache present".into());
+            }
+            None
+        }
+        "borgmatic" => {
+            if std::path::Path::new("/etc/borgmatic").exists() {
+                return Some("borgmatic config present".into());
+            }
+            None
+        }
+        _ => None,
     }
 }

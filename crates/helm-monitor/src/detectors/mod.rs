@@ -15,6 +15,7 @@ pub mod memory_pressure;
 pub mod oom_event;
 pub mod package_updates;
 pub mod restart_loop;
+pub mod restore_test;
 pub mod smart;
 pub mod swap_exhaustion;
 pub mod unhealthy_container;
@@ -92,6 +93,7 @@ impl DetectorRegistry {
         reg.register(Box::new(journal_errors::JournalErrorBurstDetector));
         reg.register(Box::new(backup_stale::StaleBackupDetector));
         reg.register(Box::new(backup_schedule::MissingBackupScheduleDetector));
+        reg.register(Box::new(restore_test::RestoreTestMissingDetector));
         reg.register(Box::new(package_updates::SecurityUpdatesDetector));
         reg
     }

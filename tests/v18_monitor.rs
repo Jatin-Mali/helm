@@ -653,3 +653,173 @@ fn watch_mode_detectors_dont_mutate_snapshot() {
         snap_clone.domains.logs.journal_errors_last_hour
     );
 }
+
+// ── Restore-test gap golden test ────────────────────────────────────────────
+
+#[test]
+fn golden_restore_test_missing_when_tools_no_evidence() {
+    let mut snap = base_snapshot();
+    snap.domains
+        .backups
+        .tools_detected
+        .push(helm_monitor::BackupTool {
+            name: "restic".into(),
+            binary_path: Some("/usr/bin/restic".into()),
+            config_path: None,
+            repo_path: None,
+            restore_test_evidence: None,
+        });
+    let reporter = MonitorReporter::new();
+    let findings = reporter
+        .registry
+        .detect(&snap, Some(&[MonitorDomain::Backups]), None);
+    let warns: Vec<_> = findings
+        .iter()
+        .filter(|f| f.severity >= Severity::Warning)
+        .collect();
+    assert!(
+        !warns.is_empty(),
+        "restic without restore evidence should trigger warning"
+    );
+    // Filter to restore-test finding specifically (other backup findings may also warn)
+    let restore = warns.iter().find(|f| f.title.contains("restore-test"));
+    assert!(
+        restore.is_some(),
+        "restore-test finding should exist among warns"
+    );
+    let restore = restore.unwrap();
+    assert!(restore.evidence[0].source.contains("restore_test_evidence"));
+}
+
+#[test]
+fn golden_restore_test_ok_when_evidence_present() {
+    let mut snap = base_snapshot();
+    snap.domains
+        .backups
+        .tools_detected
+        .push(helm_monitor::BackupTool {
+            name: "restic".into(),
+            binary_path: Some("/usr/bin/restic".into()),
+            config_path: None,
+            repo_path: None,
+            restore_test_evidence: Some("restic cache present".into()),
+        });
+    let reporter = MonitorReporter::new();
+    let findings = reporter
+        .registry
+        .detect(&snap, Some(&[MonitorDomain::Backups]), None);
+    let restore_warns: Vec<_> = findings
+        .iter()
+        .filter(|f| f.title.contains("restore-test"))
+        .collect();
+    assert!(
+        restore_warns.is_empty(),
+        "restic with evidence should NOT trigger restore-test finding"
+    );
+}
+
+#[test]
+fn golden_no_tools_does_not_fire_restore_test() {
+    let snap = base_snapshot(); // no tools
+    let reporter = MonitorReporter::new();
+    let findings = reporter
+        .registry
+        .detect(&snap, Some(&[MonitorDomain::Backups]), None);
+    let restore_warns: Vec<_> = findings
+        .iter()
+        .filter(|f| f.title.contains("restore-test"))
+        .collect();
+    assert!(
+        restore_warns.is_empty(),
+        "no tools should not trigger restore-test finding"
+    );
+}
+
+// ── OOM detector hard rule compliance tests ─────────────────────────────────
+
+#[test]
+fn golden_oom_kernel_log_with_oom() {
+    let mut snap = base_snapshot();
+    snap.domains
+        .logs
+        .kernel_errors
+        .push("2026-05-14 OOM killer: Killed process 1234 (nginx) total-vm:500000kB".into());
+    snap.domains
+        .logs
+        .kernel_errors
+        .push("2026-05-14 Out of memory: httpserver invoked oom-killer".into());
+    let reporter = MonitorReporter::new();
+    let findings = reporter
+        .registry
+        .detect(&snap, Some(&[MonitorDomain::Load]), None);
+    let crit: Vec<_> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Critical)
+        .filter(|f| f.title.contains("OOM"))
+        .collect();
+    assert!(
+        !crit.is_empty(),
+        "OOM traces should trigger critical finding"
+    );
+    // Must contain window info
+    assert!(
+        crit[0].title.contains("hour"),
+        "OOM finding must specify time window"
+    );
+    // Must contain count
+    let ev = &crit[0].evidence[0];
+    assert!(
+        ev.value.contains("2") || ev.value.contains("trace(s)"),
+        "OOM evidence must contain count of traces: {}",
+        ev.value
+    );
+    // Must cite snapshot field
+    assert_eq!(
+        ev.source, "logs.kernel_errors",
+        "OOM must cite exact snapshot field"
+    );
+}
+
+#[test]
+fn golden_oom_no_traces_no_finding() {
+    let snap = base_snapshot();
+    let reporter = MonitorReporter::new();
+    let findings = reporter
+        .registry
+        .detect(&snap, Some(&[MonitorDomain::Load]), None);
+    let oom: Vec<_> = findings
+        .iter()
+        .filter(|f| f.title.contains("OOM"))
+        .collect();
+    assert!(
+        oom.is_empty(),
+        "no OOM traces should not trigger OOM finding"
+    );
+}
+
+#[test]
+fn golden_oom_evidence_has_window_and_count() {
+    let mut snap = base_snapshot();
+    snap.domains
+        .logs
+        .kernel_errors
+        .push("2026-05-14 Out of memory: Killed process 5678".into());
+    let reporter = MonitorReporter::new();
+    let findings = reporter
+        .registry
+        .detect(&snap, Some(&[MonitorDomain::Load]), None);
+    let oom: Vec<_> = findings
+        .iter()
+        .filter(|f| f.title.contains("OOM"))
+        .collect();
+    assert_eq!(oom.len(), 1, "1 OOM trace -> 1 finding");
+    // Per ROADMAP.md:343-344: source, window, count, confidence must be present
+    assert!(
+        oom[0].evidence[0].note.contains("window"),
+        "OOM evidence must mention the collection time window"
+    );
+    assert!(
+        oom[0].evidence[0].value.chars().any(|c| c.is_ascii_digit()),
+        "OOM evidence value must contain a numeric count"
+    );
+}
