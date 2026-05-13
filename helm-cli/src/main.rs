@@ -39,7 +39,8 @@ use helm_memory::{
     SnapshotStore, StepRecord, UserProfileStore,
 };
 use helm_monitor::{
-    MonitorDomain, MonitorProfile, MonitorReport, MonitorReporter, SystemSnapshot, collect_snapshot,
+    HostIdentity, MonitorDomain, MonitorProfile, MonitorReport, MonitorReporter, SnapshotDomains,
+    SystemSnapshot, collect_snapshot,
 };
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
@@ -706,9 +707,18 @@ struct MonitorArgs {
     /// Comma-separated domains to check (e.g. "disks,services,ports")
     #[arg(long, value_name = "DOMAINS")]
     domain: Option<String>,
-    /// Watch mode: run repeatedly at the given interval in seconds
-    #[arg(long, value_name = "SECONDS")]
-    watch: Option<u64>,
+    /// Watch mode: run repeatedly
+    #[arg(long)]
+    watch: bool,
+    /// Interval in seconds for watch mode (default: 60)
+    #[arg(long, default_value = "60")]
+    interval: u64,
+    /// Write report to file
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Output format: text, json, markdown (default: text)
+    #[arg(long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
@@ -5035,49 +5045,79 @@ fn render_snapshot(snapshot: &SystemSnapshot) {
 async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
     let profile: MonitorProfile = args.profile.parse().unwrap_or(MonitorProfile::Standard);
 
-    // Parse domain filter
     let domain_filter: Option<Vec<MonitorDomain>> = args.domain.as_ref().map(|s| {
         s.split(',')
             .filter_map(|d| MonitorDomain::from_domain_str(d.trim()))
             .collect()
     });
 
-    if let Some(interval) = args.watch {
-        // Watch mode: run repeatedly
+    let db_path = default_db_path()?;
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+
+    if args.watch {
         loop {
-            let report = run_monitor_cycle(profile, domain_filter.as_deref()).await;
-            let output = if args.json {
-                helm_core::redact_secrets(&report.render_json())
-            } else if args.markdown {
-                report.render_markdown()
-            } else {
-                report.render_text()
-            };
-            // Clear terminal and print
-            print!("\x1B[2J\x1B[H{output}");
-            eprintln!("\n(watching every {interval}s — Ctrl+C to stop)");
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            let prev = load_previous_snapshot(&conn);
+            let report = run_monitor_cycle(profile, domain_filter.as_deref(), prev).await;
+            let output = format_report(&report, &args.format);
+            let redacted = helm_core::redact_secrets(&output);
+            print!("\x1B[2J\x1B[H{redacted}");
+            eprintln!("\n(watching every {}s — Ctrl+C to stop)", args.interval);
+            tokio::time::sleep(std::time::Duration::from_secs(args.interval)).await;
         }
     } else {
-        let report = run_monitor_cycle(profile, domain_filter.as_deref()).await;
-        if args.json {
-            println!("{}", helm_core::redact_secrets(&report.render_json()));
-        } else if args.markdown {
-            println!("{}", report.render_markdown());
+        let prev = load_previous_snapshot(&conn);
+        let report = run_monitor_cycle(profile, domain_filter.as_deref(), prev).await;
+        let output = format_report(&report, &args.format);
+        let redacted = helm_core::redact_secrets(&output);
+        if let Some(ref out_path) = args.output {
+            std::fs::write(out_path, &redacted)
+                .with_context(|| format!("failed to write report to {}", out_path.display()))?;
+            eprintln!("Report written to {}", out_path.display());
         } else {
-            println!("{}", report.render_text());
+            println!("{redacted}");
         }
     }
 
     Ok(())
 }
 
+fn load_previous_snapshot(conn: &rusqlite::Connection) -> Option<SystemSnapshot> {
+    let record = SnapshotStore::latest(conn).ok().flatten()?;
+    let domains: SnapshotDomains = serde_json::from_str(&record.domains_json)
+        .ok()
+        .unwrap_or_default();
+    Some(SystemSnapshot {
+        id: record.id,
+        host: HostIdentity {
+            hostname: record.host_hostname,
+            ..Default::default()
+        },
+        collected_at: chrono::DateTime::from_timestamp(record.collected_at, 0).unwrap_or_default(),
+        profile: record.profile.parse().unwrap_or(MonitorProfile::Standard),
+        domains,
+        collector_errors: serde_json::from_str(&record.collector_errors_json).unwrap_or_default(),
+        redaction_version: String::new(),
+    })
+}
+
+fn format_report(report: &MonitorReport, format: &str) -> String {
+    match format {
+        "json" => report.render_json(),
+        "markdown" => report.render_markdown(),
+        _ => report.render_text(),
+    }
+}
+
 async fn run_monitor_cycle(
     profile: MonitorProfile,
     domain_filter: Option<&[MonitorDomain]>,
+    previous_snapshot: Option<SystemSnapshot>,
 ) -> MonitorReport {
     let reporter = MonitorReporter::new();
-    reporter.run(profile, domain_filter).await
+    reporter
+        .run(profile, domain_filter, previous_snapshot)
+        .await
 }
 
 fn human_bytes(bytes: u64) -> String {

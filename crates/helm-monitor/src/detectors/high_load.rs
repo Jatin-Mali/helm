@@ -15,7 +15,11 @@ impl Detector for HighLoadDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Load
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         let cores = snapshot.domains.load.cpu_logical_count.max(1) as f64;
         let la = snapshot.domains.load.load_average;
 

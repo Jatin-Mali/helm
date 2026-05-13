@@ -15,7 +15,11 @@ impl Detector for MemoryPressureDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Load
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         let mem = &snapshot.domains.load.memory;
         if mem.total == 0 {
             return vec![];

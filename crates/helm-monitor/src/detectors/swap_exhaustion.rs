@@ -15,7 +15,11 @@ impl Detector for SwapExhaustionDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Load
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         if snapshot.domains.load.swap_total == 0 {
             return vec![];
         }

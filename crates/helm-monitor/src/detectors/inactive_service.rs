@@ -15,7 +15,11 @@ impl Detector for EnabledInactiveServiceDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Services
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         snapshot
             .domains
             .services

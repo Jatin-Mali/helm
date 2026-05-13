@@ -15,7 +15,11 @@ impl Detector for StaleBackupDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Backups
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         if snapshot.domains.backups.tools_detected.is_empty() {
             return vec![
                 Finding::new(

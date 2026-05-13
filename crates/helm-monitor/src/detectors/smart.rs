@@ -15,7 +15,11 @@ impl Detector for SmartHealthDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Disks
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         if !snapshot.domains.disks.smart_available {
             return vec![
                 Finding::new(

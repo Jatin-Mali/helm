@@ -15,7 +15,11 @@ impl Detector for OomKillerDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Load
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         // Check kernel error logs for OOM traces
         let has_oom = snapshot.domains.logs.kernel_errors.iter().any(|l| {
             l.contains("Out of memory") || l.contains("oom-kill") || l.contains("Killed process")

@@ -15,7 +15,11 @@ impl Detector for MissingBackupScheduleDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Backups
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         let tools = &snapshot.domains.backups.tools_detected;
         if tools.is_empty() {
             return vec![];

@@ -28,7 +28,8 @@ use crate::{
 pub trait Detector: Send + Sync {
     fn id(&self) -> &'static str;
     fn domain(&self) -> MonitorDomain;
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding>;
+    /// Detect issues in the current snapshot, optionally using a previous snapshot as baseline.
+    fn detect(&self, snapshot: &SystemSnapshot, previous: Option<&SystemSnapshot>) -> Vec<Finding>;
 }
 
 /// Registry of all detectors, supporting domain filtering.
@@ -57,11 +58,12 @@ impl DetectorRegistry {
         &self,
         snapshot: &SystemSnapshot,
         domains: Option<&[MonitorDomain]>,
+        previous: Option<&SystemSnapshot>,
     ) -> Vec<Finding> {
         self.detectors
             .iter()
             .filter(|d| domains.is_none_or(|doms| doms.contains(&d.domain())))
-            .flat_map(|d| d.detect(snapshot))
+            .flat_map(|d| d.detect(snapshot, previous))
             .collect()
     }
 

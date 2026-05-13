@@ -15,7 +15,11 @@ impl Detector for ExposedPortDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Ports
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         // Flag non-localhost listeners as exposed
         snapshot
             .domains

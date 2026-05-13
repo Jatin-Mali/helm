@@ -15,19 +15,41 @@ impl Detector for JournalErrorBurstDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Logs
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(&self, snapshot: &SystemSnapshot, previous: Option<&SystemSnapshot>) -> Vec<Finding> {
         let mut findings = Vec::new();
         let count = snapshot.domains.logs.journal_errors_last_hour;
 
+        // Get baseline error count from previous snapshot for drift detection
+        let prev_count = previous
+            .map(|p| p.domains.logs.journal_errors_last_hour)
+            .unwrap_or(0);
+        let has_baseline = previous.is_some();
+
         if count >= 100 {
+            let severity = if has_baseline && count > prev_count * 2 {
+                Severity::Critical
+            } else {
+                Severity::Warning
+            };
+            let base_note = if has_baseline {
+                format!(" (previous: {prev_count}/h)")
+            } else {
+                String::new()
+            };
             findings.push(
                 Finding::new(
                     &snapshot.id,
                     self.id(),
                     "system",
-                    &format!("{count} journal errors in the last hour — error burst detected"),
-                    Severity::Warning,
-                    Confidence::High,
+                    &format!(
+                        "{count} journal errors in the last hour{base_note} — error burst detected",
+                    ),
+                    severity,
+                    if has_baseline {
+                        Confidence::High
+                    } else {
+                        Confidence::Medium
+                    },
                     MonitorDomain::Logs,
                 )
                 .with_evidence(
@@ -38,13 +60,17 @@ impl Detector for JournalErrorBurstDetector {
                 .with_impact("High error rate indicates system or application problems")
                 .with_read_only_check("journalctl -p err -n 50 --no-pager"),
             );
-        } else if count >= 20 {
+        } else if count >= 20
+            && previous.is_some_and(|p| count > p.domains.logs.journal_errors_last_hour * 2)
+        {
             findings.push(
                 Finding::new(
                     &snapshot.id,
                     self.id(),
                     "system",
-                    &format!("{count} journal errors in the last hour — elevated error rate"),
+                    &format!(
+                        "{count} journal errors in the last hour (was {prev_count}) — elevated error rate",
+                    ),
                     Severity::Info,
                     Confidence::Medium,
                     MonitorDomain::Logs,
@@ -52,7 +78,26 @@ impl Detector for JournalErrorBurstDetector {
                 .with_evidence(
                     "logs.journal_errors_last_hour",
                     &count.to_string(),
-                    "Error count is above baseline",
+                    "Error count has doubled compared to previous snapshot",
+                )
+                .with_impact("Monitor for recurring error patterns")
+                .with_read_only_check("journalctl -p err --since '1 hour ago' --no-pager"),
+            );
+        } else if count >= 20 && !has_baseline {
+            findings.push(
+                Finding::new(
+                    &snapshot.id,
+                    self.id(),
+                    "system",
+                    &format!("{count} journal errors in the last hour — elevated error rate"),
+                    Severity::Info,
+                    Confidence::Low,
+                    MonitorDomain::Logs,
+                )
+                .with_evidence(
+                    "logs.journal_errors_last_hour",
+                    &count.to_string(),
+                    "Error count is above baseline threshold but below known prior levels",
                 )
                 .with_impact("Monitor for recurring error patterns")
                 .with_read_only_check("journalctl -p err --since '1 hour ago' --no-pager"),

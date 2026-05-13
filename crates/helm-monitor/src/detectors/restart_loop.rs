@@ -15,7 +15,11 @@ impl Detector for ServiceRestartLoopDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Services
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         // Detect via auto-restart sub-state in systemd units
         snapshot
             .domains

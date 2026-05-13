@@ -15,7 +15,11 @@ impl Detector for DiskUsageDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Disks
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
         for fs in &snapshot.domains.disks.filesystems {
             if fs.total_bytes == 0 {
@@ -85,7 +89,7 @@ mod tests {
     #[test]
     fn detects_high_disk_usage() {
         let snap = snapshot_with_fs("/", 500_000_000_000, 475_000_000_000);
-        let findings = DiskUsageDetector.detect(&snap);
+        let findings = DiskUsageDetector.detect(&snap, None);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Critical);
         assert!(findings[0].title.contains("95%"));
@@ -94,7 +98,7 @@ mod tests {
     #[test]
     fn skips_normal_usage() {
         let snap = snapshot_with_fs("/", 500_000_000_000, 200_000_000_000);
-        let findings = DiskUsageDetector.detect(&snap);
+        let findings = DiskUsageDetector.detect(&snap, None);
         assert!(findings.is_empty());
     }
 

@@ -15,7 +15,11 @@ impl Detector for ContainerRestartLoopDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Containers
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         snapshot
             .domains
             .containers

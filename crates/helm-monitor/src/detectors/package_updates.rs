@@ -15,7 +15,11 @@ impl Detector for SecurityUpdatesDetector {
     fn domain(&self) -> MonitorDomain {
         MonitorDomain::Packages
     }
-    fn detect(&self, snapshot: &SystemSnapshot) -> Vec<Finding> {
+    fn detect(
+        &self,
+        snapshot: &SystemSnapshot,
+        _previous: Option<&SystemSnapshot>,
+    ) -> Vec<Finding> {
         if let Some(count) = snapshot.domains.packages.security_count {
             if count > 0 {
                 return vec![Finding::new(

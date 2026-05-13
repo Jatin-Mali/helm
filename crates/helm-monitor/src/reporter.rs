@@ -33,9 +33,13 @@ impl MonitorReporter {
         &self,
         profile: MonitorProfile,
         domain_filter: Option<&[MonitorDomain]>,
+        previous_snapshot: Option<SystemSnapshot>,
     ) -> MonitorReport {
         let snapshot = collect_snapshot(profile).await;
-        let findings = self.registry.detect(&snapshot, domain_filter);
+        let previous_snapshot_id = previous_snapshot.as_ref().map(|p| p.id.clone());
+        let findings = self
+            .registry
+            .detect(&snapshot, domain_filter, previous_snapshot.as_ref());
         let domains_checked = if let Some(doms) = domain_filter {
             doms.to_vec()
         } else {
@@ -45,7 +49,7 @@ impl MonitorReporter {
             snapshot,
             findings,
             domains_checked,
-            previous_snapshot_id: None,
+            previous_snapshot_id,
         }
     }
 }
@@ -75,9 +79,13 @@ impl MonitorReport {
         let (info, warning, critical) = self.severity_counts();
         let mut out = String::new();
         out.push_str(&format!(
-            "HELM Monitor Report\n==================\nSnapshot: {}\nHost: {}\nTime: {}\n\n",
+            "HELM Monitor Report\n==================\nSnapshot: {}\nHost: {}\nTime: {}\n",
             self.snapshot.id, self.snapshot.host.hostname, self.snapshot.collected_at
         ));
+        if let Some(ref prev_id) = self.previous_snapshot_id {
+            out.push_str(&format!("Baseline: {prev_id}\n"));
+        }
+        out.push('\n');
         out.push_str(&format!(
             "Findings: {} critical, {} warning, {} info\n\n",
             critical, warning, info
