@@ -25,6 +25,7 @@ release. This checklist tracks that review.
 | backup-stale | 2026-05-13 | Low | True negative: no backup tools found is objective. May miss non-standard backup solutions. Mitigation: confidence High for detection, notes missing-data. |
 | backup-schedule | 2026-05-13 | Medium | Schedule detection is heuristic (checking cron/timers for tool names). External orchestrators are invisible. Mitigation: confidence Medium, explicit assumption note. |
 | security-updates | 2026-05-13 | Low | Package manager listing is objective. May flag updates that are not security-critical on this system. Mitigation: only flags count, not specific CVEs. |
+| restore-test-missing | 2026-05-14 | Low | Checks for restic/borg cache evidence as proxy for restore-test execution. Cache absence does not prove restores were never tested. Mitigation: confidence Medium, notes missing data explicitly. |
 
 ## Release decision
 
