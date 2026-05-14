@@ -1428,7 +1428,7 @@ fn active_grant_locked(
     Ok(None)
 }
 
-fn latest_audit_hash(conn: &Connection, target: Option<&str>) -> Result<String, MemoryError> {
+pub fn latest_audit_hash(conn: &Connection, target: Option<&str>) -> Result<String, MemoryError> {
     let sql = "SELECT event_hash FROM audit_events WHERE target IS ?1 ORDER BY id DESC LIMIT 1";
     conn.query_row(sql, params![target], |row| row.get(0))
         .optional()
@@ -1436,21 +1436,21 @@ fn latest_audit_hash(conn: &Connection, target: Option<&str>) -> Result<String, 
         .map_err(sqlite_error)
 }
 
-struct AuditHashParts<'a> {
-    previous_hash: &'a str,
-    episode_id: Option<&'a str>,
-    target: Option<&'a str>,
-    timestamp: i64,
-    tool_name: &'a str,
-    input_hash: &'a str,
-    output_hash: &'a str,
-    capability: &'a str,
-    taint: &'a str,
-    cwd: &'a str,
-    decision: &'a str,
+pub struct AuditHashParts<'a> {
+    pub previous_hash: &'a str,
+    pub episode_id: Option<&'a str>,
+    pub target: Option<&'a str>,
+    pub timestamp: i64,
+    pub tool_name: &'a str,
+    pub input_hash: &'a str,
+    pub output_hash: &'a str,
+    pub capability: &'a str,
+    pub taint: &'a str,
+    pub cwd: &'a str,
+    pub decision: &'a str,
 }
 
-fn audit_hash(parts: AuditHashParts<'_>) -> String {
+pub fn audit_hash(parts: AuditHashParts<'_>) -> String {
     let payload = format!(
         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         parts.previous_hash,

@@ -173,6 +173,7 @@ pub struct StepOutcome {
     pub changed_files: Vec<String>,
     pub verification_ok: bool,
     pub verification_output: String,
+    pub backups: Vec<PreChangeBackup>,
 }
 
 /// Drives controlled execution of a TroubleshootingPlan with pre/post snapshots,
@@ -226,11 +227,31 @@ impl ExecutionEngine {
             };
             step.output_text = outcome.output.clone();
             step.error_text = outcome.error.clone();
-            step.verification_result = if outcome.verification_ok {
-                "verified ok".into()
+
+            // 2c. Run verification commands from preview
+            let mut verify_results = Vec::new();
+            for v in &preview.verification {
+                let v_outcome = Self::execute_preview(v).await;
+                let v_text = if v_outcome.success {
+                    format!("ok: {}", v_outcome.output.lines().next().unwrap_or(""))
+                } else {
+                    format!("failed: {}", v_outcome.error.lines().next().unwrap_or(""))
+                };
+                verify_results.push(v_text);
+            }
+            step.verification_result = if verify_results.is_empty() {
+                if outcome.verification_ok {
+                    "verified ok".into()
+                } else {
+                    format!("verification: {}", outcome.verification_output)
+                }
             } else {
-                format!("verification: {}", outcome.verification_output)
+                verify_results.join("; ")
             };
+
+            // 2d. Collect backups from step outcome
+            cs.backups.extend(outcome.backups.clone());
+
             let now = chrono::Utc::now().timestamp();
             step.started_at = Some(now);
             step.completed_at = Some(now);
@@ -294,6 +315,7 @@ impl ExecutionEngine {
                         changed_files: vec![],
                         verification_ok: false,
                         verification_output: "no command to execute".into(),
+                        backups: vec![],
                     };
                 }
                 // Use tokio::process::Command to run the shell command
@@ -320,6 +342,7 @@ impl ExecutionEngine {
                             changed_files,
                             verification_ok: success,
                             verification_output,
+                            backups: vec![],
                         }
                     }
                     Err(e) => StepOutcome {
@@ -329,6 +352,7 @@ impl ExecutionEngine {
                         changed_files: vec![],
                         verification_ok: false,
                         verification_output: format!("execution error: {e}"),
+                        backups: vec![],
                     },
                 }
             }
@@ -352,6 +376,7 @@ impl ExecutionEngine {
                         changed_files: vec![],
                         verification_ok: false,
                         verification_output: "no path specified".into(),
+                        backups: vec![],
                     };
                 }
                 if std::path::Path::new(path).exists() {
@@ -374,6 +399,13 @@ impl ExecutionEngine {
                         changed_files: vec![path.to_string()],
                         verification_ok: true,
                         verification_output: format!("file {} written", path),
+                        backups: vec![PreChangeBackup {
+                            id: Uuid::new_v4().to_string(),
+                            file_path: path.to_string(),
+                            checksum_before: String::new(),
+                            backup_content: String::new(),
+                            restored: false,
+                        }],
                     },
                     Err(e) => StepOutcome {
                         success: false,
@@ -382,6 +414,7 @@ impl ExecutionEngine {
                         changed_files: vec![],
                         verification_ok: false,
                         verification_output: format!("write error: {e}"),
+                        backups: vec![],
                     },
                 }
             }
@@ -394,6 +427,7 @@ impl ExecutionEngine {
                     changed_files: vec![],
                     verification_ok: false,
                     verification_output: format!("tool {other} not supported for execution"),
+                    backups: vec![],
                 }
             }
         }

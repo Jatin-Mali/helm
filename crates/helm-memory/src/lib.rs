@@ -17,9 +17,9 @@ pub use changesets::{
     TroubleshootingPlanRecord, TroubleshootingPlanStore,
 };
 pub use episodes::{
-    AuditEventInput, AuditEventRecord, AuditVerification, CapabilityGrantRecord, EpisodeId,
-    EpisodeOutcome, EpisodeOutcomeCounts, EpisodeRecord, MemoryStore, RoutingStat, StepRecord,
-    StepRole, stable_hash_hex,
+    AuditEventInput, AuditEventRecord, AuditHashParts, AuditVerification, CapabilityGrantRecord,
+    EpisodeId, EpisodeOutcome, EpisodeOutcomeCounts, EpisodeRecord, MemoryStore, RoutingStat,
+    StepRecord, StepRole, audit_hash, latest_audit_hash, stable_hash_hex,
 };
 pub use formal_skill::{
     FormalSkill, FormalSkillError, Prerequisites, SkillDescription, SkillMeta, SkillMetadata,

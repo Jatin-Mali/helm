@@ -38,12 +38,14 @@ use helm_memory::{
     AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, SessionStore,
     SnapshotStore, SnapshotStoreRecord, StepRecord, UserProfileStore,
 };
-use helm_memory::{ChangeSetStore, TroubleshootingPlanStore};
+use helm_memory::{
+    AuditHashParts, ChangeSetStore, TroubleshootingPlanStore, audit_hash, latest_audit_hash,
+    stable_hash_hex,
+};
 use helm_monitor::{
-    CommandPreview, ExecutionEngine, Finding, HostIdentity,
-    MonitorDomain, MonitorProfile, MonitorReport, MonitorReporter, PlanSource, SnapshotDomains,
-    SystemSnapshot, collect_snapshot, explain_finding, format_change_set, plan_from_finding,
-    plan_from_problem,
+    CommandPreview, ExecutionEngine, Finding, HostIdentity, MonitorDomain, MonitorProfile,
+    MonitorReport, MonitorReporter, PlanSource, SnapshotDomains, SystemSnapshot, collect_snapshot,
+    explain_finding, format_change_set, plan_from_finding, plan_from_problem,
 };
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
@@ -5457,6 +5459,21 @@ async fn run_apply_plan_command(args: ApplyPlanArgs) -> Result<()> {
         return Ok(());
     }
 
+    // ── Audit: plan shown ──────────────────────────────────────────────
+    let plan_text = plan.render_text();
+    write_audit_event(
+        &conn,
+        &plan.id,
+        None,
+        "apply-plan",
+        &stable_hash_hex(&plan.id),
+        &stable_hash_hex(&plan_text),
+        "read",
+        "clean",
+        "",
+        "plan_shown",
+    )?;
+
     if !plan.approval_required || args.yes {
         eprintln!("WARNING: auto-approval enabled. Executing all steps...");
     } else {
@@ -5464,16 +5481,16 @@ async fn run_apply_plan_command(args: ApplyPlanArgs) -> Result<()> {
         eprintln!("This will make real changes. Review each step carefully.\n");
     }
 
-    // Build approval callback
+    // ── Approval loop: collect per-step decisions upfront ──────────────
     let auto_approve = args.yes;
-    let approve_fn: Box<dyn Fn(&CommandPreview) -> bool + Send + Sync> = if auto_approve {
-        Box::new(|_| true)
-    } else {
-        let remaining_auto = std::sync::atomic::AtomicBool::new(false);
-        Box::new(move |preview| {
-            if remaining_auto.load(std::sync::atomic::Ordering::Relaxed) {
-                return true;
-            }
+    let mut step_decisions: Vec<(String, bool)> = Vec::new();
+    let mut global_auto = false;
+
+    for step in &plan.proposed_fix_steps {
+        let approved = if auto_approve || global_auto {
+            true
+        } else {
+            let preview = &step.command;
             eprintln!("\n--- Command Preview ---");
             eprintln!("  Tool:    {}", preview.tool);
             eprintln!(
@@ -5494,32 +5511,78 @@ async fn run_apply_plan_command(args: ApplyPlanArgs) -> Result<()> {
                     );
                 }
             }
+            // Prompt loop — breaks with decision
             loop {
                 eprint!("Execute this step? [y/N/! (execute all remaining)] ");
                 use std::io::{BufRead, stdin};
                 let mut input = String::new();
                 if stdin().lock().read_line(&mut input).is_err() {
-                    return false;
+                    break false;
                 }
                 match input.trim().to_lowercase().as_str() {
-                    "y" | "yes" => return true,
+                    "y" | "yes" => break true,
                     "!" => {
-                        remaining_auto.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return true;
+                        global_auto = true;
+                        break true;
                     }
-                    "n" | "no" | "" => return false,
+                    "n" | "no" | "" => break false,
                     _ => {
-                        eprintln!("Invalid input. Enter y, N, or !");
-                        continue;
+                        eprintln!("Invalid input.");
                     }
                 }
             }
+        };
+
+        // ── Audit: approval decision ───────────────────────────────────
+        write_audit_event(
+            &conn,
+            &plan.id,
+            None,
+            "apply-plan",
+            &stable_hash_hex(&step.title),
+            &stable_hash_hex(if approved { "approved" } else { "denied" }),
+            "shell",
+            "clean",
+            "",
+            if approved { "approved" } else { "denied" },
+        )?;
+
+        step_decisions.push((step.title.clone(), approved));
+    }
+
+    // Build approval callback from decisions
+    let decisions = std::sync::Arc::new(step_decisions);
+    let approve_fn: Box<dyn Fn(&CommandPreview) -> bool + Send + Sync> = {
+        let d = std::sync::Arc::clone(&decisions);
+        // Since we iterate in order, use a counter
+        let pos = std::sync::atomic::AtomicUsize::new(0);
+        Box::new(move |_| {
+            let idx = pos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            d.get(idx).map(|(_, ok)| *ok).unwrap_or(false)
         })
     };
 
     // Execute
     let mut engine = ExecutionEngine::new(approve_fn);
     let change_set = engine.execute(&plan).await;
+
+    // ── Audit: per-step command + output + verification ────────────────
+    for step in &change_set.steps {
+        let output_text = helm_core::redact_secrets(&step.output_text);
+        let verify_text = helm_core::redact_secrets(&step.verification_result);
+        write_audit_event(
+            &conn,
+            &change_set.plan_id,
+            None,
+            &step.command.tool,
+            &stable_hash_hex(&serde_json::to_string(&step.command.input).unwrap_or_default()),
+            &stable_hash_hex(&output_text),
+            "shell",
+            "clean",
+            "",
+            &format!("executed:{} verify:{}", step.status, verify_text),
+        )?;
+    }
 
     // Persist change set
     let cs = &change_set;
@@ -5741,6 +5804,57 @@ async fn run_change_set_command(args: ChangeSetArgs) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Write a hash-chained audit event using the raw connection.
+/// This mirrors the MemoryStore::append_audit_event logic but works
+/// with a direct rusqlite::Connection for CLI commands.
+#[allow(clippy::too_many_arguments)]
+fn write_audit_event(
+    conn: &rusqlite::Connection,
+    episode_id: &str,
+    target: Option<&str>,
+    tool_name: &str,
+    input_hash: &str,
+    output_hash: &str,
+    capability: &str,
+    taint: &str,
+    cwd: &str,
+    decision: &str,
+) -> Result<(), anyhow::Error> {
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let previous_hash = latest_audit_hash(conn, target).unwrap_or_else(|_| "GENESIS".to_string());
+    let event_hash = audit_hash(AuditHashParts {
+        previous_hash: &previous_hash,
+        episode_id: Some(episode_id),
+        target,
+        timestamp,
+        tool_name,
+        input_hash,
+        output_hash,
+        capability,
+        taint,
+        cwd,
+        decision,
+    });
+    conn.execute(
+        "INSERT INTO audit_events (episode_id, target, timestamp, tool_name, input_hash, output_hash, capability, taint, cwd, decision, previous_hash, event_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            episode_id,
+            target,
+            timestamp,
+            tool_name,
+            input_hash,
+            output_hash,
+            capability,
+            taint,
+            cwd,
+            decision,
+            previous_hash,
+            event_hash,
+        ],
+    )?;
     Ok(())
 }
 
