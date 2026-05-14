@@ -63,7 +63,7 @@ use tracing_subscriber::{EnvFilter, fmt, fmt::MakeWriter, prelude::*};
 #[command(
     name = "helm",
     version,
-    about = "Self-hosted Linux monitoring and troubleshooting assistant"
+    about = "HELMOPS — live Linux/DevOps troubleshooting console"
 )]
 struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
@@ -126,7 +126,7 @@ struct Cli {
     #[arg(long = "continue", global = true)]
     continue_last: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -943,7 +943,7 @@ pub(crate) fn wrap_for_remote(task: &str, remote: Option<&String>) -> String {
 async fn run() -> Result<()> {
     let cli = parse_cli_from(env::args_os())?;
     let sandbox = apply_sandbox(cli.sandbox, cli.sandbox_dir.as_ref())?;
-    let tui_log_path = if matches!(cli.command, Command::Tui(_)) {
+    let tui_log_path = if matches!(cli.command, Some(Command::Tui(_))) || cli.command.is_none() {
         Some(default_log_path()?)
     } else {
         None
@@ -988,7 +988,15 @@ async fn run() -> Result<()> {
             .with_context(|| format!("failed to open memory database at {}", db_path.display()))?,
     );
 
-    match cli.command {
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => Command::Tui(TuiArgs {
+            mode: TuiMode::Dashboard,
+            attach: None,
+            token: None,
+        }),
+    };
+    match command {
         Command::Run(args) => {
             if args.agent_on_remote {
                 let remote_name = cli.remote.as_deref().ok_or_else(|| {
@@ -6158,7 +6166,7 @@ mod tests {
         let explicit = parse_cli_from(["helm", "run", "do thing"]).unwrap();
 
         match (default.command, explicit.command) {
-            (super::Command::Run(left), super::Command::Run(right)) => {
+            (Some(super::Command::Run(left)), Some(super::Command::Run(right))) => {
                 assert_eq!(left.task, right.task);
             }
             _ => panic!("expected run commands"),
@@ -6168,14 +6176,18 @@ mod tests {
     #[test]
     fn no_args_opens_tui() {
         let parsed = parse_cli_from(["helm"]).unwrap();
-        assert!(matches!(parsed.command, super::Command::Tui(_)));
+        // bare `helm` → defaults to tui dashboard (may parse as None or Tui depending on clap version)
+        assert!(
+            parsed.command.is_none() || matches!(parsed.command, Some(super::Command::Tui(_))),
+            "bare helm should default to tui/dashboard"
+        );
     }
 
     #[test]
     fn tui_defaults_to_dashboard_mode() {
         let parsed = parse_cli_from(["helm", "tui"]).unwrap();
         match parsed.command {
-            super::Command::Tui(args) => assert_eq!(args.mode, super::TuiMode::Dashboard),
+            Some(super::Command::Tui(args)) => assert_eq!(args.mode, super::TuiMode::Dashboard),
             other => panic!("expected tui command, got {other:?}"),
         }
     }
@@ -6191,7 +6203,7 @@ mod tests {
         ] {
             let parsed = parse_cli_from(["helm", "tui", "--mode", raw]).unwrap();
             match parsed.command {
-                super::Command::Tui(args) => assert_eq!(args.mode, expected, "{raw}"),
+                Some(super::Command::Tui(args)) => assert_eq!(args.mode, expected, "{raw}"),
                 other => panic!("expected tui command, got {other:?}"),
             }
         }
@@ -6212,23 +6224,23 @@ mod tests {
 
         assert!(matches!(
             grant.command,
-            super::Command::Permissions(super::PermissionsArgs {
+            Some(super::Command::Permissions(super::PermissionsArgs {
                 command: super::PermissionsCommand::Grant(_)
-            })
+            }))
         ));
         assert!(matches!(
             audit.command,
-            super::Command::Audit(super::AuditArgs {
+            Some(super::Command::Audit(super::AuditArgs {
                 command: super::AuditCommand::Show(_)
-            })
+            }))
         ));
 
         let verify = parse_cli_from(["helm", "audit", "verify", "--target", "prod-1"]).unwrap();
         assert!(matches!(
             verify.command,
-            super::Command::Audit(super::AuditArgs {
+            Some(super::Command::Audit(super::AuditArgs {
                 command: super::AuditCommand::Verify(_)
-            })
+            }))
         ));
     }
 
@@ -6252,7 +6264,7 @@ mod tests {
             vec!["helm", "secrets", "import-env"],
         ] {
             let parsed = parse_cli_from(args).unwrap();
-            assert!(matches!(parsed.command, super::Command::Secrets(_)));
+            assert!(matches!(parsed.command, Some(super::Command::Secrets(_))));
         }
     }
 
@@ -6266,7 +6278,7 @@ mod tests {
             vec!["helm", "config", "path"],
         ] {
             let parsed = parse_cli_from(args).unwrap();
-            assert!(matches!(parsed.command, super::Command::Config(_)));
+            assert!(matches!(parsed.command, Some(super::Command::Config(_))));
         }
     }
 
@@ -6274,7 +6286,10 @@ mod tests {
     fn completion_subcommand_parses_all_shells() {
         for shell in ["bash", "zsh", "fish"] {
             let parsed = parse_cli_from(["helm", "completion", shell]).unwrap();
-            assert!(matches!(parsed.command, super::Command::Completion(_)));
+            assert!(matches!(
+                parsed.command,
+                Some(super::Command::Completion(_))
+            ));
         }
     }
 
@@ -6296,7 +6311,7 @@ mod tests {
             ],
         ] {
             let parsed = parse_cli_from(args).unwrap();
-            assert!(matches!(parsed.command, super::Command::Mcp(_)));
+            assert!(matches!(parsed.command, Some(super::Command::Mcp(_))));
         }
     }
 
@@ -6311,7 +6326,7 @@ mod tests {
     fn continue_flag_parses_with_bare_task() {
         let parsed = parse_cli_from(["helm", "--continue", "investigate nginx"]).unwrap();
         assert!(parsed.continue_last);
-        assert!(matches!(parsed.command, super::Command::Run(_)));
+        assert!(matches!(parsed.command, Some(super::Command::Run(_))));
     }
 
     #[test]
@@ -6319,21 +6334,21 @@ mod tests {
         let parsed =
             parse_cli_from(["helm", "--resume", "sess-123", "run", "continue work"]).unwrap();
         assert_eq!(parsed.resume.as_deref(), Some("sess-123"));
-        assert!(matches!(parsed.command, super::Command::Run(_)));
+        assert!(matches!(parsed.command, Some(super::Command::Run(_))));
     }
 
     #[test]
     fn redo_command_parses() {
         let parsed =
             parse_cli_from(["helm", "redo", "--session-id", "sess-123", "--apply"]).unwrap();
-        assert!(matches!(parsed.command, super::Command::Redo(_)));
+        assert!(matches!(parsed.command, Some(super::Command::Redo(_))));
     }
 
     #[test]
     fn diagnose_command_parses() {
         let parsed = parse_cli_from(["helm", "diagnose", "why is disk usage spiking"]).unwrap();
         match parsed.command {
-            super::Command::Diagnose(args) => {
+            Some(super::Command::Diagnose(args)) => {
                 assert_eq!(args.question, "why is disk usage spiking");
             }
             other => panic!("expected diagnose command, got {other:?}"),
@@ -6344,7 +6359,7 @@ mod tests {
     fn trust_report_command_parses() {
         let parsed = parse_cli_from(["helm", "trust-report", "--json"]).unwrap();
         match parsed.command {
-            super::Command::TrustReport(args) => {
+            Some(super::Command::TrustReport(args)) => {
                 assert!(args.json);
             }
             other => panic!("expected trust-report command, got {other:?}"),
@@ -6991,7 +7006,7 @@ mod tests {
         assert!(parsed.dry_run);
         assert!(parsed.read_only);
         match parsed.command {
-            super::Command::Run(args) => {
+            Some(super::Command::Run(args)) => {
                 assert_eq!(args.task, "check disk space");
             }
             other => panic!("expected run command, got {other:?}"),
@@ -7003,7 +7018,7 @@ mod tests {
         let parsed = parse_cli_from(["helm", "run", "--evidence", "analyze logs"]).unwrap();
         assert!(parsed.evidence);
         match parsed.command {
-            super::Command::Run(args) => {
+            Some(super::Command::Run(args)) => {
                 assert_eq!(args.task, "analyze logs");
             }
             other => panic!("expected run command, got {other:?}"),

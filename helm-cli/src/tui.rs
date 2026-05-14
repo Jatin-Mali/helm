@@ -36,10 +36,7 @@ use ratatui::{
     prelude::Widget,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Borders, Cell as TCell, Clear, ListItem, Paragraph, Row, Table, Tabs,
-        Wrap,
-    },
+    widgets::{Block, BorderType, Borders, Clear, ListItem, Paragraph, Tabs, Wrap},
 };
 use serde::Deserialize;
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
@@ -211,6 +208,7 @@ enum UiEvent {
     },
     Tick,
     DashboardRefresh,
+    DashboardLiveRefresh,
 }
 
 #[derive(Clone)]
@@ -1348,6 +1346,12 @@ impl TuiApp {
             UiEvent::DashboardRefresh => {
                 if self.mode == AgentMode::Dashboard {
                     self.refresh_dashboard();
+                }
+                Ok(false)
+            }
+            UiEvent::DashboardLiveRefresh => {
+                if self.mode == AgentMode::Dashboard {
+                    let _ = self.refresh_dashboard_live().await;
                 }
                 Ok(false)
             }
@@ -4737,11 +4741,23 @@ fn spawn_tick_task(tx: mpsc::UnboundedSender<UiEvent>) {
 }
 
 fn spawn_dashboard_refresh_task(tx: mpsc::UnboundedSender<UiEvent>) {
+    let tx2 = tx.clone();
+    // Lightweight dashboard re-read every 5s (reads latest snapshot from DB)
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
             if tx.send(UiEvent::DashboardRefresh).is_err() {
+                break;
+            }
+        }
+    });
+    // Full monitor cycle every 60s (collect + detect + persist)
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if tx2.send(UiEvent::DashboardLiveRefresh).is_err() {
                 break;
             }
         }
@@ -6323,174 +6339,6 @@ fn truncate_cell(value: &str, max_chars: usize) -> String {
         out.push('…');
         out
     }
-}
-
-#[allow(dead_code)]
-fn render_dash_finding_table(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" Findings ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(HEADER_BORDER));
-    let inner = block.inner(area);
-    block.render(area, buf);
-    if visible.is_empty() {
-        Paragraph::new("No findings match the current filters.")
-            .style(Style::default().fg(DIM_FG))
-            .render(inner, buf);
-        return;
-    }
-    let body_height = inner.height.saturating_sub(2) as usize;
-    let start = if app.dashboard.selected_finding >= app.dashboard.table_scroll + body_height
-        && body_height > 0
-    {
-        app.dashboard
-            .selected_finding
-            .saturating_sub(body_height.saturating_sub(1))
-    } else {
-        app.dashboard.table_scroll
-    };
-    let rows = visible
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(body_height)
-        .map(|(visible_idx, actual_idx)| {
-            let finding = &app.dashboard.data.findings[*actual_idx];
-            let selected = visible_idx == app.dashboard.selected_finding
-                && app.dashboard.pane == DashboardFocus::Table;
-            let base = if selected {
-                Style::default().bg(Color::Rgb(27, 42, 61))
-            } else {
-                Style::default().bg(APP_BG)
-            };
-            Row::new(vec![
-                TCell::from(truncate_cell(&finding.id, 10)),
-                TCell::from(truncate_cell(&finding.kind, 9)),
-                TCell::from(Span::styled(
-                    finding.severity.to_ascii_uppercase(),
-                    base.fg(finding_severity_color(&finding.severity))
-                        .add_modifier(Modifier::BOLD),
-                )),
-                TCell::from(Span::styled(
-                    finding.status.label(),
-                    base.fg(finding_state_color(finding.status)),
-                )),
-                TCell::from(finding.age_label.clone()),
-                TCell::from(finding.occurrence_count.to_string()),
-                TCell::from(truncate_cell(&finding.sample, 42)),
-            ])
-            .style(base.fg(APP_FG))
-        })
-        .collect::<Vec<_>>();
-    let header = Row::new(vec![
-        "ID", "Kind", "Sev", "Status", "Age", "Count", "Sample",
-    ])
-    .style(Style::default().fg(DIM_FG).add_modifier(Modifier::BOLD));
-    Table::new(
-        rows,
-        [
-            Constraint::Length(11),
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Length(13),
-            Constraint::Length(9),
-            Constraint::Length(7),
-            Constraint::Min(16),
-        ],
-    )
-    .header(header)
-    .column_spacing(1)
-    .render(inner, buf);
-}
-
-#[allow(dead_code)]
-fn render_dash_footer(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buffer) {
-    let focus = match app.dashboard.pane {
-        DashboardFocus::Tabbar => "Tabs",
-        DashboardFocus::Table => "Queue",
-        DashboardFocus::Detail => "Detail",
-    };
-    let text = format!(
-        "{} visible  |  focus: {}  |  F5 refresh  Alt+E evidence  Alt+F follow-up  Alt+G plan  Alt+A apply  Alt+S suppress  Alt+R resolve  Alt+U reopen",
-        visible.len(),
-        focus
-    );
-    Paragraph::new(text)
-        .style(Style::default().fg(DIM_FG))
-        .render(area, buf);
-}
-
-#[allow(dead_code)]
-fn render_dash_detail_pane(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" Finding detail ")
-        .borders(Borders::ALL)
-        .border_style(
-            Style::default().fg(if app.dashboard.pane == DashboardFocus::Detail {
-                Color::Cyan
-            } else {
-                HEADER_BORDER
-            }),
-        );
-    let inner = block.inner(area);
-    block.render(area, buf);
-    let Some(actual_idx) = visible.get(app.dashboard.selected_finding) else {
-        Paragraph::new("Select a finding")
-            .style(Style::default().fg(DIM_FG))
-            .alignment(ratatui::layout::Alignment::Center)
-            .render(inner, buf);
-        return;
-    };
-    let finding = &app.dashboard.data.findings[*actual_idx];
-    let joined_sources = if finding.evidence_sources.is_empty() {
-        "(no sources)".to_owned()
-    } else {
-        finding.evidence_sources.join(", ")
-    };
-    let mut text = format!(
-        "{}\n{}\n\nKind: {}\nSeverity: {}\nStatus: {}\nConfidence: {}\nHost: {}\nResource: {}\nFirst seen: {}\nLast seen: {}\nCount: {}\n\nSample:\n{}\n\nImpact:\n{}\n\nSources:\n{}\n",
-        finding.title,
-        finding.id,
-        finding.kind,
-        finding.severity.to_ascii_uppercase(),
-        finding.status.label(),
-        finding.confidence.to_ascii_uppercase(),
-        finding.host,
-        finding.affected_resource,
-        format_relative_age(finding.first_seen),
-        format_relative_age(finding.last_seen),
-        finding.occurrence_count,
-        if finding.sample.is_empty() {
-            "(no sample)"
-        } else {
-            &finding.sample
-        },
-        if finding.impact.is_empty() {
-            "(impact not provided)"
-        } else {
-            &finding.impact
-        },
-        joined_sources
-    );
-    if !finding.state_note.is_empty() {
-        text.push_str(&format!("\nState note:\n{}\n", finding.state_note));
-    }
-    if !finding.read_only_checks.is_empty() {
-        text.push_str("\nRead-only checks:\n");
-        for check in &finding.read_only_checks {
-            text.push_str(&format!("  - {check}\n"));
-        }
-    }
-    if let Some(fix_plan) = &finding.fix_plan {
-        text.push_str(&format!("\nSuggested fix:\n{}\n", fix_plan));
-    }
-    if !finding.command_preview.is_empty() {
-        text.push_str(&format!("\nExact commands:\n{}\n", finding.command_preview));
-    }
-    Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(inner, buf);
 }
 
 fn provider_boundary_label(app: &TuiApp) -> &'static str {
