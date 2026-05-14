@@ -262,13 +262,13 @@ struct PermissionRevokeArgs {
 struct TuiArgs {
     /// Attach to a running `helm serve` instance instead of running locally.
     /// Format: HOST:PORT (token provided via --token or HELM_REMOTE_TOKEN env).
-    #[arg(long, value_name = "HOST:PORT")]
+    #[arg(long, value_name = "HOST:PORT", hide = true)]
     attach: Option<String>,
     /// Bearer token used when --attach is supplied.
-    #[arg(long, value_name = "TOKEN")]
+    #[arg(long, value_name = "TOKEN", hide = true)]
     token: Option<String>,
     /// Initial TUI mode. Defaults to the monitoring dashboard.
-    #[arg(long, value_enum, default_value_t = TuiMode::Dashboard)]
+    #[arg(long, value_enum, default_value_t = TuiMode::Dashboard, hide = true)]
     mode: TuiMode,
 }
 
