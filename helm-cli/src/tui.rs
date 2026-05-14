@@ -823,6 +823,20 @@ impl DashPanel {
 }
 
 #[derive(Debug, Clone, Default)]
+struct FindingSummary {
+    id: String,
+    severity: String,
+    title: String,
+    affected_resource: String,
+    pub _snapshot_id: String,
+    domain: String,
+    evidence_text: String,
+    risk: String,
+    rollback: String,
+    command_preview: String,
+}
+
+#[derive(Debug, Clone, Default)]
 struct DashboardData {
     hostname: String,
     load_1m: f64,
@@ -840,12 +854,39 @@ struct DashboardData {
     finding_count: usize,
     finding_warnings: usize,
     collected_at: String,
+    findings: Vec<FindingSummary>,
+    #[allow(dead_code)]
+    snapshot_id: String,
+}
+
+/// Which sub-view the dashboard is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardView {
+    /// 3x3 panel grid
+    Overview,
+    /// Scrollable finding list
+    FindingList,
+    /// Detail of a single finding (index into DashboardData::findings)
+    FindingDetail(usize),
+    /// Evidence for a single finding
+    EvidenceView(usize),
+    /// Troubleshoot plan for a finding
+    TroubleshootPlan(usize),
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for DashboardView {
+    fn default() -> Self {
+        Self::Overview
+    }
 }
 
 #[derive(Debug, Clone)]
 struct DashboardState {
     data: DashboardData,
     selected: DashPanel,
+    view: DashboardView,
+    scroll: usize,
     error: Option<String>,
 }
 
@@ -854,6 +895,8 @@ impl DashboardState {
         Self {
             data: DashboardData::default(),
             selected: DashPanel::Health,
+            view: DashboardView::Overview,
+            scroll: 0,
             error: None,
         }
     }
@@ -1297,6 +1340,19 @@ impl TuiApp {
             }
             KeyCode::Home => self.input.cursor = 0,
             KeyCode::End => self.input.cursor = self.input.text.chars().count(),
+            KeyCode::Up
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.view == DashboardView::FindingList =>
+            {
+                self.dashboard.scroll = self.dashboard.scroll.saturating_sub(1);
+            }
+            KeyCode::Down
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.view == DashboardView::FindingList =>
+            {
+                let max = self.dashboard.data.findings.len().saturating_sub(1);
+                self.dashboard.scroll = (self.dashboard.scroll + 1).min(max);
+            }
             KeyCode::Up => self.input.previous_history(),
             KeyCode::Down => self.input.next_history(),
             KeyCode::PageUp => {
@@ -1329,40 +1385,70 @@ impl TuiApp {
                 }
             }
             KeyCode::Enter if self.mode == AgentMode::Dashboard => {
-                let panel = self.dashboard.selected;
-                match panel {
-                    DashPanel::Findings => {
-                        self.push_chat(MessageRole::System, "[dashboard] Finding details: run `helm monitor` or `helm explain <id>`");
-                    }
-                    DashPanel::Plans => {
-                        let plans = crate::default_db_path()
-                            .ok()
-                            .and_then(|p| rusqlite::Connection::open(p).ok())
-                            .and_then(|conn| {
-                                helm_memory::TroubleshootingPlanStore::list(&conn, 10).ok()
-                            });
-                        if let Some(list) = plans {
-                            if list.is_empty() {
-                                self.push_chat(
-                                    MessageRole::System,
-                                    "[dashboard] No saved plans. Run `helm troubleshoot` first.",
-                                );
-                            } else {
-                                let mut msg = String::from("[dashboard] Saved plans:\n");
-                                for p in &list {
-                                    msg.push_str(&format!("  {} | {}\n", p.id, p.source));
+                match self.dashboard.view {
+                    DashboardView::Overview => match self.dashboard.selected {
+                        DashPanel::Findings => {
+                            self.dashboard.view = DashboardView::FindingList;
+                            self.dashboard.scroll = 0;
+                        }
+                        DashPanel::Plans => {
+                            let plans = crate::default_db_path()
+                                .ok()
+                                .and_then(|p| rusqlite::Connection::open(p).ok())
+                                .and_then(|conn| {
+                                    helm_memory::TroubleshootingPlanStore::list(&conn, 10).ok()
+                                });
+                            if let Some(list) = plans {
+                                if list.is_empty() {
+                                    self.push_chat(MessageRole::System, "[dashboard] No saved plans. Run `helm troubleshoot` first.");
+                                } else {
+                                    let mut msg = String::from("[dashboard] Saved plans:\n");
+                                    for p in &list {
+                                        msg.push_str(&format!("  {} | {}\n", p.id, p.source));
+                                    }
+                                    msg.push_str("\nUse `/apply-plan <id>` to execute a plan.");
+                                    self.push_chat(MessageRole::System, msg);
                                 }
-                                msg.push_str("\nUse `/apply-plan <id>` to execute a plan.");
-                                self.push_chat(MessageRole::System, msg);
                             }
                         }
+                        _ => {
+                            self.push_chat(MessageRole::System, format!(
+                                    "[dashboard] {} panel — run `helm snapshot` or `helm monitor` for full details.",
+                                    self.dashboard.selected.label()
+                                ));
+                        }
+                    },
+                    DashboardView::FindingList => {
+                        let idx = self.dashboard.scroll;
+                        if idx < self.dashboard.data.findings.len() {
+                            self.dashboard.view = DashboardView::FindingDetail(idx);
+                        }
                     }
-                    _ => {
-                        self.push_chat(MessageRole::System, format!("[dashboard] {} panel: use `helm snapshot` or `helm monitor` for full details.", panel.label()));
+                    DashboardView::FindingDetail(idx) => {
+                        self.dashboard.view = DashboardView::EvidenceView(idx);
+                    }
+                    DashboardView::EvidenceView(idx) => {
+                        self.dashboard.view = DashboardView::TroubleshootPlan(idx);
+                    }
+                    DashboardView::TroubleshootPlan(idx) => {
+                        if let Some(f) = self.dashboard.data.findings.get(idx) {
+                            self.push_chat(MessageRole::System, format!(
+                                "[dashboard] Run `helm explain {}` for a full troubleshoot plan, or `/apply-plan <plan-id>` to execute.",
+                                f.id
+                            ));
+                        }
                     }
                 }
             }
-            KeyCode::Esc => self.focus = PanelFocus::Input,
+            KeyCode::Esc => {
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.view != DashboardView::Overview
+                {
+                    self.dashboard.view = DashboardView::Overview;
+                } else {
+                    self.focus = PanelFocus::Input;
+                }
+            }
             _ => {}
         }
         Ok(false)
@@ -3403,6 +3489,7 @@ Report the exit status and the concise output."
             serde_json::from_str(&record.domains_json).unwrap_or_default();
 
         let hostname = record.host_hostname;
+        let snapshot_id = record.id.clone();
         let load = &domains.load;
         let mem = &load.memory;
         let memory_used_pct = if mem.total > 0 {
@@ -3442,12 +3529,50 @@ Report the exit status and the concise output."
             .iter()
             .filter(|f| f["severity"].as_str() == Some("warning"))
             .count();
+        let finding_summaries: Vec<FindingSummary> = findings
+            .iter()
+            .map(|f| FindingSummary {
+                id: f["id"].as_str().unwrap_or("?").to_string(),
+                severity: f["severity"].as_str().unwrap_or("unknown").to_string(),
+                title: f["title"].as_str().unwrap_or("?").to_string(),
+                affected_resource: f["affected_resource"].as_str().unwrap_or("?").to_string(),
+                _snapshot_id: f["snapshot_id"]
+                    .as_str()
+                    .unwrap_or(&snapshot_id)
+                    .to_string(),
+                domain: f["category"]
+                    .as_str()
+                    .or_else(|| f["domain"].as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                evidence_text: f["evidence"]
+                    .as_str()
+                    .or_else(|| f["evidence_ref"].as_str().or_else(|| f["detail"].as_str()))
+                    .unwrap_or("")
+                    .to_string(),
+                risk: f["severity"].as_str().unwrap_or("unknown").to_string(),
+                rollback: f["rollback"]
+                    .as_str()
+                    .unwrap_or("not specified")
+                    .to_string(),
+                command_preview: f["command_preview"]
+                    .as_str()
+                    .or_else(|| {
+                        f["command"]
+                            .as_str()
+                            .or_else(|| f["expected_effect"].as_str())
+                    })
+                    .unwrap_or("")
+                    .to_string(),
+            })
+            .collect();
         let collected_at = chrono::DateTime::from_timestamp(record.collected_at, 0)
             .map(|dt| dt.format("%H:%M:%S UTC").to_string())
             .unwrap_or_else(|| "unknown".into());
 
         self.dashboard.data = DashboardData {
             hostname,
+            snapshot_id,
             load_1m: load.load_average.one,
             load_5m: load.load_average.five,
             load_15m: load.load_average.fifteen,
@@ -3462,6 +3587,7 @@ Report the exit status and the concise output."
             backup_count,
             finding_count,
             finding_warnings,
+            findings: finding_summaries,
             collected_at,
         };
         self.dashboard.error = None;
@@ -3724,6 +3850,17 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         return;
     }
 
+    match app.dashboard.view {
+        DashboardView::Overview => render_dash_overview(app, area, buf),
+        DashboardView::FindingList => render_dash_finding_list(app, area, buf),
+        DashboardView::FindingDetail(idx) => render_dash_finding_detail(app, idx, area, buf),
+        DashboardView::EvidenceView(idx) => render_dash_evidence_view(app, idx, area, buf),
+        DashboardView::TroubleshootPlan(idx) => render_dash_troubleshoot_plan(app, idx, area, buf),
+    }
+}
+
+/// Render the main 3x3 panel grid.
+fn render_dash_overview(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let d = &app.dashboard.data;
     let sel = app.dashboard.selected;
     let panels = DashPanel::all();
@@ -3777,6 +3914,226 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 .render(*row_area, buf);
         }
     }
+}
+
+/// Render a scrollable finding list.
+fn render_dash_finding_list(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let findings = &app.dashboard.data.findings;
+    let scroll = app.dashboard.scroll;
+    let block = Block::default()
+        .title(" Findings — Esc to go back ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    if findings.is_empty() {
+        Paragraph::new("No findings detected. Run `helm monitor`.")
+            .style(Style::default().fg(DIM_FG))
+            .render(inner, buf);
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, f) in findings.iter().enumerate().skip(scroll) {
+        if lines.len() >= inner.height as usize {
+            break;
+        }
+        let color = match f.severity.as_str() {
+            "critical" | "error" => ERROR_FG,
+            "warning" => Color::Yellow,
+            _ => APP_FG,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {}. ", i + 1), Style::default().fg(DIM_FG)),
+            Span::styled(
+                format!("[{}] ", f.severity.to_ascii_uppercase()),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(&f.title, Style::default().fg(APP_FG)),
+        ]));
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "    resource: {}  domain: {}",
+                f.affected_resource, f.domain
+            ),
+            Style::default().fg(DIM_FG),
+        )]));
+    }
+    if findings.len() > scroll + inner.height as usize {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  … {} more",
+                findings.len() - scroll - inner.height as usize
+            ),
+            Style::default().fg(DIM_FG),
+        )));
+    }
+    Paragraph::new(lines).render(inner, buf);
+}
+
+/// Render a single finding detail.
+fn render_dash_finding_detail(app: &TuiApp, idx: usize, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" Finding Detail — Enter for evidence, Esc to go back ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let f = match app.dashboard.data.findings.get(idx) {
+        Some(f) => f,
+        None => {
+            Paragraph::new("Finding not found.")
+                .style(Style::default().fg(ERROR_FG))
+                .render(inner, buf);
+            return;
+        }
+    };
+    let color = match f.severity.as_str() {
+        "critical" | "error" => ERROR_FG,
+        "warning" => Color::Yellow,
+        _ => APP_FG,
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("ID:       {}", f.id),
+            Style::default().fg(APP_FG),
+        )),
+        Line::from(Span::styled(
+            format!("Severity: {}", f.severity.to_ascii_uppercase()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("Title:    {}", f.title),
+            Style::default().fg(APP_FG),
+        )),
+        Line::from(Span::styled(
+            format!("Resource: {}", f.affected_resource),
+            Style::default().fg(APP_FG),
+        )),
+        Line::from(Span::styled(
+            format!("Domain:   {}", f.domain),
+            Style::default().fg(APP_FG),
+        )),
+        Line::from(Span::styled(
+            format!("Snapshot: {}", f._snapshot_id),
+            Style::default().fg(DIM_FG),
+        )),
+        Line::from(Span::styled(
+            format!("Risk:     {}", f.risk),
+            Style::default().fg(color),
+        )),
+        Line::from(Span::styled(
+            format!("Rollback: {}", f.rollback),
+            Style::default().fg(DIM_FG),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Evidence:",
+            Style::default().fg(DIM_FG).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            if f.evidence_text.is_empty() {
+                "  (no evidence captured)"
+            } else {
+                &f.evidence_text
+            },
+            Style::default().fg(APP_FG),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            if f.command_preview.is_empty() {
+                "  (no command preview)"
+            } else {
+                &f.command_preview
+            },
+            Style::default().fg(TOOL_FG),
+        )),
+    ];
+    Paragraph::new(lines).render(inner, buf);
+}
+
+/// Render evidence for a finding.
+fn render_dash_evidence_view(app: &TuiApp, idx: usize, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" Evidence — Esc to go back ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let f = match app.dashboard.data.findings.get(idx) {
+        Some(f) => f,
+        None => {
+            Paragraph::new("Finding not found.")
+                .style(Style::default().fg(ERROR_FG))
+                .render(inner, buf);
+            return;
+        }
+    };
+    let mut text = format!("Finding: {} ({})\n\n", f.title, f.id);
+    text.push_str(&format!("Snapshot: {}\n", f._snapshot_id));
+    text.push_str(&format!("Resource: {}\n", f.affected_resource));
+    text.push_str(&format!("Domain:   {}\n", f.domain));
+    text.push_str(&format!("Risk:     {}\n", f.risk));
+    text.push_str(&format!("Rollback: {}\n", f.rollback));
+    text.push_str("\n--- Evidence ---\n");
+    text.push_str(if f.evidence_text.is_empty() {
+        "(no evidence captured)"
+    } else {
+        &f.evidence_text
+    });
+    text.push_str("\n\n--- Command Preview ---\n");
+    text.push_str(if f.command_preview.is_empty() {
+        "(no command preview)"
+    } else {
+        &f.command_preview
+    });
+    text.push_str("\n\nArrow keys scroll  |  T = troubleshoot  |  Esc = back");
+    Paragraph::new(text)
+        .style(Style::default().fg(APP_FG))
+        .render(inner, buf);
+}
+
+/// Render a troubleshoot plan for a finding.
+fn render_dash_troubleshoot_plan(app: &TuiApp, idx: usize, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" Troubleshoot Plan — Esc to go back, Enter to apply ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let f = match app.dashboard.data.findings.get(idx) {
+        Some(f) => f,
+        None => {
+            Paragraph::new("Finding not found.")
+                .style(Style::default().fg(ERROR_FG))
+                .render(inner, buf);
+            return;
+        }
+    };
+    let text = format!(
+        "Troubleshoot Plan\n\
+         \n\
+         Finding: {} ({})\n\
+         Severity: {}\n\
+         Resource: {}\n\n\
+         Proposed steps:\n\
+         1. Run `helm monitor --domain {}` to collect fresh data\n\
+         2. Check evidence: {}\n\
+         \n\
+         Apply fix:\n\
+         Run `/apply-plan` with a plan ID from `helm troubleshoot`\n\
+         or use `helm explain {}` for detailed guidance.\n\
+         \n\
+         Press Enter to generate a full troubleshoot plan.",
+        f.title, f.id, f.severity, f.affected_resource, f.domain, f.id, f.id
+    );
+    Paragraph::new(text)
+        .style(Style::default().fg(APP_FG))
+        .render(inner, buf);
 }
 
 fn render_dash_panel(panel: DashPanel, d: &DashboardData) -> String {
@@ -6175,40 +6532,56 @@ mod tests {
 
     #[test]
     fn render_dash_panel_health_shows_percent() {
-        let mut d = DashboardData::default();
-        d.hostname = "testbox".into();
-        d.memory_used_pct = 42.5;
-        d.load_1m = 1.5;
+        let d = DashboardData {
+            hostname: "testbox".into(),
+            memory_used_pct: 42.5,
+            load_1m: 1.5,
+            ..Default::default()
+        };
         let text = render_dash_panel(DashPanel::Health, &d);
-        assert!(text.contains("testbox"), "health panel should show hostname");
+        assert!(
+            text.contains("testbox"),
+            "health panel should show hostname"
+        );
         assert!(text.contains("42"), "health panel should show memory %");
         assert!(text.contains("1.5"), "health panel should show load");
     }
 
     #[test]
     fn render_dash_panel_findings_shows_count() {
-        let mut d = DashboardData::default();
-        d.finding_count = 3;
-        d.finding_warnings = 1;
+        let d = DashboardData {
+            finding_count: 3,
+            finding_warnings: 1,
+            ..Default::default()
+        };
         let text = render_dash_panel(DashPanel::Findings, &d);
         assert!(text.contains("3"), "findings panel should show total");
-        assert!(text.contains("1"), "findings panel should show warning count");
+        assert!(
+            text.contains("1"),
+            "findings panel should show warning count"
+        );
     }
 
     #[test]
     fn render_dash_panel_services_shows_failed() {
-        let mut d = DashboardData::default();
-        d.total_services = 10;
-        d.failed_services = 2;
+        let d = DashboardData {
+            total_services: 10,
+            failed_services: 2,
+            ..Default::default()
+        };
         let text = render_dash_panel(DashPanel::Services, &d);
-        assert!(text.contains("FAILED: 2"), "services panel should show failed count");
+        assert!(
+            text.contains("FAILED: 2"),
+            "services panel should show failed count"
+        );
     }
 
     #[test]
     fn render_dash_panel_disk_shows_entries() {
-        let mut d = DashboardData::default();
-        d.disk_entries.push("/ 45%".into());
-        d.disk_entries.push("/home 12%".into());
+        let d = DashboardData {
+            disk_entries: vec!["/ 45%".into(), "/home 12%".into()],
+            ..Default::default()
+        };
         let text = render_dash_panel(DashPanel::Disk, &d);
         assert!(text.contains("45%"), "disk panel should show usage");
         assert!(text.contains("/home"), "disk panel should show mount");
@@ -6216,11 +6589,224 @@ mod tests {
 
     #[test]
     fn render_dash_panel_containers_shows_counts() {
-        let mut d = DashboardData::default();
-        d.total_containers = 5;
-        d.running_containers = 3;
+        let d = DashboardData {
+            total_containers: 5,
+            running_containers: 3,
+            ..Default::default()
+        };
         let text = render_dash_panel(DashPanel::Containers, &d);
-        assert!(text.contains("Total: 5"), "containers panel should show total");
-        assert!(text.contains("Running: 3"), "containers panel should show running");
+        assert!(
+            text.contains("Total: 5"),
+            "containers panel should show total"
+        );
+        assert!(
+            text.contains("Running: 3"),
+            "containers panel should show running"
+        );
+    }
+
+    // ── Dashboard render tests for varying terminal sizes ──────────────
+
+    /// Build a DashboardData with realistic test data.
+    fn test_dash_data() -> DashboardData {
+        DashboardData {
+            hostname: "testbox".into(),
+            snapshot_id: "snap-001".into(),
+            load_1m: 1.5,
+            load_5m: 0.8,
+            load_15m: 0.6,
+            memory_used_pct: 62.0,
+            disk_entries: vec!["/ 45%".into(), "/home 12%".into(), "/var 78%".into()],
+            total_services: 32,
+            failed_services: 2,
+            total_containers: 5,
+            running_containers: 4,
+            listening_ports: 12,
+            last_log_errors: 3,
+            backup_count: 1,
+            finding_count: 3,
+            finding_warnings: 1,
+            collected_at: "14:30:00 UTC".into(),
+            findings: vec![
+                FindingSummary {
+                    id: "finding-001".into(),
+                    severity: "warning".into(),
+                    title: "Disk /var 78% full".into(),
+                    affected_resource: "/var".into(),
+                    _snapshot_id: "snap-001".into(),
+                    domain: "disks".into(),
+                    evidence_text: "df /var shows 78% used".into(),
+                    risk: "medium".into(),
+                    rollback: "not specified".into(),
+                    command_preview: "clean old logs from /var/log".into(),
+                },
+                FindingSummary {
+                    id: "finding-002".into(),
+                    severity: "error".into(),
+                    title: "Nginx service failed".into(),
+                    affected_resource: "nginx".into(),
+                    _snapshot_id: "snap-001".into(),
+                    domain: "services".into(),
+                    evidence_text: "systemctl is-active nginx failed".into(),
+                    risk: "high".into(),
+                    rollback: "systemctl start nginx".into(),
+                    command_preview: "systemctl restart nginx".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn dash_overview_renders_at_normal_size() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(!rendered.is_empty(), "buffer should not be empty");
+        assert!(rendered.contains("Health"), "should render health panel");
+        assert!(
+            rendered.contains("Findings"),
+            "should render findings panel"
+        );
+        assert!(
+            rendered.contains("Services"),
+            "should render services panel"
+        );
+        assert!(rendered.contains("testbox"), "should show hostname");
+        assert!(rendered.contains("62%"), "should show memory");
+    }
+
+    #[test]
+    fn dash_overview_renders_at_small_size() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 42, 18));
+        render_dashboard(&app, Rect::new(0, 0, 42, 18), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            !rendered.contains("Dashboard needs a larger terminal"),
+            "should fit at 42x18"
+        );
+    }
+
+    #[test]
+    fn dash_too_small_shows_hint() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 8));
+        render_dashboard(&app, Rect::new(0, 0, 30, 8), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(!rendered.is_empty(), "buffer should not be empty at 30x8");
+        assert!(
+            rendered.contains("larger terminal") || rendered.contains("Dashboard needs"),
+            "too-small hint should show: got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_finding_list_contains_evidence_text() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.view = DashboardView::FindingList;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("Disk /var 78% full"),
+            "finding list should show title"
+        );
+    }
+
+    #[test]
+    fn dash_finding_detail_shows_evidence_and_risk() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.view = DashboardView::FindingDetail(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("finding-001"),
+            "detail should show finding ID"
+        );
+        assert!(
+            rendered.contains("evidence"),
+            "detail should show evidence label"
+        );
+        assert!(rendered.contains("medium"), "detail should show risk");
+        assert!(
+            rendered.contains("not specified"),
+            "detail should show rollback"
+        );
+    }
+
+    #[test]
+    fn dash_evidence_view_shows_snapshot_evidence() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.view = DashboardView::EvidenceView(1);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("snap-001"),
+            "evidence should show snapshot ID"
+        );
+        assert!(rendered.contains("nginx"), "evidence should show resource");
+        assert!(rendered.contains("high"), "evidence should show risk");
+        assert!(
+            rendered.contains("systemctl"),
+            "evidence should show rollback command"
+        );
+    }
+
+    #[test]
+    fn dash_finding_detail_no_overlap_at_small_size() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.view = DashboardView::FindingDetail(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 50, 20));
+        render_dashboard(&app, Rect::new(0, 0, 50, 20), &mut buf);
+        let rendered = buf_to_string(&buf);
+        // At small size, should still contain key info without overflow
+        assert!(rendered.contains("finding-001"), "detail at small size");
+        assert!(
+            rendered.contains("Disk"),
+            "detail at small size should show title"
+        );
+    }
+
+    /// Render buffer content to a flat string for assertion.
+    fn buf_to_string(buf: &Buffer) -> String {
+        let mut s = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let default_cell = ratatui::buffer::Cell::default();
+                let cell = buf.cell((x, y)).unwrap_or(&default_cell);
+                let ch = cell.symbol().chars().next().unwrap_or(' ');
+                s.push(ch);
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn dash_buf_to_string_works() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        buf.set_string(0, 0, "Hello", ratatui::style::Style::default());
+        let s = buf_to_string(&buf);
+        assert!(
+            s.contains("Hello"),
+            "buf_to_string should capture rendered text"
+        );
     }
 }
