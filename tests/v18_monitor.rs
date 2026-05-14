@@ -543,7 +543,8 @@ fn monitor_snapshot_is_persisted_and_reloaded_as_baseline() {
             collected_at INTEGER NOT NULL,
             profile TEXT NOT NULL DEFAULT 'standard',
             domains_json TEXT NOT NULL DEFAULT '{}',
-            collector_errors_json TEXT NOT NULL DEFAULT '[]'
+            collector_errors_json TEXT NOT NULL DEFAULT '[]',
+            findings_json TEXT NOT NULL DEFAULT '[]'
         )",
     )
     .unwrap();
@@ -554,7 +555,7 @@ fn monitor_snapshot_is_persisted_and_reloaded_as_baseline() {
     snap1.collected_at = chrono::DateTime::from_timestamp(100_000, 0).unwrap();
     snap1.domains.logs.journal_errors_last_hour = 10;
     let json1 = serde_json::to_string(&snap1).unwrap();
-    helm_memory::SnapshotStore::insert(&conn, &json1).unwrap();
+    helm_memory::SnapshotStore::insert(&conn, &json1, "[]").unwrap();
 
     // Verify it's stored
     let latest = helm_memory::SnapshotStore::list(&conn, 10).unwrap();
@@ -567,7 +568,7 @@ fn monitor_snapshot_is_persisted_and_reloaded_as_baseline() {
     snap2.collected_at = chrono::DateTime::from_timestamp(200_000, 0).unwrap();
     snap2.domains.logs.journal_errors_last_hour = 200;
     let json2 = serde_json::to_string(&snap2).unwrap();
-    helm_memory::SnapshotStore::insert(&conn, &json2).unwrap();
+    helm_memory::SnapshotStore::insert(&conn, &json2, "[]").unwrap();
 
     // Latest is now snap2
     let latest2 = helm_memory::SnapshotStore::latest(&conn).unwrap().unwrap();
@@ -601,7 +602,8 @@ fn monitor_persistence_advances_baseline_across_runs() {
             collected_at INTEGER NOT NULL,
             profile TEXT NOT NULL DEFAULT 'standard',
             domains_json TEXT NOT NULL DEFAULT '{}',
-            collector_errors_json TEXT NOT NULL DEFAULT '[]'
+            collector_errors_json TEXT NOT NULL DEFAULT '[]',
+            findings_json TEXT NOT NULL DEFAULT '[]'
         )",
     )
     .unwrap();
@@ -619,7 +621,7 @@ fn monitor_persistence_advances_baseline_across_runs() {
         snap.collected_at = chrono::DateTime::from_timestamp(*ts, 0).unwrap();
         snap.domains.logs.journal_errors_last_hour = *errors;
         let json = serde_json::to_string(&snap).unwrap();
-        helm_memory::SnapshotStore::insert(&conn, &json).unwrap();
+        helm_memory::SnapshotStore::insert(&conn, &json, "[]").unwrap();
 
         let count = helm_memory::SnapshotStore::list(&conn, 10).unwrap().len();
         assert_eq!(count, i + 1, "snapshot count should increase each run");

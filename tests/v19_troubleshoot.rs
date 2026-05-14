@@ -145,6 +145,8 @@ fn plan_render_text_contains_key_sections() {
         domain: helm_monitor::MonitorDomain::Disks,
     });
     plan.proposed_fix_steps.push(helm_monitor::PlanStep {
+        expected_output: None,
+        interpretation_guide: None,
         title: "Clean apt cache".into(),
         command: CommandPreview::new("shell", "apt-get clean", "Free cache space"),
         hypothesis_id: Some("h1".into()),
@@ -166,6 +168,8 @@ fn plan_render_text_shows_rollback_status() {
     let mut plan =
         TroubleshootingPlan::new(PlanSource::UserQuestion("test".into()), "snap-1".into());
     plan.proposed_fix_steps.push(helm_monitor::PlanStep {
+        expected_output: None,
+        interpretation_guide: None,
         title: "Test step".into(),
         command: CommandPreview::new("shell", "test-cmd", "test")
             .with_rollback(RollbackStatus::Unsupported),
@@ -215,6 +219,8 @@ fn plan_text_does_not_leak_secrets() {
     let mut plan =
         TroubleshootingPlan::new(PlanSource::UserQuestion("test".into()), "snap-1".into());
     plan.proposed_fix_steps.push(helm_monitor::PlanStep {
+        expected_output: None,
+        interpretation_guide: None,
         title: "test".into(),
         command: CommandPreview::new(
             "shell",

@@ -144,6 +144,8 @@ pub struct PlanStep {
     pub title: String,
     pub command: CommandPreview,
     pub hypothesis_id: Option<String>,
+    pub expected_output: Option<String>,
+    pub interpretation_guide: Option<String>,
 }
 
 /// Source of a troubleshooting plan.
@@ -246,6 +248,12 @@ impl TroubleshootingPlan {
                 let cmd = s.command.command_text.as_deref().unwrap_or(&s.command.tool);
                 out.push_str(&format!("  $ {cmd}\n"));
                 out.push_str(&format!("    {}\n", s.command.expected_effect));
+                if let Some(eo) = &s.expected_output {
+                    out.push_str(&format!("    Expected output: {eo}\n"));
+                }
+                if let Some(ig) = &s.interpretation_guide {
+                    out.push_str(&format!("    Interpretation: {ig}\n"));
+                }
                 let r = &s.command.risk;
                 let b = &s.command.blast_radius;
                 out.push_str(&format!("    Risk: {} | Blast: {b}\n", r.as_str()));
@@ -384,6 +392,8 @@ pub async fn plan_from_finding(finding: &Finding) -> TroubleshootingPlan {
                 "Inspection command suggested by the finding",
             ),
             hypothesis_id: Some(plan.hypotheses[0].id.clone()),
+            expected_output: None,
+            interpretation_guide: None,
         };
         plan.read_only_steps.push(step);
     }
@@ -612,6 +622,8 @@ fn build_check_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     "Identify largest directories consuming disk space",
                 ),
                 hypothesis_id: Some(hypothesis.id.clone()),
+                expected_output: None,
+                interpretation_guide: None,
             });
             steps.push(PlanStep {
                 title: "Check for deleted-open files".into(),
@@ -621,6 +633,8 @@ fn build_check_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     "Find files deleted but still held open by processes",
                 ),
                 hypothesis_id: Some(hypothesis.id.clone()),
+                expected_output: None,
+                interpretation_guide: None,
             });
         }
         MonitorDomain::Load => {
@@ -632,6 +646,8 @@ fn build_check_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     "Identify highest CPU-consuming processes",
                 ),
                 hypothesis_id: Some(hypothesis.id.clone()),
+                expected_output: None,
+                interpretation_guide: None,
             });
         }
         MonitorDomain::Services => {
@@ -643,6 +659,8 @@ fn build_check_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     "List all failed systemd units with status details",
                 ),
                 hypothesis_id: Some(hypothesis.id.clone()),
+                expected_output: None,
+                interpretation_guide: None,
             });
         }
         MonitorDomain::Logs => {
@@ -654,6 +672,8 @@ fn build_check_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     "Show the 30 most recent error-level journal entries",
                 ),
                 hypothesis_id: Some(hypothesis.id.clone()),
+                expected_output: None,
+                interpretation_guide: None,
             });
         }
         _ => {}
@@ -682,6 +702,8 @@ fn build_fix_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     )],
                 },
                 hypothesis_id: Some(hypothesis.id.clone()),
+                expected_output: None,
+                interpretation_guide: None,
             });
             steps.push(PlanStep {
                 title: "Remove old journal logs".into(),
@@ -703,6 +725,8 @@ fn build_fix_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     )],
                 },
                 hypothesis_id: Some(hypothesis.id.clone()),
+                expected_output: None,
+                interpretation_guide: None,
             });
         }
         MonitorDomain::Load => {
@@ -725,6 +749,8 @@ fn build_fix_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     )],
                 },
                 hypothesis_id: Some(hypothesis.id.clone()),
+                expected_output: None,
+                interpretation_guide: None,
             });
         }
         MonitorDomain::Services => {
@@ -747,6 +773,8 @@ fn build_fix_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     )],
                 },
                 hypothesis_id: Some(hypothesis.id.clone()),
+                expected_output: None,
+                interpretation_guide: None,
             });
         }
         _ => {}

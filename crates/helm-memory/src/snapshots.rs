@@ -13,14 +13,15 @@ pub struct SnapshotRecord {
     pub profile: String,
     pub domains_json: String,
     pub collector_errors_json: String,
+    pub findings_json: String,
 }
 
 /// Store and retrieve system snapshots.
 pub struct SnapshotStore;
 
 impl SnapshotStore {
-    /// Insert a snapshot into the database.
-    pub fn insert(conn: &Connection, json: &str) -> Result<(), MemoryError> {
+    /// Insert a snapshot into the database. `findings_json` is optional; pass "[]" if absent.
+    pub fn insert(conn: &Connection, json: &str, findings_json: &str) -> Result<(), MemoryError> {
         let val: serde_json::Value =
             serde_json::from_str(json).map_err(|e| MemoryError::Other(e.to_string()))?;
 
@@ -39,8 +40,8 @@ impl SnapshotStore {
             serde_json::to_string(&val["collector_errors"]).unwrap_or_default();
 
         conn.execute(
-            "INSERT OR REPLACE INTO snapshots (id, host_hostname, collected_at, profile, domains_json, collector_errors_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, host_hostname, collected_at_ts, profile, domains_json, collector_errors_json],
+            "INSERT OR REPLACE INTO snapshots (id, host_hostname, collected_at, profile, domains_json, collector_errors_json, findings_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, host_hostname, collected_at_ts, profile, domains_json, collector_errors_json, findings_json],
         )
         .map_err(|e| MemoryError::Other(e.to_string()))?;
 
@@ -51,7 +52,7 @@ impl SnapshotStore {
     pub fn latest(conn: &Connection) -> Result<Option<SnapshotRecord>, MemoryError> {
         let result = conn
             .query_row(
-                "SELECT id, host_hostname, collected_at, profile, domains_json, collector_errors_json FROM snapshots ORDER BY collected_at DESC LIMIT 1",
+                "SELECT id, host_hostname, collected_at, profile, domains_json, collector_errors_json, findings_json FROM snapshots ORDER BY collected_at DESC LIMIT 1",
                 [],
                 |row| {
                     Ok(SnapshotRecord {
@@ -61,6 +62,7 @@ impl SnapshotStore {
                         profile: row.get(3)?,
                         domains_json: row.get(4)?,
                         collector_errors_json: row.get(5)?,
+                        findings_json: row.get(6)?,
                     })
                 },
             )
@@ -73,7 +75,7 @@ impl SnapshotStore {
     pub fn get(conn: &Connection, id: &str) -> Result<Option<SnapshotRecord>, MemoryError> {
         let result = conn
             .query_row(
-                "SELECT id, host_hostname, collected_at, profile, domains_json, collector_errors_json FROM snapshots WHERE id = ?1",
+                "SELECT id, host_hostname, collected_at, profile, domains_json, collector_errors_json, findings_json FROM snapshots WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(SnapshotRecord {
@@ -83,6 +85,7 @@ impl SnapshotStore {
                         profile: row.get(3)?,
                         domains_json: row.get(4)?,
                         collector_errors_json: row.get(5)?,
+                        findings_json: row.get(6)?,
                     })
                 },
             )
@@ -95,7 +98,7 @@ impl SnapshotStore {
     pub fn list(conn: &Connection, limit: u32) -> Result<Vec<SnapshotRecord>, MemoryError> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, host_hostname, collected_at, profile, domains_json, collector_errors_json FROM snapshots ORDER BY collected_at DESC LIMIT ?1",
+                "SELECT id, host_hostname, collected_at, profile, domains_json, collector_errors_json, findings_json FROM snapshots ORDER BY collected_at DESC LIMIT ?1",
             )
             .map_err(|e| MemoryError::Other(e.to_string()))?;
 
@@ -108,6 +111,7 @@ impl SnapshotStore {
                     profile: row.get(3)?,
                     domains_json: row.get(4)?,
                     collector_errors_json: row.get(5)?,
+                    findings_json: row.get(6)?,
                 })
             })
             .map_err(|e| MemoryError::Other(e.to_string()))?;
@@ -126,7 +130,7 @@ impl SnapshotStore {
     ) -> Result<Option<SnapshotRecord>, MemoryError> {
         let result = conn
             .query_row(
-                "SELECT id, host_hostname, collected_at, profile, domains_json, collector_errors_json FROM snapshots WHERE id != ?1 ORDER BY collected_at DESC LIMIT 1",
+                "SELECT id, host_hostname, collected_at, profile, domains_json, collector_errors_json, findings_json FROM snapshots WHERE id != ?1 ORDER BY collected_at DESC LIMIT 1",
                 params![except_id],
                 |row| {
                     Ok(SnapshotRecord {
@@ -136,6 +140,7 @@ impl SnapshotStore {
                         profile: row.get(3)?,
                         domains_json: row.get(4)?,
                         collector_errors_json: row.get(5)?,
+                        findings_json: row.get(6)?,
                     })
                 },
             )

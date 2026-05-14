@@ -298,7 +298,8 @@ fn snapshot_persistence_round_trip() {
             collected_at INTEGER NOT NULL,
             profile TEXT NOT NULL DEFAULT 'standard',
             domains_json TEXT NOT NULL DEFAULT '{}',
-            collector_errors_json TEXT NOT NULL DEFAULT '[]'
+            collector_errors_json TEXT NOT NULL DEFAULT '[]',
+            findings_json TEXT NOT NULL DEFAULT '[]'
         )",
     )
     .unwrap();
@@ -318,7 +319,7 @@ fn snapshot_persistence_round_trip() {
     let json = serde_json::to_string(&snapshot).unwrap();
 
     // Insert
-    helm_memory::SnapshotStore::insert(&conn, &json).unwrap();
+    helm_memory::SnapshotStore::insert(&conn, &json, "[]").unwrap();
 
     // Retrieve
     let record = helm_memory::SnapshotStore::latest(&conn).unwrap().unwrap();

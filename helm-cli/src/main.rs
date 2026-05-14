@@ -4699,7 +4699,8 @@ async fn run_collect_snapshot_command(args: SnapshotArgs) -> Result<()> {
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
     let raw_json = serde_json::to_string(&snapshot)?;
     let redacted_json = helm_core::redact_secrets(&raw_json);
-    SnapshotStore::insert(&conn, &redacted_json).with_context(|| "failed to persist snapshot")?;
+    SnapshotStore::insert(&conn, &redacted_json, "[]")
+        .with_context(|| "failed to persist snapshot")?;
 
     if args.diff {
         match SnapshotStore::latest_except(&conn, &snapshot.id) {
@@ -5087,7 +5088,11 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
         loop {
             let prev = load_previous_snapshot(&conn);
             let report = run_monitor_cycle(profile, domain_filter.as_deref(), prev).await;
-            persist_monitor_snapshot(&conn, &report.snapshot);
+            persist_monitor_snapshot(
+                &conn,
+                &report.snapshot,
+                &serde_json::to_string(&report.findings).unwrap_or_default(),
+            );
             let fmt = resolve_format(&args);
             let output = format_report(&report, &fmt);
             let redacted = helm_core::redact_secrets(&output);
@@ -5098,7 +5103,11 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
     } else {
         let prev = load_previous_snapshot(&conn);
         let report = run_monitor_cycle(profile, domain_filter.as_deref(), prev).await;
-        persist_monitor_snapshot(&conn, &report.snapshot);
+        persist_monitor_snapshot(
+            &conn,
+            &report.snapshot,
+            &serde_json::to_string(&report.findings).unwrap_or_default(),
+        );
         let fmt = resolve_format(&args);
         let output = format_report(&report, &fmt);
         let redacted = helm_core::redact_secrets(&output);
@@ -5126,10 +5135,14 @@ fn resolve_format(args: &MonitorArgs) -> String {
 }
 
 /// Persist the monitor snapshot so the next run can use it as baseline.
-fn persist_monitor_snapshot(conn: &rusqlite::Connection, snapshot: &SystemSnapshot) {
+fn persist_monitor_snapshot(
+    conn: &rusqlite::Connection,
+    snapshot: &SystemSnapshot,
+    findings_json: &str,
+) {
     if let Ok(raw_json) = serde_json::to_string(snapshot) {
         let redacted = helm_core::redact_secrets(&raw_json);
-        let _ = SnapshotStore::insert(conn, &redacted);
+        let _ = SnapshotStore::insert(conn, &redacted, findings_json);
     }
 }
 
@@ -5212,12 +5225,6 @@ async fn run_troubleshoot_command(args: TroubleshootArgs) -> Result<()> {
         let text = plan.render_text();
         let redacted = helm_core::redact_secrets(&text);
         print!("{redacted}");
-        if plan.approval_required && !plan.proposed_fix_steps.is_empty() {
-            eprintln!(
-                "\n[approval required — use 'helm apply-plan {}' to execute]",
-                plan.id
-            );
-        }
     }
     Ok(())
 }
