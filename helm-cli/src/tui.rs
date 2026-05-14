@@ -37,9 +37,9 @@ use serde::Deserialize;
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
 
 use crate::{
-    ProviderChoice, ProviderSettings, build_provider, custom_commands, default_api_key_env,
-    default_model_name, keybindings::KeyMap, provider_choice_name, remote::RemoteRegistry,
-    wrap_for_remote, write_helm_config,
+    ProviderChoice, ProviderSettings, TroubleshootingPlanStore, build_provider, custom_commands,
+    default_api_key_env, default_db_path, default_model_name, keybindings::KeyMap,
+    provider_choice_name, remote::RemoteRegistry, wrap_for_remote, write_helm_config,
 };
 use crate::{sandbox::ResolvedSandbox, secrets::SecretsStore};
 
@@ -380,6 +380,28 @@ enum ModalState {
         session_tokens_out: u64,
         session_cost_usd: f64,
     },
+    /// Command-by-command plan execution approval.
+    PlanExecution {
+        plan_id: String,
+        plan_title: String,
+        step_index: usize,
+        step_count: usize,
+        step_previews: Vec<String>,
+        step_effects: Vec<String>,
+        step_tools: Vec<String>,
+        step_risks: Vec<String>,
+        phase: PlanExecPhase,
+        result_summary: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PlanExecPhase {
+    Loading,
+    Approving,
+    Running,
+    Done,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,6 +486,7 @@ enum CommandAction {
     Help,
     Diagnose,
     Evidence,
+    ApplyPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,6 +589,7 @@ impl CommandAction {
             Self::Help,
             Self::Diagnose,
             Self::Evidence,
+            Self::ApplyPlan,
         ]
     }
 
@@ -600,6 +624,7 @@ impl CommandAction {
             Self::Help => "Help",
             Self::Diagnose => "Diagnose Mode",
             Self::Evidence => "Evidence Report",
+            Self::ApplyPlan => "Execute Plan",
         }
     }
 
@@ -634,6 +659,7 @@ impl CommandAction {
             Self::Help => "help",
             Self::Diagnose => "diagnose",
             Self::Evidence => "evidence",
+            Self::ApplyPlan => "apply-plan",
         }
     }
 
@@ -668,6 +694,7 @@ impl CommandAction {
             Self::Help => "keyboard shortcuts and commands",
             Self::Diagnose => "switch to diagnose mode (read-only, limited tools)",
             Self::Evidence => "show evidence report for last tool call",
+            Self::ApplyPlan => "execute a troubleshooting plan with step approval",
         }
     }
 
@@ -702,6 +729,7 @@ impl CommandAction {
             Self::Help => slug == "help",
             Self::Diagnose => slug == "diagnose",
             Self::Evidence => slug == "evidence",
+            Self::ApplyPlan => slug == "apply-plan",
         }
     }
 
@@ -1493,6 +1521,117 @@ impl TuiApp {
                 }
                 _ => {}
             },
+            Some(ModalState::PlanExecution {
+                ref plan_id,
+                ref step_index,
+                ref step_count,
+                ref phase,
+                ..
+            }) if *phase == PlanExecPhase::Approving => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let next = *step_index + 1;
+                    let plan_id_clone = plan_id.clone();
+                    if next >= *step_count {
+                        // All approved — execute
+                        if let Some(ModalState::PlanExecution { ref mut phase, .. }) = self.modal {
+                            *phase = PlanExecPhase::Running;
+                        }
+                        self.push_chat(
+                            MessageRole::System,
+                            "[apply-plan] All steps approved. Executing...",
+                        );
+                        // Audit: approve this step
+                        let _ = Self::write_apply_plan_audit(&plan_id_clone, "approved");
+                        // Use the TUI's runtime handle to spawn the apply-plan execution
+                        let handle = tokio::runtime::Handle::current();
+                        std::thread::spawn(move || {
+                            handle.block_on(async {
+                                let args = crate::ApplyPlanArgs {
+                                    plan_id: plan_id_clone,
+                                    yes: true,
+                                    json: false,
+                                };
+                                match crate::run_apply_plan_command(args).await {
+                                    Ok(()) => eprintln!("[apply-plan] Plan executed successfully."),
+                                    Err(e) => eprintln!("[apply-plan] Execution failed: {e}"),
+                                }
+                            });
+                        });
+                    } else {
+                        let _ = Self::write_apply_plan_audit(&plan_id_clone, "approved");
+                        // Move to next step
+                        if let Some(ModalState::PlanExecution {
+                            ref mut step_index, ..
+                        }) = self.modal
+                        {
+                            *step_index = next;
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    let next = *step_index + 1;
+                    let plan_id = plan_id.clone();
+                    if next >= *step_count {
+                        self.push_chat(
+                            MessageRole::System,
+                            "[apply-plan] All remaining steps skipped.",
+                        );
+                        self.modal = None;
+                    } else if let Some(ModalState::PlanExecution {
+                        ref mut step_index, ..
+                    }) = self.modal
+                    {
+                        *step_index = next;
+                    }
+                    let _ = Self::write_apply_plan_audit(&plan_id, "denied");
+                }
+                KeyCode::Char('!') => {
+                    // Approve all remaining
+                    let plan_id = plan_id.clone();
+                    if let Some(ModalState::PlanExecution { ref mut phase, .. }) = self.modal {
+                        *phase = PlanExecPhase::Running;
+                    }
+                    self.push_chat(
+                        MessageRole::System,
+                        "[apply-plan] All steps approved. Executing...",
+                    );
+                    let handle = tokio::runtime::Handle::current();
+                    std::thread::spawn(move || {
+                        handle.block_on(async {
+                            let args = crate::ApplyPlanArgs {
+                                plan_id,
+                                yes: true,
+                                json: false,
+                            };
+                            match crate::run_apply_plan_command(args).await {
+                                Ok(()) => eprintln!("[apply-plan] Plan executed successfully."),
+                                Err(e) => eprintln!("[apply-plan] Execution failed: {e}"),
+                            }
+                        });
+                    });
+                }
+                KeyCode::Esc => {
+                    self.modal = None;
+                    self.push_chat(MessageRole::System, "[apply-plan] Cancelled by user.");
+                }
+                _ => {}
+            },
+            Some(ModalState::PlanExecution {
+                phase: PlanExecPhase::Running,
+                ..
+            }) => {
+                // Phase changes are driven by the spawned task completion
+            }
+            Some(ModalState::PlanExecution {
+                phase: PlanExecPhase::Done,
+                ..
+            }) => {
+                self.modal = None;
+            }
+            Some(ModalState::PlanExecution {
+                phase: PlanExecPhase::Loading,
+                ..
+            }) => {}
             Some(_) => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     self.modal = None;
@@ -1956,11 +2095,36 @@ Report the exit status and the concise output."
     }
 
     fn push_chat(&mut self, role: MessageRole, text: impl Into<String>) {
-        self.session.chat.push(ChatMessage {
-            role,
-            text: sanitize_display_text(&text.into()),
-        });
+        let text: String = text.into();
+        self.session.chat.push(ChatMessage { role, text });
         self.session.transcript_scroll = 0;
+    }
+
+    /// Write a hash-chained audit event for a TUI apply-plan approval.
+    fn write_apply_plan_audit(plan_id: &str, decision: &str) -> Result<()> {
+        let db_path = crate::default_db_path()?;
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let prev =
+            helm_memory::latest_audit_hash(&conn, None).unwrap_or_else(|_| "GENESIS".to_string());
+        let ts = chrono::Utc::now().timestamp_millis();
+        let hash = helm_memory::audit_hash(helm_memory::AuditHashParts {
+            previous_hash: &prev,
+            episode_id: Some("tui-apply"),
+            target: Some("tui"),
+            timestamp: ts,
+            tool_name: "apply-plan",
+            input_hash: &helm_memory::stable_hash_hex(plan_id),
+            output_hash: &helm_memory::stable_hash_hex(decision),
+            capability: "shell",
+            taint: "clean",
+            cwd: "",
+            decision,
+        });
+        conn.execute(
+            "INSERT INTO audit_events (episode_id, target, timestamp, tool_name, input_hash, output_hash, capability, taint, cwd, decision, previous_hash, event_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params!["tui-apply", "tui", ts, "apply-plan", &helm_memory::stable_hash_hex(plan_id), &helm_memory::stable_hash_hex(decision), "shell", "clean", "", decision, &prev, &hash],
+        )?;
+        Ok(())
     }
 
     fn toast(&mut self, text: impl Into<String>) {
@@ -2511,6 +2675,13 @@ Report the exit status and the concise output."
             },
             CommandAction::Quit => self.shutdown = true,
             CommandAction::Help => self.modal = Some(ModalState::Help),
+            CommandAction::ApplyPlan => {
+                // ApplyPlan requires args; fallback to hint
+                self.push_chat(
+                    MessageRole::System,
+                    "Usage: /apply-plan <plan_id>\n  Apply a troubleshooting plan with step-by-step approval.",
+                );
+            }
         }
     }
 
@@ -2536,6 +2707,9 @@ Report the exit status and the concise output."
                     format!("[compact] hint noted: {args}. Transcript truncated to recent turns."),
                 );
                 self.execute_compact_inline();
+            }
+            CommandAction::ApplyPlan if !args.is_empty() => {
+                self.execute_apply_plan_inline(args);
             }
             _ => self.execute_command(command),
         }
@@ -2924,6 +3098,128 @@ Report the exit status and the concise output."
                  Each fs_write is auto-snapshot'd in the session store."
             ),
         );
+    }
+
+    fn execute_apply_plan_inline(&mut self, plan_id: &str) {
+        // Load plan from database and show preview in transcript
+        let db_path = match default_db_path() {
+            Ok(p) => p,
+            Err(e) => {
+                self.push_chat(MessageRole::Error, format!("[apply-plan] DB error: {e}"));
+                return;
+            }
+        };
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_chat(
+                    MessageRole::Error,
+                    format!("[apply-plan] DB open failed: {e}"),
+                );
+                return;
+            }
+        };
+        let record = match TroubleshootingPlanStore::get(&conn, plan_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                self.push_chat(
+                    MessageRole::Error,
+                    format!(
+                        "[apply-plan] plan '{plan_id}' not found. Run `helm troubleshoot` first."
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                self.push_chat(
+                    MessageRole::Error,
+                    format!("[apply-plan] DB query error: {e}"),
+                );
+                return;
+            }
+        };
+
+        // Parse and display steps
+        let steps: Vec<serde_json::Value> =
+            serde_json::from_str(&record.proposed_fix_steps_json).unwrap_or_default();
+        let step_count = steps.len();
+        if step_count == 0 {
+            self.push_chat(
+                MessageRole::System,
+                "[apply-plan] Plan has no fix steps to execute.",
+            );
+            return;
+        }
+
+        let title = if record.source.starts_with("user:") {
+            record.source.trim_start_matches("user:").trim().to_string()
+        } else {
+            record.source.clone()
+        };
+
+        let mut body = String::new();
+        body.push_str(&format!("Plan: {title} ({plan_id})\n"));
+        body.push_str(&format!(
+            "Snapshot: {} | {} fix steps\n\n",
+            record.snapshot_id, step_count
+        ));
+        for (i, s) in steps.iter().enumerate() {
+            let cmd = s["command"]["command_text"]
+                .as_str()
+                .unwrap_or("(no command)");
+            let effect = s["command"]["expected_effect"].as_str().unwrap_or("");
+            let risk = s["command"]["risk"].as_str().unwrap_or("none");
+            let tool = s["command"]["tool"].as_str().unwrap_or("shell");
+            body.push_str(&format!("  {}. [{risk}] {tool}: {cmd}\n", i + 1));
+            body.push_str(&format!("     Effect: {effect}\n"));
+        }
+        body.push_str("\nUse `y` to approve, `n` to skip, `!` to approve all, `Esc` to cancel.");
+
+        self.push_chat(
+            MessageRole::System,
+            format!("[apply-plan] Loaded plan:\n{body}"),
+        );
+
+        // Enter approval modal with step-by-step flow
+        let previews: Vec<String> = steps
+            .iter()
+            .map(|s| {
+                s["command"]["command_text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        let effects: Vec<String> = steps
+            .iter()
+            .map(|s| {
+                s["command"]["expected_effect"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        let tools: Vec<String> = steps
+            .iter()
+            .map(|s| s["command"]["tool"].as_str().unwrap_or("shell").to_string())
+            .collect();
+        let risks: Vec<String> = steps
+            .iter()
+            .map(|s| s["command"]["risk"].as_str().unwrap_or("none").to_string())
+            .collect();
+
+        self.modal = Some(ModalState::PlanExecution {
+            plan_id: plan_id.to_string(),
+            plan_title: title,
+            step_index: 0,
+            step_count,
+            step_previews: previews,
+            step_effects: effects,
+            step_tools: tools,
+            step_risks: risks,
+            phase: PlanExecPhase::Approving,
+            result_summary: String::new(),
+        });
     }
 
     fn open_cost_meter(&mut self) {
@@ -3756,6 +4052,88 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
             );
             Paragraph::new(content)
                 .block(modal_block(" Cost Meter "))
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
+        }
+        ModalState::PlanExecution {
+            plan_id,
+            plan_title,
+            step_index,
+            step_count,
+            step_previews,
+            step_effects,
+            step_tools,
+            step_risks,
+            phase,
+            result_summary,
+        } => {
+            let mut lines = Vec::new();
+            match phase {
+                PlanExecPhase::Approving => {
+                    let i = *step_index;
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            " Plan: {} ({}) — Step {}/{}",
+                            plan_title,
+                            plan_id,
+                            i + 1,
+                            step_count
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                    lines.push(Line::from(""));
+                    if let Some(tool) = step_tools.get(i) {
+                        lines.push(Line::from(format!(" Tool:     {tool}")));
+                    }
+                    if let Some(cmd) = step_previews.get(i) {
+                        lines.push(Line::from(format!(" Command:  {cmd}")));
+                    }
+                    if let Some(effect) = step_effects.get(i) {
+                        lines.push(Line::from(format!(" Effect:   {effect}")));
+                    }
+                    if let Some(risk) = step_risks.get(i) {
+                        lines.push(Line::from(format!(" Risk:     {risk}")));
+                    }
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        " [Y] Execute step   [N] Skip step   [!] Approve all remaining   [Esc] Cancel",
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+                PlanExecPhase::Running => {
+                    lines.push(Line::from(Span::styled(
+                        " Executing plan... ",
+                        Style::default().fg(Color::Green),
+                    )));
+                    lines.push(Line::from(format!(
+                        " {}/{} steps complete",
+                        step_index, step_count
+                    )));
+                }
+                PlanExecPhase::Done => {
+                    lines.push(Line::from(Span::styled(
+                        " Execution complete ",
+                        Style::default().fg(Color::Green),
+                    )));
+                    if !result_summary.is_empty() {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::raw(result_summary.as_str())));
+                    }
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        " Press any key to close ",
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+                PlanExecPhase::Loading => {
+                    lines.push(Line::from(Span::styled(
+                        " Loading plan... ",
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+            }
+            Paragraph::new(lines)
+                .block(modal_block(" Plan Execution "))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
