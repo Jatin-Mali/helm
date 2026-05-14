@@ -18,6 +18,7 @@ const MIGRATION_0004: &str = include_str!("../migrations/0004_security.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0005_remote_audit.sql");
 const MIGRATION_0010: &str = include_str!("../migrations/0006_snapshots.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0007_findings.sql");
+const MIGRATION_0012: &str = include_str!("../migrations/0008_changesets.sql");
 
 /// Minimal schema for per-host audit shard DBs (audit_events only).
 const SHARD_SCHEMA: &str = "\
@@ -1118,7 +1119,12 @@ fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
         8 => apply_0009(conn),
         9 => apply_0010(conn),
         10 => apply_0011(conn),
-        11 => conn
+        11 => {
+            conn.execute_batch("PRAGMA foreign_keys = ON")
+                .map_err(sqlite_error)?;
+            apply_0012(conn)
+        }
+        12 => conn
             .execute_batch("PRAGMA foreign_keys = ON")
             .map_err(sqlite_error),
         other => Err(MemoryError::Migration(format!(
@@ -1158,6 +1164,17 @@ fn apply_0011(conn: &Connection) -> Result<(), MemoryError> {
         conn.execute_batch(MIGRATION_0011).map_err(sqlite_error)?;
     }
     conn.execute_batch("PRAGMA user_version = 11")
+        .map_err(sqlite_error)?;
+    apply_0012(conn)
+}
+
+fn apply_0012(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .map_err(sqlite_error)?;
+    if !table_exists(conn, "change_sets")? {
+        conn.execute_batch(MIGRATION_0012).map_err(sqlite_error)?;
+    }
+    conn.execute_batch("PRAGMA user_version = 12")
         .map_err(sqlite_error)?;
     Ok(())
 }
@@ -1644,7 +1661,7 @@ mod tests {
     async fn schema_version_reports_current_version_edge_case() {
         let (_dir, store) = store().await;
 
-        assert_eq!(store.schema_version().await.unwrap(), 11);
+        assert_eq!(store.schema_version().await.unwrap(), 12);
     }
 
     #[tokio::test]
@@ -1717,7 +1734,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         assert_eq!(has_column, 1);
     }
 

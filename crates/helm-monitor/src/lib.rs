@@ -3,12 +3,17 @@
 pub mod collectors;
 pub mod detectors;
 pub mod engine;
+pub mod execute;
 pub mod findings;
 pub mod reporter;
 pub mod snapshot;
 pub mod troubleshoot;
 
 pub use engine::collect_snapshot;
+pub use execute::{
+    ChangeSet, ChangeSetStatus, ChangeSetStep, ExecutionEngine, PreChangeBackup, StepOutcome,
+    StepStatus, format_change_set,
+};
 pub use findings::{Confidence, EvidenceRef, Finding, FindingId, MonitorDomain, PlanId, Severity};
 pub use reporter::{MonitorReport, MonitorReporter};
 pub use snapshot::{

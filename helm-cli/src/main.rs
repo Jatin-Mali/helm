@@ -38,9 +38,11 @@ use helm_memory::{
     AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, SessionStore,
     SnapshotStore, SnapshotStoreRecord, StepRecord, UserProfileStore,
 };
+use helm_memory::{ChangeSetStore, TroubleshootingPlanStore};
 use helm_monitor::{
-    Finding, HostIdentity, MonitorDomain, MonitorProfile, MonitorReport, MonitorReporter,
-    SnapshotDomains, SystemSnapshot, collect_snapshot, explain_finding, plan_from_finding,
+    CommandPreview, ExecutionEngine, Finding, HostIdentity,
+    MonitorDomain, MonitorProfile, MonitorReport, MonitorReporter, PlanSource, SnapshotDomains,
+    SystemSnapshot, collect_snapshot, explain_finding, format_change_set, plan_from_finding,
     plan_from_problem,
 };
 use helm_providers::{
@@ -172,6 +174,10 @@ enum Command {
     Troubleshoot(TroubleshootArgs),
     /// Explain a stored finding by ID
     Explain(ExplainArgs),
+    /// Apply an approved troubleshooting plan
+    ApplyPlan(ApplyPlanArgs),
+    /// Manage change sets (list/show/rollback)
+    ChangeSet(ChangeSetArgs),
 }
 
 #[derive(Debug, Args)]
@@ -742,6 +748,50 @@ struct ExplainArgs {
     finding_id: String,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ApplyPlanArgs {
+    #[arg(value_name = "PLAN_ID")]
+    plan_id: String,
+    /// Automatically approve all steps (dangerous)
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ChangeSetArgs {
+    #[command(subcommand)]
+    command: ChangeSetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ChangeSetCommand {
+    /// List all change sets
+    List {
+        #[arg(long, default_value = "20")]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show details of a change set
+    Show {
+        #[arg(value_name = "CHANGE_SET_ID")]
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attempt to roll back a change set
+    Rollback {
+        #[arg(value_name = "CHANGE_SET_ID")]
+        id: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
@@ -1706,6 +1756,12 @@ async fn run() -> Result<()> {
         }
         Command::Explain(args) => {
             run_explain_command(args).await?;
+        }
+        Command::ApplyPlan(args) => {
+            run_apply_plan_command(args).await?;
+        }
+        Command::ChangeSet(args) => {
+            run_change_set_command(args).await?;
         }
     }
     Ok(())
@@ -5230,6 +5286,32 @@ async fn run_troubleshoot_command(args: TroubleshootArgs) -> Result<()> {
         let redacted = helm_core::redact_secrets(&text);
         print!("{redacted}");
     }
+
+    // Persist the plan to DB for later apply-plan lookup
+    if let Ok(db_path) = default_db_path() {
+        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            let source = match &plan.source {
+                PlanSource::UserQuestion(q) => format!("user: {q}"),
+                PlanSource::Finding(id) => format!("finding: {id}"),
+            };
+            let hypotheses_json = serde_json::to_string(&plan.hypotheses).unwrap_or_default();
+            let read_only_steps_json =
+                serde_json::to_string(&plan.read_only_steps).unwrap_or_default();
+            let proposed_fix_steps_json =
+                serde_json::to_string(&plan.proposed_fix_steps).unwrap_or_default();
+            let _ = TroubleshootingPlanStore::insert(
+                &conn,
+                &plan.id,
+                &source,
+                &plan.snapshot_id,
+                &helm_core::redact_secrets(&hypotheses_json),
+                &helm_core::redact_secrets(&read_only_steps_json),
+                &helm_core::redact_secrets(&proposed_fix_steps_json),
+                plan.approval_required,
+                &helm_core::redact_secrets(&plan.render_text()),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -5317,6 +5399,349 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes}B")
     }
+}
+
+async fn run_apply_plan_command(args: ApplyPlanArgs) -> Result<()> {
+    let db_path = default_db_path()?;
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+
+    // Load the persisted plan
+    let plan_record = TroubleshootingPlanStore::get(&conn, &args.plan_id)
+        .with_context(|| format!("plan '{}' not found in database", args.plan_id))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Plan '{}' not found. Run `helm troubleshoot` first to generate a plan.",
+                args.plan_id
+            )
+        })?;
+
+    // Reconstruct TroubleshootingPlan from stored JSON
+    let source = if plan_record.source.starts_with("finding:") {
+        let id = plan_record.source.trim_start_matches("finding:").trim();
+        PlanSource::Finding(id.to_string())
+    } else {
+        PlanSource::UserQuestion(
+            plan_record
+                .source
+                .trim_start_matches("user:")
+                .trim()
+                .to_string(),
+        )
+    };
+    let hypotheses: Vec<helm_monitor::Hypothesis> =
+        serde_json::from_str(&plan_record.hypotheses_json).unwrap_or_default();
+    let read_only_steps: Vec<helm_monitor::PlanStep> =
+        serde_json::from_str(&plan_record.read_only_steps_json).unwrap_or_default();
+    let proposed_fix_steps: Vec<helm_monitor::PlanStep> =
+        serde_json::from_str(&plan_record.proposed_fix_steps_json).unwrap_or_default();
+
+    let plan = helm_monitor::TroubleshootingPlan {
+        id: plan_record.id.clone(),
+        source,
+        snapshot_id: plan_record.snapshot_id.clone(),
+        hypotheses,
+        read_only_steps,
+        proposed_fix_steps,
+        approval_required: plan_record.approval_required,
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        println!("{}", plan.render_text());
+    }
+
+    if plan.proposed_fix_steps.is_empty() {
+        eprintln!("Plan has no fix steps to execute.");
+        return Ok(());
+    }
+
+    if !plan.approval_required || args.yes {
+        eprintln!("WARNING: auto-approval enabled. Executing all steps...");
+    } else {
+        eprintln!("\nYou are about to execute the above plan on this system.");
+        eprintln!("This will make real changes. Review each step carefully.\n");
+    }
+
+    // Build approval callback
+    let auto_approve = args.yes;
+    let approve_fn: Box<dyn Fn(&CommandPreview) -> bool + Send + Sync> = if auto_approve {
+        Box::new(|_| true)
+    } else {
+        let remaining_auto = std::sync::atomic::AtomicBool::new(false);
+        Box::new(move |preview| {
+            if remaining_auto.load(std::sync::atomic::Ordering::Relaxed) {
+                return true;
+            }
+            eprintln!("\n--- Command Preview ---");
+            eprintln!("  Tool:    {}", preview.tool);
+            eprintln!(
+                "  Command: {}",
+                preview.command_text.as_deref().unwrap_or("(no command)")
+            );
+            eprintln!("  Effect:  {}", preview.expected_effect);
+            eprintln!("  Risk:    {}", preview.risk.as_str());
+            eprintln!("  Blast:   {}", preview.blast_radius);
+            eprintln!("  Rollback: {}", preview.rollback);
+            if !preview.verification.is_empty() {
+                eprintln!("  Verification:");
+                for v in &preview.verification {
+                    eprintln!(
+                        "    - {}: {}",
+                        v.command_text.as_deref().unwrap_or(""),
+                        v.expected_effect
+                    );
+                }
+            }
+            loop {
+                eprint!("Execute this step? [y/N/! (execute all remaining)] ");
+                use std::io::{BufRead, stdin};
+                let mut input = String::new();
+                if stdin().lock().read_line(&mut input).is_err() {
+                    return false;
+                }
+                match input.trim().to_lowercase().as_str() {
+                    "y" | "yes" => return true,
+                    "!" => {
+                        remaining_auto.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return true;
+                    }
+                    "n" | "no" | "" => return false,
+                    _ => {
+                        eprintln!("Invalid input. Enter y, N, or !");
+                        continue;
+                    }
+                }
+            }
+        })
+    };
+
+    // Execute
+    let mut engine = ExecutionEngine::new(approve_fn);
+    let change_set = engine.execute(&plan).await;
+
+    // Persist change set
+    let cs = &change_set;
+    let _ = ChangeSetStore::insert(
+        &conn,
+        &cs.id,
+        &cs.plan_id,
+        &cs.plan_title,
+        &cs.snapshot_id,
+        &cs.before_snapshot_id,
+        &cs.status.to_string(),
+        cs.created_at,
+        &helm_core::redact_secrets(&cs.summary),
+    );
+    for step in &cs.steps {
+        let _ = ChangeSetStore::insert_step(
+            &conn,
+            &step.id,
+            &cs.id,
+            &step.plan_step_title,
+            &step.command.tool,
+            &helm_core::redact_secrets(
+                &serde_json::to_string(&step.command.input).unwrap_or_default(),
+            ),
+            step.command.command_text.as_deref(),
+            &step.command.expected_effect,
+            step.command.risk.as_str(),
+            &step.status.to_string(),
+        );
+        let _ = ChangeSetStore::update_step_outcome(
+            &conn,
+            &step.id,
+            &step.status.to_string(),
+            &helm_core::redact_secrets(&step.output_text),
+            &helm_core::redact_secrets(&step.error_text),
+            &helm_core::redact_secrets(&step.verification_result),
+        );
+    }
+    if let Some(after_id) = &cs.after_snapshot_id {
+        let _ = ChangeSetStore::update_after_snapshot(&conn, &cs.id, after_id);
+    }
+
+    let redacted = helm_core::redact_secrets(&format_change_set(&change_set));
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&change_set)?);
+    } else {
+        println!("{redacted}");
+    }
+
+    eprintln!("\nChange set saved as: {}", cs.id);
+    Ok(())
+}
+
+async fn run_change_set_command(args: ChangeSetArgs) -> Result<()> {
+    let db_path = default_db_path()?;
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+
+    match args.command {
+        ChangeSetCommand::List { limit, json } => {
+            let records =
+                ChangeSetStore::list(&conn, limit).with_context(|| "failed to list change sets")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&records)?);
+            } else if records.is_empty() {
+                println!("No change sets found.");
+            } else {
+                for r in &records {
+                    println!(
+                        "  {} | {} | {} | {}",
+                        r.id,
+                        &r.plan_title[..r.plan_title.len().min(40)],
+                        r.status,
+                        chrono::DateTime::from_timestamp(r.created_at, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        ChangeSetCommand::Show { id, json } => {
+            let full = ChangeSetStore::get_full(&conn, &id)
+                .with_context(|| format!("failed to get change set {id}"))?
+                .ok_or_else(|| anyhow::anyhow!("Change set '{}' not found.", id))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&full)?);
+            } else {
+                println!("ChangeSet: {}", full.record.id);
+                println!("  Plan ID:   {}", full.record.plan_id);
+                println!("  Status:    {}", full.record.status);
+                println!(
+                    "  Created:   {}",
+                    chrono::DateTime::from_timestamp(full.record.created_at, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_default()
+                );
+                if let Some(t) = full.record.completed_at {
+                    println!(
+                        "  Completed: {}",
+                        chrono::DateTime::from_timestamp(t, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                            .unwrap_or_default()
+                    );
+                }
+                println!("\nSteps:");
+                for s in &full.steps {
+                    println!(
+                        "  [{}] {}: {}",
+                        s.status,
+                        s.plan_step_title,
+                        s.output_text.lines().next().unwrap_or(""),
+                    );
+                    if !s.error_text.is_empty() {
+                        println!("        error: {}", s.error_text);
+                    }
+                    if !s.verification_result.is_empty() {
+                        println!("        verify: {}", s.verification_result);
+                    }
+                }
+                if !full.record.summary.is_empty() {
+                    println!("\nSummary:\n{}", full.record.summary);
+                }
+            }
+        }
+        ChangeSetCommand::Rollback { id, yes, json } => {
+            let full = ChangeSetStore::get_full(&conn, &id)
+                .with_context(|| format!("failed to get change set {id}"))?
+                .ok_or_else(|| anyhow::anyhow!("Change set '{}' not found.", id))?;
+
+            if !yes {
+                eprintln!("WARNING: Rollback is experimental and may not fully undo all changes.");
+                eprintln!("Change set '{}' has {} steps.", id, full.steps.len());
+                eprint!("Proceed with rollback? [y/N] ");
+                use std::io::{BufRead, stdin};
+                let mut input = String::new();
+                if stdin().lock().read_line(&mut input).is_err()
+                    || !input.trim().eq_ignore_ascii_case("y")
+                {
+                    eprintln!("Rollback cancelled.");
+                    return Ok(());
+                }
+            }
+
+            // Attempt rollback by reversing steps in reverse order
+            let mut results = Vec::new();
+            for step in full.steps.iter().rev() {
+                if step.status != "succeeded" {
+                    results.push(format!(
+                        "  SKIP {}: step did not succeed, skipping rollback",
+                        step.plan_step_title
+                    ));
+                    continue;
+                }
+                // Try to reverse the command
+                let cmd = step.command_text.as_deref().unwrap_or("");
+                if cmd.is_empty() {
+                    results.push(format!(
+                        "  SKIP {}: no command to reverse",
+                        step.plan_step_title
+                    ));
+                    continue;
+                }
+                // Simple heuristic: for service restarts, start the service back
+                let reverse_cmd = if cmd.contains("systemctl stop") {
+                    Some(cmd.replace("systemctl stop", "systemctl start"))
+                } else if cmd.contains("systemctl disable") {
+                    Some(cmd.replace("systemctl disable", "systemctl enable"))
+                } else if cmd.contains("rm ") {
+                    eprintln!("  WARN: cannot reverse deletion: {cmd}");
+                    None
+                } else {
+                    None
+                };
+                if let Some(reverse) = reverse_cmd {
+                    eprintln!("  Running rollback: {reverse}");
+                    let output = tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&reverse)
+                        .output()
+                        .await;
+                    match output {
+                        Ok(out) if out.status.success() => {
+                            results.push(format!(
+                                "  OK   {}: rollback succeeded",
+                                step.plan_step_title
+                            ));
+                        }
+                        Ok(out) => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            results.push(format!(
+                                "  FAIL {}: rollback failed: {stderr}",
+                                step.plan_step_title
+                            ));
+                        }
+                        Err(e) => {
+                            results.push(format!(
+                                "  FAIL {}: rollback error: {e}",
+                                step.plan_step_title
+                            ));
+                        }
+                    }
+                } else {
+                    results.push(format!(
+                        "  SKIP {}: no rollback available for this step",
+                        step.plan_step_title
+                    ));
+                }
+            }
+
+            let _ = ChangeSetStore::update_status(&conn, &id, "rolled_back");
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                for r in &results {
+                    println!("{r}");
+                }
+                println!("\nChange set {id} marked as rolled_back.");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! SQLite-backed episode memory store for HELM.
 
+pub mod changesets;
 pub mod episodes;
 pub mod formal_skill;
 pub mod graph;
@@ -11,6 +12,10 @@ pub mod skills;
 pub mod snapshots;
 pub mod user_profile;
 
+pub use changesets::{
+    ChangeSetBackupRecord, ChangeSetRecord, ChangeSetStepRecord, ChangeSetStore, FullChangeSet,
+    TroubleshootingPlanRecord, TroubleshootingPlanStore,
+};
 pub use episodes::{
     AuditEventInput, AuditEventRecord, AuditVerification, CapabilityGrantRecord, EpisodeId,
     EpisodeOutcome, EpisodeOutcomeCounts, EpisodeRecord, MemoryStore, RoutingStat, StepRecord,
