@@ -487,6 +487,7 @@ enum CommandAction {
     Diagnose,
     Evidence,
     ApplyPlan,
+    Dashboard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -590,6 +591,7 @@ impl CommandAction {
             Self::Diagnose,
             Self::Evidence,
             Self::ApplyPlan,
+            Self::Dashboard,
         ]
     }
 
@@ -625,6 +627,7 @@ impl CommandAction {
             Self::Diagnose => "Diagnose Mode",
             Self::Evidence => "Evidence Report",
             Self::ApplyPlan => "Execute Plan",
+            Self::Dashboard => "Dashboard",
         }
     }
 
@@ -660,6 +663,7 @@ impl CommandAction {
             Self::Diagnose => "diagnose",
             Self::Evidence => "evidence",
             Self::ApplyPlan => "apply-plan",
+            Self::Dashboard => "dashboard",
         }
     }
 
@@ -695,6 +699,7 @@ impl CommandAction {
             Self::Diagnose => "switch to diagnose mode (read-only, limited tools)",
             Self::Evidence => "show evidence report for last tool call",
             Self::ApplyPlan => "execute a troubleshooting plan with step approval",
+            Self::Dashboard => "switch to monitoring dashboard",
         }
     }
 
@@ -730,6 +735,7 @@ impl CommandAction {
             Self::Diagnose => slug == "diagnose",
             Self::Evidence => slug == "evidence",
             Self::ApplyPlan => slug == "apply-plan",
+            Self::Dashboard => matches!(slug, "dashboard" | "monitor"),
         }
     }
 
@@ -746,6 +752,7 @@ pub enum AgentMode {
     Plan,
     AutoAccept,
     Diagnose,
+    Dashboard,
 }
 
 impl AgentMode {
@@ -754,7 +761,8 @@ impl AgentMode {
             Self::Chat => Self::Plan,
             Self::Plan => Self::AutoAccept,
             Self::AutoAccept => Self::Diagnose,
-            Self::Diagnose => Self::Chat,
+            Self::Diagnose => Self::Dashboard,
+            Self::Dashboard => Self::Chat,
         }
     }
 
@@ -764,6 +772,89 @@ impl AgentMode {
             Self::Plan => "Plan",
             Self::AutoAccept => "Auto-Accept",
             Self::Diagnose => "Diagnose",
+            Self::Dashboard => "Dashboard",
+        }
+    }
+}
+
+// ── Dashboard types ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashPanel {
+    Health,
+    Findings,
+    Services,
+    Containers,
+    Disk,
+    Ports,
+    Logs,
+    Backups,
+    Plans,
+}
+
+impl DashPanel {
+    fn all() -> &'static [Self] {
+        &[
+            Self::Health,
+            Self::Findings,
+            Self::Services,
+            Self::Containers,
+            Self::Disk,
+            Self::Ports,
+            Self::Logs,
+            Self::Backups,
+            Self::Plans,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Health => "Health",
+            Self::Findings => "Findings",
+            Self::Services => "Services",
+            Self::Containers => "Containers",
+            Self::Disk => "Disk",
+            Self::Ports => "Ports",
+            Self::Logs => "Logs",
+            Self::Backups => "Backups",
+            Self::Plans => "Plans",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DashboardData {
+    hostname: String,
+    load_1m: f64,
+    load_5m: f64,
+    load_15m: f64,
+    memory_used_pct: f64,
+    disk_entries: Vec<String>,
+    total_services: usize,
+    failed_services: usize,
+    total_containers: usize,
+    running_containers: usize,
+    listening_ports: usize,
+    last_log_errors: u64,
+    backup_count: usize,
+    finding_count: usize,
+    finding_warnings: usize,
+    collected_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct DashboardState {
+    data: DashboardData,
+    selected: DashPanel,
+    error: Option<String>,
+}
+
+impl DashboardState {
+    fn new() -> Self {
+        Self {
+            data: DashboardData::default(),
+            selected: DashPanel::Health,
+            error: None,
         }
     }
 }
@@ -804,6 +895,7 @@ pub struct TuiApp {
     resume_context: Option<String>,
     #[allow(dead_code)]
     theme: Theme,
+    dashboard: DashboardState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -914,6 +1006,7 @@ impl TuiApp {
             session_tokens_out: 0,
             resume_context: None,
             theme: Theme::default(),
+            dashboard: DashboardState::new(),
         }
     }
 
@@ -1216,10 +1309,58 @@ impl TuiApp {
                 self.session.transcript_scroll =
                     self.session.transcript_scroll.saturating_sub(step.max(1));
             }
-            KeyCode::Tab => self.focus = PanelFocus::Input,
+            KeyCode::Tab => {
+                if self.mode == AgentMode::Dashboard {
+                    let panels = DashPanel::all();
+                    let next = (self.dashboard.selected as usize + 1) % panels.len();
+                    self.dashboard.selected = panels[next];
+                } else {
+                    self.focus = PanelFocus::Input
+                }
+            }
             KeyCode::BackTab => {
-                self.mode = self.mode.next();
-                self.toast(format!("Mode changed to {}", self.mode.as_str()));
+                if self.mode == AgentMode::Dashboard {
+                    let panels = DashPanel::all();
+                    let prev = (self.dashboard.selected as usize + panels.len() - 1) % panels.len();
+                    self.dashboard.selected = panels[prev];
+                } else {
+                    self.mode = self.mode.next();
+                    self.toast(format!("Mode changed to {}", self.mode.as_str()));
+                }
+            }
+            KeyCode::Enter if self.mode == AgentMode::Dashboard => {
+                let panel = self.dashboard.selected;
+                match panel {
+                    DashPanel::Findings => {
+                        self.push_chat(MessageRole::System, "[dashboard] Finding details: run `helm monitor` or `helm explain <id>`");
+                    }
+                    DashPanel::Plans => {
+                        let plans = crate::default_db_path()
+                            .ok()
+                            .and_then(|p| rusqlite::Connection::open(p).ok())
+                            .and_then(|conn| {
+                                helm_memory::TroubleshootingPlanStore::list(&conn, 10).ok()
+                            });
+                        if let Some(list) = plans {
+                            if list.is_empty() {
+                                self.push_chat(
+                                    MessageRole::System,
+                                    "[dashboard] No saved plans. Run `helm troubleshoot` first.",
+                                );
+                            } else {
+                                let mut msg = String::from("[dashboard] Saved plans:\n");
+                                for p in &list {
+                                    msg.push_str(&format!("  {} | {}\n", p.id, p.source));
+                                }
+                                msg.push_str("\nUse `/apply-plan <id>` to execute a plan.");
+                                self.push_chat(MessageRole::System, msg);
+                            }
+                        }
+                    }
+                    _ => {
+                        self.push_chat(MessageRole::System, format!("[dashboard] {} panel: use `helm snapshot` or `helm monitor` for full details.", panel.label()));
+                    }
+                }
             }
             KeyCode::Esc => self.focus = PanelFocus::Input,
             _ => {}
@@ -2682,6 +2823,11 @@ Report the exit status and the concise output."
                     "Usage: /apply-plan <plan_id>\n  Apply a troubleshooting plan with step-by-step approval.",
                 );
             }
+            CommandAction::Dashboard => {
+                self.mode = AgentMode::Dashboard;
+                self.refresh_dashboard();
+                self.toast("Dashboard mode");
+            }
         }
     }
 
@@ -3222,6 +3368,105 @@ Report the exit status and the concise output."
         });
     }
 
+    /// Reload dashboard data from the latest snapshot.
+    fn refresh_dashboard(&mut self) {
+        use helm_memory::SnapshotStore;
+        use helm_monitor::SnapshotDomains;
+
+        let db_path = match crate::default_db_path() {
+            Ok(p) => p,
+            Err(e) => {
+                self.dashboard.error = Some(format!("db error: {e}"));
+                return;
+            }
+        };
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.dashboard.error = Some(format!("db open: {e}"));
+                return;
+            }
+        };
+        let record = match SnapshotStore::latest(&conn) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                self.dashboard.error =
+                    Some("no snapshots yet. Run `helm snapshot` or `helm monitor` first.".into());
+                return;
+            }
+            Err(e) => {
+                self.dashboard.error = Some(format!("snapshot error: {e}"));
+                return;
+            }
+        };
+        let domains: SnapshotDomains =
+            serde_json::from_str(&record.domains_json).unwrap_or_default();
+
+        let hostname = record.host_hostname;
+        let load = &domains.load;
+        let mem = &load.memory;
+        let memory_used_pct = if mem.total > 0 {
+            mem.used as f64 / mem.total as f64 * 100.0
+        } else {
+            0.0
+        };
+        let disk_entries: Vec<String> = domains
+            .disks
+            .filesystems
+            .iter()
+            .map(|fs| {
+                let pct = if fs.total_bytes > 0 {
+                    fs.used_bytes as f64 / fs.total_bytes as f64 * 100.0
+                } else {
+                    0.0
+                };
+                format!("{} {:.0}%", fs.mount_point, pct)
+            })
+            .collect();
+        let total_services = domains.services.units.len();
+        let failed_services = domains.services.failed_units.len();
+        let total_containers = domains.containers.containers.len();
+        let running_containers = domains
+            .containers
+            .containers
+            .iter()
+            .filter(|c| c.status == "running")
+            .count();
+        let listening_ports = domains.ports.listeners.len();
+        let last_log_errors = domains.logs.journal_errors_last_hour;
+        let backup_count = domains.backups.tools_detected.len();
+        let findings: Vec<serde_json::Value> =
+            serde_json::from_str(&record.findings_json).unwrap_or_default();
+        let finding_count = findings.len();
+        let finding_warnings = findings
+            .iter()
+            .filter(|f| f["severity"].as_str() == Some("warning"))
+            .count();
+        let collected_at = chrono::DateTime::from_timestamp(record.collected_at, 0)
+            .map(|dt| dt.format("%H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "unknown".into());
+
+        self.dashboard.data = DashboardData {
+            hostname,
+            load_1m: load.load_average.one,
+            load_5m: load.load_average.five,
+            load_15m: load.load_average.fifteen,
+            memory_used_pct,
+            disk_entries,
+            total_services,
+            failed_services,
+            total_containers,
+            running_containers,
+            listening_ports,
+            last_log_errors,
+            backup_count,
+            finding_count,
+            finding_warnings,
+            collected_at,
+        };
+        self.dashboard.error = None;
+    }
+
     fn open_cost_meter(&mut self) {
         let memory = Arc::clone(&self.runtime.memory);
         let (tokens_in, tokens_out) = tokio::task::block_in_place(|| {
@@ -3390,7 +3635,11 @@ fn render_app(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .split(main_area);
 
     render_status(app, vertical[0], buf);
-    render_chat(app, vertical[1], buf);
+    if app.mode == AgentMode::Dashboard {
+        render_dashboard(app, vertical[1], buf);
+    } else {
+        render_chat(app, vertical[1], buf);
+    }
     render_input(app, vertical[2], buf);
     render_footer(app, vertical[3], buf);
 
@@ -3453,6 +3702,151 @@ fn render_sidebar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     list.render(inner, buf);
 }
 
+/// Render the monitoring dashboard with compact system panels.
+fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    if area.width < 40 || area.height < 10 {
+        Paragraph::new("Dashboard needs a larger terminal")
+            .style(Style::default().fg(DIM_FG))
+            .render(area, buf);
+        return;
+    }
+
+    if let Some(error) = &app.dashboard.error {
+        Paragraph::new(error.as_str())
+            .style(Style::default().fg(ERROR_FG))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Dashboard ")
+                    .border_style(Style::default().fg(HEADER_BORDER)),
+            )
+            .render(area, buf);
+        return;
+    }
+
+    let d = &app.dashboard.data;
+    let sel = app.dashboard.selected;
+    let panels = DashPanel::all();
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(area);
+
+    for (col, col_area) in cols.iter().enumerate() {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+            ])
+            .split(*col_area);
+
+        for (row, row_area) in rows.iter().enumerate() {
+            let idx = col * 3 + row;
+            if idx >= panels.len() {
+                continue;
+            }
+            let panel = panels[idx];
+            let is_sel = panel == sel;
+            let text = render_dash_panel(panel, d);
+            let title_style = if is_sel {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(DIM_FG)
+            };
+            let border_style = if is_sel {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(HEADER_BORDER)
+            };
+            let block = Block::default()
+                .title(Span::styled(format!(" {} ", panel.label()), title_style))
+                .borders(Borders::ALL)
+                .border_style(border_style);
+            Paragraph::new(text)
+                .block(block)
+                .style(Style::default().fg(APP_FG).bg(APP_BG))
+                .render(*row_area, buf);
+        }
+    }
+}
+
+fn render_dash_panel(panel: DashPanel, d: &DashboardData) -> String {
+    match panel {
+        DashPanel::Health => {
+            format!(
+                "Host: {}\nCollected: {}\n\nLoad:  {:.1} {:.1} {:.1}\nMemory: {:.0}%",
+                d.hostname, d.collected_at, d.load_1m, d.load_5m, d.load_15m, d.memory_used_pct
+            )
+        }
+        DashPanel::Findings => {
+            let mut out = format!(
+                "Total: {}\nWarnings: {}",
+                d.finding_count, d.finding_warnings
+            );
+            if d.finding_count > 0 {
+                out.push_str("\n\n> Enter to view");
+            }
+            out
+        }
+        DashPanel::Services => {
+            let mut out = format!("Total: {}", d.total_services);
+            if d.failed_services > 0 {
+                out.push_str(&format!("\nFAILED: {}", d.failed_services));
+            } else {
+                out.push_str("\nAll active");
+            }
+            out
+        }
+        DashPanel::Containers => {
+            format!(
+                "Total: {}\nRunning: {}",
+                d.total_containers, d.running_containers
+            )
+        }
+        DashPanel::Disk => {
+            let mut out = String::new();
+            for entry in d.disk_entries.iter().take(4) {
+                out.push_str(entry);
+                out.push('\n');
+            }
+            if d.disk_entries.len() > 4 {
+                out.push_str(&format!("... {} more", d.disk_entries.len() - 4));
+            }
+            out
+        }
+        DashPanel::Ports => {
+            format!("Listening: {}", d.listening_ports)
+        }
+        DashPanel::Logs => {
+            format!("Errors (1h): {}", d.last_log_errors)
+        }
+        DashPanel::Backups => {
+            format!("Tools: {}", d.backup_count)
+        }
+        DashPanel::Plans => {
+            let count = crate::default_db_path()
+                .ok()
+                .and_then(|p| rusqlite::Connection::open(p).ok())
+                .and_then(|conn| {
+                    helm_memory::TroubleshootingPlanStore::list(&conn, 100)
+                        .ok()
+                        .map(|plans| plans.len())
+                })
+                .unwrap_or(0);
+            format!("Saved plans: {count}\n\n> Enter to view")
+        }
+    }
+}
+
 fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -3484,6 +3878,10 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         AgentMode::Diagnose => Style::default()
             .fg(Color::White)
             .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+        AgentMode::Dashboard => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(80, 200, 120))
             .add_modifier(Modifier::BOLD),
     };
     let mut line = Line::from(vec![
@@ -3727,6 +4125,7 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             AgentMode::Plan => "Plan an approach (no writes yet)...",
             AgentMode::AutoAccept => "Run with auto-approved tools...",
             AgentMode::Chat => "Ask HELM to do something...",
+            AgentMode::Dashboard => "Dashboard — type a task or /command",
         };
         vec![Line::from(vec![
             Span::styled(
@@ -3768,12 +4167,14 @@ fn render_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
         AgentMode::Plan => "PLAN",
         AgentMode::AutoAccept => "AUTO",
         AgentMode::Diagnose => "DIAGNOSE",
+        AgentMode::Dashboard => "DASHBOARD",
     };
     let mode_hint = match _app.mode {
         AgentMode::Chat => "Shift+Tab -> Plan",
         AgentMode::Plan => "READ-ONLY | Shift+Tab -> Auto",
         AgentMode::AutoAccept => "AUTO-ACCEPT | Shift+Tab -> Diagnose",
-        AgentMode::Diagnose => "DIAGNOSE | Shift+Tab -> Chat",
+        AgentMode::Diagnose => "DIAGNOSE | Shift+Tab -> Dashboard",
+        AgentMode::Dashboard => "DASHBOARD | Shift+Tab -> Chat",
     };
     let line = Line::from(vec![
         Span::styled(
@@ -5728,5 +6129,98 @@ mod tests {
             assert!(entries.iter().any(|entry| entry.model == "llama3.3:70b"));
             mock.assert_async().await;
         });
+    }
+
+    // ── Dashboard tests ────────────────────────────────────────────────
+
+    #[test]
+    fn dash_panel_all_returns_nine_panels() {
+        assert_eq!(DashPanel::all().len(), 9);
+    }
+
+    #[test]
+    fn dash_panel_labels_are_non_empty() {
+        for panel in DashPanel::all() {
+            assert!(!panel.label().is_empty(), "panel label should not be empty");
+        }
+    }
+
+    #[test]
+    fn dash_panel_cycle_forward_and_back() {
+        let panels = DashPanel::all();
+        let mut idx = 0usize;
+        // forward
+        idx = (idx + 1) % panels.len();
+        assert_eq!(panels[idx], DashPanel::Findings);
+        // backward
+        idx = (idx + panels.len() - 1) % panels.len();
+        assert_eq!(panels[idx], DashPanel::Health);
+    }
+
+    #[test]
+    fn dashboard_state_initializes_clean() {
+        let state = DashboardState::new();
+        assert_eq!(state.selected, DashPanel::Health);
+        assert!(state.error.is_none());
+        assert_eq!(state.data.hostname, "");
+    }
+
+    #[test]
+    fn dashboard_data_defaults_are_zero() {
+        let d = DashboardData::default();
+        assert_eq!(d.load_1m, 0.0);
+        assert_eq!(d.total_services, 0);
+        assert_eq!(d.finding_count, 0);
+    }
+
+    #[test]
+    fn render_dash_panel_health_shows_percent() {
+        let mut d = DashboardData::default();
+        d.hostname = "testbox".into();
+        d.memory_used_pct = 42.5;
+        d.load_1m = 1.5;
+        let text = render_dash_panel(DashPanel::Health, &d);
+        assert!(text.contains("testbox"), "health panel should show hostname");
+        assert!(text.contains("42"), "health panel should show memory %");
+        assert!(text.contains("1.5"), "health panel should show load");
+    }
+
+    #[test]
+    fn render_dash_panel_findings_shows_count() {
+        let mut d = DashboardData::default();
+        d.finding_count = 3;
+        d.finding_warnings = 1;
+        let text = render_dash_panel(DashPanel::Findings, &d);
+        assert!(text.contains("3"), "findings panel should show total");
+        assert!(text.contains("1"), "findings panel should show warning count");
+    }
+
+    #[test]
+    fn render_dash_panel_services_shows_failed() {
+        let mut d = DashboardData::default();
+        d.total_services = 10;
+        d.failed_services = 2;
+        let text = render_dash_panel(DashPanel::Services, &d);
+        assert!(text.contains("FAILED: 2"), "services panel should show failed count");
+    }
+
+    #[test]
+    fn render_dash_panel_disk_shows_entries() {
+        let mut d = DashboardData::default();
+        d.disk_entries.push("/ 45%".into());
+        d.disk_entries.push("/home 12%".into());
+        let text = render_dash_panel(DashPanel::Disk, &d);
+        assert!(text.contains("45%"), "disk panel should show usage");
+        assert!(text.contains("/home"), "disk panel should show mount");
+    }
+
+    #[test]
+    fn render_dash_panel_containers_shows_counts() {
+        let mut d = DashboardData::default();
+        d.total_containers = 5;
+        d.running_containers = 3;
+        let text = render_dash_panel(DashPanel::Containers, &d);
+        assert!(text.contains("Total: 5"), "containers panel should show total");
+        assert!(text.contains("Running: 3"), "containers panel should show running");
     }
 }
