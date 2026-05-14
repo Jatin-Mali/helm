@@ -39,8 +39,9 @@ use helm_memory::{
     SnapshotStore, SnapshotStoreRecord, StepRecord, UserProfileStore,
 };
 use helm_monitor::{
-    HostIdentity, MonitorDomain, MonitorProfile, MonitorReport, MonitorReporter, SnapshotDomains,
-    SystemSnapshot, collect_snapshot, explain_finding, plan_from_finding, plan_from_problem,
+    Finding, HostIdentity, MonitorDomain, MonitorProfile, MonitorReport, MonitorReporter,
+    SnapshotDomains, SystemSnapshot, collect_snapshot, explain_finding, plan_from_finding,
+    plan_from_problem,
 };
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
@@ -5185,29 +5186,32 @@ async fn run_monitor_cycle(
 }
 
 async fn run_troubleshoot_command(args: TroubleshootArgs) -> Result<()> {
-    let db_path = default_db_path()?;
-    let conn = rusqlite::Connection::open(&db_path)
-        .with_context(|| format!("failed to open db at {}", db_path.display()))?;
-
     let plan = if let Some(finding_id) = &args.from_finding {
         let mut found = false;
         let mut result = plan_from_problem(&args.problem).await;
-        if let Ok(Some(finding_record)) = SnapshotStore::latest(&conn) {
-            let d: SnapshotDomains =
-                serde_json::from_str(&finding_record.domains_json).unwrap_or_default();
-            let snapshot = reconstruct_snapshot(&finding_record, d);
-
-            // Run detectors to find matching finding
-            let reporter = MonitorReporter::new();
-            let all_findings = reporter.registry.detect(&snapshot, None, None);
-            if let Some(matched) = all_findings.into_iter().find(|f| f.id == *finding_id) {
-                result = plan_from_finding(&matched).await;
+        let db_path = default_db_path()?;
+        let conn = rusqlite::Connection::open(&db_path).ok();
+        if let Some(conn) = conn {
+            // Search all persisted findings first
+            if let Some(finding) = find_finding_by_id(&conn, finding_id) {
+                result = plan_from_finding(&finding).await;
                 found = true;
+            } else if let Ok(Some(finding_record)) = SnapshotStore::latest(&conn) {
+                // Fallback: reconstruct from latest snapshot
+                let d: SnapshotDomains =
+                    serde_json::from_str(&finding_record.domains_json).unwrap_or_default();
+                let snapshot = reconstruct_snapshot(&finding_record, d);
+                let reporter = MonitorReporter::new();
+                let all_findings = reporter.registry.detect(&snapshot, None, None);
+                if let Some(matched) = all_findings.into_iter().find(|f| f.id == *finding_id) {
+                    result = plan_from_finding(&matched).await;
+                    found = true;
+                }
             }
         }
         if !found {
             eprintln!(
-                "Finding '{}' not found in latest snapshot. Starting from problem description.",
+                "Finding '{}' not found in any snapshot. Starting from problem description.",
                 finding_id
             );
         }
@@ -5244,27 +5248,47 @@ fn reconstruct_snapshot(record: &SnapshotStoreRecord, domains: SnapshotDomains) 
     }
 }
 
+/// Search all stored snapshots for a finding by ID. Returns the first match from any snapshot.
+fn find_finding_by_id(conn: &rusqlite::Connection, finding_id: &str) -> Option<Finding> {
+    let records = SnapshotStore::list(conn, 100).ok()?;
+    for record in &records {
+        if let Ok(findings) = serde_json::from_str::<Vec<Finding>>(&record.findings_json) {
+            if let Some(f) = findings.into_iter().find(|f| f.id == finding_id) {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
 async fn run_explain_command(args: ExplainArgs) -> Result<()> {
     let finding_id = &args.finding_id;
     let mut output = String::new();
     output.push_str(&format!("Explanation for finding: {finding_id}\n"));
-    output.push_str("To examine this finding, run a monitor cycle targeting its domain:\n");
-    output.push_str("  $ helm monitor\n\n");
 
     let db_path = default_db_path()?;
     let conn = rusqlite::Connection::open(&db_path).ok();
     if let Some(conn) = conn {
-        if let Ok(Some(record)) = SnapshotStore::latest(&conn) {
-            let d: SnapshotDomains = serde_json::from_str(&record.domains_json).unwrap_or_default();
-            let snapshot = reconstruct_snapshot(&record, d);
-            let reporter = MonitorReporter::new();
-            let findings = reporter.registry.detect(&snapshot, None, None);
-            let matched: Vec<_> = findings
-                .into_iter()
-                .filter(|f| f.id == *finding_id)
-                .collect();
-            if !matched.is_empty() {
-                output.push_str(&explain_finding(&matched[0]));
+        // Search all persisted findings first (durable path)
+        if let Some(finding) = find_finding_by_id(&conn, finding_id) {
+            output.push_str(&explain_finding(&finding));
+        } else {
+            // Fallback: reconstruct from latest snapshot
+            output
+                .push_str("Finding not found in persisted reports. Scanning latest snapshot...\n");
+            if let Ok(Some(record)) = SnapshotStore::latest(&conn) {
+                let d: SnapshotDomains =
+                    serde_json::from_str(&record.domains_json).unwrap_or_default();
+                let snapshot = reconstruct_snapshot(&record, d);
+                let reporter = MonitorReporter::new();
+                let findings = reporter.registry.detect(&snapshot, None, None);
+                if let Some(f) = findings.into_iter().find(|f| f.id == *finding_id) {
+                    output.push_str(&explain_finding(&f));
+                } else {
+                    output.push_str("Finding ID not found in any stored snapshot.\n");
+                }
+            } else {
+                output.push_str("No snapshots available to search.\n");
             }
         }
     }

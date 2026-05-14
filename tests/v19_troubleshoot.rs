@@ -1,12 +1,25 @@
 //! v1.9 Guided Troubleshooting — comprehensive test suite.
 
+use helm_monitor::snapshot::FilesystemEntry;
 use helm_monitor::{
     BlastRadius, CommandPreview, Hypothesis, PlanSource, RiskLevel, RollbackStatus,
     TroubleshootingPlan, explain_finding,
     findings::{Confidence, Finding, Severity},
     plan_from_problem, plan_from_problem_with_snapshot,
-    snapshot::{FilesystemEntry, HostIdentity, MonitorProfile, SnapshotDomains, SystemSnapshot},
+    snapshot::{HostIdentity, MonitorProfile, SnapshotDomains, SystemSnapshot},
 };
+
+fn base_snapshot() -> SystemSnapshot {
+    SystemSnapshot {
+        id: "base".into(),
+        host: HostIdentity::default(),
+        collected_at: chrono::Utc::now(),
+        profile: MonitorProfile::Standard,
+        domains: SnapshotDomains::default(),
+        collector_errors: vec![],
+        redaction_version: "0.1.0".into(),
+    }
+}
 
 #[allow(dead_code)]
 fn empty_snapshot() -> SystemSnapshot {
@@ -415,4 +428,166 @@ fn e2e_fixture_plan_from_finding_has_hypotheses() {
         !plan.read_only_steps.is_empty(),
         "finding checks should become plan steps"
     );
+}
+
+// ── Finding persistence across snapshots ────────────────────────────────
+
+#[test]
+fn findings_persisted_in_snapshot_can_be_retrieved_by_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("findings-test.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS snapshots (
+            id TEXT PRIMARY KEY,
+            host_hostname TEXT NOT NULL DEFAULT 'unknown',
+            collected_at INTEGER NOT NULL,
+            profile TEXT NOT NULL DEFAULT 'standard',
+            domains_json TEXT NOT NULL DEFAULT '{}',
+            collector_errors_json TEXT NOT NULL DEFAULT '[]',
+            findings_json TEXT NOT NULL DEFAULT '[]'
+        )",
+    )
+    .unwrap();
+
+    // Create two snapshots with different findings
+    let mut snap1 = base_snapshot();
+    snap1.id = "snap-1".into();
+    snap1.collected_at = chrono::DateTime::from_timestamp(100_000, 0).unwrap();
+
+    let f1 = Finding::new(
+        "snap-1",
+        "disk-usage",
+        "/",
+        "Root fs 95% full",
+        Severity::Warning,
+        Confidence::High,
+        helm_monitor::MonitorDomain::Disks,
+    );
+    let findings1 = serde_json::to_string(&vec![f1.clone()]).unwrap();
+    let json1 = serde_json::to_string(&snap1).unwrap();
+
+    helm_memory::SnapshotStore::insert(&conn, &json1, &findings1).unwrap();
+
+    // Second snapshot with different finding
+    let mut snap2 = base_snapshot();
+    snap2.id = "snap-2".into();
+    snap2.collected_at = chrono::DateTime::from_timestamp(200_000, 0).unwrap();
+
+    let f2 = Finding::new(
+        "snap-2",
+        "failed-services",
+        "nginx",
+        "nginx service failed",
+        Severity::Warning,
+        Confidence::High,
+        helm_monitor::MonitorDomain::Services,
+    );
+    let findings2 = serde_json::to_string(&vec![f2.clone()]).unwrap();
+    let json2 = serde_json::to_string(&snap2).unwrap();
+
+    helm_memory::SnapshotStore::insert(&conn, &json2, &findings2).unwrap();
+
+    // Verify we can find findings from both snapshots
+    let records = helm_memory::SnapshotStore::list(&conn, 100).unwrap();
+    assert_eq!(records.len(), 2, "both snapshots should be stored");
+
+    // Search for f1 from first snapshot
+    let mut found_f1 = None;
+    for record in &records {
+        if let Ok(parsed) = serde_json::from_str::<Vec<Finding>>(&record.findings_json) {
+            if let Some(f) = parsed.into_iter().find(|f| f.id == f1.id) {
+                found_f1 = Some(f);
+                break;
+            }
+        }
+    }
+    assert!(
+        found_f1.is_some(),
+        "finding f1 should be found across snapshots"
+    );
+    assert_eq!(found_f1.unwrap().title, "Root fs 95% full");
+
+    // Search for f2 from second snapshot (same logic, different snapshot)
+    let mut found_f2 = None;
+    for record in &records {
+        if let Ok(parsed) = serde_json::from_str::<Vec<Finding>>(&record.findings_json) {
+            if let Some(f) = parsed.into_iter().find(|f| f.id == f2.id) {
+                found_f2 = Some(f);
+                break;
+            }
+        }
+    }
+    assert!(
+        found_f2.is_some(),
+        "finding f2 should be found across snapshots"
+    );
+    assert_eq!(
+        found_f2.unwrap().category,
+        helm_monitor::MonitorDomain::Services
+    );
+}
+
+#[test]
+fn explain_finding_works_across_multiple_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("explain-test.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS snapshots (
+            id TEXT PRIMARY KEY,
+            host_hostname TEXT NOT NULL DEFAULT 'unknown',
+            collected_at INTEGER NOT NULL,
+            profile TEXT NOT NULL DEFAULT 'standard',
+            domains_json TEXT NOT NULL DEFAULT '{}',
+            collector_errors_json TEXT NOT NULL DEFAULT '[]',
+            findings_json TEXT NOT NULL DEFAULT '[]'
+        )",
+    )
+    .unwrap();
+
+    // Only store a finding in an OLDER snapshot (not the latest)
+    let mut old_snap = base_snapshot();
+    old_snap.id = "old-snap".into();
+    old_snap.collected_at = chrono::DateTime::from_timestamp(50_000, 0).unwrap();
+
+    let old_finding = Finding::new(
+        "old-snap",
+        "disk-usage",
+        "/data",
+        "Old data disk usage",
+        Severity::Warning,
+        Confidence::Medium,
+        helm_monitor::MonitorDomain::Disks,
+    );
+    let old_findings_json = serde_json::to_string(&vec![old_finding.clone()]).unwrap();
+    let old_json = serde_json::to_string(&old_snap).unwrap();
+    helm_memory::SnapshotStore::insert(&conn, &old_json, &old_findings_json).unwrap();
+
+    // Latest snapshot has no findings
+    let mut new_snap = base_snapshot();
+    new_snap.id = "new-snap".into();
+    new_snap.collected_at = chrono::DateTime::from_timestamp(300_000, 0).unwrap();
+    new_snap.domains.logs.journal_errors_last_hour = 10;
+    let new_json = serde_json::to_string(&new_snap).unwrap();
+    helm_memory::SnapshotStore::insert(&conn, &new_json, "[]").unwrap();
+
+    // Search across all snapshots for the old finding
+    let records = helm_memory::SnapshotStore::list(&conn, 100).unwrap();
+    assert_eq!(records.len(), 2);
+
+    let mut found = None;
+    for record in &records {
+        if let Ok(parsed) = serde_json::from_str::<Vec<Finding>>(&record.findings_json) {
+            if let Some(f) = parsed.into_iter().find(|f| f.id == old_finding.id) {
+                found = Some(f);
+                break;
+            }
+        }
+    }
+    assert!(
+        found.is_some(),
+        "old finding should be found even though latest snapshot has no findings"
+    );
+    assert_eq!(found.unwrap().affected_resource, "/data");
 }
