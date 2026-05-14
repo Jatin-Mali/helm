@@ -34,6 +34,13 @@ The existing codebase already contains a useful foundation:
 - sandbox support
 - hooks, skills, MCP, and custom commands
 
+What is now true in the current product surface:
+
+- `helm` opens the dashboard by default
+- the dashboard is the primary UX, not chat
+- monitor, explain, troubleshoot, and apply are the canonical flow
+- command execution is a drill-down path from findings, not the entry point
+
 What is wrong with the old direction:
 
 - It still smells like "AI with shell access" to the market.
@@ -50,15 +57,15 @@ What is wrong with the old direction:
 HELM should feel like this:
 
 ```text
-helm monitor
-  Collects a local system snapshot:
-  disk health, filesystems, inodes, SMART, services, containers, ports,
-  load, memory, logs, backups, timers, certificates, package updates,
-  firewall exposure, recent changes, and known risks.
+helm
+  Opens a terminal-native dashboard:
+  health, findings, services, containers, disk, ports, logs, backups, plans,
+  provider boundary, and recent system context.
 
-  Outputs:
-  issue list, severity, evidence, likely causes, confidence, missing data,
-  suggested read-only follow-up checks, and safe next commands.
+  From the dashboard:
+  refresh the host state, open a finding, inspect evidence, run a read-only
+  follow-up check, generate a troubleshooting plan, and open the reviewed
+  apply flow.
 ```
 
 ```text
@@ -440,9 +447,12 @@ Verification:
 
 ### v2.1 - Local TUI Monitoring Dashboard
 
+Status: shipped in the current working tree, pending release packaging.
+
 Purpose:
 
 - Make HELM useful as an always-open ops console.
+- Make the dashboard the default entrypoint for the product.
 
 Deliverables:
 
@@ -456,6 +466,8 @@ Deliverables:
   - logs
   - backups
   - plans
+- `helm` opens the dashboard by default
+- `helm tui --mode dashboard|chat|plan|diagnose`
 - keyboard flow:
   - open finding
   - view evidence

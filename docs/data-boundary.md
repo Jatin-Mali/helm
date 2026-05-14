@@ -1,58 +1,91 @@
 # Data Boundary
 
-HELM enforces a strict boundary between external and local data. This prevents injection, exfiltration, and accidental writes.
+HELM enforces a hard boundary between local state, external inputs, and
+approved mutations. Monitoring is useful only if the product is honest about
+what it saw, where that data came from, and when commands leave the machine.
 
-## Taint System
+## Default Boundary
 
-Every piece of data in HELM carries a `TaintLevel`:
+When you run `helm`, you land in the dashboard. That default path is read-only.
+
+Read-only surfaces:
+
+- `helm`
+- `helm snapshot`
+- `helm monitor`
+- `helm diagnose`
+- dashboard refresh, evidence views, and read-only follow-up checks
+
+These flows may inspect system state and call local or remote providers for
+reasoning, but they do not mutate the host.
+
+## Provider Boundary
+
+HELM supports two provider classes:
+
+- **local model**: inference stays on the machine, for example Ollama
+- **API provider**: prompts leave the machine, for example Anthropic, Gemini,
+  Groq, OpenRouter, or Nvidia NIM
+
+The dashboard status bar and `helm trust-report` must always make that boundary
+explicit. Local monitoring data does not imply local inference.
+
+## Taint Boundary
+
+Every piece of data in HELM carries a `TaintLevel`.
 
 | Level | Source | Write Allowed? |
 |-------|--------|----------------|
-| `Local` | User input, local files | Yes |
-| `External` | Browser output, SSH, MCP servers | **No** |
+| `Local` | user input, local files, local collectors | Yes, after approval |
+| `External` | browser output, SSH, MCP, HTTP, remote tools | No direct write escalation |
 
-Taint is propagated through `Tainted<T>`. Operations that mix external and local data produce `External`-tainted results.
+Taint is propagated through `Tainted<T>`. External content cannot silently
+become an approved local mutation.
 
-## Write Gate
+## Mutation Boundary
 
-The capability gate enforces: **`*.write` capabilities are blocked on `TaintLevel::External` tainted inputs.**
+Mutation starts only when the user leaves monitor/troubleshoot flows and opens
+an apply flow.
 
-This means:
-- A browser's HTML output cannot be written to a local file
-- SSH command output cannot seed a package install
-- MCP server responses cannot control service management
+Required before mutation:
 
-## Stripping Taint
+1. a stored finding or explicit user problem
+2. a troubleshooting plan
+3. exact command preview
+4. expected effect on this host
+5. blast radius and rollback note
+6. explicit approval
 
-Taint can only be stripped by explicit user action — approving a permission modal or passing `--yes`. There is no programmatic taint strip. The `Tainted<T>` type has no `into_inner()` — only `map()` and `and_then()` for safe transformation.
+No dashboard surface may hide that transition.
 
-## Diagnose Boundary
+## Protected Local State
 
-In diagnose mode (Level 0), the data boundary is absolute:
-- Only 9 read tools are registered
-- Shell output cannot be redirected to files
-- No tool can modify the filesystem
-- No package installation, service control, or network writes
+HELM local state is sensitive and must stay redacted in persistence and trace
+output:
 
-## Audit Trail
+- `$XDG_CONFIG_HOME/helm/secrets.toml`
+- `$XDG_CONFIG_HOME/helm/.secrets.toml.lock`
+- `$XDG_DATA_HOME/helm/helm.db`
+- `$XDG_DATA_HOME/helm/logs/helm.log`
 
-Every tool call is logged with:
-- Tool name and input schema
-- Taint level at call time
-- Capability gate result
-- Timestamp and session ID
+`fs_read` denies these paths by default.
 
-The audit log is append-only. The HMAC chain must verify from episode 0 to current — any gap or mismatch is reported by `helm trust-report`.
+## Audit Boundary
 
-## Trust Report
+Important state transitions must be auditable:
+
+- snapshot stored
+- findings generated
+- plan rendered
+- approval granted or denied
+- command executed
+- verification result
+
+Use:
 
 ```bash
 helm trust-report
+helm audit verify
 ```
 
-Reports:
-1. **Grants** — active capability grants and their scope (session/permanent)
-2. **Audit** — HMAC chain verification, episode count, last episode timestamp
-3. **Sandbox** — whether Bubblewrap is available and configured
-4. **Diagnose** — current diagnose-mode status, tool allowlist
-5. **Integrity** — binary checksum, config hash
+to inspect boundary-related trust signals.

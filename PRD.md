@@ -110,6 +110,7 @@ HELM's moat:
 Current shipped foundation:
 
 - CLI and TUI
+- dashboard-first default entrypoint
 - provider support
 - local Ollama path
 - read-only diagnose mode
@@ -127,12 +128,13 @@ Current shipped foundation:
 
 Current product gap:
 
-- Monitoring is not yet the main UX.
-- There is no canonical `SystemSnapshot`.
-- There is no detector framework that converts observations into findings.
-- There is no first-class `helm monitor`.
-- Troubleshooting is still prompt-driven instead of finding-driven.
-- Evidence exists, but must become a product-wide contract.
+- Monitoring is now the main UX, but backup confidence, fleet monitoring, and
+  deeper self-hosted integrations are still ahead.
+- The dashboard must remain the default product surface as later features land.
+- Evidence quality, read-only follow-up checks, and command previews must stay
+  ahead of any new automation features.
+- Dashboard and CLI flows must continue to expose the local-vs-API provider
+  boundary clearly.
 
 ## 7. Core Workflows
 
@@ -141,16 +143,16 @@ Current product gap:
 Command:
 
 ```sh
-helm monitor
+helm
 ```
 
 Expected behavior:
 
-- collects a read-only system snapshot
-- prints issues grouped by severity
-- shows evidence for each issue
-- suggests read-only checks
-- suggests optional fix plans without executing them
+- opens the dashboard
+- loads the latest snapshot or asks the user to collect one
+- shows issues grouped by severity
+- shows evidence and drill-down paths for each issue
+- keeps all dashboard actions read-only until the user opens an apply flow
 
 Acceptance criteria:
 

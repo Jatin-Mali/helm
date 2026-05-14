@@ -60,7 +60,11 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, fmt::MakeWriter, prelude::*};
 
 #[derive(Debug, Parser)]
-#[command(name = "helm", version, about = "Self-hosted Linux operations agent")]
+#[command(
+    name = "helm",
+    version,
+    about = "Self-hosted Linux monitoring and troubleshooting assistant"
+)]
 struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     db_path: Option<PathBuf>,
@@ -263,6 +267,18 @@ struct TuiArgs {
     /// Bearer token used when --attach is supplied.
     #[arg(long, value_name = "TOKEN")]
     token: Option<String>,
+    /// Initial TUI mode. Defaults to the monitoring dashboard.
+    #[arg(long, value_enum, default_value_t = TuiMode::Dashboard)]
+    mode: TuiMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TuiMode {
+    Dashboard,
+    Chat,
+    Plan,
+    Diagnose,
+    Auto,
 }
 
 #[derive(Debug, Args)]
@@ -1693,6 +1709,18 @@ async fn run() -> Result<()> {
                     })?;
                 run_attach_session(target, &token).await?;
             } else {
+                let (dashboard_mode, read_only, diagnose_mode, auto_approve) = match args.mode {
+                    TuiMode::Dashboard => (true, false, false, false),
+                    TuiMode::Chat => (false, false, false, false),
+                    TuiMode::Plan => (false, true, false, false),
+                    TuiMode::Diagnose => (false, false, true, false),
+                    TuiMode::Auto => (false, false, false, true),
+                };
+                let dashboard_mode = if cli.read_only || cli.yes {
+                    false
+                } else {
+                    dashboard_mode
+                };
                 tui::run_tui(tui::TuiRuntime {
                     provider_settings,
                     db_path,
@@ -1705,9 +1733,10 @@ async fn run() -> Result<()> {
                         .and_then(|config| config.security.as_ref())
                         .and_then(|security| security.tui_paste_key_modal)
                         .unwrap_or(true),
-                    auto_approve: cli.yes,
-                    read_only: cli.read_only,
-                    diagnose_mode: false,
+                    auto_approve: cli.yes || auto_approve,
+                    read_only: cli.read_only || read_only,
+                    diagnose_mode,
+                    dashboard_mode,
                     sandbox: sandbox.clone(),
                     remote_target: cli.remote.clone(),
                 })
@@ -5194,7 +5223,7 @@ fn resolve_format(args: &MonitorArgs) -> String {
 }
 
 /// Persist the monitor snapshot so the next run can use it as baseline.
-fn persist_monitor_snapshot(
+pub(crate) fn persist_monitor_snapshot(
     conn: &rusqlite::Connection,
     snapshot: &SystemSnapshot,
     findings_json: &str,
@@ -5205,7 +5234,7 @@ fn persist_monitor_snapshot(
     }
 }
 
-fn load_previous_snapshot(conn: &rusqlite::Connection) -> Option<SystemSnapshot> {
+pub(crate) fn load_previous_snapshot(conn: &rusqlite::Connection) -> Option<SystemSnapshot> {
     let record = SnapshotStore::latest(conn).ok().flatten()?;
     let domains: SnapshotDomains = serde_json::from_str(&record.domains_json)
         .ok()
@@ -5232,7 +5261,7 @@ fn format_report(report: &MonitorReport, format: &str) -> String {
     }
 }
 
-async fn run_monitor_cycle(
+pub(crate) async fn run_monitor_cycle(
     profile: MonitorProfile,
     domain_filter: Option<&[MonitorDomain]>,
     previous_snapshot: Option<SystemSnapshot>,
@@ -5333,7 +5362,7 @@ fn reconstruct_snapshot(record: &SnapshotStoreRecord, domains: SnapshotDomains) 
 }
 
 /// Search all stored snapshots for a finding by ID. Returns the first match from any snapshot.
-fn find_finding_by_id(conn: &rusqlite::Connection, finding_id: &str) -> Option<Finding> {
+pub(crate) fn find_finding_by_id(conn: &rusqlite::Connection, finding_id: &str) -> Option<Finding> {
     let records = SnapshotStore::list(conn, 100).ok()?;
     for record in &records {
         if let Ok(findings) = serde_json::from_str::<Vec<Finding>>(&record.findings_json) {
@@ -6140,6 +6169,32 @@ mod tests {
     fn no_args_opens_tui() {
         let parsed = parse_cli_from(["helm"]).unwrap();
         assert!(matches!(parsed.command, super::Command::Tui(_)));
+    }
+
+    #[test]
+    fn tui_defaults_to_dashboard_mode() {
+        let parsed = parse_cli_from(["helm", "tui"]).unwrap();
+        match parsed.command {
+            super::Command::Tui(args) => assert_eq!(args.mode, super::TuiMode::Dashboard),
+            other => panic!("expected tui command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tui_mode_parses_explicit_values() {
+        for (raw, expected) in [
+            ("dashboard", super::TuiMode::Dashboard),
+            ("chat", super::TuiMode::Chat),
+            ("plan", super::TuiMode::Plan),
+            ("diagnose", super::TuiMode::Diagnose),
+            ("auto", super::TuiMode::Auto),
+        ] {
+            let parsed = parse_cli_from(["helm", "tui", "--mode", raw]).unwrap();
+            match parsed.command {
+                super::Command::Tui(args) => assert_eq!(args.mode, expected, "{raw}"),
+                other => panic!("expected tui command, got {other:?}"),
+            }
+        }
     }
 
     #[test]

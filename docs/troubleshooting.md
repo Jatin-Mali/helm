@@ -1,5 +1,16 @@
 # Troubleshooting
 
+## `helm` opens the dashboard and shows no findings
+
+Collect a fresh snapshot:
+
+```sh
+helm monitor
+helm monitor --watch --interval 60s
+```
+
+Inside the dashboard, `F5` refreshes the current monitor snapshot.
+
 ## Installer returns 404
 
 This fork expects release assets from `Jatin-Mali/helm`.
@@ -18,14 +29,33 @@ cd helm
 cargo build --release -p helm-cli
 ./target/release/helm init
 ./target/release/helm doctor
+./target/release/helm
 ```
 
-## The model wrote `$(date)` literally
+## The dashboard says `llm api` and you expected local inference
 
-Use a tool-capable model and prefer shell redirection:
+The status bar reflects provider class, not where the host runs.
+
+- `llm local` means local model inference, usually Ollama
+- `llm api` means prompts leave the machine for provider inference
+
+To switch to local inference:
 
 ```sh
-HELM_MODEL=openai/gpt-oss-20b helm "create /tmp/hello.txt with the output of date and uname -a"
+ollama pull qwen3:4b
+helm init --force --provider ollama --model qwen3:4b
+helm
+```
+
+## A follow-up command is suggested but not executed
+
+That is expected. Dashboard, monitor, diagnose, and troubleshoot flows are
+read-only until you explicitly open an apply flow.
+
+```sh
+helm explain <finding-id>
+helm troubleshoot --from-finding <finding-id>
+helm apply-plan <plan-id>
 ```
 
 ## Groq rate limits
@@ -46,6 +76,7 @@ use the source-build path above. The installer now prints the exact commands.
 ```sh
 ollama pull qwen3:4b
 helm models
+helm
 ```
 
 ## Browser tool missing

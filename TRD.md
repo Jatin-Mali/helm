@@ -348,6 +348,7 @@ Persistence rules:
 
 The TUI must support:
 
+- dashboard-first startup when `helm` is run with no arguments
 - monitor dashboard
 - finding list
 - finding detail view
@@ -362,9 +363,11 @@ Design constraints:
 - dense terminal-first layout
 - no decorative UI
 - clear severity markers
+- every dashboard panel must have a drill-down detail view
 - no overlapping text at small terminal sizes
 - keyboard-first navigation
 - visible local/API boundary
+- dashboard refresh and follow-up checks remain read-only
 
 ## 13. Remote Requirements
 
@@ -446,7 +449,7 @@ rg -n "white-phantom|github.com/helm|helm.sh/install" .
 7. Add troubleshoot planner from findings.
 8. Add command preview and approval flow.
 9. Add change-set execution.
-10. Add TUI monitor dashboard.
+10. Make the TUI dashboard the default product surface.
 11. Add remote read-only monitoring.
 12. Add daemon and notifications.
 

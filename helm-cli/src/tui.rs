@@ -20,7 +20,8 @@ use crossterm::{
 };
 use helm_agent::{AgentEvent, AgentEventSink, Budget, ReactAgent, RunResult, StructuredEvidence};
 use helm_core::{Capability, HelmError, Message};
-use helm_memory::MemoryStore;
+use helm_memory::{ChangeSetRecord, ChangeSetStore, MemoryStore, TroubleshootingPlanRecord};
+use helm_monitor::{CollectorError, Finding, MonitorProfile, SnapshotDomains, plan_from_finding};
 use helm_providers::ChatRequest;
 use helm_tools::ToolRegistry;
 use ratatui::{
@@ -149,6 +150,7 @@ pub(crate) struct TuiRuntime {
     pub(crate) auto_approve: bool,
     pub(crate) read_only: bool,
     pub(crate) diagnose_mode: bool,
+    pub(crate) dashboard_mode: bool,
     pub(crate) sandbox: Option<ResolvedSandbox>,
     pub(crate) remote_target: Option<String>,
 }
@@ -827,10 +829,17 @@ struct FindingSummary {
     id: String,
     severity: String,
     title: String,
+    confidence: String,
     affected_resource: String,
-    pub _snapshot_id: String,
+    snapshot_id: String,
     domain: String,
     evidence_text: String,
+    evidence_sources: Vec<String>,
+    impact: String,
+    assumptions: Vec<String>,
+    missing_data: Vec<String>,
+    read_only_checks: Vec<String>,
+    fix_plan: Option<String>,
     risk: String,
     rollback: String,
     command_preview: String,
@@ -839,6 +848,7 @@ struct FindingSummary {
 #[derive(Debug, Clone, Default)]
 struct DashboardData {
     hostname: String,
+    profile: String,
     load_1m: f64,
     load_5m: f64,
     load_15m: f64,
@@ -855,8 +865,11 @@ struct DashboardData {
     finding_warnings: usize,
     collected_at: String,
     findings: Vec<FindingSummary>,
-    #[allow(dead_code)]
     snapshot_id: String,
+    collector_errors: Vec<String>,
+    domains: SnapshotDomains,
+    plans: Vec<TroubleshootingPlanRecord>,
+    change_sets: Vec<ChangeSetRecord>,
 }
 
 /// Which sub-view the dashboard is showing.
@@ -864,6 +877,8 @@ struct DashboardData {
 enum DashboardView {
     /// 3x3 panel grid
     Overview,
+    /// Detailed view for a non-finding panel.
+    PanelDetail(DashPanel),
     /// Scrollable finding list
     FindingList,
     /// Detail of a single finding (index into DashboardData::findings)
@@ -881,12 +896,22 @@ impl Default for DashboardView {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct DashboardPlan {
+    finding_id: String,
+    plan_id: String,
+    summary: String,
+    read_only_steps: usize,
+    fix_steps: usize,
+}
+
 #[derive(Debug, Clone)]
 struct DashboardState {
     data: DashboardData,
     selected: DashPanel,
     view: DashboardView,
     scroll: usize,
+    active_plan: Option<DashboardPlan>,
     error: Option<String>,
 }
 
@@ -897,6 +922,7 @@ impl DashboardState {
             selected: DashPanel::Health,
             view: DashboardView::Overview,
             scroll: 0,
+            active_plan: None,
             error: None,
         }
     }
@@ -1002,11 +1028,13 @@ impl TuiApp {
             AgentMode::AutoAccept
         } else if runtime.diagnose_mode {
             AgentMode::Diagnose
+        } else if runtime.dashboard_mode {
+            AgentMode::Dashboard
         } else {
             AgentMode::Chat
         };
 
-        Self {
+        let mut app = Self {
             runtime: Arc::new(TuiRuntimeInner {
                 db_path: runtime.db_path,
                 config_path,
@@ -1050,7 +1078,11 @@ impl TuiApp {
             resume_context: None,
             theme: Theme::default(),
             dashboard: DashboardState::new(),
+        };
+        if mode == AgentMode::Dashboard {
+            app.refresh_dashboard();
         }
+        app
     }
 
     async fn run(mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -1058,9 +1090,14 @@ impl TuiApp {
         spawn_input_thread(tx.clone());
         spawn_tick_task(tx.clone());
 
+        let ready = if self.mode == AgentMode::Dashboard {
+            "HELM dashboard ready. Press F5 to collect a fresh monitor snapshot, Enter to drill into panels, or type a task."
+        } else {
+            "HELM ready. Type a task, or Ctrl+P for commands."
+        };
         self.session.chat.push(ChatMessage {
             role: MessageRole::System,
-            text: "HELM ready. Type a task, or Ctrl+P for commands.".to_owned(),
+            text: ready.to_owned(),
         });
 
         loop {
@@ -1295,6 +1332,41 @@ impl TuiApp {
             return Ok(false);
         }
 
+        if self.mode == AgentMode::Dashboard
+            && self.input.text.trim().is_empty()
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            match key.code {
+                KeyCode::Enter
+                    if !key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    self.handle_dashboard_enter(tx.clone()).await?;
+                    return Ok(false);
+                }
+                KeyCode::F(5) => {
+                    self.refresh_dashboard_live().await?;
+                    return Ok(false);
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.refresh_dashboard_live().await?;
+                    return Ok(false);
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.run_dashboard_follow_up(tx.clone()).await?;
+                    return Ok(false);
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.generate_dashboard_plan().await?;
+                    return Ok(false);
+                }
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.apply_dashboard_plan().await?;
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
         if !key.modifiers.contains(KeyModifiers::ALT)
             && !key.modifiers.contains(KeyModifiers::SHIFT)
             && self.key_matches(&key, "send", KeyCode::Enter, KeyModifiers::NONE)
@@ -1353,20 +1425,40 @@ impl TuiApp {
                 let max = self.dashboard.data.findings.len().saturating_sub(1);
                 self.dashboard.scroll = (self.dashboard.scroll + 1).min(max);
             }
+            KeyCode::Up if self.mode == AgentMode::Dashboard => {
+                self.dashboard.scroll = self.dashboard.scroll.saturating_sub(1);
+            }
+            KeyCode::Down if self.mode == AgentMode::Dashboard => {
+                self.dashboard.scroll = self.dashboard.scroll.saturating_add(1);
+            }
             KeyCode::Up => self.input.previous_history(),
             KeyCode::Down => self.input.next_history(),
             KeyCode::PageUp => {
-                let step = usize::from(self.last_chat_height.get().max(6) / 2);
-                self.session.transcript_scroll =
-                    self.session.transcript_scroll.saturating_add(step.max(1));
+                let step = usize::from(self.last_chat_height.get().max(6) / 2).max(1);
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.view != DashboardView::Overview
+                {
+                    self.dashboard.scroll = self.dashboard.scroll.saturating_add(step);
+                } else {
+                    self.session.transcript_scroll =
+                        self.session.transcript_scroll.saturating_add(step);
+                }
             }
             KeyCode::PageDown => {
-                let step = usize::from(self.last_chat_height.get().max(6) / 2);
-                self.session.transcript_scroll =
-                    self.session.transcript_scroll.saturating_sub(step.max(1));
+                let step = usize::from(self.last_chat_height.get().max(6) / 2).max(1);
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.view != DashboardView::Overview
+                {
+                    self.dashboard.scroll = self.dashboard.scroll.saturating_sub(step);
+                } else {
+                    self.session.transcript_scroll =
+                        self.session.transcript_scroll.saturating_sub(step);
+                }
             }
             KeyCode::Tab => {
-                if self.mode == AgentMode::Dashboard {
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.view == DashboardView::Overview
+                {
                     let panels = DashPanel::all();
                     let next = (self.dashboard.selected as usize + 1) % panels.len();
                     self.dashboard.selected = panels[next];
@@ -1375,7 +1467,9 @@ impl TuiApp {
                 }
             }
             KeyCode::BackTab => {
-                if self.mode == AgentMode::Dashboard {
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.view == DashboardView::Overview
+                {
                     let panels = DashPanel::all();
                     let prev = (self.dashboard.selected as usize + panels.len() - 1) % panels.len();
                     self.dashboard.selected = panels[prev];
@@ -1384,67 +1478,27 @@ impl TuiApp {
                     self.toast(format!("Mode changed to {}", self.mode.as_str()));
                 }
             }
-            KeyCode::Enter if self.mode == AgentMode::Dashboard => {
-                match self.dashboard.view {
-                    DashboardView::Overview => match self.dashboard.selected {
-                        DashPanel::Findings => {
+            KeyCode::Esc => {
+                if self.mode == AgentMode::Dashboard {
+                    match self.dashboard.view {
+                        DashboardView::Overview => self.focus = PanelFocus::Input,
+                        DashboardView::PanelDetail(_) | DashboardView::FindingList => {
+                            self.dashboard.view = DashboardView::Overview;
+                            self.dashboard.scroll = 0;
+                        }
+                        DashboardView::FindingDetail(_) => {
                             self.dashboard.view = DashboardView::FindingList;
                             self.dashboard.scroll = 0;
                         }
-                        DashPanel::Plans => {
-                            let plans = crate::default_db_path()
-                                .ok()
-                                .and_then(|p| rusqlite::Connection::open(p).ok())
-                                .and_then(|conn| {
-                                    helm_memory::TroubleshootingPlanStore::list(&conn, 10).ok()
-                                });
-                            if let Some(list) = plans {
-                                if list.is_empty() {
-                                    self.push_chat(MessageRole::System, "[dashboard] No saved plans. Run `helm troubleshoot` first.");
-                                } else {
-                                    let mut msg = String::from("[dashboard] Saved plans:\n");
-                                    for p in &list {
-                                        msg.push_str(&format!("  {} | {}\n", p.id, p.source));
-                                    }
-                                    msg.push_str("\nUse `/apply-plan <id>` to execute a plan.");
-                                    self.push_chat(MessageRole::System, msg);
-                                }
-                            }
-                        }
-                        _ => {
-                            self.push_chat(MessageRole::System, format!(
-                                    "[dashboard] {} panel — run `helm snapshot` or `helm monitor` for full details.",
-                                    self.dashboard.selected.label()
-                                ));
-                        }
-                    },
-                    DashboardView::FindingList => {
-                        let idx = self.dashboard.scroll;
-                        if idx < self.dashboard.data.findings.len() {
+                        DashboardView::EvidenceView(idx) => {
                             self.dashboard.view = DashboardView::FindingDetail(idx);
+                            self.dashboard.scroll = 0;
+                        }
+                        DashboardView::TroubleshootPlan(idx) => {
+                            self.dashboard.view = DashboardView::EvidenceView(idx);
+                            self.dashboard.scroll = 0;
                         }
                     }
-                    DashboardView::FindingDetail(idx) => {
-                        self.dashboard.view = DashboardView::EvidenceView(idx);
-                    }
-                    DashboardView::EvidenceView(idx) => {
-                        self.dashboard.view = DashboardView::TroubleshootPlan(idx);
-                    }
-                    DashboardView::TroubleshootPlan(idx) => {
-                        if let Some(f) = self.dashboard.data.findings.get(idx) {
-                            self.push_chat(MessageRole::System, format!(
-                                "[dashboard] Run `helm explain {}` for a full troubleshoot plan, or `/apply-plan <plan-id>` to execute.",
-                                f.id
-                            ));
-                        }
-                    }
-                }
-            }
-            KeyCode::Esc => {
-                if self.mode == AgentMode::Dashboard
-                    && self.dashboard.view != DashboardView::Overview
-                {
-                    self.dashboard.view = DashboardView::Overview;
                 } else {
                     self.focus = PanelFocus::Input;
                 }
@@ -1948,6 +2002,21 @@ Report the exit status and the concise output."
         self.start_task_internal(agent_task, tx).await
     }
 
+    async fn start_prepared_task_in_mode(
+        &mut self,
+        display_task: String,
+        agent_task: String,
+        tx: mpsc::UnboundedSender<UiEvent>,
+        mode: AgentMode,
+    ) -> Result<()> {
+        if self.running {
+            return Ok(());
+        }
+        self.push_chat(MessageRole::User, display_task);
+        self.start_task_internal_with_mode(agent_task, tx, mode)
+            .await
+    }
+
     async fn start_task(
         &mut self,
         task: String,
@@ -1968,6 +2037,16 @@ Report the exit status and the concise output."
         task: String,
         tx: mpsc::UnboundedSender<UiEvent>,
     ) -> Result<()> {
+        self.start_task_internal_with_mode(task, tx, self.mode)
+            .await
+    }
+
+    async fn start_task_internal_with_mode(
+        &mut self,
+        task: String,
+        tx: mpsc::UnboundedSender<UiEvent>,
+        mode: AgentMode,
+    ) -> Result<()> {
         self.record_tool_event("queued", "agent", "task submitted");
         self.running = true;
         self.task_started = Some(Instant::now());
@@ -1986,7 +2065,6 @@ Report the exit status and the concise output."
         let effective_task = wrap_for_remote(&contextual_task, self.active_remote.as_ref());
         let task_for_event = effective_task.clone();
         let remote_target = self.active_remote.clone();
-        let mode = self.mode;
         self.agent_task = Some(tokio::spawn(async move {
             let result = run_agent_task(
                 runtime,
@@ -3454,10 +3532,190 @@ Report the exit status and the concise output."
         });
     }
 
+    fn dashboard_selected_finding_index(&self) -> Option<usize> {
+        match self.dashboard.view {
+            DashboardView::FindingDetail(idx)
+            | DashboardView::EvidenceView(idx)
+            | DashboardView::TroubleshootPlan(idx) => Some(idx),
+            DashboardView::FindingList => Some(self.dashboard.scroll),
+            _ => None,
+        }
+    }
+
+    async fn handle_dashboard_enter(&mut self, tx: mpsc::UnboundedSender<UiEvent>) -> Result<()> {
+        match self.dashboard.view {
+            DashboardView::Overview => {
+                self.dashboard.scroll = 0;
+                self.dashboard.active_plan = None;
+                self.dashboard.view = match self.dashboard.selected {
+                    DashPanel::Findings => DashboardView::FindingList,
+                    other => DashboardView::PanelDetail(other),
+                };
+            }
+            DashboardView::PanelDetail(DashPanel::Plans) => {
+                if let Some(plan_id) = self
+                    .dashboard
+                    .data
+                    .plans
+                    .first()
+                    .map(|plan| plan.id.clone())
+                {
+                    self.execute_apply_plan_inline(&plan_id);
+                } else {
+                    self.toast("No saved plans yet");
+                }
+            }
+            DashboardView::PanelDetail(_) => {}
+            DashboardView::FindingList => {
+                let idx = self.dashboard.scroll;
+                if idx < self.dashboard.data.findings.len() {
+                    self.dashboard.view = DashboardView::FindingDetail(idx);
+                    self.dashboard.scroll = 0;
+                }
+            }
+            DashboardView::FindingDetail(idx) => {
+                self.dashboard.view = DashboardView::EvidenceView(idx);
+                self.dashboard.scroll = 0;
+            }
+            DashboardView::EvidenceView(_) => {
+                self.generate_dashboard_plan().await?;
+            }
+            DashboardView::TroubleshootPlan(_) => {
+                self.apply_dashboard_plan().await?;
+            }
+        }
+        if matches!(self.dashboard.view, DashboardView::FindingDetail(_))
+            || matches!(self.dashboard.view, DashboardView::EvidenceView(_))
+            || matches!(self.dashboard.view, DashboardView::TroubleshootPlan(_))
+        {
+            self.session.transcript_scroll = 0;
+        }
+        let _ = tx;
+        Ok(())
+    }
+
+    async fn refresh_dashboard_live(&mut self) -> Result<()> {
+        let db_path = default_db_path()?;
+        let conn = rusqlite::Connection::open(&db_path)
+            .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+        self.toast("Refreshing dashboard...");
+        let prev = crate::load_previous_snapshot(&conn);
+        let report = crate::run_monitor_cycle(MonitorProfile::Standard, None, prev).await;
+        let findings_json = serde_json::to_string(&report.findings).unwrap_or_default();
+        crate::persist_monitor_snapshot(&conn, &report.snapshot, &findings_json);
+        self.refresh_dashboard();
+        self.toast(format!(
+            "Dashboard refreshed: {} finding(s) on {}",
+            report.findings.len(),
+            report.snapshot.host.hostname
+        ));
+        Ok(())
+    }
+
+    async fn generate_dashboard_plan(&mut self) -> Result<()> {
+        let Some(idx) = self.dashboard_selected_finding_index() else {
+            self.toast("Select a finding first");
+            return Ok(());
+        };
+        let Some(summary) = self.dashboard.data.findings.get(idx).cloned() else {
+            self.toast("Finding not found");
+            return Ok(());
+        };
+        let db_path = default_db_path()?;
+        let conn = rusqlite::Connection::open(&db_path)
+            .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+        let Some(finding) = crate::find_finding_by_id(&conn, &summary.id) else {
+            self.push_chat(
+                MessageRole::Error,
+                format!("[dashboard] finding `{}` is no longer stored.", summary.id),
+            );
+            return Ok(());
+        };
+        let plan = plan_from_finding(&finding).await;
+        let hypotheses_json = serde_json::to_string(&plan.hypotheses).unwrap_or_default();
+        let read_only_steps_json = serde_json::to_string(&plan.read_only_steps).unwrap_or_default();
+        let proposed_fix_steps_json =
+            serde_json::to_string(&plan.proposed_fix_steps).unwrap_or_default();
+        let source = format!("finding:{}", finding.id);
+        let verdict_summary = helm_core::redact_secrets(&plan.render_text());
+        TroubleshootingPlanStore::insert(
+            &conn,
+            &plan.id,
+            &source,
+            &plan.snapshot_id,
+            &helm_core::redact_secrets(&hypotheses_json),
+            &helm_core::redact_secrets(&read_only_steps_json),
+            &helm_core::redact_secrets(&proposed_fix_steps_json),
+            plan.approval_required,
+            &verdict_summary,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        self.dashboard.active_plan = Some(DashboardPlan {
+            finding_id: finding.id.clone(),
+            plan_id: plan.id.clone(),
+            summary: verdict_summary,
+            read_only_steps: plan.read_only_steps.len(),
+            fix_steps: plan.proposed_fix_steps.len(),
+        });
+        self.dashboard.view = DashboardView::TroubleshootPlan(idx);
+        self.dashboard.scroll = 0;
+        self.refresh_dashboard();
+        self.toast(format!("Generated plan {}", plan.id));
+        Ok(())
+    }
+
+    async fn apply_dashboard_plan(&mut self) -> Result<()> {
+        let Some(idx) = self.dashboard_selected_finding_index() else {
+            self.toast("Select a finding first");
+            return Ok(());
+        };
+        let Some(summary) = self.dashboard.data.findings.get(idx).cloned() else {
+            self.toast("Finding not found");
+            return Ok(());
+        };
+        let plan_id = match &self.dashboard.active_plan {
+            Some(plan) if plan.finding_id == summary.id => plan.plan_id.clone(),
+            _ => {
+                self.generate_dashboard_plan().await?;
+                match &self.dashboard.active_plan {
+                    Some(plan) if plan.finding_id == summary.id => plan.plan_id.clone(),
+                    _ => {
+                        self.toast("Could not prepare plan");
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        self.execute_apply_plan_inline(&plan_id);
+        Ok(())
+    }
+
+    async fn run_dashboard_follow_up(&mut self, tx: mpsc::UnboundedSender<UiEvent>) -> Result<()> {
+        let Some(idx) = self.dashboard_selected_finding_index() else {
+            self.toast("Select a finding first");
+            return Ok(());
+        };
+        let Some(summary) = self.dashboard.data.findings.get(idx) else {
+            self.toast("Finding not found");
+            return Ok(());
+        };
+        let Some(check) = summary.read_only_checks.first() else {
+            self.toast("No read-only follow-up check for this finding");
+            return Ok(());
+        };
+        let display = format!("[follow-up:{}] {}", summary.id, check);
+        let agent_task = format!(
+            "Run this exact read-only follow-up check once using diagnose-safe tools only. \
+Do not modify the system. Then explain what the result means for finding {}.\n\nCommand:\n{}",
+            summary.id, check
+        );
+        self.start_prepared_task_in_mode(display, agent_task, tx, AgentMode::Diagnose)
+            .await
+    }
+
     /// Reload dashboard data from the latest snapshot.
     fn refresh_dashboard(&mut self) {
         use helm_memory::SnapshotStore;
-        use helm_monitor::SnapshotDomains;
 
         let db_path = match crate::default_db_path() {
             Ok(p) => p,
@@ -3477,7 +3735,7 @@ Report the exit status and the concise output."
             Ok(Some(r)) => r,
             Ok(None) => {
                 self.dashboard.error =
-                    Some("no snapshots yet. Run `helm snapshot` or `helm monitor` first.".into());
+                    Some("no snapshots yet. Press F5 to collect a fresh monitor snapshot.".into());
                 return;
             }
             Err(e) => {
@@ -3522,50 +3780,56 @@ Report the exit status and the concise output."
         let listening_ports = domains.ports.listeners.len();
         let last_log_errors = domains.logs.journal_errors_last_hour;
         let backup_count = domains.backups.tools_detected.len();
-        let findings: Vec<serde_json::Value> =
+        let findings: Vec<Finding> =
             serde_json::from_str(&record.findings_json).unwrap_or_default();
         let finding_count = findings.len();
         let finding_warnings = findings
             .iter()
-            .filter(|f| f["severity"].as_str() == Some("warning"))
+            .filter(|f| f.severity.as_str() == "warning")
             .count();
         let finding_summaries: Vec<FindingSummary> = findings
             .iter()
             .map(|f| FindingSummary {
-                id: f["id"].as_str().unwrap_or("?").to_string(),
-                severity: f["severity"].as_str().unwrap_or("unknown").to_string(),
-                title: f["title"].as_str().unwrap_or("?").to_string(),
-                affected_resource: f["affected_resource"].as_str().unwrap_or("?").to_string(),
-                _snapshot_id: f["snapshot_id"]
-                    .as_str()
-                    .unwrap_or(&snapshot_id)
-                    .to_string(),
-                domain: f["category"]
-                    .as_str()
-                    .or_else(|| f["domain"].as_str())
-                    .unwrap_or("?")
-                    .to_string(),
-                evidence_text: f["evidence"]
-                    .as_str()
-                    .or_else(|| f["evidence_ref"].as_str().or_else(|| f["detail"].as_str()))
-                    .unwrap_or("")
-                    .to_string(),
-                risk: f["severity"].as_str().unwrap_or("unknown").to_string(),
-                rollback: f["rollback"]
-                    .as_str()
-                    .unwrap_or("not specified")
-                    .to_string(),
-                command_preview: f["command_preview"]
-                    .as_str()
-                    .or_else(|| {
-                        f["command"]
-                            .as_str()
-                            .or_else(|| f["expected_effect"].as_str())
-                    })
-                    .unwrap_or("")
-                    .to_string(),
+                id: f.id.clone(),
+                severity: f.severity.as_str().to_string(),
+                confidence: f.confidence.as_str().to_string(),
+                title: f.title.clone(),
+                affected_resource: f.affected_resource.clone(),
+                snapshot_id: f.snapshot_id.clone(),
+                domain: f.category.as_str().to_string(),
+                evidence_text: f
+                    .evidence
+                    .iter()
+                    .map(|e| format!("{} = {} — {}", e.source, e.value, e.note))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                evidence_sources: f.evidence.iter().map(|e| e.source.clone()).collect(),
+                impact: f.impact.clone(),
+                assumptions: f.assumptions.clone(),
+                missing_data: f.missing_data.clone(),
+                read_only_checks: f.read_only_checks.clone(),
+                fix_plan: f.fix_plan.clone(),
+                risk: match f.severity.as_str() {
+                    "critical" => "high".to_owned(),
+                    "warning" => "medium".to_owned(),
+                    _ => "low".to_owned(),
+                },
+                rollback: f
+                    .fix_plan
+                    .as_ref()
+                    .map(|_| "review generated plan before apply".to_owned())
+                    .unwrap_or_else(|| "read-only / not applicable".to_owned()),
+                command_preview: f.read_only_checks.join("\n"),
             })
             .collect();
+        let collector_errors =
+            serde_json::from_str::<Vec<CollectorError>>(&record.collector_errors_json)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| format!("{}: {}", e.domain, e.message))
+                .collect::<Vec<_>>();
+        let plans = TroubleshootingPlanStore::list(&conn, 12).unwrap_or_default();
+        let change_sets = ChangeSetStore::list(&conn, 12).unwrap_or_default();
         let collected_at = chrono::DateTime::from_timestamp(record.collected_at, 0)
             .map(|dt| dt.format("%H:%M:%S UTC").to_string())
             .unwrap_or_else(|| "unknown".into());
@@ -3573,6 +3837,7 @@ Report the exit status and the concise output."
         self.dashboard.data = DashboardData {
             hostname,
             snapshot_id,
+            profile: record.profile,
             load_1m: load.load_average.one,
             load_5m: load.load_average.five,
             load_15m: load.load_average.fifteen,
@@ -3589,6 +3854,10 @@ Report the exit status and the concise output."
             finding_warnings,
             findings: finding_summaries,
             collected_at,
+            collector_errors,
+            domains,
+            plans,
+            change_sets,
         };
         self.dashboard.error = None;
     }
@@ -3852,6 +4121,7 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     match app.dashboard.view {
         DashboardView::Overview => render_dash_overview(app, area, buf),
+        DashboardView::PanelDetail(panel) => render_dash_panel_detail(app, panel, area, buf),
         DashboardView::FindingList => render_dash_finding_list(app, area, buf),
         DashboardView::FindingDetail(idx) => render_dash_finding_detail(app, idx, area, buf),
         DashboardView::EvidenceView(idx) => render_dash_evidence_view(app, idx, area, buf),
@@ -3916,6 +4186,341 @@ fn render_dash_overview(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     }
 }
 
+fn render_dash_panel_detail(app: &TuiApp, panel: DashPanel, area: Rect, buf: &mut Buffer) {
+    let title = format!(" {} Detail — Enter/Esc back, F5 refresh ", panel.label());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let text = render_dash_panel_detail_text(app, panel);
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((app.dashboard.scroll as u16, 0))
+        .style(Style::default().fg(APP_FG))
+        .render(inner, buf);
+}
+
+fn render_dash_panel_detail_text(app: &TuiApp, panel: DashPanel) -> String {
+    let d = &app.dashboard.data;
+    let domains = &d.domains;
+    match panel {
+        DashPanel::Health => {
+            let host = &domains.host;
+            let load = &domains.load;
+            let mut out = String::new();
+            let os_name = host.os_pretty_name.as_deref().unwrap_or("unknown");
+            out.push_str(&format!(
+                "Snapshot {}\nCollected {}\nProfile {}\n\n",
+                d.snapshot_id, d.collected_at, d.profile
+            ));
+            out.push_str(&format!(
+                "Host: {}  |  OS: {}  |  Kernel: {} {}  |  Arch: {}\n",
+                host.hostname, os_name, host.kernel_name, host.kernel_release, host.machine
+            ));
+            out.push_str(&format!("Uptime: {} seconds\n\n", host.uptime_seconds));
+            out.push_str(&format!(
+                "Load: {:.2} {:.2} {:.2}\nCPU logical: {}\nMemory used: {:.1}%  |  Swap used: {} / {}\n",
+                load.load_average.one,
+                load.load_average.five,
+                load.load_average.fifteen,
+                load.cpu_logical_count,
+                d.memory_used_pct,
+                load.swap_used,
+                load.swap_total
+            ));
+            if let Some(available) = load.memory.available {
+                out.push_str(&format!("Memory available: {available}\n"));
+            }
+            if let Some(psi) = load.cpu_pressure {
+                out.push_str(&format!(
+                    "CPU PSI: avg10={:?} avg60={:?} avg300={:?}\n",
+                    psi.avg10, psi.avg60, psi.avg300
+                ));
+            }
+            if let Some(psi) = load.memory_pressure {
+                out.push_str(&format!(
+                    "Mem PSI: avg10={:?} avg60={:?} avg300={:?}\n",
+                    psi.avg10, psi.avg60, psi.avg300
+                ));
+            }
+            if let Some(psi) = load.io_pressure {
+                out.push_str(&format!(
+                    "IO PSI:  avg10={:?} avg60={:?} avg300={:?}\n",
+                    psi.avg10, psi.avg60, psi.avg300
+                ));
+            }
+            out.push('\n');
+            out.push_str(&format!(
+                "Packages: manager={} upgradable={:?} security={:?}\n",
+                domains
+                    .packages
+                    .package_manager
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                domains.packages.upgradable_count,
+                domains.packages.security_count
+            ));
+            out.push_str(&format!(
+                "Processes: total={} zombies={}\n",
+                domains.processes.total_count, domains.processes.zombie_count
+            ));
+            for proc in domains.processes.top_by_cpu.iter().take(5) {
+                out.push_str(&format!(
+                    "  CPU {:>5.1}%  MEM {:>5.1}%  pid {:>6}  {}\n",
+                    proc.cpu_percent, proc.mem_percent, proc.pid, proc.command
+                ));
+            }
+            out.push('\n');
+            out.push_str(&format!(
+                "Network: {} interfaces, {} routes, nameservers={}\n",
+                domains.network.interfaces.len(),
+                domains.network.routes.len(),
+                if domains.network.nameservers.is_empty() {
+                    "none".to_owned()
+                } else {
+                    domains.network.nameservers.join(", ")
+                }
+            ));
+            for iface in domains.network.interfaces.iter().take(6) {
+                out.push_str(&format!(
+                    "  {} [{}] {}\n",
+                    iface.name,
+                    iface.state,
+                    iface.addresses.join(", ")
+                ));
+            }
+            out.push('\n');
+            out.push_str(&format!(
+                "Firewall: tool={} ufw={:?} firewalld={:?} rules={:?} default_accept_input={:?}\n",
+                domains.firewall.firewall_tool.as_deref().unwrap_or("none"),
+                domains.firewall.ufw_active,
+                domains.firewall.firewalld_active,
+                domains.firewall.iptables_rule_count,
+                domains.firewall.default_accept_input
+            ));
+            out.push_str(&format!(
+                "Timers: systemd={} cron={}\n",
+                domains.timers.systemd_timers.len(),
+                domains.timers.cron_jobs.len()
+            ));
+            if !d.collector_errors.is_empty() {
+                out.push_str("\nCollector errors:\n");
+                for err in &d.collector_errors {
+                    out.push_str(&format!("  - {err}\n"));
+                }
+            }
+            out
+        }
+        DashPanel::Services => {
+            let mut out = format!(
+                "Services: total={} failed={} timers={}\n\n",
+                d.total_services,
+                d.failed_services,
+                domains.services.timers.len()
+            );
+            if domains.services.failed_units.is_empty() {
+                out.push_str("No failed units.\n");
+            } else {
+                out.push_str("Failed units:\n");
+                for unit in &domains.services.failed_units {
+                    out.push_str(&format!(
+                        "  - {} [{}:{}:{}] {}\n",
+                        unit.name, unit.loaded, unit.active, unit.sub, unit.description
+                    ));
+                }
+            }
+            out.push_str("\nLoaded units (first 20):\n");
+            for unit in domains.services.units.iter().take(20) {
+                out.push_str(&format!(
+                    "  - {} [{}:{}:{}] {}\n",
+                    unit.name, unit.load, unit.active, unit.sub, unit.description
+                ));
+            }
+            if !domains.services.timers.is_empty() {
+                out.push_str("\nTimers:\n");
+                for timer in domains.services.timers.iter().take(20) {
+                    out.push_str(&format!(
+                        "  - {} next={} last={} unit={}\n",
+                        timer.name, timer.next_trigger, timer.last_trigger, timer.activates
+                    ));
+                }
+            }
+            out
+        }
+        DashPanel::Containers => {
+            let runtime = domains
+                .containers
+                .runtime
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "none".to_owned());
+            let mut out = format!(
+                "Runtime: {runtime}\nContainers: total={} running={}\n\n",
+                d.total_containers, d.running_containers
+            );
+            for container in &domains.containers.containers {
+                out.push_str(&format!(
+                    "  - {} ({}) [{}]\n    image: {}\n    ports: {}\n    mounts: {}\n    restarts: {:?}  health: {:?}\n",
+                    container.name,
+                    container.id,
+                    container.status,
+                    container.image,
+                    if container.ports.is_empty() { "none".to_owned() } else { container.ports.join(", ") },
+                    if container.mounts.is_empty() { "none".to_owned() } else { container.mounts.join(", ") },
+                    container.restart_count,
+                    container.health
+                ));
+            }
+            out
+        }
+        DashPanel::Disk => {
+            let mut out = String::from("Filesystems:\n");
+            for fs in &domains.disks.filesystems {
+                let pct = if fs.total_bytes > 0 {
+                    fs.used_bytes as f64 / fs.total_bytes as f64 * 100.0
+                } else {
+                    0.0
+                };
+                out.push_str(&format!(
+                    "  - {} on {} [{}] {:.1}% used  avail={}\n",
+                    fs.device, fs.mount_point, fs.fs_type, pct, fs.available_bytes
+                ));
+            }
+            if !domains.disks.inodes.is_empty() {
+                out.push_str("\nInodes:\n");
+                for inode in &domains.disks.inodes {
+                    out.push_str(&format!(
+                        "  - {} on {} used={} free={}\n",
+                        inode.device, inode.mount_point, inode.used, inode.free
+                    ));
+                }
+            }
+            if !domains.disks.mounts.is_empty() {
+                out.push_str("\nMounts:\n");
+                for mount in domains.disks.mounts.iter().take(20) {
+                    out.push_str(&format!(
+                        "  - {} -> {} ({}) [{}]\n",
+                        mount.source, mount.target, mount.fs_type, mount.options
+                    ));
+                }
+            }
+            if !domains.disks.block_devices.is_empty() {
+                out.push_str("\nBlock devices:\n");
+                for dev in &domains.disks.block_devices {
+                    out.push_str(&format!(
+                        "  - {} size={:?} ro={} mounts={}\n",
+                        dev.name,
+                        dev.size,
+                        dev.ro,
+                        dev.mount_points.join(", ")
+                    ));
+                }
+            }
+            if domains.disks.smart_available {
+                out.push_str("\nSMART:\n");
+                for smart in &domains.disks.smart_devices {
+                    out.push_str(&format!(
+                        "  - {} model={:?} health={:?} temp={:?}C\n",
+                        smart.device, smart.model, smart.health, smart.temperature_celsius
+                    ));
+                }
+            }
+            out
+        }
+        DashPanel::Ports => {
+            let mut out = format!("Listening ports: {}\n\n", domains.ports.listeners.len());
+            for listener in &domains.ports.listeners {
+                out.push_str(&format!(
+                    "  - {} {}:{} pid={:?} proc={:?}\n",
+                    listener.protocol,
+                    listener.local_address,
+                    listener.local_port,
+                    listener.pid,
+                    listener.process_name
+                ));
+            }
+            out
+        }
+        DashPanel::Logs => {
+            let mut out = format!(
+                "Journal errors (1h): {}\nError rate / min: {:?}\n\nKernel errors:\n",
+                domains.logs.journal_errors_last_hour, domains.logs.error_rate_per_minute
+            );
+            if domains.logs.kernel_errors.is_empty() {
+                out.push_str("  none\n");
+            } else {
+                for line in &domains.logs.kernel_errors {
+                    out.push_str(&format!("  - {line}\n"));
+                }
+            }
+            out.push_str("\nAuth failures:\n");
+            if domains.logs.auth_failures.is_empty() {
+                out.push_str("  none\n");
+            } else {
+                for line in &domains.logs.auth_failures {
+                    out.push_str(&format!("  - {line}\n"));
+                }
+            }
+            out
+        }
+        DashPanel::Backups => {
+            let mut out = format!(
+                "Backup tools detected: {}\n\n",
+                domains.backups.tools_detected.len()
+            );
+            if domains.backups.tools_detected.is_empty() {
+                out.push_str("No backup tooling detected.\n");
+            } else {
+                for tool in &domains.backups.tools_detected {
+                    out.push_str(&format!(
+                        "  - {}  binary={:?}\n    config={:?}\n    repo={:?}\n    restore-test={}\n",
+                        tool.name,
+                        tool.binary_path,
+                        tool.config_path,
+                        tool.repo_path,
+                        tool.restore_test_evidence.as_deref().unwrap_or("missing")
+                    ));
+                }
+            }
+            out
+        }
+        DashPanel::Plans => {
+            let mut out = format!(
+                "Saved plans: {}\nRecent change sets: {}\n\n",
+                d.plans.len(),
+                d.change_sets.len()
+            );
+            if d.plans.is_empty() {
+                out.push_str("No saved troubleshooting plans.\n");
+            } else {
+                out.push_str("Plans:\n");
+                for plan in &d.plans {
+                    out.push_str(&format!(
+                        "  - {} | {} | snapshot={} | verdict={}\n",
+                        plan.id, plan.source, plan.snapshot_id, plan.verdict_summary
+                    ));
+                }
+            }
+            if !d.change_sets.is_empty() {
+                out.push_str("\nChange sets:\n");
+                for change in &d.change_sets {
+                    out.push_str(&format!(
+                        "  - {} [{}] {} | {}\n",
+                        change.id, change.status, change.plan_title, change.summary
+                    ));
+                }
+            }
+            out.push_str("\nEnter applies the most recent saved plan.");
+            out
+        }
+        DashPanel::Findings => format!(
+            "Findings available: {}\nWarnings: {}\n\nPress Enter to browse findings.",
+            d.finding_count, d.finding_warnings
+        ),
+    }
+}
+
 /// Render a scrollable finding list.
 fn render_dash_finding_list(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let findings = &app.dashboard.data.findings;
@@ -3975,7 +4580,7 @@ fn render_dash_finding_list(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 /// Render a single finding detail.
 fn render_dash_finding_detail(app: &TuiApp, idx: usize, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
-        .title(" Finding Detail — Enter for evidence, Esc to go back ")
+        .title(" Finding Detail — Enter evidence, Alt+F follow-up, Alt+G plan, Esc back ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -3990,74 +4595,61 @@ fn render_dash_finding_detail(app: &TuiApp, idx: usize, area: Rect, buf: &mut Bu
             return;
         }
     };
-    let color = match f.severity.as_str() {
-        "critical" | "error" => ERROR_FG,
-        "warning" => Color::Yellow,
-        _ => APP_FG,
-    };
-    let lines = vec![
-        Line::from(Span::styled(
-            format!("ID:       {}", f.id),
-            Style::default().fg(APP_FG),
-        )),
-        Line::from(Span::styled(
-            format!("Severity: {}", f.severity.to_ascii_uppercase()),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            format!("Title:    {}", f.title),
-            Style::default().fg(APP_FG),
-        )),
-        Line::from(Span::styled(
-            format!("Resource: {}", f.affected_resource),
-            Style::default().fg(APP_FG),
-        )),
-        Line::from(Span::styled(
-            format!("Domain:   {}", f.domain),
-            Style::default().fg(APP_FG),
-        )),
-        Line::from(Span::styled(
-            format!("Snapshot: {}", f._snapshot_id),
-            Style::default().fg(DIM_FG),
-        )),
-        Line::from(Span::styled(
-            format!("Risk:     {}", f.risk),
-            Style::default().fg(color),
-        )),
-        Line::from(Span::styled(
-            format!("Rollback: {}", f.rollback),
-            Style::default().fg(DIM_FG),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Evidence:",
-            Style::default().fg(DIM_FG).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            if f.evidence_text.is_empty() {
-                "  (no evidence captured)"
-            } else {
-                &f.evidence_text
-            },
-            Style::default().fg(APP_FG),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            if f.command_preview.is_empty() {
-                "  (no command preview)"
-            } else {
-                &f.command_preview
-            },
-            Style::default().fg(TOOL_FG),
-        )),
-    ];
-    Paragraph::new(lines).render(inner, buf);
+    let mut text = format!(
+        "ID:       {}\nSeverity: {}\nConfidence: {}\nTitle:    {}\nResource: {}\nDomain:   {}\nSnapshot: {}\nImpact:   {}\nRisk:     {}\nRollback: {}\n\nSources:  {}\n\nEvidence:\n{}\n\nExact commands / previews:\n{}\n",
+        f.id,
+        f.severity.to_ascii_uppercase(),
+        f.confidence.to_ascii_uppercase(),
+        f.title,
+        f.affected_resource,
+        f.domain,
+        f.snapshot_id,
+        f.impact,
+        f.risk,
+        f.rollback,
+        f.evidence_sources.join(", "),
+        if f.evidence_text.is_empty() {
+            "(no evidence captured)"
+        } else {
+            &f.evidence_text
+        },
+        if f.command_preview.is_empty() {
+            "(no command preview)"
+        } else {
+            &f.command_preview
+        }
+    );
+    if !f.assumptions.is_empty() {
+        text.push_str("\n\nAssumptions:\n");
+        for item in &f.assumptions {
+            text.push_str(&format!("  - {item}\n"));
+        }
+    }
+    if !f.missing_data.is_empty() {
+        text.push_str("\nMissing data:\n");
+        for item in &f.missing_data {
+            text.push_str(&format!("  - {item}\n"));
+        }
+    }
+    if !f.read_only_checks.is_empty() {
+        text.push_str("\nRead-only follow-up checks:\n");
+        for item in &f.read_only_checks {
+            text.push_str(&format!("  - {item}\n"));
+        }
+    }
+    if let Some(fix_plan) = &f.fix_plan {
+        text.push_str(&format!("\nSuggested fix plan:\n  {fix_plan}\n"));
+    }
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((app.dashboard.scroll as u16, 0))
+        .render(inner, buf);
 }
 
 /// Render evidence for a finding.
 fn render_dash_evidence_view(app: &TuiApp, idx: usize, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
-        .title(" Evidence — Esc to go back ")
+        .title(" Evidence — Enter plan, Alt+F follow-up, Alt+G plan, Esc back ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -4073,11 +4665,18 @@ fn render_dash_evidence_view(app: &TuiApp, idx: usize, area: Rect, buf: &mut Buf
         }
     };
     let mut text = format!("Finding: {} ({})\n\n", f.title, f.id);
-    text.push_str(&format!("Snapshot: {}\n", f._snapshot_id));
+    text.push_str(&format!("Snapshot: {}\n", f.snapshot_id));
     text.push_str(&format!("Resource: {}\n", f.affected_resource));
     text.push_str(&format!("Domain:   {}\n", f.domain));
+    text.push_str(&format!("Sources:  {}\n", f.evidence_sources.join(", ")));
     text.push_str(&format!("Risk:     {}\n", f.risk));
     text.push_str(&format!("Rollback: {}\n", f.rollback));
+    if !f.assumptions.is_empty() {
+        text.push_str(&format!("\nAssumptions: {}\n", f.assumptions.join("; ")));
+    }
+    if !f.missing_data.is_empty() {
+        text.push_str(&format!("Missing data: {}\n", f.missing_data.join("; ")));
+    }
     text.push_str("\n--- Evidence ---\n");
     text.push_str(if f.evidence_text.is_empty() {
         "(no evidence captured)"
@@ -4090,16 +4689,27 @@ fn render_dash_evidence_view(app: &TuiApp, idx: usize, area: Rect, buf: &mut Buf
     } else {
         &f.command_preview
     });
-    text.push_str("\n\nArrow keys scroll  |  T = troubleshoot  |  Esc = back");
+    if !f.read_only_checks.is_empty() {
+        text.push_str("\n\n--- Read-only checks ---\n");
+        for check in &f.read_only_checks {
+            text.push_str(&format!("- {check}\n"));
+        }
+    }
+    if let Some(fix_plan) = &f.fix_plan {
+        text.push_str(&format!("\n--- Suggested fix ---\n{fix_plan}\n"));
+    }
+    text.push_str("\n\nF5 refresh  |  Alt+F follow-up  |  Enter/Alt+G generate plan  |  Esc back");
     Paragraph::new(text)
         .style(Style::default().fg(APP_FG))
+        .wrap(Wrap { trim: false })
+        .scroll((app.dashboard.scroll as u16, 0))
         .render(inner, buf);
 }
 
 /// Render a troubleshoot plan for a finding.
 fn render_dash_troubleshoot_plan(app: &TuiApp, idx: usize, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
-        .title(" Troubleshoot Plan — Esc to go back, Enter to apply ")
+        .title(" Troubleshoot Plan — Enter apply, Alt+A apply, Esc back ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
@@ -4114,25 +4724,30 @@ fn render_dash_troubleshoot_plan(app: &TuiApp, idx: usize, area: Rect, buf: &mut
             return;
         }
     };
-    let text = format!(
-        "Troubleshoot Plan\n\
-         \n\
-         Finding: {} ({})\n\
-         Severity: {}\n\
-         Resource: {}\n\n\
-         Proposed steps:\n\
-         1. Run `helm monitor --domain {}` to collect fresh data\n\
-         2. Check evidence: {}\n\
-         \n\
-         Apply fix:\n\
-         Run `/apply-plan` with a plan ID from `helm troubleshoot`\n\
-         or use `helm explain {}` for detailed guidance.\n\
-         \n\
-         Press Enter to generate a full troubleshoot plan.",
-        f.title, f.id, f.severity, f.affected_resource, f.domain, f.id, f.id
+    let mut text = format!(
+        "Troubleshoot Plan\n\nFinding: {} ({})\nSeverity: {}\nResource: {}\nSnapshot: {}\n\n",
+        f.title, f.id, f.severity, f.affected_resource, f.snapshot_id
     );
+    if let Some(plan) = &app.dashboard.active_plan {
+        if plan.finding_id == f.id {
+            text.push_str(&format!(
+                "Plan ID: {}\nRead-only steps: {}\nFix steps: {}\n\n",
+                plan.plan_id, plan.read_only_steps, plan.fix_steps
+            ));
+            text.push_str(&plan.summary);
+            text.push_str("\n\nPress Enter or Alt+A to open reviewed apply flow.");
+        } else {
+            text.push_str("No active generated plan for this finding yet.\nPress Enter or Alt+G to generate one.");
+        }
+    } else {
+        text.push_str(
+            "No active generated plan for this finding yet.\nPress Enter or Alt+G to generate one.",
+        );
+    }
     Paragraph::new(text)
         .style(Style::default().fg(APP_FG))
+        .wrap(Wrap { trim: false })
+        .scroll((app.dashboard.scroll as u16, 0))
         .render(inner, buf);
 }
 
@@ -4140,8 +4755,15 @@ fn render_dash_panel(panel: DashPanel, d: &DashboardData) -> String {
     match panel {
         DashPanel::Health => {
             format!(
-                "Host: {}\nCollected: {}\n\nLoad:  {:.1} {:.1} {:.1}\nMemory: {:.0}%",
-                d.hostname, d.collected_at, d.load_1m, d.load_5m, d.load_15m, d.memory_used_pct
+                "Host: {}\nCollected: {}\n\nLoad:  {:.1} {:.1} {:.1}\nMemory: {:.0}%\nPkg: {:?}/{:?}",
+                d.hostname,
+                d.collected_at,
+                d.load_1m,
+                d.load_5m,
+                d.load_15m,
+                d.memory_used_pct,
+                d.domains.packages.upgradable_count,
+                d.domains.packages.security_count
             )
         }
         DashPanel::Findings => {
@@ -4190,17 +4812,20 @@ fn render_dash_panel(panel: DashPanel, d: &DashboardData) -> String {
             format!("Tools: {}", d.backup_count)
         }
         DashPanel::Plans => {
-            let count = crate::default_db_path()
-                .ok()
-                .and_then(|p| rusqlite::Connection::open(p).ok())
-                .and_then(|conn| {
-                    helm_memory::TroubleshootingPlanStore::list(&conn, 100)
-                        .ok()
-                        .map(|plans| plans.len())
-                })
-                .unwrap_or(0);
-            format!("Saved plans: {count}\n\n> Enter to view")
+            format!(
+                "Saved plans: {}\nChange sets: {}\n\n> Enter to review/apply",
+                d.plans.len(),
+                d.change_sets.len()
+            )
         }
+    }
+}
+
+fn provider_boundary_label(app: &TuiApp) -> &'static str {
+    if app.active_settings.choice == ProviderChoice::Ollama && !app.model.ends_with(":cloud") {
+        "llm local"
+    } else {
+        "llm api"
     }
 }
 
@@ -4252,6 +4877,12 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         Span::styled(
             format!(" {} / {} ", app.provider_name, truncate(&app.model, 42)),
             Style::default().fg(APP_FG).bg(HEADER_BG),
+        ),
+        Span::styled(
+            format!(" {} ", provider_boundary_label(app)),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(128, 203, 196)),
         ),
         Span::styled(
             format!(
@@ -4482,7 +5113,9 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             AgentMode::Plan => "Plan an approach (no writes yet)...",
             AgentMode::AutoAccept => "Run with auto-approved tools...",
             AgentMode::Chat => "Ask HELM to do something...",
-            AgentMode::Dashboard => "Dashboard — type a task or /command",
+            AgentMode::Dashboard => {
+                "Dashboard — F5 refresh, Enter drill down, /command for advanced actions"
+            }
         };
         vec![Line::from(vec![
             Span::styled(
@@ -4531,7 +5164,9 @@ fn render_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
         AgentMode::Plan => "READ-ONLY | Shift+Tab -> Auto",
         AgentMode::AutoAccept => "AUTO-ACCEPT | Shift+Tab -> Diagnose",
         AgentMode::Diagnose => "DIAGNOSE | Shift+Tab -> Dashboard",
-        AgentMode::Dashboard => "DASHBOARD | Shift+Tab -> Chat",
+        AgentMode::Dashboard => {
+            "F5 refresh | Enter drill down | Alt+F follow-up | Shift+Tab -> Chat"
+        }
     };
     let line = Line::from(vec![
         Span::styled(
@@ -5911,6 +6546,7 @@ mod tests {
             auto_approve: false,
             read_only: false,
             diagnose_mode: false,
+            dashboard_mode: false,
             sandbox: None,
             remote_target: None,
         })
@@ -6612,6 +7248,7 @@ mod tests {
         DashboardData {
             hostname: "testbox".into(),
             snapshot_id: "snap-001".into(),
+            profile: "standard".into(),
             load_1m: 1.5,
             load_5m: 0.8,
             load_15m: 0.6,
@@ -6631,28 +7268,43 @@ mod tests {
                 FindingSummary {
                     id: "finding-001".into(),
                     severity: "warning".into(),
+                    confidence: "high".into(),
                     title: "Disk /var 78% full".into(),
                     affected_resource: "/var".into(),
-                    _snapshot_id: "snap-001".into(),
+                    snapshot_id: "snap-001".into(),
                     domain: "disks".into(),
                     evidence_text: "df /var shows 78% used".into(),
+                    evidence_sources: vec!["disks.filesystems[/var].used_bytes".into()],
+                    impact: "disk pressure may block writes".into(),
+                    assumptions: vec!["log growth is recent".into()],
+                    missing_data: vec!["largest directories under /var".into()],
+                    read_only_checks: vec!["du -sh /var/* | sort -h".into()],
+                    fix_plan: Some("clean old logs from /var/log".into()),
                     risk: "medium".into(),
                     rollback: "not specified".into(),
                     command_preview: "clean old logs from /var/log".into(),
                 },
                 FindingSummary {
                     id: "finding-002".into(),
-                    severity: "error".into(),
+                    severity: "critical".into(),
+                    confidence: "high".into(),
                     title: "Nginx service failed".into(),
                     affected_resource: "nginx".into(),
-                    _snapshot_id: "snap-001".into(),
+                    snapshot_id: "snap-001".into(),
                     domain: "services".into(),
                     evidence_text: "systemctl is-active nginx failed".into(),
+                    evidence_sources: vec!["services.failed_units[nginx.service]".into()],
+                    impact: "service outage".into(),
+                    assumptions: vec!["config was recently changed".into()],
+                    missing_data: vec!["recent nginx journal lines".into()],
+                    read_only_checks: vec!["journalctl -u nginx -n 50".into()],
+                    fix_plan: Some("systemctl restart nginx".into()),
                     risk: "high".into(),
                     rollback: "systemctl start nginx".into(),
                     command_preview: "systemctl restart nginx".into(),
                 },
             ],
+            ..Default::default()
         }
     }
 
