@@ -489,47 +489,41 @@ Verification:
 - evidence panel must show sources, finding, risk, rollback, exact commands
 - no overlapping text in constrained terminal sizes
 
-### v2.1.1 - Morning Triage Dashboard
+### v2.1.1 - HELMOPS Tabbed Ops Console
 
 Purpose:
 
-- turn the dashboard into a real finding inbox instead of a panel grid
+- turn the dashboard into a clean, professional ops console
 - support daily review, suppression, remediation prep, and operator triage
+- default `helm` command opens the dashboard
 
 Deliverables:
 
-- three-pane dashboard:
-  - filter sidebar
-  - briefing cards, charts, and finding queue
-  - detail pane
-- workflow tabs:
-  - review
-  - cleanup
-  - remediate
-- finding lifecycle states:
-  - open
-  - new
-  - recurring
-  - suppressed
-  - resolved
-  - self-resolved
-- persistent suppression and resolve state
-- queue columns:
-  - id
-  - kind
-  - severity
-  - status
-  - age
-  - count
-  - sample
-- keyboard actions for:
-  - evidence
-  - follow-up checks
-  - plan generation
-  - apply handoff
-  - suppress
-  - resolve
-  - reopen
+- HELMOPS header: product name | hostname | provider | LIVE | time | load | memory
+- health status strip: CRIT N  WARN N  INFO N  with disk bar summaries
+- seven domain tabs:
+  - **ALERTS**: finding queue + selected finding detail
+  - **SERVICES**: systemd service status, failed-unit diagnosis entrypoint
+  - **PROCESSES**: top CPU/memory processes, memory-pressure hints
+  - **LOGS**: journal/log stream with severity grouping, kernel/auth failure samples
+  - **NETWORK**: listening ports, 0.0.0.0 exposure, closed expected ports
+  - **DISK**: filesystem bars with % usage, inode summaries, risk/growth hints
+  - **CHANGES**: audit/change log entries, approval state, change-set tracking
+- persistent finding lifecycle states:
+  - open, new, recurring, suppressed, resolved, self-resolved
+- finding queue: severity, status, age, sample
+- right detail pane with: title, id, severity, status, resource, host, impact, evidence, fix plan, rollback
+- keyboard shortcuts:
+  - Tab/Shift+Tab: cycle panes
+  - Left/Right: switch tabs
+  - 1-7: jump to tab
+  - Up/Down: move queue selection
+  - Enter: open selected finding detail
+  - Alt+E: evidence, Alt+S: suppress, Alt+R: resolve, Alt+U: reopen
+  - F5: refresh from latest snapshot
+- HELMOPS color palette (GitHub-dark inspired):
+  - background #0d1117, surface #161b22, border #21262d
+  - blue #58a6ff, green #3fb950, yellow #d29922, red #f85149
 
 Hard rules:
 
@@ -537,10 +531,12 @@ Hard rules:
 - queue rows must be backed by persisted snapshot findings
 - recurring state must be derived from finding fingerprints, not string-only matching
 - suppression and resolution must survive process restart
+- no boxed grid layout — use horizontal separators, sparsing, one dominant selected item
 
 Verification:
 
-- targeted dashboard render tests stay green
+- dashboard render tests for all 7 tabs with real snapshot data
+- small/normal/wide terminal render tests
 - finding state persistence tests stay green
 - full release gate passes
 

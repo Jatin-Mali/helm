@@ -1,0 +1,364 @@
+
+<h2 class="sr-only">HelmOps TUI dashboard — interactive terminal mockup with alerts, services, processes, logs, network, disk, and changes views</h2>
+<div style="border-radius:var(--border-radius-lg);border:0.5px solid var(--color-border-secondary);overflow:hidden;font-family:var(--font-mono);">
+<div id="term" style="background:#0d1117;color:#c9d1d9;font-size:11.5px;line-height:1.4;">
+
+<div style="background:#161b22;border-bottom:1px solid #21262d;padding:5px 10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+<span style="color:#58a6ff;font-weight:500;letter-spacing:.08em;">HELMOPS</span>
+<span style="color:#6e7681;">|</span>
+<span style="color:#c9d1d9;">PHANTOM</span>
+<span style="color:#6e7681;">|</span>
+<span style="color:#8b949e;">groq/llama-3.3-70b</span>
+<span style="color:#6e7681;">|</span>
+<span style="color:#3fb950;">●</span><span style="color:#3fb950;margin-left:2px;">LIVE</span>
+<span style="color:#6e7681;">|</span>
+<span id="clock" style="color:#8b949e;">14:42:06 UTC</span>
+<span style="color:#6e7681;margin-left:auto;">load <span style="color:#d29922;">0.4</span> <span style="color:#8b949e;">0.9 1.6</span></span>
+<span style="color:#6e7681;">mem <span id="mem-val" style="color:#d29922;">35%</span></span>
+<span style="color:#6e7681;">cpu <span style="color:#3fb950;">12%</span></span>
+</div>
+
+<div style="background:#0d1117;border-bottom:1px solid #21262d;padding:4px 10px;display:flex;align-items:center;gap:14px;">
+<span style="background:#3d1a1a;color:#f85149;padding:1px 8px;border-radius:3px;font-weight:500;">CRIT 2</span>
+<span style="background:#2d2008;color:#d29922;padding:1px 8px;border-radius:3px;font-weight:500;">WARN 14</span>
+<span style="background:#0d2137;color:#58a6ff;padding:1px 8px;border-radius:3px;">INFO 38</span>
+<span style="color:#6e7681;margin-left:auto;font-size:10.5px;">
+  /: <span id="disk-pct" style="color:#f85149;">88%</span>
+  <span style="display:inline-block;width:60px;height:6px;background:#21262d;border-radius:2px;vertical-align:middle;margin:0 3px;position:relative;overflow:hidden;"><span style="display:block;height:100%;width:88%;background:#f85149;border-radius:2px;"></span></span>
+  /home: <span style="color:#d29922;">54%</span>
+  <span style="display:inline-block;width:40px;height:6px;background:#21262d;border-radius:2px;vertical-align:middle;margin:0 3px;position:relative;overflow:hidden;"><span style="display:block;height:100%;width:54%;background:#d29922;border-radius:2px;"></span></span>
+</span>
+</div>
+
+<div id="tabbar" style="background:#161b22;border-bottom:1px solid #21262d;display:flex;overflow-x:auto;">
+</div>
+
+<div id="main-content" style="display:flex;min-height:360px;">
+<div id="left-pane" style="width:240px;flex-shrink:0;border-right:1px solid #21262d;display:flex;flex-direction:column;">
+<div style="background:#161b22;border-bottom:1px solid #21262d;padding:4px 8px;display:flex;justify-content:space-between;align-items:center;">
+<span style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;">FINDING QUEUE</span>
+<span id="queue-count" style="color:#58a6ff;font-size:10.5px;">18 open</span>
+</div>
+<div id="queue-list" style="flex:1;overflow-y:auto;"></div>
+</div>
+<div id="right-pane" style="flex:1;min-width:0;overflow-y:auto;padding:10px 12px;"></div>
+</div>
+
+<div style="background:#161b22;border-top:1px solid #21262d;padding:4px 10px;display:flex;gap:0;flex-wrap:wrap;font-size:10.5px;color:#6e7681;">
+<span style="margin-right:14px;"><span style="color:#8b949e;">Tab</span> focus panes</span>
+<span style="margin-right:14px;"><span style="color:#8b949e;">F5</span> refresh</span>
+<span style="margin-right:14px;"><span style="color:#8b949e;">Enter</span> select</span>
+<span style="margin-right:14px;"><span style="color:#8b949e;">Alt+G</span> gen plan</span>
+<span style="margin-right:14px;"><span style="color:#8b949e;">Alt+E</span> evidence</span>
+<span style="margin-right:14px;"><span style="color:#8b949e;">Alt+A</span> apply</span>
+<span style="margin-right:14px;"><span style="color:#8b949e;">S</span> suppress</span>
+<span style="margin-right:14px;"><span style="color:#8b949e;">R</span> resolve</span>
+<span style="margin-left:auto;"><span style="color:#8b949e;">F1</span> help</span>
+</div>
+</div>
+</div>
+
+<script>
+const TABS=['ALERTS','SERVICES','PROCESSES','LOGS','NETWORK','DISK','CHANGES'];
+let activeTab='ALERTS';
+let selectedFinding=0;
+
+const findings=[
+{id:'f001',sev:'CRIT',kind:'Service',title:'nginx not running',age:'2m',host:'PHANTOM',
+when:'14:40:01 UTC (2 min ago)',count:1,status:'open',
+why:'OOM killer fired at 14:39:58. System memory hit 98% pressure. nginx worker PID 4821 was the largest single consumer and was terminated by the kernel.',
+impact:'Ports 80 and 443 not responding. All HTTP/HTTPS traffic blocked. 0 active connections. Site unreachable from public internet.',
+plan:['systemctl start nginx  # restart service','journalctl -u nginx -n 100  # check for error context','systemctl edit nginx  # add MemoryMax=512M under [Service]','systemctl daemon-reload && systemctl restart nginx'],
+evidence:['systemctl status nginx','journalctl -u nginx --since "1 hour ago"','cat /proc/meminfo','dmesg | grep -i "out of memory"'],
+rollback:'systemctl stop nginx — reverses the restart if unstable.'},
+{id:'f002',sev:'WARN',kind:'Disk',title:'/ mount at 88% (43G/50G)',age:'1h',host:'PHANTOM',
+when:'13:42:00 UTC (1h ago)',count:9,status:'recurring',
+why:'/var/log/nginx/access.log grew 40GB in 72h. A bot crawler from 45.33.x.x has been hitting the site ~900 times/hour generating access logs.',
+impact:'At current growth rate (~550MB/h), disk full in approx 6 hours. PostgreSQL will fail first — it writes to / for WAL. nginx crash follows.',
+plan:['du -sh /var/log/* | sort -h  # find top consumers','logrotate -f /etc/logrotate.d/nginx  # force rotate now','ufw deny from 45.33.32.0/24  # block crawler subnet','echo "/var/log/nginx/*.log { daily rotate 7 compress }" >> /etc/logrotate.d/nginx'],
+evidence:['df -h /','du -sh /var/log/nginx/*','cat /var/log/nginx/access.log | grep "45.33" | wc -l'],
+rollback:'Log rotation compresses, does not delete. ufw deny is reversible with ufw delete.'},
+{id:'f003',sev:'WARN',kind:'Backup',title:'Backup stale — 48h gap',age:'2d',host:'PHANTOM',
+when:'2026-05-12 03:00 (last success)',count:1,status:'open',
+why:'Backup cron job at 03:00 daily. Last exit code: 1. Error in /var/log/backup.log: "rsync: connection unexpectedly closed". Remote destination unreachable at time of run.',
+impact:'48 hours of data without backup. If disk fails or data corrupted, recovery point is 2 days old. Combined with disk at 88%, risk is elevated.',
+plan:['cat /var/log/backup.log | tail -100  # read full error','ping -c 3 backup.server.local  # check destination reachable','bash /usr/local/bin/backup.sh --dry-run  # test without executing','bash /usr/local/bin/backup.sh  # run manually if dry-run passes'],
+evidence:['systemctl status backup.timer','cat /var/log/backup.log','ls -lh /backup/ 2>/dev/null || echo "no local backup dir"'],
+rollback:'Backup run is read-only on source. No rollback needed.'},
+{id:'f004',sev:'WARN',kind:'Memory',title:'Memory pressure 94%',age:'10m',host:'PHANTOM',
+when:'14:32:00 UTC (10 min ago)',count:4,status:'recurring',
+why:'postgres at 2.1GB RSS (largest consumer). No swap configured. System has 4GB RAM. After nginx used 512MB, postgres growth left <128MB headroom, triggering OOM for nginx.',
+impact:'System is operating without a safety net. Next OOM event will kill the highest-memory non-essential process. Postgres is at risk.',
+plan:['free -h  # confirm current state','ps aux --sort=-%mem | head -15  # identify consumers','fallocate -l 2G /swapfile','chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile','echo "/swapfile none swap sw 0 0" >> /etc/fstab  # persist'],
+evidence:['cat /proc/meminfo','ps aux --sort=-%mem | head -20','cat /proc/swaps','sysctl vm.swappiness'],
+rollback:'swapoff /swapfile  — removes swap if added. Safe to reverse.'},
+{id:'f005',sev:'INFO',kind:'Port',title:'Port :22 exposed to 0.0.0.0',age:'0h',host:'PHANTOM',
+when:'14:42:00 UTC (now, recurring)',count:9,status:'recurring',
+why:'sshd configured to listen on all interfaces. Public IP included. 3 failed auth attempts in last hour from 45.33.x.x.',
+impact:'Low risk if PasswordAuthentication is disabled and key-only auth enforced. High risk if password auth is still on.',
+plan:['grep -E "PasswordAuth|PermitRoot" /etc/ssh/sshd_config  # check auth config','ss -tlnp | grep :22  # confirm listener','cat /var/log/auth.log | grep "Failed" | tail -20  # check brute force'],
+evidence:['ss -tulpn | grep :22','sshd -T | grep -i password','cat /var/log/auth.log | grep sshd | tail -30'],
+rollback:'No action required unless password auth is found enabled.'},
+];
+
+const services=[
+{name:'nginx',status:'failed',since:'2m',pid:'-',restarts:1},
+{name:'postgresql',status:'active',since:'14d',pid:'1204',restarts:0},
+{name:'docker',status:'active',since:'14d',pid:'891',restarts:0},
+{name:'sshd',status:'active',since:'14d',pid:'542',restarts:0},
+{name:'fail2ban',status:'active',since:'14d',pid:'2301',restarts:0},
+{name:'cron',status:'active',since:'14d',pid:'445',restarts:0},
+{name:'backup.timer',status:'failed',since:'2d',pid:'-',restarts:3},
+{name:'ufw',status:'active',since:'14d',pid:'334',restarts:0},
+{name:'nextcloud.service',status:'active',since:'5d',pid:'4102',restarts:0},
+{name:'grafana-server',status:'active',since:'5d',pid:'4501',restarts:0},
+];
+
+const procs=[
+{pid:'1204',user:'postgres',cpu:'12.4',mem:'2.1G',vsz:'4.2G',cmd:'postgres: checkpointer'},
+{pid:'3421',user:'www-data',cpu:'8.2',mem:'512M',vsz:'1.1G',cmd:'node /app/server.js'},
+{pid:'2201',user:'www-data',cpu:'4.1',mem:'228M',vsz:'640M',cmd:'php-fpm: pool www'},
+{pid:'891',user:'root',cpu:'2.3',mem:'96M',vsz:'2.1G',cmd:'dockerd --host fd://'},
+{pid:'4501',user:'grafana',cpu:'1.4',mem:'88M',vsz:'420M',cmd:'grafana-server --config /etc'},
+{pid:'4102',user:'www-data',cpu:'0.8',mem:'64M',vsz:'380M',cmd:'php-fpm: pool nextcloud'},
+{pid:'445',user:'root',cpu:'0.1',mem:'4.2M',vsz:'12M',cmd:'cron'},
+{pid:'542',user:'root',cpu:'0.0',mem:'3.1M',vsz:'8M',cmd:'sshd: accepting connections'},
+];
+
+const logs=[
+{time:'14:40:01',lvl:'CRIT',svc:'kernel',msg:'Out of memory: Killed process 4821 (nginx) total-vm:524288kB anon-rss:385024kB'},
+{time:'14:39:58',lvl:'ERR',svc:'nginx',msg:'[emerg] open() "/run/nginx.pid" failed (13: Permission denied)'},
+{time:'14:32:11',lvl:'WARN',svc:'kernel',msg:'page allocation failure: order:4, mode:0x14200c0, gfp_mask:0x(GFP_KERNEL)'},
+{time:'14:23:04',lvl:'ERR',svc:'backup',msg:'rsync: connection unexpectedly closed (0 bytes received so far) [sender]'},
+{time:'14:15:33',lvl:'ERR',svc:'postgres',msg:'FATAL: could not write to file "pg_wal/000000010000000000000001": No space left'},
+{time:'13:44:22',lvl:'WARN',svc:'fail2ban',msg:'[sshd] Ban 45.33.32.156 — 5 failures in 600s'},
+{time:'13:42:00',lvl:'WARN',svc:'kernel',msg:'EXT4-fs warning (device sda1): ext4_dx_add_entry: Directory index full'},
+{time:'13:11:05',lvl:'INFO',svc:'sshd',msg:'Accepted publickey for admin from 192.168.1.100 port 54321 ssh2: RSA'},
+{time:'12:05:33',lvl:'INFO',svc:'cron',msg:'/usr/sbin/logrotate /etc/logrotate.conf: success (manual run via helmops)'},
+];
+
+const ports=[
+{port:'22',proto:'tcp',state:'LISTEN',proc:'sshd',pid:'542',bind:'0.0.0.0',risk:'info'},
+{port:'80',proto:'tcp',state:'CLOSED',proc:'(none)',pid:'-',bind:'-',risk:'crit'},
+{port:'443',proto:'tcp',state:'CLOSED',proc:'(none)',pid:'-',bind:'-',risk:'crit'},
+{port:'5432',proto:'tcp',state:'LISTEN',proc:'postgres',pid:'1204',bind:'127.0.0.1',risk:'ok'},
+{port:'2375',proto:'tcp',state:'LISTEN',proc:'dockerd',pid:'891',bind:'127.0.0.1',risk:'ok'},
+{port:'3000',proto:'tcp',state:'LISTEN',proc:'grafana',pid:'4501',bind:'0.0.0.0',risk:'warn'},
+{port:'41641',proto:'udp',state:'LISTEN',proc:'tailscaled',pid:'3891',bind:'0.0.0.0',risk:'info'},
+];
+
+const disks=[
+{mount:'/',dev:'/dev/sda1',used:'43G',total:'50G',pct:88,inodes:34,smart:'ok'},
+{mount:'/home',dev:'/dev/sda2',used:'108G',total:'200G',pct:54,inodes:12,smart:'ok'},
+{mount:'/var/log',dev:'/dev/sda1',used:'2.3G',total:'10G',pct:23,inodes:8,smart:'ok'},
+{mount:'/tmp',dev:'tmpfs',used:'124M',total:'2G',pct:6,inodes:2,smart:'-'},
+];
+
+const chgs=[
+{time:'14:40:12',cap:'read',tool:'systemctl status nginx',approved:'auto',episode:'diag-001'},
+{time:'14:40:08',cap:'read',tool:'journalctl --since 30min',approved:'auto',episode:'diag-001'},
+{time:'14:40:01',cap:'read',tool:'dmesg | grep "out of memory"',approved:'auto',episode:'diag-001'},
+{time:'13:11:05',cap:'read',tool:'df -h',approved:'auto',episode:'mon-snap'},
+{time:'12:05:33',cap:'exec',tool:'logrotate -f /etc/logrotate.d/nginx',approved:'user',episode:'fix-log-001'},
+{time:'12:04:01',cap:'read',tool:'du -sh /var/log/*',approved:'auto',episode:'fix-log-001'},
+{time:'09:22:14',cap:'plan',tool:'apply-plan check-disk-001',approved:'plan_shown',episode:'check-disk-001'},
+];
+
+function sevColor(s){return s==='CRIT'?'#f85149':s==='WARN'?'#d29922':s==='INFO'?'#58a6ff':'#8b949e';}
+function statusColor(s){return s==='active'||s==='LISTEN'?'#3fb950':s==='failed'||s==='CLOSED'?'#f85149':s==='ok'?'#3fb950':s==='warn'?'#d29922':s==='info'?'#58a6ff':'#8b949e';}
+function bar(pct,w){const c=pct>=85?'#f85149':pct>=70?'#d29922':'#3fb950';return `<span style="display:inline-block;width:${w}px;height:5px;background:#21262d;border-radius:2px;vertical-align:middle;overflow:hidden;"><span style="display:block;height:100%;width:${pct}%;background:${c};border-radius:2px;"></span></span>`;}
+
+function renderTabs(){
+  const tb=document.getElementById('tabbar');
+  if(!tb)return;
+  tb.innerHTML=TABS.map(t=>`<button onclick="switchTab('${t}')" style="padding:6px 12px;background:${t===activeTab?'#0d1117':'transparent'};color:${t===activeTab?'#c9d1d9':'#6e7681'};border:none;border-bottom:${t===activeTab?'2px solid #58a6ff':'2px solid transparent'};cursor:pointer;font-family:var(--font-mono);font-size:11px;white-space:nowrap;letter-spacing:.04em;">${t}</button>`).join('');
+}
+
+function renderQueue(){
+  const el=document.getElementById('queue-list');
+  if(!el)return;
+  if(activeTab!=='ALERTS'){el.innerHTML='<div style="padding:10px 8px;color:#6e7681;font-size:11px;">View active in ALERTS tab</div>';return;}
+  el.innerHTML=findings.map((f,i)=>`<div onclick="selectFinding(${i})" style="padding:6px 8px;border-bottom:1px solid #21262d;cursor:pointer;background:${i===selectedFinding?'#161b22':'transparent'};">
+  <div style="display:flex;align-items:center;gap:6px;margin-bottom:1px;">
+    <span style="color:${sevColor(f.sev)};font-size:12px;">●</span>
+    <span style="color:${sevColor(f.sev)};font-size:10px;font-weight:500;">${f.sev}</span>
+    <span style="color:#6e7681;font-size:10px;margin-left:auto;">${f.age}</span>
+  </div>
+  <div style="color:${i===selectedFinding?'#e6edf3':'#c9d1d9'};font-size:11px;padding-left:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${f.title}</div>
+  <div style="color:#6e7681;font-size:10px;padding-left:16px;">${f.kind} · ${f.host}</div>
+  </div>`).join('');
+}
+
+function renderDetail(){
+  const el=document.getElementById('right-pane');
+  if(!el)return;
+  if(activeTab==='SERVICES'){renderServices(el);return;}
+  if(activeTab==='PROCESSES'){renderProcesses(el);return;}
+  if(activeTab==='LOGS'){renderLogs(el);return;}
+  if(activeTab==='NETWORK'){renderNetwork(el);return;}
+  if(activeTab==='DISK'){renderDisk(el);return;}
+  if(activeTab==='CHANGES'){renderChanges(el);return;}
+  const f=findings[selectedFinding];
+  if(!f){el.innerHTML='<div style="color:#6e7681;padding:10px;">No finding selected</div>';return;}
+  el.innerHTML=`
+  <div style="margin-bottom:10px;">
+    <span style="color:${sevColor(f.sev)};font-weight:500;font-size:13px;">● ${f.sev} · ${f.kind}</span>
+    <span style="color:#c9d1d9;font-size:13px;margin-left:8px;">${f.title}</span>
+  </div>
+  <table style="width:100%;border-collapse:collapse;margin-bottom:12px;font-size:11px;">
+    <tr><td style="color:#6e7681;padding:2px 0;width:70px;">When</td><td style="color:#c9d1d9;">${f.when}</td></tr>
+    <tr><td style="color:#6e7681;padding:2px 0;">Host</td><td style="color:#c9d1d9;">${f.host}</td></tr>
+    <tr><td style="color:#6e7681;padding:2px 0;">Status</td><td style="color:#58a6ff;">${f.status}</td></tr>
+    <tr><td style="color:#6e7681;padding:2px 0;">Count</td><td style="color:#c9d1d9;">${f.count} occurrence${f.count>1?'s':''}</td></tr>
+  </table>
+  <div style="border-top:1px solid #21262d;padding-top:8px;margin-bottom:10px;">
+    <div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:5px;">WHY IT HAPPENED</div>
+    <div style="color:#c9d1d9;font-size:11px;line-height:1.6;">${f.why}</div>
+  </div>
+  <div style="border-top:1px solid #21262d;padding-top:8px;margin-bottom:10px;">
+    <div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:5px;">IMPACT</div>
+    <div style="color:#c9d1d9;font-size:11px;line-height:1.6;">${f.impact}</div>
+  </div>
+  <div style="border-top:1px solid #21262d;padding-top:8px;margin-bottom:10px;">
+    <div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:6px;">FIX PLAN <span style="color:#6e7681;">(approval required per step)</span></div>
+    ${f.plan.map((s,i)=>`<div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:5px;">
+      <span style="color:#6e7681;font-size:10.5px;min-width:14px;">${i+1}.</span>
+      <code style="color:#79c0ff;font-size:11px;background:#161b22;padding:2px 6px;border-radius:3px;border:1px solid #21262d;display:block;flex:1;">${s}</code>
+    </div>`).join('')}
+  </div>
+  <div style="border-top:1px solid #21262d;padding-top:8px;margin-bottom:10px;">
+    <div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:5px;">EVIDENCE READ <span style="color:#6e7681;">(read-only, already collected)</span></div>
+    ${f.evidence.map(e=>`<div style="color:#8b949e;font-size:11px;padding:1px 0;"><span style="color:#3fb950;">✓</span> <code style="color:#6e7681;">${e}</code></div>`).join('')}
+  </div>
+  <div style="border-top:1px solid #21262d;padding-top:8px;margin-bottom:12px;">
+    <div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:4px;">ROLLBACK</div>
+    <div style="color:#c9d1d9;font-size:11px;">${f.rollback}</div>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;">
+    <button onclick="sendPrompt('Generate and show me the full guided fix plan for HelmOps finding: ${f.title} on host ${f.host}')" style="font-size:10.5px;padding:4px 10px;border-radius:3px;background:#1a2332;color:#58a6ff;border:1px solid #30363d;cursor:pointer;">Alt+G — Generate plan ↗</button>
+    <button onclick="sendPrompt('Show me the complete evidence and root cause analysis for HelmOps finding: ${f.title}')" style="font-size:10.5px;padding:4px 10px;border-radius:3px;background:#1a2332;color:#58a6ff;border:1px solid #30363d;cursor:pointer;">Alt+E — Evidence ↗</button>
+    <button style="font-size:10.5px;padding:4px 10px;border-radius:3px;background:#1a2008;color:#d29922;border:1px solid #2d2008;cursor:pointer;">S — Suppress</button>
+    <button style="font-size:10.5px;padding:4px 10px;border-radius:3px;background:#0d2008;color:#3fb950;border:1px solid #0d2d0d;cursor:pointer;">R — Resolve</button>
+  </div>`;
+}
+
+function renderServices(el){
+  el.innerHTML=`<div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:8px;">SYSTEMD SERVICES</div>
+  <table style="width:100%;border-collapse:collapse;font-size:11px;">
+  <tr style="border-bottom:1px solid #21262d;"><th style="text-align:left;color:#6e7681;padding:3px 0;width:160px;">service</th><th style="text-align:left;color:#6e7681;padding:3px 8px;width:70px;">status</th><th style="text-align:left;color:#6e7681;padding:3px 8px;width:50px;">uptime</th><th style="text-align:right;color:#6e7681;padding:3px 0;">pid</th></tr>
+  ${services.map(s=>`<tr style="border-bottom:1px solid #161b22;">
+    <td style="padding:4px 0;color:${s.status==='failed'?'#f85149':'#c9d1d9'};">${s.name}</td>
+    <td style="padding:4px 8px;"><span style="color:${statusColor(s.status)};">${s.status}</span></td>
+    <td style="padding:4px 8px;color:#8b949e;">${s.since}</td>
+    <td style="padding:4px 0;text-align:right;color:#6e7681;">${s.pid}</td>
+  </tr>`).join('')}
+  </table>
+  <div style="margin-top:12px;color:#6e7681;font-size:10.5px;">2 failed · 8 active · <span style="color:#f85149;">nginx and backup.timer require attention</span></div>
+  <button onclick="sendPrompt('Why did nginx fail and how do I restart it safely in HelmOps?')" style="margin-top:8px;font-size:10.5px;padding:4px 10px;border-radius:3px;background:#1a2332;color:#58a6ff;border:1px solid #30363d;cursor:pointer;">Diagnose failed services ↗</button>`;
+}
+
+function renderProcesses(el){
+  el.innerHTML=`<div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:8px;">TOP PROCESSES <span style="color:#6e7681;font-weight:400;">sorted by memory · read-only</span></div>
+  <table style="width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed;">
+  <tr style="border-bottom:1px solid #21262d;"><th style="text-align:left;color:#6e7681;padding:3px 0;width:50px;">PID</th><th style="text-align:left;color:#6e7681;padding:3px 6px;width:70px;">user</th><th style="text-align:right;color:#6e7681;padding:3px 6px;width:40px;">cpu%</th><th style="text-align:right;color:#6e7681;padding:3px 6px;width:50px;">mem</th><th style="text-align:left;color:#6e7681;padding:3px 6px;">command</th></tr>
+  ${procs.map(p=>`<tr style="border-bottom:1px solid #161b22;">
+    <td style="padding:3px 0;color:#6e7681;">${p.pid}</td>
+    <td style="padding:3px 6px;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${p.user}</td>
+    <td style="padding:3px 6px;text-align:right;color:${parseFloat(p.cpu)>10?'#d29922':'#c9d1d9'};">${p.cpu}</td>
+    <td style="padding:3px 6px;text-align:right;color:${p.mem.includes('G')&&parseFloat(p.mem)>1?'#f85149':p.mem.includes('G')?'#d29922':'#c9d1d9'};">${p.mem}</td>
+    <td style="padding:3px 6px;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${p.cmd}</td>
+  </tr>`).join('')}
+  </table>
+  <div style="margin-top:10px;color:#6e7681;font-size:10.5px;">postgres consuming 2.1GB · no swap configured · OOM risk HIGH</div>`;
+}
+
+function renderLogs(el){
+  el.innerHTML=`<div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:8px;">JOURNAL LOG STREAM <span style="color:#3fb950;font-size:10px;">● live</span></div>
+  ${logs.map(l=>`<div style="display:flex;gap:8px;margin-bottom:4px;font-size:11px;border-bottom:1px solid #161b22;padding-bottom:3px;">
+    <span style="color:#6e7681;white-space:nowrap;flex-shrink:0;">${l.time}</span>
+    <span style="white-space:nowrap;flex-shrink:0;min-width:36px;text-align:center;font-weight:500;color:${l.lvl==='CRIT'?'#f85149':l.lvl==='ERR'?'#f85149':l.lvl==='WARN'?'#d29922':'#58a6ff'};background:${l.lvl==='CRIT'?'#3d1a1a':l.lvl==='ERR'?'#3d1a1a':l.lvl==='WARN'?'#2d2008':'#0d2137'};border-radius:2px;padding:0 3px;">${l.lvl}</span>
+    <span style="color:#8b949e;white-space:nowrap;flex-shrink:0;min-width:55px;">${l.svc}</span>
+    <span style="color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${l.msg}</span>
+  </div>`).join('')}
+  <div style="margin-top:8px;color:#6e7681;font-size:10.5px;">Showing last 9 entries · <span style="color:#f85149;">2 CRIT · 3 ERR · 3 WARN</span> in last 24h</div>`;
+}
+
+function renderNetwork(el){
+  el.innerHTML=`<div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:8px;">LISTENING PORTS <span style="color:#6e7681;font-weight:400;">read-only · ss -tulpn</span></div>
+  <table style="width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed;">
+  <tr style="border-bottom:1px solid #21262d;"><th style="text-align:left;color:#6e7681;padding:3px 0;width:50px;">port</th><th style="text-align:left;color:#6e7681;padding:3px 6px;width:40px;">proto</th><th style="text-align:left;color:#6e7681;padding:3px 6px;width:65px;">state</th><th style="text-align:left;color:#6e7681;padding:3px 6px;width:80px;">bind</th><th style="text-align:left;color:#6e7681;padding:3px 6px;">process</th><th style="text-align:right;color:#6e7681;padding:3px 0;width:45px;">risk</th></tr>
+  ${ports.map(p=>`<tr style="border-bottom:1px solid #161b22;">
+    <td style="padding:3px 0;color:${statusColor(p.risk==='crit'?'failed':p.risk==='warn'?'WARN':'active')};font-weight:500;">:${p.port}</td>
+    <td style="padding:3px 6px;color:#6e7681;">${p.proto}</td>
+    <td style="padding:3px 6px;color:${statusColor(p.state==='LISTEN'?'active':'failed')};">${p.state}</td>
+    <td style="padding:3px 6px;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${p.bind}</td>
+    <td style="padding:3px 6px;color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${p.proc}</td>
+    <td style="padding:3px 0;text-align:right;"><span style="color:${p.risk==='crit'?'#f85149':p.risk==='warn'?'#d29922':p.risk==='ok'?'#3fb950':'#58a6ff'};font-size:10px;">${p.risk.toUpperCase()}</span></td>
+  </tr>`).join('')}
+  </table>
+  <div style="margin-top:10px;color:#6e7681;font-size:10.5px;"><span style="color:#f85149;">Ports 80 and 443 CLOSED</span> — nginx is down. Grafana :3000 exposed on all interfaces.</div>`;
+}
+
+function renderDisk(el){
+  el.innerHTML=`<div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:10px;">DISK USAGE <span style="color:#6e7681;font-weight:400;">df -h + inode check + SMART</span></div>
+  ${disks.map(d=>`<div style="margin-bottom:12px;">
+    <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+      <span style="color:#c9d1d9;font-weight:500;">${d.mount}</span>
+      <span style="color:${d.pct>=85?'#f85149':d.pct>=70?'#d29922':'#3fb950'};font-weight:500;">${d.pct}%</span>
+    </div>
+    <div style="background:#21262d;height:8px;border-radius:3px;overflow:hidden;margin-bottom:3px;">
+      <div style="height:100%;width:${d.pct}%;background:${d.pct>=85?'#f85149':d.pct>=70?'#d29922':'#3fb950'};border-radius:3px;"></div>
+    </div>
+    <div style="display:flex;gap:16px;font-size:10.5px;color:#6e7681;">
+      <span>${d.used} / ${d.total} used</span>
+      <span>${d.dev}</span>
+      <span>inodes ${d.inodes}%</span>
+      <span>SMART <span style="color:${d.smart==='ok'?'#3fb950':'#f85149'}">${d.smart}</span></span>
+    </div>
+  </div>`).join('')}
+  <div style="border-top:1px solid #21262d;padding-top:8px;color:#6e7681;font-size:10.5px;"><span style="color:#f85149;">/ at 88% — critical.</span> At current growth rate, full in ~6h. Largest consumer: /var/log (crawler logs).</div>
+  <button onclick="sendPrompt('Find the largest directories on / and show me what is consuming disk space in HelmOps')" style="margin-top:8px;font-size:10.5px;padding:4px 10px;border-radius:3px;background:#1a2332;color:#58a6ff;border:1px solid #30363d;cursor:pointer;">Find top disk consumers ↗</button>`;
+}
+
+function renderChanges(el){
+  el.innerHTML=`<div style="color:#8b949e;font-size:10.5px;letter-spacing:.06em;margin-bottom:8px;">AUDIT LOG <span style="color:#3fb950;font-size:10px;">● chain verified</span></div>
+  <table style="width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed;">
+  <tr style="border-bottom:1px solid #21262d;"><th style="text-align:left;color:#6e7681;padding:3px 0;width:60px;">time</th><th style="text-align:left;color:#6e7681;padding:3px 6px;width:45px;">cap</th><th style="text-align:left;color:#6e7681;padding:3px 6px;">command</th><th style="text-align:right;color:#6e7681;padding:3px 0;width:60px;">approved</th></tr>
+  ${chgs.map(c=>`<tr style="border-bottom:1px solid #161b22;">
+    <td style="padding:3px 0;color:#6e7681;">${c.time}</td>
+    <td style="padding:3px 6px;"><span style="color:${c.cap==='exec'?'#d29922':c.cap==='plan'?'#58a6ff':'#3fb950'};font-size:10px;">${c.cap}</span></td>
+    <td style="padding:3px 6px;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"><code style="font-size:10.5px;">${c.tool}</code></td>
+    <td style="padding:3px 0;text-align:right;color:${c.approved==='user'?'#d29922':c.approved==='auto'?'#6e7681':'#58a6ff'};font-size:10px;">${c.approved}</td>
+  </tr>`).join('')}
+  </table>
+  <div style="margin-top:10px;color:#6e7681;font-size:10.5px;">7 events · 1 exec (user-approved) · 5 read (auto) · 1 plan · HMAC chain intact</div>`;
+}
+
+function selectFinding(i){
+  selectedFinding=i;
+  renderQueue();
+  renderDetail();
+}
+
+function switchTab(t){
+  activeTab=t;
+  selectedFinding=0;
+  renderTabs();
+  renderQueue();
+  renderDetail();
+}
+
+function updateClock(){
+  const el=document.getElementById('clock');
+  if(el){const n=new Date();el.textContent=n.toUTCString().slice(17,25)+' UTC';}
+}
+
+renderTabs();
+renderQueue();
+renderDetail();
+setInterval(updateClock,1000);
+setInterval(()=>{
+  const m=document.getElementById('mem-val');
+  if(m){const v=33+Math.round(Math.random()*4);m.textContent=v+'%';m.style.color=v>90?'#f85149':v>75?'#d29922':'#3fb950';}
+},3000);
+</script>

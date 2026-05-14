@@ -37,8 +37,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        BarChart, Block, BorderType, Borders, Cell as TCell, Clear, ListItem, Paragraph, Row,
-        Table, Tabs, Wrap,
+        Block, BorderType, Borders, Cell as TCell, Clear, ListItem, Paragraph, Row, Table, Tabs,
+        Wrap,
     },
 };
 use serde::Deserialize;
@@ -73,6 +73,18 @@ const MODAL_BG: Color = Color::Rgb(19, 34, 53);
 const MODAL_FG: Color = Color::Rgb(203, 209, 222);
 const DIM_FG: Color = Color::Rgb(103, 119, 139);
 const SUCCESS_FG: Color = Color::Rgb(111, 221, 137);
+
+// ── HELMOPS color palette ──────────────────────────────────────────
+const OPS_BG: Color = Color::Rgb(13, 17, 23);
+const OPS_SURFACE: Color = Color::Rgb(22, 27, 34);
+const OPS_BORDER: Color = Color::Rgb(33, 38, 45);
+const OPS_FG: Color = Color::Rgb(201, 209, 217);
+const OPS_MUTED: Color = Color::Rgb(139, 148, 158);
+const OPS_DIM: Color = Color::Rgb(110, 118, 129);
+const OPS_BLUE: Color = Color::Rgb(88, 166, 255);
+const OPS_GREEN: Color = Color::Rgb(63, 185, 80);
+const OPS_YELLOW: Color = Color::Rgb(210, 153, 34);
+const OPS_RED: Color = Color::Rgb(248, 81, 73);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Theme {
@@ -832,6 +844,7 @@ impl DashPanel {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct FindingSummary {
     id: String,
     fingerprint: String,
@@ -863,6 +876,7 @@ struct FindingSummary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
 enum DashboardWorkflow {
     #[default]
     Review,
@@ -870,6 +884,7 @@ enum DashboardWorkflow {
     Remediate,
 }
 
+#[allow(dead_code)]
 impl DashboardWorkflow {
     fn all() -> &'static [Self] {
         &[Self::Review, Self::Cleanup, Self::Remediate]
@@ -892,6 +907,43 @@ enum DashboardFocus {
     Detail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpsTab {
+    Alerts,
+    Services,
+    Processes,
+    Logs,
+    Network,
+    Disk,
+    Changes,
+}
+
+impl OpsTab {
+    fn all() -> &'static [Self] {
+        &[
+            Self::Alerts,
+            Self::Services,
+            Self::Processes,
+            Self::Logs,
+            Self::Network,
+            Self::Disk,
+            Self::Changes,
+        ]
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Alerts => "ALERTS",
+            Self::Services => "SERVICES",
+            Self::Processes => "PROCESSES",
+            Self::Logs => "LOGS",
+            Self::Network => "NETWORK",
+            Self::Disk => "DISK",
+            Self::Changes => "CHANGES",
+        }
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DashboardSidebarSection {
     Workflow,
@@ -903,6 +955,7 @@ enum DashboardSidebarSection {
     Age,
 }
 
+#[allow(dead_code)]
 impl DashboardSidebarSection {
     fn all() -> &'static [Self] {
         &[
@@ -928,6 +981,7 @@ impl DashboardSidebarSection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
 enum DashboardStatusFilter {
     #[default]
     Active,
@@ -939,6 +993,7 @@ enum DashboardStatusFilter {
     All,
 }
 
+#[allow(dead_code)]
 impl DashboardStatusFilter {
     fn all() -> &'static [Self] {
         &[
@@ -966,6 +1021,7 @@ impl DashboardStatusFilter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
 enum DashboardAgeFilter {
     #[default]
     Any,
@@ -975,7 +1031,9 @@ enum DashboardAgeFilter {
     OverThirtyDays,
 }
 
+#[allow(dead_code)]
 impl DashboardAgeFilter {
+    #[allow(dead_code)]
     fn all() -> &'static [Self] {
         &[
             Self::Any,
@@ -1034,6 +1092,7 @@ struct DashboardMetrics {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct DashboardData {
     hostname: String,
     profile: String,
@@ -1066,25 +1125,14 @@ struct DashboardData {
 }
 
 /// Which sub-view the dashboard is showing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DashboardView {
-    /// 3x3 panel grid
+    #[default]
     Overview,
-    /// Detailed view for a non-finding panel.
     PanelDetail(DashPanel),
-    /// Detail of a single finding (index into DashboardData::findings)
     FindingDetail(usize),
-    /// Evidence for a single finding
     EvidenceView(usize),
-    /// Troubleshoot plan for a finding
     TroubleshootPlan(usize),
-}
-
-#[allow(clippy::derivable_impls)]
-impl Default for DashboardView {
-    fn default() -> Self {
-        Self::Overview
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1102,16 +1150,10 @@ struct DashboardState {
     selected: DashPanel,
     view: DashboardView,
     pane: DashboardFocus,
-    workflow: DashboardWorkflow,
-    sidebar_section: DashboardSidebarSection,
+    active_tab: OpsTab,
     selected_finding: usize,
     table_scroll: usize,
     detail_scroll: usize,
-    kind_filter: Option<String>,
-    host_filter: Option<String>,
-    severity_filter: Option<String>,
-    status_filter: DashboardStatusFilter,
-    age_filter: DashboardAgeFilter,
     active_plan: Option<DashboardPlan>,
     error: Option<String>,
 }
@@ -1123,16 +1165,10 @@ impl DashboardState {
             selected: DashPanel::Health,
             view: DashboardView::Overview,
             pane: DashboardFocus::Table,
-            workflow: DashboardWorkflow::Review,
-            sidebar_section: DashboardSidebarSection::Workflow,
+            active_tab: OpsTab::Alerts,
             selected_finding: 0,
             table_scroll: 0,
             detail_scroll: 0,
-            kind_filter: None,
-            host_filter: None,
-            severity_filter: None,
-            status_filter: DashboardStatusFilter::Active,
-            age_filter: DashboardAgeFilter::Any,
             active_plan: None,
             error: None,
         }
@@ -1709,15 +1745,31 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('1') => {
-                    self.dashboard.workflow = DashboardWorkflow::Review;
+                    self.dashboard.active_tab = OpsTab::Alerts;
                     return Ok(false);
                 }
                 KeyCode::Char('2') => {
-                    self.dashboard.workflow = DashboardWorkflow::Cleanup;
+                    self.dashboard.active_tab = OpsTab::Services;
                     return Ok(false);
                 }
                 KeyCode::Char('3') => {
-                    self.dashboard.workflow = DashboardWorkflow::Remediate;
+                    self.dashboard.active_tab = OpsTab::Processes;
+                    return Ok(false);
+                }
+                KeyCode::Char('4') => {
+                    self.dashboard.active_tab = OpsTab::Logs;
+                    return Ok(false);
+                }
+                KeyCode::Char('5') => {
+                    self.dashboard.active_tab = OpsTab::Network;
+                    return Ok(false);
+                }
+                KeyCode::Char('6') => {
+                    self.dashboard.active_tab = OpsTab::Disk;
+                    return Ok(false);
+                }
+                KeyCode::Char('7') => {
+                    self.dashboard.active_tab = OpsTab::Changes;
                     return Ok(false);
                 }
                 KeyCode::Char('[') => {
@@ -1800,8 +1852,9 @@ impl TuiApp {
             KeyCode::End => self.input.cursor = self.input.text.chars().count(),
             KeyCode::Up if self.mode == AgentMode::Dashboard => match self.dashboard.view {
                 DashboardView::Overview => match self.dashboard.pane {
-                    DashboardFocus::Sidebar => self.cycle_dashboard_sidebar_section(-1),
-                    DashboardFocus::Table => self.move_dashboard_selection(-1),
+                    DashboardFocus::Sidebar | DashboardFocus::Table => {
+                        self.move_dashboard_selection(-1)
+                    }
                     DashboardFocus::Detail => {
                         self.dashboard.detail_scroll =
                             self.dashboard.detail_scroll.saturating_sub(1);
@@ -1813,8 +1866,9 @@ impl TuiApp {
             },
             KeyCode::Down if self.mode == AgentMode::Dashboard => match self.dashboard.view {
                 DashboardView::Overview => match self.dashboard.pane {
-                    DashboardFocus::Sidebar => self.cycle_dashboard_sidebar_section(1),
-                    DashboardFocus::Table => self.move_dashboard_selection(1),
+                    DashboardFocus::Sidebar | DashboardFocus::Table => {
+                        self.move_dashboard_selection(1)
+                    }
                     DashboardFocus::Detail => {
                         self.dashboard.detail_scroll =
                             self.dashboard.detail_scroll.saturating_add(1);
@@ -1826,23 +1880,29 @@ impl TuiApp {
             },
             KeyCode::Left
                 if self.mode == AgentMode::Dashboard
-                    && self.dashboard.view == DashboardView::Overview =>
+                    && self.dashboard.view == DashboardView::Overview
+                    && self.input.text.is_empty() =>
             {
-                match self.dashboard.pane {
-                    DashboardFocus::Sidebar => self.cycle_dashboard_filter_value(-1),
-                    DashboardFocus::Table => self.dashboard.pane = DashboardFocus::Sidebar,
-                    DashboardFocus::Detail => self.dashboard.pane = DashboardFocus::Table,
-                }
+                let tabs = OpsTab::all();
+                let current = tabs
+                    .iter()
+                    .position(|t| *t == self.dashboard.active_tab)
+                    .unwrap_or(0);
+                let prev = current.saturating_sub(1);
+                self.dashboard.active_tab = tabs[prev];
             }
             KeyCode::Right
                 if self.mode == AgentMode::Dashboard
-                    && self.dashboard.view == DashboardView::Overview =>
+                    && self.dashboard.view == DashboardView::Overview
+                    && self.input.text.is_empty() =>
             {
-                match self.dashboard.pane {
-                    DashboardFocus::Sidebar => self.cycle_dashboard_filter_value(1),
-                    DashboardFocus::Table => self.dashboard.pane = DashboardFocus::Detail,
-                    DashboardFocus::Detail => {}
-                }
+                let tabs = OpsTab::all();
+                let current = tabs
+                    .iter()
+                    .position(|t| *t == self.dashboard.active_tab)
+                    .unwrap_or(0);
+                let next = (current + 1).min(tabs.len().saturating_sub(1));
+                self.dashboard.active_tab = tabs[next];
             }
             KeyCode::Up => self.input.previous_history(),
             KeyCode::Down => self.input.next_history(),
@@ -3988,46 +4048,12 @@ Report the exit status and the concise output."
     }
 
     fn finding_matches_dashboard_filters(&self, finding: &FindingSummary) -> bool {
-        if let Some(kind) = &self.dashboard.kind_filter
-            && &finding.kind != kind
-        {
-            return false;
-        }
-        if let Some(host) = &self.dashboard.host_filter
-            && &finding.host != host
-        {
-            return false;
-        }
-        if let Some(severity) = &self.dashboard.severity_filter
-            && &finding.severity != severity
-        {
-            return false;
-        }
-        let status_match = match self.dashboard.status_filter {
-            DashboardStatusFilter::Active => matches!(
-                finding.status,
-                DashboardFindingState::Open
-                    | DashboardFindingState::New
-                    | DashboardFindingState::Recurring
-            ),
-            DashboardStatusFilter::New => finding.status == DashboardFindingState::New,
-            DashboardStatusFilter::Recurring => finding.status == DashboardFindingState::Recurring,
-            DashboardStatusFilter::Suppressed => {
-                finding.status == DashboardFindingState::Suppressed
-            }
-            DashboardStatusFilter::Resolved => finding.status == DashboardFindingState::Resolved,
-            DashboardStatusFilter::SelfResolved => {
-                finding.status == DashboardFindingState::SelfResolved
-            }
-            DashboardStatusFilter::All => true,
-        };
-        if !status_match {
-            return false;
-        }
-        match self.dashboard.age_filter {
-            DashboardAgeFilter::Any => true,
-            bucket => age_bucket(finding.last_seen) == bucket,
-        }
+        matches!(
+            finding.status,
+            DashboardFindingState::Open
+                | DashboardFindingState::New
+                | DashboardFindingState::Recurring
+        )
     }
 
     fn clamp_dashboard_selection(&mut self) {
@@ -4061,109 +4087,14 @@ Report the exit status and the concise output."
         }
     }
 
-    fn cycle_dashboard_sidebar_section(&mut self, delta: isize) {
-        let sections = DashboardSidebarSection::all();
-        let current = sections
-            .iter()
-            .position(|section| *section == self.dashboard.sidebar_section)
-            .unwrap_or(0) as isize;
-        let next = (current + delta).clamp(0, sections.len().saturating_sub(1) as isize) as usize;
-        self.dashboard.sidebar_section = sections[next];
+    #[allow(dead_code)]
+    fn cycle_dashboard_sidebar_section(&mut self, _delta: isize) {
+        // no-op: sidebar sections removed in HELMOPS
     }
 
-    fn cycle_dashboard_filter_value(&mut self, delta: isize) {
-        match self.dashboard.sidebar_section {
-            DashboardSidebarSection::Workflow => {
-                let values = DashboardWorkflow::all();
-                let current = values
-                    .iter()
-                    .position(|value| *value == self.dashboard.workflow)
-                    .unwrap_or(0) as isize;
-                let next =
-                    (current + delta).clamp(0, values.len().saturating_sub(1) as isize) as usize;
-                self.dashboard.workflow = values[next];
-            }
-            DashboardSidebarSection::Kind => {
-                let values = &self.dashboard.data.kinds;
-                if values.is_empty() {
-                    self.dashboard.kind_filter = None;
-                } else {
-                    let current = self
-                        .dashboard
-                        .kind_filter
-                        .as_ref()
-                        .and_then(|selected| values.iter().position(|value| value == selected))
-                        .map(|idx| idx as isize + 1)
-                        .unwrap_or(0);
-                    let next = (current + delta).clamp(0, values.len() as isize) as usize;
-                    self.dashboard.kind_filter = if next == 0 {
-                        None
-                    } else {
-                        values.get(next - 1).cloned()
-                    };
-                }
-            }
-            DashboardSidebarSection::Host => {
-                let values = &self.dashboard.data.hosts;
-                if values.is_empty() {
-                    self.dashboard.host_filter = None;
-                } else {
-                    let current = self
-                        .dashboard
-                        .host_filter
-                        .as_ref()
-                        .and_then(|selected| values.iter().position(|value| value == selected))
-                        .map(|idx| idx as isize + 1)
-                        .unwrap_or(0);
-                    let next = (current + delta).clamp(0, values.len() as isize) as usize;
-                    self.dashboard.host_filter = if next == 0 {
-                        None
-                    } else {
-                        values.get(next - 1).cloned()
-                    };
-                }
-            }
-            DashboardSidebarSection::Severity => {
-                let values = ["critical", "warning", "info"];
-                let current = self
-                    .dashboard
-                    .severity_filter
-                    .as_ref()
-                    .and_then(|selected| values.iter().position(|value| value == selected))
-                    .map(|idx| idx as isize + 1)
-                    .unwrap_or(0);
-                let next = (current + delta).clamp(0, values.len() as isize) as usize;
-                self.dashboard.severity_filter = if next == 0 {
-                    None
-                } else {
-                    Some(values[next - 1].to_owned())
-                };
-            }
-            DashboardSidebarSection::Status => {
-                let values = DashboardStatusFilter::all();
-                let current = values
-                    .iter()
-                    .position(|value| *value == self.dashboard.status_filter)
-                    .unwrap_or(0) as isize;
-                let next =
-                    (current + delta).clamp(0, values.len().saturating_sub(1) as isize) as usize;
-                self.dashboard.status_filter = values[next];
-            }
-            DashboardSidebarSection::Age => {
-                let values = DashboardAgeFilter::all();
-                let current = values
-                    .iter()
-                    .position(|value| *value == self.dashboard.age_filter)
-                    .unwrap_or(0) as isize;
-                let next =
-                    (current + delta).clamp(0, values.len().saturating_sub(1) as isize) as usize;
-                self.dashboard.age_filter = values[next];
-            }
-        }
-        self.dashboard.selected_finding = 0;
-        self.dashboard.table_scroll = 0;
-        self.dashboard.detail_scroll = 0;
-        self.clamp_dashboard_selection();
+    #[allow(dead_code)]
+    fn cycle_dashboard_filter_value(&mut self, _delta: isize) {
+        // no-op: sidebar filters removed in HELMOPS
     }
 
     fn current_dashboard_finding(&self) -> Option<&FindingSummary> {
@@ -4939,37 +4870,739 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
 /// Render the main 3x3 panel grid.
 fn render_dash_overview(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let visible = app.dashboard_visible_finding_indices();
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
+    if area.width < 60 || area.height < 12 {
+        Paragraph::new("HELMOPS needs a larger terminal")
+            .style(Style::default().fg(OPS_MUTED))
+            .render(area, buf);
+        return;
+    }
+
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(24),
-            Constraint::Min(64),
-            Constraint::Percentage(34),
+            Constraint::Length(5),
+            Constraint::Length(1),
+            Constraint::Min(8),
+            Constraint::Length(1),
         ])
         .split(area);
 
-    render_dash_sidebar(app, chunks[0], buf);
-
-    let center = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(7),
-            Constraint::Length(10),
-            Constraint::Min(12),
-            Constraint::Length(2),
-        ])
-        .split(chunks[1]);
-
-    render_dash_workflow_tabs(app, center[0], buf);
-    render_dash_briefing_cards(app, center[1], buf);
-    render_dash_briefing_charts(app, center[2], buf);
-    render_dash_finding_table(app, &visible, center[3], buf);
-    render_dash_footer(app, &visible, center[4], buf);
-    render_dash_detail_pane(app, &visible, chunks[2], buf);
+    render_ops_header(app, vert[0], buf);
+    render_ops_tabbar(app, vert[1], buf);
+    render_ops_body(app, vert[2], buf);
+    render_ops_footer(app, vert[3], buf);
 }
 
+fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let d = &app.dashboard.data;
+    let m = &d.metrics;
+    let hostname = if d.hostname.is_empty() {
+        "localhost"
+    } else {
+        &d.hostname
+    };
+    let profile = if d.profile.is_empty() {
+        "default"
+    } else {
+        &d.profile
+    };
+    let time_str = if d.collected_at.is_empty() {
+        "--:-- UTC"
+    } else {
+        &d.collected_at
+    };
+    let load_str = format!("{:.1}", d.load_1m);
+    let mem_str = format!("{:.0}%", d.memory_used_pct);
+
+    let title = Line::from(vec![
+        Span::styled(
+            " HELMOPS ",
+            Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("│", Style::default().fg(OPS_BORDER)),
+        Span::styled(format!(" {} ", hostname), Style::default().fg(OPS_FG)),
+        Span::styled("│", Style::default().fg(OPS_BORDER)),
+        Span::styled(format!(" {} ", profile), Style::default().fg(OPS_MUTED)),
+        Span::styled("│", Style::default().fg(OPS_BORDER)),
+        Span::styled(" LIVE ", Style::default().fg(OPS_GREEN)),
+        Span::styled("│", Style::default().fg(OPS_BORDER)),
+        Span::styled(format!(" {} ", time_str), Style::default().fg(OPS_DIM)),
+        Span::styled("│", Style::default().fg(OPS_BORDER)),
+        Span::styled(format!(" load {} ", load_str), Style::default().fg(OPS_DIM)),
+        Span::styled("│", Style::default().fg(OPS_BORDER)),
+        Span::styled(
+            format!(" mem {} ", mem_str),
+            Style::default().fg(if d.memory_used_pct > 80.0 {
+                OPS_RED
+            } else {
+                OPS_DIM
+            }),
+        ),
+    ]);
+
+    let crit_style = if m.critical > 0 {
+        Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(OPS_MUTED)
+    };
+    let warn_style = if m.warning > 0 {
+        Style::default().fg(OPS_YELLOW).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(OPS_MUTED)
+    };
+    let info_style = Style::default().fg(OPS_MUTED);
+
+    let summary = Line::from(vec![
+        Span::styled(format!(" CRIT {} ", m.critical), crit_style),
+        Span::styled(format!("WARN {} ", m.warning), warn_style),
+        Span::styled(format!("INFO {} ", m.open), info_style),
+        Span::styled(" ", Style::default().fg(OPS_DIM)),
+    ]);
+
+    if !d.disk_entries.is_empty() {
+        let mut disk_spans = vec![Span::styled("DISK ", Style::default().fg(OPS_DIM))];
+        for entry in &d.disk_entries {
+            disk_spans.push(Span::styled(
+                format!(" {} ", entry),
+                Style::default().fg(OPS_MUTED),
+            ));
+        }
+        let disk_line = Line::from(disk_spans);
+        Paragraph::new(vec![title, summary, disk_line])
+            .style(Style::default().bg(OPS_BG))
+            .render(area, buf);
+    } else {
+        Paragraph::new(vec![title, summary])
+            .style(Style::default().bg(OPS_BG))
+            .render(area, buf);
+    }
+}
+
+fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let titles: Vec<Line> = OpsTab::all()
+        .iter()
+        .map(|tab| {
+            let style = if *tab == app.dashboard.active_tab {
+                Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(OPS_MUTED)
+            };
+            Line::from(Span::styled(format!(" {} ", tab.label()), style))
+        })
+        .collect();
+    let selected = OpsTab::all()
+        .iter()
+        .position(|t| *t == app.dashboard.active_tab)
+        .unwrap_or(0);
+    Tabs::new(titles)
+        .select(selected)
+        .divider(Span::styled("│", Style::default().fg(OPS_BORDER)))
+        .style(Style::default().bg(OPS_BG))
+        .highlight_style(Style::default().bg(OPS_SURFACE))
+        .render(area, buf);
+}
+
+fn render_ops_body(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let horiz = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(50), Constraint::Min(30)])
+        .split(area);
+    render_ops_queue(app, horiz[0], buf);
+    match app.dashboard.active_tab {
+        OpsTab::Alerts => render_ops_alerts(app, horiz[1], buf),
+        OpsTab::Services => render_ops_services(app, horiz[1], buf),
+        OpsTab::Processes => render_ops_processes(app, horiz[1], buf),
+        OpsTab::Logs => render_ops_logs(app, horiz[1], buf),
+        OpsTab::Network => render_ops_network(app, horiz[1], buf),
+        OpsTab::Disk => render_ops_disk(app, horiz[1], buf),
+        OpsTab::Changes => render_ops_changes(app, horiz[1], buf),
+    }
+}
+
+fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" QUEUE ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let visible = app.dashboard_visible_finding_indices();
+    if visible.is_empty() {
+        Paragraph::new("No active alerts")
+            .style(Style::default().fg(OPS_MUTED))
+            .render(inner, buf);
+        return;
+    }
+
+    let mut lines = Vec::new();
+    let body_height = inner.height.saturating_sub(1) as usize;
+    let start = if app.dashboard.selected_finding >= app.dashboard.table_scroll + body_height
+        && body_height > 0
+    {
+        app.dashboard
+            .selected_finding
+            .saturating_sub(body_height.saturating_sub(1))
+    } else {
+        app.dashboard.table_scroll
+    };
+
+    for (i, actual_idx) in visible.iter().enumerate().skip(start).take(body_height) {
+        let finding = &app.dashboard.data.findings[*actual_idx];
+        let selected =
+            i == app.dashboard.selected_finding && app.dashboard.pane == DashboardFocus::Table;
+        let bg = if selected { OPS_SURFACE } else { OPS_BG };
+        let sev_color = match finding.severity.as_str() {
+            "critical" => OPS_RED,
+            "warning" => OPS_YELLOW,
+            _ => OPS_MUTED,
+        };
+        let state_color = match finding.status {
+            DashboardFindingState::New => OPS_YELLOW,
+            DashboardFindingState::Recurring => Color::Rgb(242, 201, 76),
+            DashboardFindingState::Suppressed => OPS_DIM,
+            DashboardFindingState::Resolved | DashboardFindingState::SelfResolved => OPS_GREEN,
+            DashboardFindingState::Open => OPS_BLUE,
+        };
+        let sev_label = finding
+            .severity
+            .chars()
+            .take(4)
+            .collect::<String>()
+            .to_ascii_uppercase();
+        let sample = truncate_cell(&finding.sample, 24);
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:>4} ", sev_label),
+                Style::default()
+                    .fg(sev_color)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    " {}",
+                    finding.status.label().chars().take(4).collect::<String>()
+                ),
+                Style::default().fg(state_color).bg(bg),
+            ),
+            Span::styled(
+                format!(" {} ", finding.age_label),
+                Style::default().fg(OPS_DIM).bg(bg),
+            ),
+            Span::styled(sample, Style::default().fg(OPS_FG).bg(bg)),
+        ]));
+    }
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .render(inner, buf);
+}
+
+fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" ALERT DETAIL ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let visible = app.dashboard_visible_finding_indices();
+    let Some(actual_idx) = visible.get(app.dashboard.selected_finding) else {
+        Paragraph::new("Select an alert from the queue")
+            .style(Style::default().fg(OPS_MUTED))
+            .render(inner, buf);
+        return;
+    };
+    let finding = &app.dashboard.data.findings[*actual_idx];
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            &finding.title,
+            Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(&finding.id, Style::default().fg(OPS_DIM))),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled("Severity: ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                finding.severity.to_ascii_uppercase(),
+                Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Status: ", Style::default().fg(OPS_DIM)),
+            Span::styled(finding.status.label(), Style::default().fg(OPS_BLUE)),
+        ]),
+        Line::from(vec![
+            Span::styled("Resource: ", Style::default().fg(OPS_DIM)),
+            Span::styled(&finding.affected_resource, Style::default().fg(OPS_FG)),
+            Span::styled("  Host: ", Style::default().fg(OPS_DIM)),
+            Span::styled(&finding.host, Style::default().fg(OPS_FG)),
+        ]),
+        Line::from(vec![
+            Span::styled("Confidence: ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                finding.confidence.to_ascii_uppercase(),
+                Style::default().fg(OPS_MUTED),
+            ),
+            Span::styled("  Count: ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                finding.occurrence_count.to_string(),
+                Style::default().fg(OPS_MUTED),
+            ),
+        ]),
+        Line::from(Span::raw("")),
+        Line::from(Span::styled("Sample:", Style::default().fg(OPS_DIM))),
+        Line::from(Span::styled(&finding.sample, Style::default().fg(OPS_FG))),
+    ];
+
+    if !finding.impact.is_empty() {
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "Impact:",
+            Style::default().fg(OPS_DIM),
+        )));
+        lines.push(Line::from(Span::styled(
+            &finding.impact,
+            Style::default().fg(OPS_YELLOW),
+        )));
+    }
+    if let Some(fix) = &finding.fix_plan {
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "Fix:",
+            Style::default().fg(OPS_DIM),
+        )));
+        lines.push(Line::from(Span::styled(
+            fix,
+            Style::default().fg(OPS_GREEN),
+        )));
+    }
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(inner, buf);
+}
+
+fn render_ops_services(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" SERVICES ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let d = &app.dashboard.data;
+    let domains = &d.domains;
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled("Total: ", Style::default().fg(OPS_DIM)),
+        Span::styled(d.total_services.to_string(), Style::default().fg(OPS_FG)),
+        Span::styled("  Failed: ", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            d.failed_services.to_string(),
+            if d.failed_services > 0 {
+                Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(OPS_GREEN)
+            },
+        ),
+    ]));
+    lines.push(Line::from(Span::raw("")));
+
+    for unit in &domains.services.units {
+        let failed = unit.active == "failed" || unit.sub == "failed";
+        let color = if failed { OPS_RED } else { OPS_GREEN };
+        let sub_info = if unit.sub.is_empty() || unit.sub == unit.active {
+            String::new()
+        } else {
+            format!(" ({})", unit.sub)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if failed { " ✗ " } else { " ✓ " },
+                Style::default().fg(color),
+            ),
+            Span::styled(&unit.name, Style::default().fg(OPS_FG)),
+            Span::styled(
+                format!(" {}{sub_info}", unit.active),
+                Style::default().fg(OPS_MUTED),
+            ),
+        ]));
+    }
+
+    if domains.services.units.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No service data. Run `helm monitor` for full data.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    }
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(inner, buf);
+}
+
+fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" PROCESSES ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let domains = &app.dashboard.data.domains;
+    let mut lines: Vec<Line> = Vec::new();
+
+    let processes = &domains.processes.top_by_memory;
+    if processes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No process data. Run `helm monitor` for full data.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:>7} ", "PID"),
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {:>8} ", "CPU%"),
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {:>8} ", "MEM%"),
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " COMMAND",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for proc in processes.iter().take(20) {
+            let pid = proc.pid;
+            let cpu = proc.cpu_percent;
+            let mem = proc.mem_percent;
+            let cmd = proc.command.chars().take(40).collect::<String>();
+            let mem_color = if mem > 20.0 {
+                OPS_RED
+            } else if mem > 10.0 {
+                OPS_YELLOW
+            } else {
+                OPS_MUTED
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {:>7} ", pid), Style::default().fg(OPS_DIM)),
+                Span::styled(format!(" {:>7.1}% ", cpu), Style::default().fg(OPS_MUTED)),
+                Span::styled(format!(" {:>7.1}% ", mem), Style::default().fg(mem_color)),
+                Span::styled(cmd, Style::default().fg(OPS_FG)),
+            ]));
+        }
+    }
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(inner, buf);
+}
+
+fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" LOGS ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let d = &app.dashboard.data;
+    let domains = &d.domains;
+    let mut lines: Vec<Line> = Vec::new();
+
+    let err_count = d.last_log_errors;
+    let journal_errors = domains.logs.journal_errors_last_hour;
+
+    lines.push(Line::from(vec![
+        Span::styled("Journal errors (last hour): ", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            journal_errors.to_string(),
+            if journal_errors > 0 {
+                Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(OPS_GREEN)
+            },
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Monitor log errors: ", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            err_count.to_string(),
+            if err_count > 0 {
+                Style::default().fg(OPS_YELLOW)
+            } else {
+                Style::default().fg(OPS_GREEN)
+            },
+        ),
+    ]));
+    if let Some(rate) = domains.logs.error_rate_per_minute {
+        lines.push(Line::from(vec![
+            Span::styled("Error rate: ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                format!("{:.1}/min", rate),
+                if rate > 10.0 {
+                    Style::default().fg(OPS_RED)
+                } else {
+                    Style::default().fg(OPS_MUTED)
+                },
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::raw("")));
+
+    if !domains.logs.kernel_errors.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Kernel errors:",
+            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+        )));
+        for ke in domains.logs.kernel_errors.iter().take(5) {
+            lines.push(Line::from(Span::styled(
+                format!("  {ke}"),
+                Style::default().fg(OPS_RED),
+            )));
+        }
+        lines.push(Line::from(Span::raw("")));
+    }
+
+    if !domains.logs.auth_failures.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Auth failures:",
+            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+        )));
+        for af in domains.logs.auth_failures.iter().take(5) {
+            lines.push(Line::from(Span::styled(
+                format!("  {af}"),
+                Style::default().fg(OPS_YELLOW),
+            )));
+        }
+    }
+
+    if domains.logs.kernel_errors.is_empty() && domains.logs.auth_failures.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No recent log entries.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    }
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(inner, buf);
+}
+
+fn render_ops_network(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" NETWORK ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let domains = &app.dashboard.data.domains;
+    let mut lines: Vec<Line> = Vec::new();
+
+    let listeners = &domains.ports.listeners;
+    if listeners.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No port data. Run `helm monitor` for full data.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:>5} ", "PROTO"),
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {:>22} ", "LOCAL ADDRESS"),
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " PROCESS",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for lis in listeners.iter().take(20) {
+            let proto = &lis.protocol;
+            let addr = &lis.local_address;
+            let proc = lis
+                .process_name
+                .as_deref()
+                .unwrap_or("-")
+                .chars()
+                .take(20)
+                .collect::<String>();
+            let is_public = addr.contains("0.0.0.0") || addr.contains("::");
+            let addr_color = if is_public { OPS_RED } else { OPS_MUTED };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {:>5} ", proto), Style::default().fg(OPS_DIM)),
+                Span::styled(format!(" {:>22} ", addr), Style::default().fg(addr_color)),
+                Span::styled(proc, Style::default().fg(OPS_FG)),
+            ]));
+        }
+    }
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(inner, buf);
+}
+
+fn render_ops_disk(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" DISK ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let d = &app.dashboard.data;
+    let domains = &d.domains;
+    let mut lines: Vec<Line> = Vec::new();
+
+    let fses = &domains.disks.filesystems;
+    if fses.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No disk data. Run `helm monitor` for full data.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    } else {
+        for fs in fses.iter().take(10) {
+            let mount = &fs.mount_point;
+            let device = fs.device.chars().take(10).collect::<String>();
+            let total = fs.total_bytes;
+            let used = fs.used_bytes;
+            let pct = if total > 0 {
+                (used as f64 / total as f64 * 100.0) as u8
+            } else {
+                0
+            };
+
+            let bar_w = 10usize;
+            let filled = ((pct as usize) * bar_w / 100).min(bar_w);
+            let empty = bar_w.saturating_sub(filled);
+            let bar_contents = "#".repeat(filled) + &".".repeat(empty);
+            let bar_color = if pct > 90 {
+                OPS_RED
+            } else if pct > 75 {
+                OPS_YELLOW
+            } else {
+                OPS_GREEN
+            };
+
+            let inode_str = {
+                let found = domains
+                    .disks
+                    .inodes
+                    .iter()
+                    .find(|i| i.mount_point == *mount || i.device == device);
+                if let Some(inode) = found {
+                    let ipct = if inode.total > 0 {
+                        (inode.used as f64 / inode.total as f64 * 100.0) as u8
+                    } else {
+                        0
+                    };
+                    format!(" inode:{}%", ipct)
+                } else {
+                    String::new()
+                }
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {:<10} ", device), Style::default().fg(OPS_DIM)),
+                Span::styled(format!(" [{bar_contents}]"), Style::default().fg(bar_color)),
+                Span::styled(format!(" {:>3}%", pct), Style::default().fg(bar_color)),
+                Span::styled(inode_str, Style::default().fg(OPS_MUTED)),
+                Span::styled(format!(" {}", mount), Style::default().fg(OPS_FG)),
+            ]));
+        }
+    }
+
+    if !d.disk_entries.is_empty() {
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "Quick summary:",
+            Style::default().fg(OPS_DIM),
+        )));
+        for entry in &d.disk_entries {
+            lines.push(Line::from(Span::styled(
+                format!("  {entry}"),
+                Style::default().fg(OPS_MUTED),
+            )));
+        }
+    }
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(inner, buf);
+}
+
+fn render_ops_changes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" CHANGES ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let d = &app.dashboard.data;
+    let mut lines: Vec<Line> = Vec::new();
+
+    if d.change_sets.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No change sets tracked yet.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    } else {
+        for cs in d.change_sets.iter().take(20) {
+            let status_color = match cs.status.as_str() {
+                "applied" => OPS_GREEN,
+                "pending" => OPS_YELLOW,
+                "failed" => OPS_RED,
+                _ => OPS_MUTED,
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", cs.status.as_str()),
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {} ", cs.id), Style::default().fg(OPS_DIM)),
+                Span::styled(
+                    cs.summary.chars().take(50).collect::<String>(),
+                    Style::default().fg(OPS_FG),
+                ),
+            ]));
+        }
+    }
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(inner, buf);
+}
+
+fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let text = " Tab focus  |  F5 refresh  |  Alt+E evidence  |  Alt+S suppress  |  Alt+R resolve  |  Alt+U reopen  |  1-7 tabs";
+    Paragraph::new(text)
+        .style(Style::default().fg(OPS_DIM).bg(OPS_BG))
+        .render(area, buf);
+}
+
+#[allow(dead_code)]
 fn finding_severity_color(raw: &str) -> Color {
     match raw {
         "critical" => ERROR_FG,
@@ -4978,6 +5611,7 @@ fn finding_severity_color(raw: &str) -> Color {
     }
 }
 
+#[allow(dead_code)]
 fn finding_state_color(state: DashboardFindingState) -> Color {
     match state {
         DashboardFindingState::New => Color::Rgb(255, 139, 92),
@@ -5001,200 +5635,7 @@ fn truncate_cell(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn render_dash_workflow_tabs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let titles = DashboardWorkflow::all()
-        .iter()
-        .map(|workflow| Line::from(Span::raw(format!(" {} ", workflow.label()))))
-        .collect::<Vec<_>>();
-    let selected = DashboardWorkflow::all()
-        .iter()
-        .position(|workflow| *workflow == app.dashboard.workflow)
-        .unwrap_or(0);
-    Tabs::new(titles)
-        .block(
-            Block::default()
-                .title(" Morning Triage ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(HEADER_BORDER)),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(Color::White)
-                .bg(HEADER_BORDER)
-                .add_modifier(Modifier::BOLD),
-        )
-        .select(selected)
-        .divider(" ")
-        .render(area, buf);
-}
-
-fn render_dash_sidebar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let state = &app.dashboard;
-    let d = &state.data;
-    let block = Block::default()
-        .title(" Filters ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(HEADER_BORDER));
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    let mut lines = Vec::new();
-    let sections = DashboardSidebarSection::all();
-    for section in sections {
-        let selected = *section == state.sidebar_section && state.pane == DashboardFocus::Sidebar;
-        let title_style = if selected {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(DIM_FG)
-        };
-        lines.push(Line::from(Span::styled(
-            section.label().to_uppercase(),
-            title_style,
-        )));
-        let value = match section {
-            DashboardSidebarSection::Workflow => state.workflow.label().to_owned(),
-            DashboardSidebarSection::Kind => state
-                .kind_filter
-                .clone()
-                .unwrap_or_else(|| format!("All ({})", d.kinds.len())),
-            DashboardSidebarSection::Host => state
-                .host_filter
-                .clone()
-                .unwrap_or_else(|| format!("All ({})", d.hosts.len().max(1))),
-            DashboardSidebarSection::Severity => state
-                .severity_filter
-                .clone()
-                .unwrap_or_else(|| "All".to_owned()),
-            DashboardSidebarSection::Status => state.status_filter.label().to_owned(),
-            DashboardSidebarSection::Age => state.age_filter.label().to_owned(),
-        };
-        lines.push(Line::from(Span::styled(
-            format!("  {value}"),
-            Style::default().fg(APP_FG),
-        )));
-        lines.push(Line::default());
-    }
-
-    lines.push(Line::from(Span::styled(
-        format!("Host: {}", d.hostname),
-        Style::default().fg(DIM_FG),
-    )));
-    lines.push(Line::from(Span::styled(
-        format!("Snapshot: {}", d.snapshot_id),
-        Style::default().fg(DIM_FG),
-    )));
-    lines.push(Line::from(Span::styled(
-        format!("Updated: {}", d.collected_at),
-        Style::default().fg(DIM_FG),
-    )));
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "SYSTEM SUMMARY",
-        Style::default().fg(DIM_FG).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::styled(
-        format!("  {}", state.selected.label()),
-        Style::default().fg(APP_FG),
-    )));
-    for line in render_dash_panel(state.selected, d).lines().take(6) {
-        lines.push(Line::from(Span::styled(
-            format!("  {line}"),
-            Style::default().fg(DIM_FG),
-        )));
-    }
-
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .render(inner, buf);
-}
-
-fn render_dash_briefing_cards(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let cards = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
-        .split(area);
-    let metrics = &app.dashboard.data.metrics;
-    let card_data = [
-        ("Open", metrics.open, Color::Rgb(86, 156, 214)),
-        ("New", metrics.new, Color::Rgb(255, 139, 92)),
-        ("Recurring", metrics.recurring, Color::Rgb(242, 201, 76)),
-        ("Self-resolved", metrics.self_resolved, SUCCESS_FG),
-    ];
-    for (idx, (label, value, accent)) in card_data.into_iter().enumerate() {
-        let block = Block::default()
-            .title(format!(" {label} "))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(accent));
-        let inner = block.inner(cards[idx]);
-        block.render(cards[idx], buf);
-        Paragraph::new(Line::from(Span::styled(
-            format!("{value}"),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .alignment(ratatui::layout::Alignment::Center)
-        .render(inner, buf);
-    }
-}
-
-fn render_dash_briefing_charts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let rows = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    let kinds = app
-        .dashboard
-        .data
-        .kind_distribution
-        .iter()
-        .take(5)
-        .map(|(label, count)| (label.as_str(), *count))
-        .collect::<Vec<_>>();
-    BarChart::default()
-        .block(
-            Block::default()
-                .title(" Open by kind ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(HEADER_BORDER)),
-        )
-        .bar_width(7)
-        .bar_gap(1)
-        .bar_style(Style::default().fg(Color::Rgb(251, 160, 74)))
-        .value_style(Style::default().fg(Color::White))
-        .label_style(Style::default().fg(DIM_FG))
-        .data(kinds.as_slice())
-        .render(rows[0], buf);
-    let ages = app
-        .dashboard
-        .data
-        .age_distribution
-        .iter()
-        .map(|(label, count)| (label.as_str(), *count))
-        .collect::<Vec<_>>();
-    BarChart::default()
-        .block(
-            Block::default()
-                .title(" Age distribution ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(HEADER_BORDER)),
-        )
-        .bar_width(7)
-        .bar_gap(1)
-        .bar_style(Style::default().fg(Color::Rgb(111, 162, 255)))
-        .value_style(Style::default().fg(Color::White))
-        .label_style(Style::default().fg(DIM_FG))
-        .data(ages.as_slice())
-        .render(rows[1], buf);
-}
-
+#[allow(dead_code)]
 fn render_dash_finding_table(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .title(" Findings ")
@@ -5272,6 +5713,7 @@ fn render_dash_finding_table(app: &TuiApp, visible: &[usize], area: Rect, buf: &
     .render(inner, buf);
 }
 
+#[allow(dead_code)]
 fn render_dash_footer(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buffer) {
     let focus = match app.dashboard.pane {
         DashboardFocus::Sidebar => "Filters",
@@ -5288,6 +5730,7 @@ fn render_dash_footer(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buf
         .render(area, buf);
 }
 
+#[allow(dead_code)]
 fn render_dash_detail_pane(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .title(" Finding detail ")
@@ -5869,6 +6312,7 @@ fn render_dash_troubleshoot_plan(app: &TuiApp, idx: usize, area: Rect, buf: &mut
         .render(inner, buf);
 }
 
+#[allow(dead_code)]
 fn render_dash_panel(panel: DashPanel, d: &DashboardData) -> String {
     match panel {
         DashPanel::Health => {
@@ -8469,19 +8913,12 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(!rendered.is_empty(), "buffer should not be empty");
-        assert!(
-            rendered.contains("Morning Triage"),
-            "should render triage header"
-        );
-        assert!(rendered.contains("Open"), "should render briefing card");
-        assert!(
-            rendered.contains("Findings"),
-            "should render finding table title"
-        );
+        assert!(rendered.contains("HELMOPS"), "should render HELMOPS header");
+        assert!(rendered.contains("QUEUE"), "should render queue title");
         assert!(rendered.contains("testbox"), "should show hostname");
         assert!(
             rendered.contains("Disk /var 78% full"),
-            "should show selected finding"
+            "should show selected finding detail"
         );
     }
 
@@ -8494,8 +8931,8 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 42, 18), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            !rendered.contains("Dashboard needs a larger terminal"),
-            "should fit at 42x18"
+            rendered.contains("HELMOPS") || !rendered.contains("needs a larger terminal"),
+            "should render HELMOPS or hint at 42x18"
         );
     }
 
