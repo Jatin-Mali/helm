@@ -622,8 +622,8 @@ fn build_check_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     "Identify largest directories consuming disk space",
                 ),
                 hypothesis_id: Some(hypothesis.id.clone()),
-                expected_output: None,
-                interpretation_guide: None,
+                expected_output: Some("Sorted list of directory sizes (e.g., '4.5G /var/log')".into()),
+                interpretation_guide: Some("The top entry is the largest space consumer. Cross-check with df to account for all usage.".into()),
             });
             steps.push(PlanStep {
                 title: "Check for deleted-open files".into(),
@@ -633,8 +633,8 @@ fn build_check_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     "Find files deleted but still held open by processes",
                 ),
                 hypothesis_id: Some(hypothesis.id.clone()),
-                expected_output: None,
-                interpretation_guide: None,
+                expected_output: Some("Lines with '(deleted)' in the filename column".into()),
+                interpretation_guide: Some("Files appearing here occupy space not shown by du. Restart the owning process to release space.".into()),
             });
         }
         MonitorDomain::Load => {
@@ -646,8 +646,8 @@ fn build_check_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     "Identify highest CPU-consuming processes",
                 ),
                 hypothesis_id: Some(hypothesis.id.clone()),
-                expected_output: None,
-                interpretation_guide: None,
+                expected_output: Some("Table: PID, %CPU, %MEM, COMMAND sorted by CPU descending".into()),
+                interpretation_guide: Some("Processes above 50% CPU may be problematic. A single process near 100% indicates it is CPU-bound.".into()),
             });
         }
         MonitorDomain::Services => {
@@ -659,8 +659,8 @@ fn build_check_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     "List all failed systemd units with status details",
                 ),
                 hypothesis_id: Some(hypothesis.id.clone()),
-                expected_output: None,
-                interpretation_guide: None,
+                expected_output: Some("Table with columns: UNIT, LOAD, ACTIVE, SUB, DESCRIPTION".into()),
+                interpretation_guide: Some("Any unit with sub=failed needs investigation. Run 'journalctl -u <unit>' for the failure reason.".into()),
             });
         }
         MonitorDomain::Logs => {
@@ -672,8 +672,8 @@ fn build_check_steps(hypothesis: &Hypothesis) -> Vec<PlanStep> {
                     "Show the 30 most recent error-level journal entries",
                 ),
                 hypothesis_id: Some(hypothesis.id.clone()),
-                expected_output: None,
-                interpretation_guide: None,
+                expected_output: Some("Timestamped error messages (priority 'err' or higher)".into()),
+                interpretation_guide: Some("Recurring identical errors indicate an active fault. OOM killer entries signal memory exhaustion. Service crash patterns help identify root cause.".into()),
             });
         }
         _ => {}
