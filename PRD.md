@@ -111,6 +111,7 @@ Current shipped foundation:
 
 - CLI and TUI
 - dashboard-first default entrypoint
+- morning-triage dashboard layout with filters, queue, and detail pane
 - provider support
 - local Ollama path
 - read-only diagnose mode
@@ -150,7 +151,7 @@ Expected behavior:
 
 - opens the dashboard
 - loads the latest snapshot or asks the user to collect one
-- shows issues grouped by severity
+- shows a triage queue with lifecycle state and sample evidence
 - shows evidence and drill-down paths for each issue
 - keeps all dashboard actions read-only until the user opens an apply flow
 

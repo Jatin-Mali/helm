@@ -2,6 +2,7 @@
 
 pub mod changesets;
 pub mod episodes;
+pub mod finding_state;
 pub mod formal_skill;
 pub mod graph;
 pub mod merge_episodes;
@@ -21,6 +22,7 @@ pub use episodes::{
     EpisodeId, EpisodeOutcome, EpisodeOutcomeCounts, EpisodeRecord, MemoryStore, RoutingStat,
     StepRecord, StepRole, audit_hash, latest_audit_hash, stable_hash_hex,
 };
+pub use finding_state::{FindingStateRecord, FindingStateStatus, FindingStateStore};
 pub use formal_skill::{
     FormalSkill, FormalSkillError, Prerequisites, SkillDescription, SkillMeta, SkillMetadata,
 };

@@ -350,6 +350,7 @@ The TUI must support:
 
 - dashboard-first startup when `helm` is run with no arguments
 - monitor dashboard
+- triage queue with persisted lifecycle state
 - finding list
 - finding detail view
 - evidence view
@@ -364,6 +365,7 @@ Design constraints:
 - no decorative UI
 - clear severity markers
 - every dashboard panel must have a drill-down detail view
+- filter sidebar, queue, and detail pane must stay usable at the same time
 - no overlapping text at small terminal sizes
 - keyboard-first navigation
 - visible local/API boundary

@@ -19,6 +19,7 @@ const MIGRATION_0009: &str = include_str!("../migrations/0005_remote_audit.sql")
 const MIGRATION_0010: &str = include_str!("../migrations/0006_snapshots.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0007_findings.sql");
 const MIGRATION_0012: &str = include_str!("../migrations/0008_changesets.sql");
+const MIGRATION_0013: &str = include_str!("../migrations/0009_finding_state.sql");
 
 /// Minimal schema for per-host audit shard DBs (audit_events only).
 const SHARD_SCHEMA: &str = "\
@@ -1124,7 +1125,8 @@ fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
                 .map_err(sqlite_error)?;
             apply_0012(conn)
         }
-        12 => conn
+        12 => apply_0013(conn),
+        13 => conn
             .execute_batch("PRAGMA foreign_keys = ON")
             .map_err(sqlite_error),
         other => Err(MemoryError::Migration(format!(
@@ -1175,6 +1177,17 @@ fn apply_0012(conn: &Connection) -> Result<(), MemoryError> {
         conn.execute_batch(MIGRATION_0012).map_err(sqlite_error)?;
     }
     conn.execute_batch("PRAGMA user_version = 12")
+        .map_err(sqlite_error)?;
+    apply_0013(conn)
+}
+
+fn apply_0013(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .map_err(sqlite_error)?;
+    if !table_exists(conn, "finding_states")? {
+        conn.execute_batch(MIGRATION_0013).map_err(sqlite_error)?;
+    }
+    conn.execute_batch("PRAGMA user_version = 13")
         .map_err(sqlite_error)?;
     Ok(())
 }
@@ -1661,7 +1674,7 @@ mod tests {
     async fn schema_version_reports_current_version_edge_case() {
         let (_dir, store) = store().await;
 
-        assert_eq!(store.schema_version().await.unwrap(), 12);
+        assert_eq!(store.schema_version().await.unwrap(), 13);
     }
 
     #[tokio::test]
@@ -1734,7 +1747,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         assert_eq!(has_column, 1);
     }
 

@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use chrono::Utc;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -20,7 +21,10 @@ use crossterm::{
 };
 use helm_agent::{AgentEvent, AgentEventSink, Budget, ReactAgent, RunResult, StructuredEvidence};
 use helm_core::{Capability, HelmError, Message};
-use helm_memory::{ChangeSetRecord, ChangeSetStore, MemoryStore, TroubleshootingPlanRecord};
+use helm_memory::{
+    ChangeSetRecord, ChangeSetStore, FindingStateRecord, FindingStateStatus, FindingStateStore,
+    MemoryStore, TroubleshootingPlanRecord,
+};
 use helm_monitor::{CollectorError, Finding, MonitorProfile, SnapshotDomains, plan_from_finding};
 use helm_providers::ChatRequest;
 use helm_tools::ToolRegistry;
@@ -32,7 +36,10 @@ use ratatui::{
     prelude::Widget,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, ListItem, Paragraph, Wrap},
+    widgets::{
+        BarChart, Block, BorderType, Borders, Cell as TCell, Clear, ListItem, Paragraph, Row,
+        Table, Tabs, Wrap,
+    },
 };
 use serde::Deserialize;
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
@@ -827,12 +834,22 @@ impl DashPanel {
 #[derive(Debug, Clone, Default)]
 struct FindingSummary {
     id: String,
+    fingerprint: String,
     severity: String,
     title: String,
     confidence: String,
     affected_resource: String,
     snapshot_id: String,
     domain: String,
+    kind: String,
+    host: String,
+    status: DashboardFindingState,
+    occurrence_count: usize,
+    first_seen: i64,
+    last_seen: i64,
+    age_label: String,
+    sample: String,
+    state_note: String,
     evidence_text: String,
     evidence_sources: Vec<String>,
     impact: String,
@@ -843,6 +860,177 @@ struct FindingSummary {
     risk: String,
     rollback: String,
     command_preview: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DashboardWorkflow {
+    #[default]
+    Review,
+    Cleanup,
+    Remediate,
+}
+
+impl DashboardWorkflow {
+    fn all() -> &'static [Self] {
+        &[Self::Review, Self::Cleanup, Self::Remediate]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Review => "Review",
+            Self::Cleanup => "Cleanup",
+            Self::Remediate => "Remediate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DashboardFocus {
+    Sidebar,
+    #[default]
+    Table,
+    Detail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DashboardSidebarSection {
+    Workflow,
+    Kind,
+    Host,
+    Severity,
+    Status,
+    #[default]
+    Age,
+}
+
+impl DashboardSidebarSection {
+    fn all() -> &'static [Self] {
+        &[
+            Self::Workflow,
+            Self::Kind,
+            Self::Host,
+            Self::Severity,
+            Self::Status,
+            Self::Age,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Workflow => "Workflow",
+            Self::Kind => "Kind",
+            Self::Host => "Host",
+            Self::Severity => "Severity",
+            Self::Status => "Status",
+            Self::Age => "Age",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DashboardStatusFilter {
+    #[default]
+    Active,
+    New,
+    Recurring,
+    Suppressed,
+    Resolved,
+    SelfResolved,
+    All,
+}
+
+impl DashboardStatusFilter {
+    fn all() -> &'static [Self] {
+        &[
+            Self::Active,
+            Self::New,
+            Self::Recurring,
+            Self::Suppressed,
+            Self::Resolved,
+            Self::SelfResolved,
+            Self::All,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Open",
+            Self::New => "New",
+            Self::Recurring => "Recurring",
+            Self::Suppressed => "Suppressed",
+            Self::Resolved => "Resolved",
+            Self::SelfResolved => "Self-resolved",
+            Self::All => "All",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DashboardAgeFilter {
+    #[default]
+    Any,
+    UnderOneDay,
+    TwoToSevenDays,
+    EightToThirtyDays,
+    OverThirtyDays,
+}
+
+impl DashboardAgeFilter {
+    fn all() -> &'static [Self] {
+        &[
+            Self::Any,
+            Self::UnderOneDay,
+            Self::TwoToSevenDays,
+            Self::EightToThirtyDays,
+            Self::OverThirtyDays,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any age",
+            Self::UnderOneDay => "<= 1d",
+            Self::TwoToSevenDays => "2-7d",
+            Self::EightToThirtyDays => "8-30d",
+            Self::OverThirtyDays => "30d+",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DashboardFindingState {
+    #[default]
+    Open,
+    New,
+    Recurring,
+    Suppressed,
+    Resolved,
+    SelfResolved,
+}
+
+impl DashboardFindingState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::New => "New",
+            Self::Recurring => "Recurring",
+            Self::Suppressed => "Suppressed",
+            Self::Resolved => "Resolved",
+            Self::SelfResolved => "Self-resolved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DashboardMetrics {
+    open: usize,
+    new: usize,
+    recurring: usize,
+    self_resolved: usize,
+    suppressed: usize,
+    resolved: usize,
+    critical: usize,
+    warning: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -865,6 +1053,11 @@ struct DashboardData {
     finding_warnings: usize,
     collected_at: String,
     findings: Vec<FindingSummary>,
+    hosts: Vec<String>,
+    kinds: Vec<String>,
+    metrics: DashboardMetrics,
+    kind_distribution: Vec<(String, u64)>,
+    age_distribution: Vec<(String, u64)>,
     snapshot_id: String,
     collector_errors: Vec<String>,
     domains: SnapshotDomains,
@@ -879,8 +1072,6 @@ enum DashboardView {
     Overview,
     /// Detailed view for a non-finding panel.
     PanelDetail(DashPanel),
-    /// Scrollable finding list
-    FindingList,
     /// Detail of a single finding (index into DashboardData::findings)
     FindingDetail(usize),
     /// Evidence for a single finding
@@ -910,7 +1101,17 @@ struct DashboardState {
     data: DashboardData,
     selected: DashPanel,
     view: DashboardView,
-    scroll: usize,
+    pane: DashboardFocus,
+    workflow: DashboardWorkflow,
+    sidebar_section: DashboardSidebarSection,
+    selected_finding: usize,
+    table_scroll: usize,
+    detail_scroll: usize,
+    kind_filter: Option<String>,
+    host_filter: Option<String>,
+    severity_filter: Option<String>,
+    status_filter: DashboardStatusFilter,
+    age_filter: DashboardAgeFilter,
     active_plan: Option<DashboardPlan>,
     error: Option<String>,
 }
@@ -921,10 +1122,92 @@ impl DashboardState {
             data: DashboardData::default(),
             selected: DashPanel::Health,
             view: DashboardView::Overview,
-            scroll: 0,
+            pane: DashboardFocus::Table,
+            workflow: DashboardWorkflow::Review,
+            sidebar_section: DashboardSidebarSection::Workflow,
+            selected_finding: 0,
+            table_scroll: 0,
+            detail_scroll: 0,
+            kind_filter: None,
+            host_filter: None,
+            severity_filter: None,
+            status_filter: DashboardStatusFilter::Active,
+            age_filter: DashboardAgeFilter::Any,
             active_plan: None,
             error: None,
         }
+    }
+}
+
+fn format_relative_age(timestamp: i64) -> String {
+    let now = Utc::now().timestamp();
+    let age_secs = now.saturating_sub(timestamp).max(0);
+    let hours = age_secs / 3600;
+    let days = age_secs / 86_400;
+    if hours < 24 {
+        format!("{hours}h ago")
+    } else {
+        format!("{}d ago", days)
+    }
+}
+
+fn age_bucket(timestamp: i64) -> DashboardAgeFilter {
+    let now = Utc::now().timestamp();
+    let age_secs = now.saturating_sub(timestamp).max(0);
+    let days = age_secs / 86_400;
+    match days {
+        0..=1 => DashboardAgeFilter::UnderOneDay,
+        2..=7 => DashboardAgeFilter::TwoToSevenDays,
+        8..=30 => DashboardAgeFilter::EightToThirtyDays,
+        _ => DashboardAgeFilter::OverThirtyDays,
+    }
+}
+
+fn infer_finding_kind(finding: &Finding) -> String {
+    let title = finding.title.to_ascii_lowercase();
+    let resource = finding.affected_resource.to_ascii_lowercase();
+    let sources = finding
+        .evidence
+        .iter()
+        .map(|e| e.source.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (needle, label) in [
+        ("apache", "Apache"),
+        ("nginx", "Nginx"),
+        ("syslog", "Syslog"),
+        ("journal", "Syslog"),
+        ("auth", "Access"),
+        ("ssh", "Access"),
+        ("process", "Process"),
+        ("docker", "Container"),
+        ("podman", "Container"),
+        ("backup", "Backup"),
+        ("port", "Port"),
+        ("timer", "Timer"),
+        ("firewall", "Firewall"),
+        ("memory", "Load"),
+        ("cpu", "Load"),
+        ("disk", "Disk"),
+        ("inode", "Disk"),
+    ] {
+        if title.contains(needle) || resource.contains(needle) || sources.contains(needle) {
+            return label.to_owned();
+        }
+    }
+    match finding.category {
+        helm_monitor::MonitorDomain::Disks => "Disk".to_owned(),
+        helm_monitor::MonitorDomain::Services => "Service".to_owned(),
+        helm_monitor::MonitorDomain::Containers => "Container".to_owned(),
+        helm_monitor::MonitorDomain::Ports => "Port".to_owned(),
+        helm_monitor::MonitorDomain::Load => "Load".to_owned(),
+        helm_monitor::MonitorDomain::Logs => "Syslog".to_owned(),
+        helm_monitor::MonitorDomain::Backups => "Backup".to_owned(),
+        helm_monitor::MonitorDomain::Packages => "Package".to_owned(),
+        helm_monitor::MonitorDomain::Network => "Network".to_owned(),
+        helm_monitor::MonitorDomain::Timers => "Timer".to_owned(),
+        helm_monitor::MonitorDomain::Processes => "Process".to_owned(),
+        helm_monitor::MonitorDomain::Firewall => "Firewall".to_owned(),
     }
 }
 
@@ -1091,7 +1374,7 @@ impl TuiApp {
         spawn_tick_task(tx.clone());
 
         let ready = if self.mode == AgentMode::Dashboard {
-            "HELM dashboard ready. Press F5 to collect a fresh monitor snapshot, Enter to drill into panels, or type a task."
+            "HELM triage dashboard ready. Press F5 to refresh, Tab to move between filters, queue, and detail, or type a task."
         } else {
             "HELM ready. Type a task, or Ctrl+P for commands."
         };
@@ -1356,12 +1639,105 @@ impl TuiApp {
                     self.run_dashboard_follow_up(tx.clone()).await?;
                     return Ok(false);
                 }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if let Some(idx) = self.dashboard_selected_finding_index() {
+                        self.dashboard.view = DashboardView::EvidenceView(idx);
+                        self.dashboard.detail_scroll = 0;
+                    }
+                    return Ok(false);
+                }
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::ALT) => {
                     self.generate_dashboard_plan().await?;
                     return Ok(false);
                 }
                 KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
                     self.apply_dashboard_plan().await?;
+                    return Ok(false);
+                }
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.dashboard.view = DashboardView::PanelDetail(self.dashboard.selected);
+                    self.dashboard.detail_scroll = 0;
+                    return Ok(false);
+                }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if let Some(finding) = self.current_dashboard_finding().cloned() {
+                        let db_path = default_db_path()?;
+                        let conn = rusqlite::Connection::open(&db_path)?;
+                        FindingStateStore::set_status(
+                            &conn,
+                            &finding.fingerprint,
+                            FindingStateStatus::Suppressed,
+                            "suppressed from dashboard",
+                            "reviewed and muted",
+                            &finding.snapshot_id,
+                            &finding.id,
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        self.refresh_dashboard();
+                        self.toast(format!("Suppressed {}", finding.id));
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if let Some(finding) = self.current_dashboard_finding().cloned() {
+                        let db_path = default_db_path()?;
+                        let conn = rusqlite::Connection::open(&db_path)?;
+                        FindingStateStore::set_status(
+                            &conn,
+                            &finding.fingerprint,
+                            FindingStateStatus::Resolved,
+                            "",
+                            "resolved from dashboard",
+                            &finding.snapshot_id,
+                            &finding.id,
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        self.refresh_dashboard();
+                        self.toast(format!("Resolved {}", finding.id));
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if let Some(finding) = self.current_dashboard_finding().cloned() {
+                        let db_path = default_db_path()?;
+                        let conn = rusqlite::Connection::open(&db_path)?;
+                        FindingStateStore::clear(&conn, &finding.fingerprint)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        self.refresh_dashboard();
+                        self.toast(format!("Reopened {}", finding.id));
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('1') => {
+                    self.dashboard.workflow = DashboardWorkflow::Review;
+                    return Ok(false);
+                }
+                KeyCode::Char('2') => {
+                    self.dashboard.workflow = DashboardWorkflow::Cleanup;
+                    return Ok(false);
+                }
+                KeyCode::Char('3') => {
+                    self.dashboard.workflow = DashboardWorkflow::Remediate;
+                    return Ok(false);
+                }
+                KeyCode::Char('[') => {
+                    let panels = DashPanel::all();
+                    let current = panels
+                        .iter()
+                        .position(|panel| *panel == self.dashboard.selected)
+                        .unwrap_or(0);
+                    let next = current.saturating_sub(1);
+                    self.dashboard.selected = panels[next];
+                    return Ok(false);
+                }
+                KeyCode::Char(']') => {
+                    let panels = DashPanel::all();
+                    let current = panels
+                        .iter()
+                        .position(|panel| *panel == self.dashboard.selected)
+                        .unwrap_or(0);
+                    let next = (current + 1).min(panels.len().saturating_sub(1));
+                    self.dashboard.selected = panels[next];
                     return Ok(false);
                 }
                 _ => {}
@@ -1406,39 +1782,86 @@ impl TuiApp {
                 self.input.delete();
                 self.update_slash_popup();
             }
-            KeyCode::Left => self.input.cursor = self.input.cursor.saturating_sub(1),
-            KeyCode::Right => {
+            KeyCode::Left
+                if !(self.mode == AgentMode::Dashboard
+                    && self.dashboard.view == DashboardView::Overview
+                    && self.input.text.is_empty()) =>
+            {
+                self.input.cursor = self.input.cursor.saturating_sub(1)
+            }
+            KeyCode::Right
+                if !(self.mode == AgentMode::Dashboard
+                    && self.dashboard.view == DashboardView::Overview
+                    && self.input.text.is_empty()) =>
+            {
                 self.input.cursor = (self.input.cursor + 1).min(self.input.text.chars().count());
             }
             KeyCode::Home => self.input.cursor = 0,
             KeyCode::End => self.input.cursor = self.input.text.chars().count(),
-            KeyCode::Up
+            KeyCode::Up if self.mode == AgentMode::Dashboard => match self.dashboard.view {
+                DashboardView::Overview => match self.dashboard.pane {
+                    DashboardFocus::Sidebar => self.cycle_dashboard_sidebar_section(-1),
+                    DashboardFocus::Table => self.move_dashboard_selection(-1),
+                    DashboardFocus::Detail => {
+                        self.dashboard.detail_scroll =
+                            self.dashboard.detail_scroll.saturating_sub(1);
+                    }
+                },
+                _ => {
+                    self.dashboard.detail_scroll = self.dashboard.detail_scroll.saturating_sub(1);
+                }
+            },
+            KeyCode::Down if self.mode == AgentMode::Dashboard => match self.dashboard.view {
+                DashboardView::Overview => match self.dashboard.pane {
+                    DashboardFocus::Sidebar => self.cycle_dashboard_sidebar_section(1),
+                    DashboardFocus::Table => self.move_dashboard_selection(1),
+                    DashboardFocus::Detail => {
+                        self.dashboard.detail_scroll =
+                            self.dashboard.detail_scroll.saturating_add(1);
+                    }
+                },
+                _ => {
+                    self.dashboard.detail_scroll = self.dashboard.detail_scroll.saturating_add(1);
+                }
+            },
+            KeyCode::Left
                 if self.mode == AgentMode::Dashboard
-                    && self.dashboard.view == DashboardView::FindingList =>
+                    && self.dashboard.view == DashboardView::Overview =>
             {
-                self.dashboard.scroll = self.dashboard.scroll.saturating_sub(1);
+                match self.dashboard.pane {
+                    DashboardFocus::Sidebar => self.cycle_dashboard_filter_value(-1),
+                    DashboardFocus::Table => self.dashboard.pane = DashboardFocus::Sidebar,
+                    DashboardFocus::Detail => self.dashboard.pane = DashboardFocus::Table,
+                }
             }
-            KeyCode::Down
+            KeyCode::Right
                 if self.mode == AgentMode::Dashboard
-                    && self.dashboard.view == DashboardView::FindingList =>
+                    && self.dashboard.view == DashboardView::Overview =>
             {
-                let max = self.dashboard.data.findings.len().saturating_sub(1);
-                self.dashboard.scroll = (self.dashboard.scroll + 1).min(max);
-            }
-            KeyCode::Up if self.mode == AgentMode::Dashboard => {
-                self.dashboard.scroll = self.dashboard.scroll.saturating_sub(1);
-            }
-            KeyCode::Down if self.mode == AgentMode::Dashboard => {
-                self.dashboard.scroll = self.dashboard.scroll.saturating_add(1);
+                match self.dashboard.pane {
+                    DashboardFocus::Sidebar => self.cycle_dashboard_filter_value(1),
+                    DashboardFocus::Table => self.dashboard.pane = DashboardFocus::Detail,
+                    DashboardFocus::Detail => {}
+                }
             }
             KeyCode::Up => self.input.previous_history(),
             KeyCode::Down => self.input.next_history(),
             KeyCode::PageUp => {
                 let step = usize::from(self.last_chat_height.get().max(6) / 2).max(1);
-                if self.mode == AgentMode::Dashboard
-                    && self.dashboard.view != DashboardView::Overview
-                {
-                    self.dashboard.scroll = self.dashboard.scroll.saturating_add(step);
+                if self.mode == AgentMode::Dashboard {
+                    match self.dashboard.view {
+                        DashboardView::Overview if self.dashboard.pane == DashboardFocus::Table => {
+                            self.move_dashboard_selection(-(step as isize));
+                        }
+                        DashboardView::Overview => {
+                            self.dashboard.detail_scroll =
+                                self.dashboard.detail_scroll.saturating_sub(step);
+                        }
+                        _ => {
+                            self.dashboard.detail_scroll =
+                                self.dashboard.detail_scroll.saturating_sub(step);
+                        }
+                    }
                 } else {
                     self.session.transcript_scroll =
                         self.session.transcript_scroll.saturating_add(step);
@@ -1446,10 +1869,20 @@ impl TuiApp {
             }
             KeyCode::PageDown => {
                 let step = usize::from(self.last_chat_height.get().max(6) / 2).max(1);
-                if self.mode == AgentMode::Dashboard
-                    && self.dashboard.view != DashboardView::Overview
-                {
-                    self.dashboard.scroll = self.dashboard.scroll.saturating_sub(step);
+                if self.mode == AgentMode::Dashboard {
+                    match self.dashboard.view {
+                        DashboardView::Overview if self.dashboard.pane == DashboardFocus::Table => {
+                            self.move_dashboard_selection(step as isize);
+                        }
+                        DashboardView::Overview => {
+                            self.dashboard.detail_scroll =
+                                self.dashboard.detail_scroll.saturating_add(step);
+                        }
+                        _ => {
+                            self.dashboard.detail_scroll =
+                                self.dashboard.detail_scroll.saturating_add(step);
+                        }
+                    }
                 } else {
                     self.session.transcript_scroll =
                         self.session.transcript_scroll.saturating_sub(step);
@@ -1459,44 +1892,41 @@ impl TuiApp {
                 if self.mode == AgentMode::Dashboard
                     && self.dashboard.view == DashboardView::Overview
                 {
-                    let panels = DashPanel::all();
-                    let next = (self.dashboard.selected as usize + 1) % panels.len();
-                    self.dashboard.selected = panels[next];
+                    self.dashboard.pane = match self.dashboard.pane {
+                        DashboardFocus::Sidebar => DashboardFocus::Table,
+                        DashboardFocus::Table => DashboardFocus::Detail,
+                        DashboardFocus::Detail => DashboardFocus::Sidebar,
+                    };
                 } else {
                     self.focus = PanelFocus::Input
                 }
             }
             KeyCode::BackTab => {
-                if self.mode == AgentMode::Dashboard
-                    && self.dashboard.view == DashboardView::Overview
-                {
-                    let panels = DashPanel::all();
-                    let prev = (self.dashboard.selected as usize + panels.len() - 1) % panels.len();
-                    self.dashboard.selected = panels[prev];
-                } else {
-                    self.mode = self.mode.next();
-                    self.toast(format!("Mode changed to {}", self.mode.as_str()));
-                }
+                self.mode = self.mode.next();
+                self.toast(format!("Mode changed to {}", self.mode.as_str()));
             }
             KeyCode::Esc => {
                 if self.mode == AgentMode::Dashboard {
                     match self.dashboard.view {
-                        DashboardView::Overview => self.focus = PanelFocus::Input,
-                        DashboardView::PanelDetail(_) | DashboardView::FindingList => {
+                        DashboardView::Overview => {
+                            self.dashboard.pane = DashboardFocus::Table;
+                            self.focus = PanelFocus::Input;
+                        }
+                        DashboardView::PanelDetail(_) => {
                             self.dashboard.view = DashboardView::Overview;
-                            self.dashboard.scroll = 0;
+                            self.dashboard.detail_scroll = 0;
                         }
                         DashboardView::FindingDetail(_) => {
-                            self.dashboard.view = DashboardView::FindingList;
-                            self.dashboard.scroll = 0;
+                            self.dashboard.view = DashboardView::Overview;
+                            self.dashboard.detail_scroll = 0;
                         }
                         DashboardView::EvidenceView(idx) => {
                             self.dashboard.view = DashboardView::FindingDetail(idx);
-                            self.dashboard.scroll = 0;
+                            self.dashboard.detail_scroll = 0;
                         }
                         DashboardView::TroubleshootPlan(idx) => {
                             self.dashboard.view = DashboardView::EvidenceView(idx);
-                            self.dashboard.scroll = 0;
+                            self.dashboard.detail_scroll = 0;
                         }
                     }
                 } else {
@@ -3537,20 +3967,228 @@ Report the exit status and the concise output."
             DashboardView::FindingDetail(idx)
             | DashboardView::EvidenceView(idx)
             | DashboardView::TroubleshootPlan(idx) => Some(idx),
-            DashboardView::FindingList => Some(self.dashboard.scroll),
-            _ => None,
+            _ => self
+                .dashboard_visible_finding_indices()
+                .get(self.dashboard.selected_finding)
+                .copied(),
         }
+    }
+
+    fn dashboard_visible_finding_indices(&self) -> Vec<usize> {
+        self.dashboard
+            .data
+            .findings
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, finding)| {
+                self.finding_matches_dashboard_filters(finding)
+                    .then_some(idx)
+            })
+            .collect()
+    }
+
+    fn finding_matches_dashboard_filters(&self, finding: &FindingSummary) -> bool {
+        if let Some(kind) = &self.dashboard.kind_filter
+            && &finding.kind != kind
+        {
+            return false;
+        }
+        if let Some(host) = &self.dashboard.host_filter
+            && &finding.host != host
+        {
+            return false;
+        }
+        if let Some(severity) = &self.dashboard.severity_filter
+            && &finding.severity != severity
+        {
+            return false;
+        }
+        let status_match = match self.dashboard.status_filter {
+            DashboardStatusFilter::Active => matches!(
+                finding.status,
+                DashboardFindingState::Open
+                    | DashboardFindingState::New
+                    | DashboardFindingState::Recurring
+            ),
+            DashboardStatusFilter::New => finding.status == DashboardFindingState::New,
+            DashboardStatusFilter::Recurring => finding.status == DashboardFindingState::Recurring,
+            DashboardStatusFilter::Suppressed => {
+                finding.status == DashboardFindingState::Suppressed
+            }
+            DashboardStatusFilter::Resolved => finding.status == DashboardFindingState::Resolved,
+            DashboardStatusFilter::SelfResolved => {
+                finding.status == DashboardFindingState::SelfResolved
+            }
+            DashboardStatusFilter::All => true,
+        };
+        if !status_match {
+            return false;
+        }
+        match self.dashboard.age_filter {
+            DashboardAgeFilter::Any => true,
+            bucket => age_bucket(finding.last_seen) == bucket,
+        }
+    }
+
+    fn clamp_dashboard_selection(&mut self) {
+        let visible = self.dashboard_visible_finding_indices();
+        if visible.is_empty() {
+            self.dashboard.selected_finding = 0;
+            self.dashboard.table_scroll = 0;
+            self.dashboard.detail_scroll = 0;
+            return;
+        }
+        if self.dashboard.selected_finding >= visible.len() {
+            self.dashboard.selected_finding = visible.len().saturating_sub(1);
+        }
+        if self.dashboard.selected_finding < self.dashboard.table_scroll {
+            self.dashboard.table_scroll = self.dashboard.selected_finding;
+        }
+    }
+
+    fn move_dashboard_selection(&mut self, delta: isize) {
+        let visible = self.dashboard_visible_finding_indices();
+        if visible.is_empty() {
+            self.dashboard.selected_finding = 0;
+            self.dashboard.table_scroll = 0;
+            return;
+        }
+        let current = self.dashboard.selected_finding as isize;
+        let next = (current + delta).clamp(0, visible.len().saturating_sub(1) as isize) as usize;
+        self.dashboard.selected_finding = next;
+        if self.dashboard.selected_finding < self.dashboard.table_scroll {
+            self.dashboard.table_scroll = self.dashboard.selected_finding;
+        }
+    }
+
+    fn cycle_dashboard_sidebar_section(&mut self, delta: isize) {
+        let sections = DashboardSidebarSection::all();
+        let current = sections
+            .iter()
+            .position(|section| *section == self.dashboard.sidebar_section)
+            .unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, sections.len().saturating_sub(1) as isize) as usize;
+        self.dashboard.sidebar_section = sections[next];
+    }
+
+    fn cycle_dashboard_filter_value(&mut self, delta: isize) {
+        match self.dashboard.sidebar_section {
+            DashboardSidebarSection::Workflow => {
+                let values = DashboardWorkflow::all();
+                let current = values
+                    .iter()
+                    .position(|value| *value == self.dashboard.workflow)
+                    .unwrap_or(0) as isize;
+                let next =
+                    (current + delta).clamp(0, values.len().saturating_sub(1) as isize) as usize;
+                self.dashboard.workflow = values[next];
+            }
+            DashboardSidebarSection::Kind => {
+                let values = &self.dashboard.data.kinds;
+                if values.is_empty() {
+                    self.dashboard.kind_filter = None;
+                } else {
+                    let current = self
+                        .dashboard
+                        .kind_filter
+                        .as_ref()
+                        .and_then(|selected| values.iter().position(|value| value == selected))
+                        .map(|idx| idx as isize + 1)
+                        .unwrap_or(0);
+                    let next = (current + delta).clamp(0, values.len() as isize) as usize;
+                    self.dashboard.kind_filter = if next == 0 {
+                        None
+                    } else {
+                        values.get(next - 1).cloned()
+                    };
+                }
+            }
+            DashboardSidebarSection::Host => {
+                let values = &self.dashboard.data.hosts;
+                if values.is_empty() {
+                    self.dashboard.host_filter = None;
+                } else {
+                    let current = self
+                        .dashboard
+                        .host_filter
+                        .as_ref()
+                        .and_then(|selected| values.iter().position(|value| value == selected))
+                        .map(|idx| idx as isize + 1)
+                        .unwrap_or(0);
+                    let next = (current + delta).clamp(0, values.len() as isize) as usize;
+                    self.dashboard.host_filter = if next == 0 {
+                        None
+                    } else {
+                        values.get(next - 1).cloned()
+                    };
+                }
+            }
+            DashboardSidebarSection::Severity => {
+                let values = ["critical", "warning", "info"];
+                let current = self
+                    .dashboard
+                    .severity_filter
+                    .as_ref()
+                    .and_then(|selected| values.iter().position(|value| value == selected))
+                    .map(|idx| idx as isize + 1)
+                    .unwrap_or(0);
+                let next = (current + delta).clamp(0, values.len() as isize) as usize;
+                self.dashboard.severity_filter = if next == 0 {
+                    None
+                } else {
+                    Some(values[next - 1].to_owned())
+                };
+            }
+            DashboardSidebarSection::Status => {
+                let values = DashboardStatusFilter::all();
+                let current = values
+                    .iter()
+                    .position(|value| *value == self.dashboard.status_filter)
+                    .unwrap_or(0) as isize;
+                let next =
+                    (current + delta).clamp(0, values.len().saturating_sub(1) as isize) as usize;
+                self.dashboard.status_filter = values[next];
+            }
+            DashboardSidebarSection::Age => {
+                let values = DashboardAgeFilter::all();
+                let current = values
+                    .iter()
+                    .position(|value| *value == self.dashboard.age_filter)
+                    .unwrap_or(0) as isize;
+                let next =
+                    (current + delta).clamp(0, values.len().saturating_sub(1) as isize) as usize;
+                self.dashboard.age_filter = values[next];
+            }
+        }
+        self.dashboard.selected_finding = 0;
+        self.dashboard.table_scroll = 0;
+        self.dashboard.detail_scroll = 0;
+        self.clamp_dashboard_selection();
+    }
+
+    fn current_dashboard_finding(&self) -> Option<&FindingSummary> {
+        let visible = self.dashboard_visible_finding_indices();
+        let idx = visible.get(self.dashboard.selected_finding)?;
+        self.dashboard.data.findings.get(*idx)
     }
 
     async fn handle_dashboard_enter(&mut self, tx: mpsc::UnboundedSender<UiEvent>) -> Result<()> {
         match self.dashboard.view {
             DashboardView::Overview => {
-                self.dashboard.scroll = 0;
                 self.dashboard.active_plan = None;
-                self.dashboard.view = match self.dashboard.selected {
-                    DashPanel::Findings => DashboardView::FindingList,
-                    other => DashboardView::PanelDetail(other),
-                };
+                match self.dashboard.pane {
+                    DashboardFocus::Sidebar => {
+                        self.dashboard.pane = DashboardFocus::Table;
+                    }
+                    DashboardFocus::Table | DashboardFocus::Detail => {
+                        if let Some(idx) = self.dashboard_selected_finding_index() {
+                            self.dashboard.view = DashboardView::FindingDetail(idx);
+                            self.dashboard.detail_scroll = 0;
+                        } else {
+                            self.toast("No finding selected");
+                        }
+                    }
+                }
             }
             DashboardView::PanelDetail(DashPanel::Plans) => {
                 if let Some(plan_id) = self
@@ -3566,16 +4204,9 @@ Report the exit status and the concise output."
                 }
             }
             DashboardView::PanelDetail(_) => {}
-            DashboardView::FindingList => {
-                let idx = self.dashboard.scroll;
-                if idx < self.dashboard.data.findings.len() {
-                    self.dashboard.view = DashboardView::FindingDetail(idx);
-                    self.dashboard.scroll = 0;
-                }
-            }
             DashboardView::FindingDetail(idx) => {
                 self.dashboard.view = DashboardView::EvidenceView(idx);
-                self.dashboard.scroll = 0;
+                self.dashboard.detail_scroll = 0;
             }
             DashboardView::EvidenceView(_) => {
                 self.generate_dashboard_plan().await?;
@@ -3658,7 +4289,7 @@ Report the exit status and the concise output."
             fix_steps: plan.proposed_fix_steps.len(),
         });
         self.dashboard.view = DashboardView::TroubleshootPlan(idx);
-        self.dashboard.scroll = 0;
+        self.dashboard.detail_scroll = 0;
         self.refresh_dashboard();
         self.toast(format!("Generated plan {}", plan.id));
         Ok(())
@@ -3780,48 +4411,204 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         let listening_ports = domains.ports.listeners.len();
         let last_log_errors = domains.logs.journal_errors_last_hour;
         let backup_count = domains.backups.tools_detected.len();
-        let findings: Vec<Finding> =
+
+        #[derive(Debug, Clone)]
+        struct AggregateFinding {
+            latest: Finding,
+            host: String,
+            first_seen: i64,
+            last_seen: i64,
+            occurrence_count: usize,
+            is_current: bool,
+        }
+
+        let latest_findings: Vec<Finding> =
             serde_json::from_str(&record.findings_json).unwrap_or_default();
-        let finding_count = findings.len();
-        let finding_warnings = findings
+        let finding_count = latest_findings.len();
+        let finding_warnings = latest_findings
             .iter()
             .filter(|f| f.severity.as_str() == "warning")
             .count();
-        let finding_summaries: Vec<FindingSummary> = findings
-            .iter()
-            .map(|f| FindingSummary {
-                id: f.id.clone(),
-                severity: f.severity.as_str().to_string(),
-                confidence: f.confidence.as_str().to_string(),
-                title: f.title.clone(),
-                affected_resource: f.affected_resource.clone(),
-                snapshot_id: f.snapshot_id.clone(),
-                domain: f.category.as_str().to_string(),
-                evidence_text: f
+
+        let state_records = FindingStateStore::list(&conn).unwrap_or_default();
+        let state_map: HashMap<String, FindingStateRecord> = state_records
+            .into_iter()
+            .map(|record| (record.fingerprint.clone(), record))
+            .collect();
+        let snapshot_records = SnapshotStore::list(&conn, 90).unwrap_or_default();
+        let mut aggregates: HashMap<String, AggregateFinding> = HashMap::new();
+        for snapshot in &snapshot_records {
+            let findings: Vec<Finding> =
+                serde_json::from_str(&snapshot.findings_json).unwrap_or_default();
+            for finding in findings {
+                let fingerprint = finding.fingerprint();
+                let entry = aggregates
+                    .entry(fingerprint)
+                    .or_insert_with(|| AggregateFinding {
+                        latest: finding.clone(),
+                        host: snapshot.host_hostname.clone(),
+                        first_seen: snapshot.collected_at,
+                        last_seen: snapshot.collected_at,
+                        occurrence_count: 0,
+                        is_current: false,
+                    });
+                entry.occurrence_count += 1;
+                if snapshot.collected_at < entry.first_seen {
+                    entry.first_seen = snapshot.collected_at;
+                }
+                if snapshot.collected_at >= entry.last_seen {
+                    entry.last_seen = snapshot.collected_at;
+                    entry.latest = finding.clone();
+                    entry.host = snapshot.host_hostname.clone();
+                }
+                if snapshot.id == record.id {
+                    entry.is_current = true;
+                }
+            }
+        }
+
+        let mut metrics = DashboardMetrics::default();
+        let mut kind_distribution: HashMap<String, u64> = HashMap::new();
+        let mut age_distribution: HashMap<String, u64> = HashMap::new();
+        let mut finding_summaries: Vec<FindingSummary> = aggregates
+            .into_iter()
+            .map(|(fingerprint, aggregate)| {
+                let kind = infer_finding_kind(&aggregate.latest);
+                let state_record = state_map.get(&fingerprint);
+                let state = if aggregate.is_current {
+                    match state_record.map(|record| record.status) {
+                        Some(FindingStateStatus::Suppressed) => DashboardFindingState::Suppressed,
+                        Some(FindingStateStatus::Resolved) => DashboardFindingState::Resolved,
+                        _ if aggregate.occurrence_count == 1
+                            && age_bucket(aggregate.last_seen)
+                                == DashboardAgeFilter::UnderOneDay =>
+                        {
+                            DashboardFindingState::New
+                        }
+                        _ if aggregate.occurrence_count > 1 => DashboardFindingState::Recurring,
+                        _ => DashboardFindingState::Open,
+                    }
+                } else {
+                    match state_record.map(|record| record.status) {
+                        Some(FindingStateStatus::Resolved) => DashboardFindingState::Resolved,
+                        Some(FindingStateStatus::Suppressed) => DashboardFindingState::Suppressed,
+                        _ => DashboardFindingState::SelfResolved,
+                    }
+                };
+                match state {
+                    DashboardFindingState::Open => metrics.open += 1,
+                    DashboardFindingState::New => {
+                        metrics.open += 1;
+                        metrics.new += 1;
+                    }
+                    DashboardFindingState::Recurring => {
+                        metrics.open += 1;
+                        metrics.recurring += 1;
+                    }
+                    DashboardFindingState::Suppressed => metrics.suppressed += 1,
+                    DashboardFindingState::Resolved => metrics.resolved += 1,
+                    DashboardFindingState::SelfResolved => metrics.self_resolved += 1,
+                }
+                match aggregate.latest.severity.as_str() {
+                    "critical" => metrics.critical += 1,
+                    "warning" => metrics.warning += 1,
+                    _ => {}
+                }
+                *kind_distribution.entry(kind.clone()).or_insert(0) += 1;
+                *age_distribution
+                    .entry(age_bucket(aggregate.last_seen).label().to_owned())
+                    .or_insert(0) += 1;
+                let sample = aggregate
+                    .latest
                     .evidence
-                    .iter()
-                    .map(|e| format!("{} = {} — {}", e.source, e.value, e.note))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                evidence_sources: f.evidence.iter().map(|e| e.source.clone()).collect(),
-                impact: f.impact.clone(),
-                assumptions: f.assumptions.clone(),
-                missing_data: f.missing_data.clone(),
-                read_only_checks: f.read_only_checks.clone(),
-                fix_plan: f.fix_plan.clone(),
-                risk: match f.severity.as_str() {
-                    "critical" => "high".to_owned(),
-                    "warning" => "medium".to_owned(),
-                    _ => "low".to_owned(),
-                },
-                rollback: f
-                    .fix_plan
-                    .as_ref()
-                    .map(|_| "review generated plan before apply".to_owned())
-                    .unwrap_or_else(|| "read-only / not applicable".to_owned()),
-                command_preview: f.read_only_checks.join("\n"),
+                    .first()
+                    .map(|e| {
+                        if e.value.trim().is_empty() {
+                            e.note.clone()
+                        } else {
+                            e.value.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| aggregate.latest.title.clone());
+                FindingSummary {
+                    id: aggregate.latest.id.clone(),
+                    fingerprint,
+                    severity: aggregate.latest.severity.as_str().to_string(),
+                    confidence: aggregate.latest.confidence.as_str().to_string(),
+                    title: aggregate.latest.title.clone(),
+                    affected_resource: aggregate.latest.affected_resource.clone(),
+                    snapshot_id: aggregate.latest.snapshot_id.clone(),
+                    domain: aggregate.latest.category.as_str().to_string(),
+                    kind,
+                    host: aggregate.host,
+                    status: state,
+                    occurrence_count: aggregate.occurrence_count,
+                    first_seen: aggregate.first_seen,
+                    last_seen: aggregate.last_seen,
+                    age_label: format_relative_age(aggregate.last_seen),
+                    sample,
+                    state_note: state_record
+                        .map(|record| {
+                            if !record.suppression_reason.is_empty() {
+                                record.suppression_reason.clone()
+                            } else {
+                                record.note.clone()
+                            }
+                        })
+                        .unwrap_or_default(),
+                    evidence_text: aggregate
+                        .latest
+                        .evidence
+                        .iter()
+                        .map(|e| format!("{} = {} -- {}", e.source, e.value, e.note))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    evidence_sources: aggregate
+                        .latest
+                        .evidence
+                        .iter()
+                        .map(|e| e.source.clone())
+                        .collect(),
+                    impact: aggregate.latest.impact.clone(),
+                    assumptions: aggregate.latest.assumptions.clone(),
+                    missing_data: aggregate.latest.missing_data.clone(),
+                    read_only_checks: aggregate.latest.read_only_checks.clone(),
+                    fix_plan: aggregate.latest.fix_plan.clone(),
+                    risk: match aggregate.latest.severity.as_str() {
+                        "critical" => "high".to_owned(),
+                        "warning" => "medium".to_owned(),
+                        _ => "low".to_owned(),
+                    },
+                    rollback: aggregate
+                        .latest
+                        .fix_plan
+                        .as_ref()
+                        .map(|_| "review generated plan before apply".to_owned())
+                        .unwrap_or_else(|| "read-only / not applicable".to_owned()),
+                    command_preview: aggregate.latest.read_only_checks.join("\n"),
+                }
             })
             .collect();
+        finding_summaries.sort_by(|left, right| {
+            let status_rank = |state: DashboardFindingState| match state {
+                DashboardFindingState::New => 0,
+                DashboardFindingState::Recurring => 1,
+                DashboardFindingState::Open => 2,
+                DashboardFindingState::Suppressed => 3,
+                DashboardFindingState::Resolved => 4,
+                DashboardFindingState::SelfResolved => 5,
+            };
+            let severity_rank = |severity: &str| match severity {
+                "critical" => 0,
+                "warning" => 1,
+                _ => 2,
+            };
+            status_rank(left.status)
+                .cmp(&status_rank(right.status))
+                .then(severity_rank(&left.severity).cmp(&severity_rank(&right.severity)))
+                .then(right.last_seen.cmp(&left.last_seen))
+                .then(right.occurrence_count.cmp(&left.occurrence_count))
+        });
         let collector_errors =
             serde_json::from_str::<Vec<CollectorError>>(&record.collector_errors_json)
                 .unwrap_or_default()
@@ -3833,6 +4620,22 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         let collected_at = chrono::DateTime::from_timestamp(record.collected_at, 0)
             .map(|dt| dt.format("%H:%M:%S UTC").to_string())
             .unwrap_or_else(|| "unknown".into());
+        let mut hosts = finding_summaries
+            .iter()
+            .map(|finding| finding.host.clone())
+            .collect::<Vec<_>>();
+        hosts.sort();
+        hosts.dedup();
+        let mut kinds = finding_summaries
+            .iter()
+            .map(|finding| finding.kind.clone())
+            .collect::<Vec<_>>();
+        kinds.sort();
+        kinds.dedup();
+        let mut kind_distribution = kind_distribution.into_iter().collect::<Vec<_>>();
+        kind_distribution.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        let mut age_distribution = age_distribution.into_iter().collect::<Vec<_>>();
+        age_distribution.sort_by(|left, right| left.0.cmp(&right.0));
 
         self.dashboard.data = DashboardData {
             hostname,
@@ -3853,12 +4656,18 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             finding_count,
             finding_warnings,
             findings: finding_summaries,
+            hosts,
+            kinds,
+            metrics,
+            kind_distribution,
+            age_distribution,
             collected_at,
             collector_errors,
             domains,
             plans,
             change_sets,
         };
+        self.clamp_dashboard_selection();
         self.dashboard.error = None;
     }
 
@@ -4122,7 +4931,6 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     match app.dashboard.view {
         DashboardView::Overview => render_dash_overview(app, area, buf),
         DashboardView::PanelDetail(panel) => render_dash_panel_detail(app, panel, area, buf),
-        DashboardView::FindingList => render_dash_finding_list(app, area, buf),
         DashboardView::FindingDetail(idx) => render_dash_finding_detail(app, idx, area, buf),
         DashboardView::EvidenceView(idx) => render_dash_evidence_view(app, idx, area, buf),
         DashboardView::TroubleshootPlan(idx) => render_dash_troubleshoot_plan(app, idx, area, buf),
@@ -4131,59 +4939,425 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
 /// Render the main 3x3 panel grid.
 fn render_dash_overview(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let d = &app.dashboard.data;
-    let sel = app.dashboard.selected;
-    let panels = DashPanel::all();
-
-    let cols = Layout::default()
+    let visible = app.dashboard_visible_finding_indices();
+    let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
+            Constraint::Length(24),
+            Constraint::Min(64),
             Constraint::Percentage(34),
         ])
         .split(area);
 
-    for (col, col_area) in cols.iter().enumerate() {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
-                Constraint::Percentage(34),
-            ])
-            .split(*col_area);
+    render_dash_sidebar(app, chunks[0], buf);
 
-        for (row, row_area) in rows.iter().enumerate() {
-            let idx = col * 3 + row;
-            if idx >= panels.len() {
-                continue;
-            }
-            let panel = panels[idx];
-            let is_sel = panel == sel;
-            let text = render_dash_panel(panel, d);
-            let title_style = if is_sel {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(DIM_FG)
-            };
-            let border_style = if is_sel {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(HEADER_BORDER)
-            };
-            let block = Block::default()
-                .title(Span::styled(format!(" {} ", panel.label()), title_style))
+    let center = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(7),
+            Constraint::Length(10),
+            Constraint::Min(12),
+            Constraint::Length(2),
+        ])
+        .split(chunks[1]);
+
+    render_dash_workflow_tabs(app, center[0], buf);
+    render_dash_briefing_cards(app, center[1], buf);
+    render_dash_briefing_charts(app, center[2], buf);
+    render_dash_finding_table(app, &visible, center[3], buf);
+    render_dash_footer(app, &visible, center[4], buf);
+    render_dash_detail_pane(app, &visible, chunks[2], buf);
+}
+
+fn finding_severity_color(raw: &str) -> Color {
+    match raw {
+        "critical" => ERROR_FG,
+        "warning" => Color::Rgb(245, 184, 73),
+        _ => SUCCESS_FG,
+    }
+}
+
+fn finding_state_color(state: DashboardFindingState) -> Color {
+    match state {
+        DashboardFindingState::New => Color::Rgb(255, 139, 92),
+        DashboardFindingState::Recurring => Color::Rgb(242, 201, 76),
+        DashboardFindingState::Suppressed => DIM_FG,
+        DashboardFindingState::Resolved | DashboardFindingState::SelfResolved => SUCCESS_FG,
+        DashboardFindingState::Open => Color::Rgb(86, 156, 214),
+    }
+}
+
+fn truncate_cell(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_owned()
+    } else {
+        let mut out = value
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        out.push('…');
+        out
+    }
+}
+
+fn render_dash_workflow_tabs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let titles = DashboardWorkflow::all()
+        .iter()
+        .map(|workflow| Line::from(Span::raw(format!(" {} ", workflow.label()))))
+        .collect::<Vec<_>>();
+    let selected = DashboardWorkflow::all()
+        .iter()
+        .position(|workflow| *workflow == app.dashboard.workflow)
+        .unwrap_or(0);
+    Tabs::new(titles)
+        .block(
+            Block::default()
+                .title(" Morning Triage ")
                 .borders(Borders::ALL)
-                .border_style(border_style);
-            Paragraph::new(text)
-                .block(block)
-                .style(Style::default().fg(APP_FG).bg(APP_BG))
-                .render(*row_area, buf);
+                .border_style(Style::default().fg(HEADER_BORDER)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BORDER)
+                .add_modifier(Modifier::BOLD),
+        )
+        .select(selected)
+        .divider(" ")
+        .render(area, buf);
+}
+
+fn render_dash_sidebar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let state = &app.dashboard;
+    let d = &state.data;
+    let block = Block::default()
+        .title(" Filters ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(HEADER_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let mut lines = Vec::new();
+    let sections = DashboardSidebarSection::all();
+    for section in sections {
+        let selected = *section == state.sidebar_section && state.pane == DashboardFocus::Sidebar;
+        let title_style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM_FG)
+        };
+        lines.push(Line::from(Span::styled(
+            section.label().to_uppercase(),
+            title_style,
+        )));
+        let value = match section {
+            DashboardSidebarSection::Workflow => state.workflow.label().to_owned(),
+            DashboardSidebarSection::Kind => state
+                .kind_filter
+                .clone()
+                .unwrap_or_else(|| format!("All ({})", d.kinds.len())),
+            DashboardSidebarSection::Host => state
+                .host_filter
+                .clone()
+                .unwrap_or_else(|| format!("All ({})", d.hosts.len().max(1))),
+            DashboardSidebarSection::Severity => state
+                .severity_filter
+                .clone()
+                .unwrap_or_else(|| "All".to_owned()),
+            DashboardSidebarSection::Status => state.status_filter.label().to_owned(),
+            DashboardSidebarSection::Age => state.age_filter.label().to_owned(),
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {value}"),
+            Style::default().fg(APP_FG),
+        )));
+        lines.push(Line::default());
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!("Host: {}", d.hostname),
+        Style::default().fg(DIM_FG),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("Snapshot: {}", d.snapshot_id),
+        Style::default().fg(DIM_FG),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("Updated: {}", d.collected_at),
+        Style::default().fg(DIM_FG),
+    )));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "SYSTEM SUMMARY",
+        Style::default().fg(DIM_FG).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", state.selected.label()),
+        Style::default().fg(APP_FG),
+    )));
+    for line in render_dash_panel(state.selected, d).lines().take(6) {
+        lines.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(DIM_FG),
+        )));
+    }
+
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
+}
+
+fn render_dash_briefing_cards(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let cards = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+        ])
+        .split(area);
+    let metrics = &app.dashboard.data.metrics;
+    let card_data = [
+        ("Open", metrics.open, Color::Rgb(86, 156, 214)),
+        ("New", metrics.new, Color::Rgb(255, 139, 92)),
+        ("Recurring", metrics.recurring, Color::Rgb(242, 201, 76)),
+        ("Self-resolved", metrics.self_resolved, SUCCESS_FG),
+    ];
+    for (idx, (label, value, accent)) in card_data.into_iter().enumerate() {
+        let block = Block::default()
+            .title(format!(" {label} "))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent));
+        let inner = block.inner(cards[idx]);
+        block.render(cards[idx], buf);
+        Paragraph::new(Line::from(Span::styled(
+            format!("{value}"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .alignment(ratatui::layout::Alignment::Center)
+        .render(inner, buf);
+    }
+}
+
+fn render_dash_briefing_charts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let rows = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let kinds = app
+        .dashboard
+        .data
+        .kind_distribution
+        .iter()
+        .take(5)
+        .map(|(label, count)| (label.as_str(), *count))
+        .collect::<Vec<_>>();
+    BarChart::default()
+        .block(
+            Block::default()
+                .title(" Open by kind ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(HEADER_BORDER)),
+        )
+        .bar_width(7)
+        .bar_gap(1)
+        .bar_style(Style::default().fg(Color::Rgb(251, 160, 74)))
+        .value_style(Style::default().fg(Color::White))
+        .label_style(Style::default().fg(DIM_FG))
+        .data(kinds.as_slice())
+        .render(rows[0], buf);
+    let ages = app
+        .dashboard
+        .data
+        .age_distribution
+        .iter()
+        .map(|(label, count)| (label.as_str(), *count))
+        .collect::<Vec<_>>();
+    BarChart::default()
+        .block(
+            Block::default()
+                .title(" Age distribution ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(HEADER_BORDER)),
+        )
+        .bar_width(7)
+        .bar_gap(1)
+        .bar_style(Style::default().fg(Color::Rgb(111, 162, 255)))
+        .value_style(Style::default().fg(Color::White))
+        .label_style(Style::default().fg(DIM_FG))
+        .data(ages.as_slice())
+        .render(rows[1], buf);
+}
+
+fn render_dash_finding_table(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" Findings ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(HEADER_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    if visible.is_empty() {
+        Paragraph::new("No findings match the current filters.")
+            .style(Style::default().fg(DIM_FG))
+            .render(inner, buf);
+        return;
+    }
+    let body_height = inner.height.saturating_sub(2) as usize;
+    let start = if app.dashboard.selected_finding >= app.dashboard.table_scroll + body_height
+        && body_height > 0
+    {
+        app.dashboard
+            .selected_finding
+            .saturating_sub(body_height.saturating_sub(1))
+    } else {
+        app.dashboard.table_scroll
+    };
+    let rows = visible
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(body_height)
+        .map(|(visible_idx, actual_idx)| {
+            let finding = &app.dashboard.data.findings[*actual_idx];
+            let selected = visible_idx == app.dashboard.selected_finding
+                && app.dashboard.pane == DashboardFocus::Table;
+            let base = if selected {
+                Style::default().bg(Color::Rgb(27, 42, 61))
+            } else {
+                Style::default().bg(APP_BG)
+            };
+            Row::new(vec![
+                TCell::from(truncate_cell(&finding.id, 10)),
+                TCell::from(truncate_cell(&finding.kind, 9)),
+                TCell::from(Span::styled(
+                    finding.severity.to_ascii_uppercase(),
+                    base.fg(finding_severity_color(&finding.severity))
+                        .add_modifier(Modifier::BOLD),
+                )),
+                TCell::from(Span::styled(
+                    finding.status.label(),
+                    base.fg(finding_state_color(finding.status)),
+                )),
+                TCell::from(finding.age_label.clone()),
+                TCell::from(finding.occurrence_count.to_string()),
+                TCell::from(truncate_cell(&finding.sample, 42)),
+            ])
+            .style(base.fg(APP_FG))
+        })
+        .collect::<Vec<_>>();
+    let header = Row::new(vec![
+        "ID", "Kind", "Sev", "Status", "Age", "Count", "Sample",
+    ])
+    .style(Style::default().fg(DIM_FG).add_modifier(Modifier::BOLD));
+    Table::new(
+        rows,
+        [
+            Constraint::Length(11),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(13),
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Min(16),
+        ],
+    )
+    .header(header)
+    .column_spacing(1)
+    .render(inner, buf);
+}
+
+fn render_dash_footer(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buffer) {
+    let focus = match app.dashboard.pane {
+        DashboardFocus::Sidebar => "Filters",
+        DashboardFocus::Table => "Queue",
+        DashboardFocus::Detail => "Detail",
+    };
+    let text = format!(
+        "{} visible  |  focus: {}  |  F5 refresh  Alt+E evidence  Alt+F follow-up  Alt+G plan  Alt+A apply  Alt+S suppress  Alt+R resolve  Alt+U reopen",
+        visible.len(),
+        focus
+    );
+    Paragraph::new(text)
+        .style(Style::default().fg(DIM_FG))
+        .render(area, buf);
+}
+
+fn render_dash_detail_pane(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" Finding detail ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default().fg(if app.dashboard.pane == DashboardFocus::Detail {
+                Color::Cyan
+            } else {
+                HEADER_BORDER
+            }),
+        );
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let Some(actual_idx) = visible.get(app.dashboard.selected_finding) else {
+        Paragraph::new("Select a finding")
+            .style(Style::default().fg(DIM_FG))
+            .alignment(ratatui::layout::Alignment::Center)
+            .render(inner, buf);
+        return;
+    };
+    let finding = &app.dashboard.data.findings[*actual_idx];
+    let joined_sources = if finding.evidence_sources.is_empty() {
+        "(no sources)".to_owned()
+    } else {
+        finding.evidence_sources.join(", ")
+    };
+    let mut text = format!(
+        "{}\n{}\n\nKind: {}\nSeverity: {}\nStatus: {}\nConfidence: {}\nHost: {}\nResource: {}\nFirst seen: {}\nLast seen: {}\nCount: {}\n\nSample:\n{}\n\nImpact:\n{}\n\nSources:\n{}\n",
+        finding.title,
+        finding.id,
+        finding.kind,
+        finding.severity.to_ascii_uppercase(),
+        finding.status.label(),
+        finding.confidence.to_ascii_uppercase(),
+        finding.host,
+        finding.affected_resource,
+        format_relative_age(finding.first_seen),
+        format_relative_age(finding.last_seen),
+        finding.occurrence_count,
+        if finding.sample.is_empty() {
+            "(no sample)"
+        } else {
+            &finding.sample
+        },
+        if finding.impact.is_empty() {
+            "(impact not provided)"
+        } else {
+            &finding.impact
+        },
+        joined_sources
+    );
+    if !finding.state_note.is_empty() {
+        text.push_str(&format!("\nState note:\n{}\n", finding.state_note));
+    }
+    if !finding.read_only_checks.is_empty() {
+        text.push_str("\nRead-only checks:\n");
+        for check in &finding.read_only_checks {
+            text.push_str(&format!("  - {check}\n"));
         }
     }
+    if let Some(fix_plan) = &finding.fix_plan {
+        text.push_str(&format!("\nSuggested fix:\n{}\n", fix_plan));
+    }
+    if !finding.command_preview.is_empty() {
+        text.push_str(&format!("\nExact commands:\n{}\n", finding.command_preview));
+    }
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(inner, buf);
 }
 
 fn render_dash_panel_detail(app: &TuiApp, panel: DashPanel, area: Rect, buf: &mut Buffer) {
@@ -4197,7 +5371,7 @@ fn render_dash_panel_detail(app: &TuiApp, panel: DashPanel, area: Rect, buf: &mu
     let text = render_dash_panel_detail_text(app, panel);
     Paragraph::new(text)
         .wrap(Wrap { trim: false })
-        .scroll((app.dashboard.scroll as u16, 0))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
         .style(Style::default().fg(APP_FG))
         .render(inner, buf);
 }
@@ -4521,62 +5695,6 @@ fn render_dash_panel_detail_text(app: &TuiApp, panel: DashPanel) -> String {
     }
 }
 
-/// Render a scrollable finding list.
-fn render_dash_finding_list(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let findings = &app.dashboard.data.findings;
-    let scroll = app.dashboard.scroll;
-    let block = Block::default()
-        .title(" Findings — Esc to go back ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    if findings.is_empty() {
-        Paragraph::new("No findings detected. Run `helm monitor`.")
-            .style(Style::default().fg(DIM_FG))
-            .render(inner, buf);
-        return;
-    }
-
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, f) in findings.iter().enumerate().skip(scroll) {
-        if lines.len() >= inner.height as usize {
-            break;
-        }
-        let color = match f.severity.as_str() {
-            "critical" | "error" => ERROR_FG,
-            "warning" => Color::Yellow,
-            _ => APP_FG,
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {}. ", i + 1), Style::default().fg(DIM_FG)),
-            Span::styled(
-                format!("[{}] ", f.severity.to_ascii_uppercase()),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(&f.title, Style::default().fg(APP_FG)),
-        ]));
-        lines.push(Line::from(vec![Span::styled(
-            format!(
-                "    resource: {}  domain: {}",
-                f.affected_resource, f.domain
-            ),
-            Style::default().fg(DIM_FG),
-        )]));
-    }
-    if findings.len() > scroll + inner.height as usize {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  … {} more",
-                findings.len() - scroll - inner.height as usize
-            ),
-            Style::default().fg(DIM_FG),
-        )));
-    }
-    Paragraph::new(lines).render(inner, buf);
-}
-
 /// Render a single finding detail.
 fn render_dash_finding_detail(app: &TuiApp, idx: usize, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
@@ -4642,7 +5760,7 @@ fn render_dash_finding_detail(app: &TuiApp, idx: usize, area: Rect, buf: &mut Bu
     }
     Paragraph::new(text)
         .wrap(Wrap { trim: false })
-        .scroll((app.dashboard.scroll as u16, 0))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
         .render(inner, buf);
 }
 
@@ -4702,7 +5820,7 @@ fn render_dash_evidence_view(app: &TuiApp, idx: usize, area: Rect, buf: &mut Buf
     Paragraph::new(text)
         .style(Style::default().fg(APP_FG))
         .wrap(Wrap { trim: false })
-        .scroll((app.dashboard.scroll as u16, 0))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
         .render(inner, buf);
 }
 
@@ -4747,7 +5865,7 @@ fn render_dash_troubleshoot_plan(app: &TuiApp, idx: usize, area: Rect, buf: &mut
     Paragraph::new(text)
         .style(Style::default().fg(APP_FG))
         .wrap(Wrap { trim: false })
-        .scroll((app.dashboard.scroll as u16, 0))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
         .render(inner, buf);
 }
 
@@ -5114,7 +6232,7 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             AgentMode::AutoAccept => "Run with auto-approved tools...",
             AgentMode::Chat => "Ask HELM to do something...",
             AgentMode::Dashboard => {
-                "Dashboard — F5 refresh, Enter drill down, /command for advanced actions"
+                "Morning triage — Tab focus panes, F5 refresh, Alt+G plan, /command for advanced actions"
             }
         };
         vec![Line::from(vec![
@@ -5165,7 +6283,7 @@ fn render_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
         AgentMode::AutoAccept => "AUTO-ACCEPT | Shift+Tab -> Diagnose",
         AgentMode::Diagnose => "DIAGNOSE | Shift+Tab -> Dashboard",
         AgentMode::Dashboard => {
-            "F5 refresh | Enter drill down | Alt+F follow-up | Shift+Tab -> Chat"
+            "Tab panes | F5 refresh | Alt+E evidence | Alt+F check | Alt+G plan | Shift+Tab -> Chat"
         }
     };
     let line = Line::from(vec![
@@ -7261,18 +8379,28 @@ mod tests {
             listening_ports: 12,
             last_log_errors: 3,
             backup_count: 1,
-            finding_count: 3,
+            finding_count: 2,
             finding_warnings: 1,
             collected_at: "14:30:00 UTC".into(),
             findings: vec![
                 FindingSummary {
                     id: "finding-001".into(),
+                    fingerprint: "fp-001".into(),
                     severity: "warning".into(),
                     confidence: "high".into(),
                     title: "Disk /var 78% full".into(),
                     affected_resource: "/var".into(),
                     snapshot_id: "snap-001".into(),
                     domain: "disks".into(),
+                    kind: "Disk".into(),
+                    host: "testbox".into(),
+                    status: DashboardFindingState::New,
+                    occurrence_count: 1,
+                    first_seen: Utc::now().timestamp() - 3600,
+                    last_seen: Utc::now().timestamp() - 1200,
+                    age_label: "0h ago".into(),
+                    sample: "df /var shows 78% used".into(),
+                    state_note: String::new(),
                     evidence_text: "df /var shows 78% used".into(),
                     evidence_sources: vec!["disks.filesystems[/var].used_bytes".into()],
                     impact: "disk pressure may block writes".into(),
@@ -7286,12 +8414,22 @@ mod tests {
                 },
                 FindingSummary {
                     id: "finding-002".into(),
+                    fingerprint: "fp-002".into(),
                     severity: "critical".into(),
                     confidence: "high".into(),
                     title: "Nginx service failed".into(),
                     affected_resource: "nginx".into(),
                     snapshot_id: "snap-001".into(),
                     domain: "services".into(),
+                    kind: "Nginx".into(),
+                    host: "testbox".into(),
+                    status: DashboardFindingState::Recurring,
+                    occurrence_count: 3,
+                    first_seen: Utc::now().timestamp() - 172800,
+                    last_seen: Utc::now().timestamp() - 3600,
+                    age_label: "1d ago".into(),
+                    sample: "systemctl is-active nginx failed".into(),
+                    state_note: "tracked from previous run".into(),
                     evidence_text: "systemctl is-active nginx failed".into(),
                     evidence_sources: vec!["services.failed_units[nginx.service]".into()],
                     impact: "service outage".into(),
@@ -7304,6 +8442,20 @@ mod tests {
                     command_preview: "systemctl restart nginx".into(),
                 },
             ],
+            hosts: vec!["testbox".into()],
+            kinds: vec!["Disk".into(), "Nginx".into()],
+            metrics: DashboardMetrics {
+                open: 2,
+                new: 1,
+                recurring: 1,
+                self_resolved: 0,
+                suppressed: 0,
+                resolved: 0,
+                critical: 1,
+                warning: 1,
+            },
+            kind_distribution: vec![("Disk".into(), 1), ("Nginx".into(), 1)],
+            age_distribution: vec![("<= 1d".into(), 2)],
             ..Default::default()
         }
     }
@@ -7317,17 +8469,20 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(!rendered.is_empty(), "buffer should not be empty");
-        assert!(rendered.contains("Health"), "should render health panel");
+        assert!(
+            rendered.contains("Morning Triage"),
+            "should render triage header"
+        );
+        assert!(rendered.contains("Open"), "should render briefing card");
         assert!(
             rendered.contains("Findings"),
-            "should render findings panel"
-        );
-        assert!(
-            rendered.contains("Services"),
-            "should render services panel"
+            "should render finding table title"
         );
         assert!(rendered.contains("testbox"), "should show hostname");
-        assert!(rendered.contains("62%"), "should show memory");
+        assert!(
+            rendered.contains("Disk /var 78% full"),
+            "should show selected finding"
+        );
     }
 
     #[test]
@@ -7360,21 +8515,6 @@ mod tests {
     }
 
     #[test]
-    fn dash_finding_list_contains_evidence_text() {
-        let mut app = app();
-        app.mode = AgentMode::Dashboard;
-        app.dashboard.data = test_dash_data();
-        app.dashboard.view = DashboardView::FindingList;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
-        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
-        let rendered = buf_to_string(&buf);
-        assert!(
-            rendered.contains("Disk /var 78% full"),
-            "finding list should show title"
-        );
-    }
-
-    #[test]
     fn dash_finding_detail_shows_evidence_and_risk() {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
@@ -7388,7 +8528,7 @@ mod tests {
             "detail should show finding ID"
         );
         assert!(
-            rendered.contains("evidence"),
+            rendered.contains("Evidence"),
             "detail should show evidence label"
         );
         assert!(rendered.contains("medium"), "detail should show risk");

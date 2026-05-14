@@ -112,6 +112,10 @@ impl MonitorDomain {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Finding {
     pub id: FindingId,
+    #[serde(default)]
+    pub detector_id: String,
+    #[serde(default)]
+    pub fingerprint: String,
     pub snapshot_id: SnapshotId,
     pub severity: Severity,
     pub confidence: Confidence,
@@ -154,8 +158,11 @@ impl Finding {
         detector_id.hash(&mut h);
         affected_resource.hash(&mut h);
         let hash = h.finish();
+        let fingerprint = compute_fingerprint(detector_id, category, affected_resource, title);
         Self {
             id: format!("{:016x}", hash),
+            detector_id: detector_id.into(),
+            fingerprint,
             snapshot_id: snapshot_id.into(),
             severity,
             confidence,
@@ -199,6 +206,37 @@ impl Finding {
         self.read_only_checks.push(check.into());
         self
     }
+
+    pub fn fingerprint(&self) -> String {
+        if self.fingerprint.is_empty() {
+            compute_fingerprint(
+                &self.detector_id,
+                self.category,
+                &self.affected_resource,
+                &self.title,
+            )
+        } else {
+            self.fingerprint.clone()
+        }
+    }
+}
+
+fn compute_fingerprint(
+    detector_id: &str,
+    category: MonitorDomain,
+    affected_resource: &str,
+    title: &str,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    detector_id.hash(&mut h);
+    category.hash(&mut h);
+    affected_resource.hash(&mut h);
+    if detector_id.is_empty() {
+        title.hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
 }
 
 #[cfg(test)]

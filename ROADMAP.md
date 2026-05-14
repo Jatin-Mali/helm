@@ -489,6 +489,61 @@ Verification:
 - evidence panel must show sources, finding, risk, rollback, exact commands
 - no overlapping text in constrained terminal sizes
 
+### v2.1.1 - Morning Triage Dashboard
+
+Purpose:
+
+- turn the dashboard into a real finding inbox instead of a panel grid
+- support daily review, suppression, remediation prep, and operator triage
+
+Deliverables:
+
+- three-pane dashboard:
+  - filter sidebar
+  - briefing cards, charts, and finding queue
+  - detail pane
+- workflow tabs:
+  - review
+  - cleanup
+  - remediate
+- finding lifecycle states:
+  - open
+  - new
+  - recurring
+  - suppressed
+  - resolved
+  - self-resolved
+- persistent suppression and resolve state
+- queue columns:
+  - id
+  - kind
+  - severity
+  - status
+  - age
+  - count
+  - sample
+- keyboard actions for:
+  - evidence
+  - follow-up checks
+  - plan generation
+  - apply handoff
+  - suppress
+  - resolve
+  - reopen
+
+Hard rules:
+
+- dashboard stays read-only until an apply flow is opened
+- queue rows must be backed by persisted snapshot findings
+- recurring state must be derived from finding fingerprints, not string-only matching
+- suppression and resolution must survive process restart
+
+Verification:
+
+- targeted dashboard render tests stay green
+- finding state persistence tests stay green
+- full release gate passes
+
 ### v2.2 - Backups And Recovery Confidence
 
 Purpose:

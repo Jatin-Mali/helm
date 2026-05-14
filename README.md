@@ -20,8 +20,10 @@ Current default product surface:
 
 Current shipped core:
 
-- dashboard with panels for health, findings, services, containers, disk,
-  ports, logs, backups, and plans
+- morning-triage dashboard with briefing cards, sidebar filters, finding queue,
+  detail pane, and deep host/service/disk/log/backup drill-down
+- finding lifecycle states: open, new, recurring, suppressed, resolved,
+  self-resolved
 - read-only monitor and diagnose flows
 - structured evidence with risk, rollback, and exact command previews
 - troubleshooting plans with expected output and interpretation guidance
@@ -43,10 +45,16 @@ helm
 Dashboard shortcuts:
 
 - `F5` refresh system state
-- `Enter` drill into the selected panel
+- `Tab` move between filters, queue, and detail
+- `1` / `2` / `3` switch Review, Cleanup, and Remediate workflow tabs
+- `Enter` open the selected finding
+- `Alt+E` open evidence
 - `Alt+F` run a read-only follow-up check for the selected finding
 - `Alt+G` generate a troubleshooting plan
 - `Alt+A` open the reviewed apply flow for the active plan
+- `Alt+S` suppress a finding
+- `Alt+R` mark a finding resolved
+- `Alt+U` reopen a suppressed or resolved finding
 - `Shift+Tab` cycle Dashboard → Chat → Plan → Diagnose
 
 ## Safe CLI Flows
