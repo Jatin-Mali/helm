@@ -210,6 +210,7 @@ enum UiEvent {
         result: Result<RunResult, HelmError>,
     },
     Tick,
+    DashboardRefresh,
 }
 
 #[derive(Clone)]
@@ -834,7 +835,7 @@ struct FindingSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DashboardFocus {
-    Sidebar,
+    Tabbar,
     #[default]
     Table,
     Detail,
@@ -847,7 +848,9 @@ pub enum OpsTab {
     Processes,
     Logs,
     Network,
-    Disk,
+    Storage,
+    Containers,
+    Security,
     Changes,
     Assist,
 }
@@ -860,7 +863,9 @@ impl OpsTab {
             Self::Processes,
             Self::Logs,
             Self::Network,
-            Self::Disk,
+            Self::Storage,
+            Self::Containers,
+            Self::Security,
             Self::Changes,
             Self::Assist,
         ]
@@ -868,13 +873,15 @@ impl OpsTab {
     fn label(self) -> &'static str {
         match self {
             Self::Alerts => "ALERTS",
-            Self::Services => "SERVICES",
-            Self::Processes => "PROCESSES",
+            Self::Services => "SVCS",
+            Self::Processes => "PROCS",
             Self::Logs => "LOGS",
-            Self::Network => "NETWORK",
-            Self::Disk => "DISK",
-            Self::Changes => "CHANGES",
-            Self::Assist => "ASSIST",
+            Self::Network => "NET",
+            Self::Storage => "STORAGE",
+            Self::Containers => "CTRS",
+            Self::Security => "SEC",
+            Self::Changes => "CHG",
+            Self::Assist => "CHAT",
         }
     }
 }
@@ -1275,6 +1282,7 @@ impl TuiApp {
         let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
         spawn_input_thread(tx.clone());
         spawn_tick_task(tx.clone());
+        spawn_dashboard_refresh_task(tx.clone());
 
         let ready = if self.mode == AgentMode::Dashboard {
             "HELM triage dashboard ready. Press F5 to refresh, Tab to move between filters, queue, and detail, or type a task."
@@ -1334,6 +1342,12 @@ impl TuiApp {
                     .is_some_and(|toast| toast.created.elapsed() > Duration::from_secs(2))
                 {
                     self.toast = None;
+                }
+                Ok(false)
+            }
+            UiEvent::DashboardRefresh => {
+                if self.mode == AgentMode::Dashboard {
+                    self.refresh_dashboard();
                 }
                 Ok(false)
             }
@@ -1633,14 +1647,22 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('6') => {
-                    self.dashboard.active_tab = OpsTab::Disk;
+                    self.dashboard.active_tab = OpsTab::Storage;
                     return Ok(false);
                 }
                 KeyCode::Char('7') => {
-                    self.dashboard.active_tab = OpsTab::Changes;
+                    self.dashboard.active_tab = OpsTab::Containers;
                     return Ok(false);
                 }
                 KeyCode::Char('8') => {
+                    self.dashboard.active_tab = OpsTab::Security;
+                    return Ok(false);
+                }
+                KeyCode::Char('9') => {
+                    self.dashboard.active_tab = OpsTab::Changes;
+                    return Ok(false);
+                }
+                KeyCode::Char('0') => {
                     self.dashboard.active_tab = OpsTab::Assist;
                     return Ok(false);
                 }
@@ -1704,7 +1726,7 @@ impl TuiApp {
             KeyCode::End => self.input.cursor = self.input.text.chars().count(),
             KeyCode::Up if self.mode == AgentMode::Dashboard => match self.dashboard.view {
                 DashboardView::Overview => match self.dashboard.pane {
-                    DashboardFocus::Sidebar | DashboardFocus::Table => {
+                    DashboardFocus::Tabbar | DashboardFocus::Table => {
                         self.move_dashboard_selection(-1)
                     }
                     DashboardFocus::Detail => {
@@ -1718,7 +1740,7 @@ impl TuiApp {
             },
             KeyCode::Down if self.mode == AgentMode::Dashboard => match self.dashboard.view {
                 DashboardView::Overview => match self.dashboard.pane {
-                    DashboardFocus::Sidebar | DashboardFocus::Table => {
+                    DashboardFocus::Tabbar | DashboardFocus::Table => {
                         self.move_dashboard_selection(1)
                     }
                     DashboardFocus::Detail => {
@@ -1733,7 +1755,8 @@ impl TuiApp {
             KeyCode::Left
                 if self.mode == AgentMode::Dashboard
                     && self.dashboard.view == DashboardView::Overview
-                    && self.input.text.is_empty() =>
+                    && self.input.text.is_empty()
+                    && self.dashboard.pane == DashboardFocus::Tabbar =>
             {
                 let tabs = OpsTab::all();
                 let current = tabs
@@ -1746,7 +1769,8 @@ impl TuiApp {
             KeyCode::Right
                 if self.mode == AgentMode::Dashboard
                     && self.dashboard.view == DashboardView::Overview
-                    && self.input.text.is_empty() =>
+                    && self.input.text.is_empty()
+                    && self.dashboard.pane == DashboardFocus::Tabbar =>
             {
                 let tabs = OpsTab::all();
                 let current = tabs
@@ -1804,32 +1828,29 @@ impl TuiApp {
                 if self.mode == AgentMode::Dashboard
                     && self.dashboard.view == DashboardView::Overview
                 {
-                    self.dashboard.pane = match (self.dashboard.active_tab, self.dashboard.pane) {
-                        (OpsTab::Assist, DashboardFocus::Table) => DashboardFocus::Detail,
-                        (OpsTab::Assist, DashboardFocus::Detail) => DashboardFocus::Sidebar,
-                        (OpsTab::Assist, DashboardFocus::Sidebar) => DashboardFocus::Table,
-                        (_, DashboardFocus::Table) => DashboardFocus::Detail,
-                        (_, DashboardFocus::Detail) => DashboardFocus::Table,
-                        (_, DashboardFocus::Sidebar) => DashboardFocus::Table,
+                    self.dashboard.pane = match self.dashboard.pane {
+                        DashboardFocus::Tabbar => DashboardFocus::Table,
+                        DashboardFocus::Table => DashboardFocus::Detail,
+                        DashboardFocus::Detail => {
+                            if self.dashboard.active_tab == OpsTab::Assist {
+                                self.focus = PanelFocus::Input;
+                            }
+                            self.dashboard.pane
+                        }
                     };
-                    if self.dashboard.active_tab == OpsTab::Assist
-                        && self.dashboard.pane == DashboardFocus::Sidebar
-                    {
-                        self.focus = PanelFocus::Input;
-                    }
                 } else {
                     self.focus = PanelFocus::Input
                 }
             }
             KeyCode::BackTab => {
-                if self.mode == AgentMode::Dashboard {
-                    let tabs = OpsTab::all();
-                    let current = tabs
-                        .iter()
-                        .position(|t| *t == self.dashboard.active_tab)
-                        .unwrap_or(0);
-                    let prev = current.saturating_sub(1);
-                    self.dashboard.active_tab = tabs[prev];
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.view == DashboardView::Overview
+                {
+                    self.dashboard.pane = match self.dashboard.pane {
+                        DashboardFocus::Tabbar => DashboardFocus::Detail,
+                        DashboardFocus::Table => DashboardFocus::Tabbar,
+                        DashboardFocus::Detail => DashboardFocus::Table,
+                    };
                 } else {
                     self.mode = self.mode.next();
                     self.toast(format!("Mode changed to {}", self.mode.as_str()));
@@ -3972,7 +3993,7 @@ Report the exit status and the concise output."
             DashboardView::Overview => {
                 self.dashboard.active_plan = None;
                 match self.dashboard.pane {
-                    DashboardFocus::Sidebar => {
+                    DashboardFocus::Tabbar => {
                         self.dashboard.pane = DashboardFocus::Table;
                     }
                     DashboardFocus::Table | DashboardFocus::Detail => {
@@ -4231,12 +4252,11 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         let snapshot_id = record.id.clone();
         let load = &domains.load;
         let mem = &load.memory;
-        let cpu_percent = domains
-            .processes
-            .top_by_cpu
-            .first()
-            .map(|proc| proc.cpu_percent)
-            .unwrap_or(0.0);
+        let cpu_percent = if load.cpu_logical_count > 0 {
+            ((load.load_average.one / load.cpu_logical_count as f64) * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
         let memory_used_pct = if mem.total > 0 {
             mem.used as f64 / mem.total as f64 * 100.0
         } else {
@@ -4716,6 +4736,18 @@ fn spawn_tick_task(tx: mpsc::UnboundedSender<UiEvent>) {
     });
 }
 
+fn spawn_dashboard_refresh_task(tx: mpsc::UnboundedSender<UiEvent>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            if tx.send(UiEvent::DashboardRefresh).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn render_app(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     if area.width < 20 || area.height < 8 {
         Paragraph::new("HELM needs a larger terminal")
@@ -4882,14 +4914,12 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             Constraint::Length(5),
             Constraint::Length(1),
             Constraint::Min(8),
-            Constraint::Length(1),
         ])
         .split(area);
 
     render_ops_header(app, vert[0], buf);
     render_ops_tabbar(app, vert[1], buf);
     render_ops_body(app, vert[2], buf);
-    render_ops_footer(app, vert[3], buf);
 }
 
 fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -4910,9 +4940,20 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     } else {
         &d.collected_at
     };
-    let load_str = format!("{:.1} {:.1} {:.1}", d.load_1m, d.load_5m, d.load_15m);
+    let load_str = format!("{:.2} {:.2} {:.2}", d.load_1m, d.load_5m, d.load_15m);
     let mem_str = format!("{:.0}%", d.memory_used_pct);
     let cpu_str = format!("{:.0}%", d.cpu_percent);
+
+    let live_status = if app.dashboard.error.is_some() {
+        " STALE "
+    } else {
+        " LIVE  "
+    };
+    let live_color = if app.dashboard.error.is_some() {
+        OPS_YELLOW
+    } else {
+        OPS_GREEN
+    };
 
     let title = Line::from(vec![
         Span::styled(
@@ -4924,7 +4965,10 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         Span::styled("│", Style::default().fg(OPS_BORDER)),
         Span::styled(format!(" {} ", profile), Style::default().fg(OPS_MUTED)),
         Span::styled("│", Style::default().fg(OPS_BORDER)),
-        Span::styled(" LIVE ", Style::default().fg(OPS_GREEN)),
+        Span::styled(
+            live_status,
+            Style::default().fg(live_color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("│", Style::default().fg(OPS_BORDER)),
         Span::styled(format!(" {} ", time_str), Style::default().fg(OPS_DIM)),
         Span::styled("│", Style::default().fg(OPS_BORDER)),
@@ -5000,7 +5044,10 @@ fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .iter()
         .map(|tab| {
             let style = if *tab == app.dashboard.active_tab {
-                Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(OPS_BLUE)
+                    .bg(OPS_SURFACE)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(OPS_MUTED)
             };
@@ -5014,8 +5061,17 @@ fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     Tabs::new(titles)
         .select(selected)
         .divider(Span::styled("│", Style::default().fg(OPS_BORDER)))
-        .style(Style::default().bg(OPS_BG))
-        .highlight_style(Style::default().bg(OPS_SURFACE))
+        .style(if app.dashboard.pane == DashboardFocus::Tabbar {
+            Style::default().fg(OPS_BLUE)
+        } else {
+            Style::default().fg(OPS_MUTED)
+        })
+        .highlight_style(
+            Style::default()
+                .fg(OPS_BLUE)
+                .bg(OPS_SURFACE)
+                .add_modifier(Modifier::BOLD),
+        )
         .render(area, buf);
 }
 
@@ -5035,7 +5091,9 @@ fn render_ops_body(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         (OpsTab::Processes, _) => render_ops_processes(app, horiz[1], buf),
         (OpsTab::Logs, _) => render_ops_logs(app, horiz[1], buf),
         (OpsTab::Network, _) => render_ops_network(app, horiz[1], buf),
-        (OpsTab::Disk, _) => render_ops_disk(app, horiz[1], buf),
+        (OpsTab::Storage, _) => render_ops_storage(app, horiz[1], buf),
+        (OpsTab::Containers, _) => render_ops_containers(app, horiz[1], buf),
+        (OpsTab::Security, _) => render_ops_security(app, horiz[1], buf),
         (OpsTab::Changes, _) => render_ops_changes(app, horiz[1], buf),
         (OpsTab::Assist, _) => render_ops_assist(app, horiz[1], buf),
     }
@@ -5050,13 +5108,6 @@ fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .border_style(Style::default().fg(OPS_BORDER));
     let inner = block.inner(area);
     block.render(area, buf);
-
-    if app.dashboard.active_tab != OpsTab::Alerts && app.dashboard.active_tab != OpsTab::Assist {
-        Paragraph::new("View active in ALERTS tab")
-            .style(Style::default().fg(OPS_MUTED))
-            .render(inner, buf);
-        return;
-    }
 
     if visible.is_empty() {
         Paragraph::new("No active alerts")
@@ -5317,13 +5368,22 @@ fn render_ops_services(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .title(" SERVICES ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER));
+        .border_style(Style::default().fg(OPS_BORDER))
+        .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     block.render(area, buf);
 
     let d = &app.dashboard.data;
     let domains = &d.domains;
     let mut lines: Vec<Line> = Vec::new();
+
+    // Filter: show only .service and .timer units
+    let service_units: Vec<&helm_monitor::SystemdUnit> = domains
+        .services
+        .units
+        .iter()
+        .filter(|u| u.name.ends_with(".service") || u.name.ends_with(".timer"))
+        .collect();
 
     lines.push(Line::from(vec![
         Span::styled("Total: ", Style::default().fg(OPS_DIM)),
@@ -5337,33 +5397,68 @@ fn render_ops_services(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 Style::default().fg(OPS_GREEN)
             },
         ),
+        Span::styled(
+            format!("  showing {} service/timer units", service_units.len()),
+            Style::default().fg(OPS_MUTED),
+        ),
     ]));
     lines.push(Line::from(Span::raw("")));
 
-    for unit in &domains.services.units {
+    lines.push(Line::from(vec![
+        Span::styled(
+            " UNIT                     ",
+            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " LOADED   ",
+            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " ACTIVE    ",
+            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " SUB",
+            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    for unit in service_units.iter().take(20) {
         let failed = unit.active == "failed" || unit.sub == "failed";
-        let color = if failed { OPS_RED } else { OPS_GREEN };
-        let sub_info = if unit.sub.is_empty() || unit.sub == unit.active {
-            String::new()
+        let color = if failed {
+            OPS_RED
+        } else if unit.active == "inactive" {
+            OPS_YELLOW
         } else {
-            format!(" ({})", unit.sub)
+            OPS_GREEN
         };
+        let sub_info = if unit.sub.is_empty() || unit.sub == unit.active {
+            "–".to_owned()
+        } else {
+            unit.sub.clone()
+        };
+        let name = unit.name.chars().take(25).collect::<String>();
         lines.push(Line::from(vec![
             Span::styled(
-                if failed { " ✗ " } else { " ✓ " },
-                Style::default().fg(color),
+                format!(" {:<25} ", name),
+                if failed {
+                    Style::default().fg(color).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(OPS_FG)
+                },
             ),
-            Span::styled(&unit.name, Style::default().fg(OPS_FG)),
             Span::styled(
-                format!(" {}{sub_info}", unit.active),
+                format!(" {:<9} ", unit.load),
                 Style::default().fg(OPS_MUTED),
             ),
+            Span::styled(format!(" {:<10} ", unit.active), Style::default().fg(color)),
+            Span::styled(sub_info, Style::default().fg(OPS_DIM)),
         ]));
     }
 
-    if domains.services.units.is_empty() {
+    if service_units.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No service data. Run `helm monitor` for full data.",
+            "No service data. Run a monitor cycle to collect systemd state.",
             Style::default().fg(OPS_MUTED),
         )));
     }
@@ -5378,7 +5473,8 @@ fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .title(" PROCESSES ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER));
+        .border_style(Style::default().fg(OPS_BORDER))
+        .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -5388,21 +5484,49 @@ fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let processes = &domains.processes.top_by_memory;
     if processes.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No process data. Run `helm monitor` for full data.",
+            "No process data. Run a monitor cycle first.",
             Style::default().fg(OPS_MUTED),
         )));
     } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} cpu ", app.dashboard.data.cpu_percent),
+                Style::default().fg(OPS_DIM),
+            ),
+            Span::styled(
+                format!("{:.0}% mem ", app.dashboard.data.memory_used_pct),
+                Style::default().fg(OPS_DIM),
+            ),
+            Span::styled(
+                format!("{} logical cores ", domains.load.cpu_logical_count),
+                Style::default().fg(OPS_DIM),
+            ),
+            Span::styled(
+                format!("zombies: {}", domains.processes.zombie_count),
+                Style::default().fg(if domains.processes.zombie_count > 0 {
+                    OPS_RED
+                } else {
+                    OPS_DIM
+                }),
+            ),
+        ]));
+        lines.push(Line::from(Span::raw("")));
+
         lines.push(Line::from(vec![
             Span::styled(
                 format!(" {:>7} ", "PID"),
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" {:>8} ", "CPU%"),
+                format!(" {:<8} ", "USER"),
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" {:>8} ", "MEM%"),
+                format!(" {:>6} ", "CPU%"),
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {:>6} ", "MEM%"),
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -5410,8 +5534,9 @@ fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
         ]));
-        for proc in processes.iter().take(20) {
+        for proc in processes.iter().take(18) {
             let pid = proc.pid;
+            let user = proc.user.chars().take(8).collect::<String>();
             let cpu = proc.cpu_percent;
             let mem = proc.mem_percent;
             let cmd = proc.command.chars().take(40).collect::<String>();
@@ -5424,8 +5549,16 @@ fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             };
             lines.push(Line::from(vec![
                 Span::styled(format!(" {:>7} ", pid), Style::default().fg(OPS_DIM)),
-                Span::styled(format!(" {:>7.1}% ", cpu), Style::default().fg(OPS_MUTED)),
-                Span::styled(format!(" {:>7.1}% ", mem), Style::default().fg(mem_color)),
+                Span::styled(format!(" {:<8} ", user), Style::default().fg(OPS_FG)),
+                Span::styled(format!(" {:>5.1}% ", cpu), Style::default().fg(OPS_MUTED)),
+                Span::styled(
+                    format!(" {:>5.1}% ", mem),
+                    Style::default().fg(mem_color).add_modifier(if mem > 20.0 {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
                 Span::styled(cmd, Style::default().fg(OPS_FG)),
             ]));
         }
@@ -5441,7 +5574,8 @@ fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .title(" LOGS ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER));
+        .border_style(Style::default().fg(OPS_BORDER))
+        .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -5449,7 +5583,6 @@ fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let domains = &d.domains;
     let mut lines: Vec<Line> = Vec::new();
 
-    let err_count = d.last_log_errors;
     let journal_errors = domains.logs.journal_errors_last_hour;
 
     lines.push(Line::from(vec![
@@ -5462,41 +5595,37 @@ fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 Style::default().fg(OPS_GREEN)
             },
         ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Monitor log errors: ", Style::default().fg(OPS_DIM)),
-        Span::styled(
-            err_count.to_string(),
-            if err_count > 0 {
-                Style::default().fg(OPS_YELLOW)
-            } else {
-                Style::default().fg(OPS_GREEN)
-            },
-        ),
-    ]));
-    if let Some(rate) = domains.logs.error_rate_per_minute {
-        lines.push(Line::from(vec![
-            Span::styled("Error rate: ", Style::default().fg(OPS_DIM)),
+        if let Some(rate) = domains.logs.error_rate_per_minute {
             Span::styled(
-                format!("{:.1}/min", rate),
+                format!("  rate: {:.1}/min", rate),
                 if rate > 10.0 {
                     Style::default().fg(OPS_RED)
                 } else {
                     Style::default().fg(OPS_MUTED)
                 },
-            ),
-        ]));
-    }
+            )
+        } else {
+            Span::styled("", Style::default().fg(OPS_DIM))
+        },
+    ]));
     lines.push(Line::from(Span::raw("")));
 
     if !domains.logs.kernel_errors.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Kernel errors:",
-            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-        )));
-        for ke in domains.logs.kernel_errors.iter().take(5) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "KERNEL  ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} entries", domains.logs.kernel_errors.len()),
+                Style::default().fg(OPS_RED),
+            ),
+            Span::styled("  (latest shown)", Style::default().fg(OPS_MUTED)),
+        ]));
+        for ke in domains.logs.kernel_errors.iter().take(6) {
+            let short = ke.chars().take(64).collect::<String>();
             lines.push(Line::from(Span::styled(
-                format!("  {ke}"),
+                format!("  {short}"),
                 Style::default().fg(OPS_RED),
             )));
         }
@@ -5504,13 +5633,21 @@ fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     }
 
     if !domains.logs.auth_failures.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Auth failures:",
-            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-        )));
-        for af in domains.logs.auth_failures.iter().take(5) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "AUTH    ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} entries", domains.logs.auth_failures.len()),
+                Style::default().fg(OPS_YELLOW),
+            ),
+            Span::styled("  (latest shown)", Style::default().fg(OPS_MUTED)),
+        ]));
+        for af in domains.logs.auth_failures.iter().take(6) {
+            let short = af.chars().take(64).collect::<String>();
             lines.push(Line::from(Span::styled(
-                format!("  {af}"),
+                format!("  {short}"),
                 Style::default().fg(OPS_YELLOW),
             )));
         }
@@ -5518,7 +5655,7 @@ fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     if domains.logs.kernel_errors.is_empty() && domains.logs.auth_failures.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No recent log entries.",
+            "No recent log signals. System appears quiet.",
             Style::default().fg(OPS_MUTED),
         )));
     }
@@ -5533,7 +5670,8 @@ fn render_ops_network(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .title(" NETWORK ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER));
+        .border_style(Style::default().fg(OPS_BORDER))
+        .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -5543,17 +5681,25 @@ fn render_ops_network(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let listeners = &domains.ports.listeners;
     if listeners.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No port data. Run `helm monitor` for full data.",
+            "No port data. Run a monitor cycle first.",
             Style::default().fg(OPS_MUTED),
         )));
     } else {
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {:>5} ", "PROTO"),
+                " PORT ",
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" {:>22} ", "LOCAL ADDRESS"),
+                " PROTO ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " BIND ADDRESS          ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " RISK   ",
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -5569,13 +5715,42 @@ fn render_ops_network(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 .as_deref()
                 .unwrap_or("-")
                 .chars()
-                .take(20)
+                .take(14)
                 .collect::<String>();
             let is_public = addr.contains("0.0.0.0") || addr.contains("::");
+            let is_localhost = addr.contains("127.0.0.1") || addr.contains("::1");
+            let risk = if is_public {
+                "OPEN  "
+            } else if is_localhost {
+                "local "
+            } else {
+                "bound "
+            };
+            let risk_color = if is_public {
+                OPS_RED
+            } else if is_localhost {
+                OPS_GREEN
+            } else {
+                OPS_MUTED
+            };
             let addr_color = if is_public { OPS_RED } else { OPS_MUTED };
+            let addr_display = addr.chars().take(22).collect::<String>();
+            let port_display = format!("{:>5}", lis.local_port);
             lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", port_display), Style::default().fg(OPS_FG)),
                 Span::styled(format!(" {:>5} ", proto), Style::default().fg(OPS_DIM)),
-                Span::styled(format!(" {:>22} ", addr), Style::default().fg(addr_color)),
+                Span::styled(
+                    format!(" {:<22} ", addr_display),
+                    Style::default().fg(addr_color),
+                ),
+                Span::styled(
+                    risk,
+                    Style::default().fg(risk_color).add_modifier(if is_public {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
                 Span::styled(proc, Style::default().fg(OPS_FG)),
             ]));
         }
@@ -5587,85 +5762,386 @@ fn render_ops_network(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .render(inner, buf);
 }
 
-fn render_ops_disk(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_ops_storage(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
-        .title(" DISK ")
+        .title(" STORAGE ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER));
+        .border_style(Style::default().fg(OPS_BORDER))
+        .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let d = &app.dashboard.data;
-    let domains = &d.domains;
+    let domains = &app.dashboard.data.domains;
+    let fses = &domains.disks.filesystems;
     let mut lines: Vec<Line> = Vec::new();
 
-    let fses = &domains.disks.filesystems;
     if fses.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No disk data. Run `helm monitor` for full data.",
+            "No storage data. Run a monitor cycle first.",
             Style::default().fg(OPS_MUTED),
         )));
     } else {
-        for fs in fses.iter().take(10) {
-            let mount = &fs.mount_point;
-            let device = fs.device.chars().take(10).collect::<String>();
-            let total = fs.total_bytes;
-            let used = fs.used_bytes;
-            let pct = if total > 0 {
-                (used as f64 / total as f64 * 100.0) as u8
+        // header
+        lines.push(Line::from(vec![
+            Span::styled(
+                " DEVICE      ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " MOUNT      ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " USAGE BAR          ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  USE%",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " INODE%",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        for fs in fses.iter().take(14) {
+            let device = fs.device.chars().take(12).collect::<String>();
+            let mount = fs.mount_point.chars().take(12).collect::<String>();
+            let pct = if fs.total_bytes > 0 {
+                (fs.used_bytes as f64 / fs.total_bytes as f64 * 100.0).clamp(0.0, 100.0) as u8
             } else {
                 0
             };
-
-            let bar_w = 10usize;
+            let bar_w = 12usize;
             let filled = ((pct as usize) * bar_w / 100).min(bar_w);
-            let empty = bar_w.saturating_sub(filled);
-            let bar_contents = "#".repeat(filled) + &".".repeat(empty);
-            let bar_color = if pct > 90 {
+            let empty_b = bar_w.saturating_sub(filled);
+            let bar_contents = "#".repeat(filled) + &"·".repeat(empty_b);
+            let bar_color = if pct >= 95 {
                 OPS_RED
-            } else if pct > 75 {
+            } else if pct >= 80 {
                 OPS_YELLOW
             } else {
                 OPS_GREEN
             };
-
-            let inode_str = {
-                let found = domains
-                    .disks
-                    .inodes
-                    .iter()
-                    .find(|i| i.mount_point == *mount || i.device == device);
-                if let Some(inode) = found {
-                    let ipct = if inode.total > 0 {
-                        (inode.used as f64 / inode.total as f64 * 100.0) as u8
+            let inode_str = domains
+                .disks
+                .inodes
+                .iter()
+                .find(|i| i.mount_point == mount.trim() || i.device == device.trim())
+                .map(|ino| {
+                    let ipct = if ino.total > 0 {
+                        (ino.used as f64 / ino.total as f64 * 100.0).clamp(0.0, 100.0) as u8
                     } else {
                         0
                     };
-                    format!(" inode:{}%", ipct)
-                } else {
-                    String::new()
-                }
-            };
+                    let ic = if ipct >= 90 {
+                        OPS_RED
+                    } else if ipct >= 75 {
+                        OPS_YELLOW
+                    } else {
+                        OPS_GREEN
+                    };
+                    (format!("{ipct:>5}%"), ic)
+                })
+                .unwrap_or_else(|| ("    –".to_owned(), OPS_DIM));
 
             lines.push(Line::from(vec![
-                Span::styled(format!(" {:<10} ", device), Style::default().fg(OPS_DIM)),
-                Span::styled(format!(" [{bar_contents}]"), Style::default().fg(bar_color)),
-                Span::styled(format!(" {:>3}%", pct), Style::default().fg(bar_color)),
-                Span::styled(inode_str, Style::default().fg(OPS_MUTED)),
-                Span::styled(format!(" {}", mount), Style::default().fg(OPS_FG)),
+                Span::styled(format!(" {:<12} ", device), Style::default().fg(OPS_DIM)),
+                Span::styled(format!(" {:<12} ", mount), Style::default().fg(OPS_FG)),
+                Span::styled(format!("[{bar_contents}] "), Style::default().fg(bar_color)),
+                Span::styled(
+                    format!("{:>3}% ", pct),
+                    Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(inode_str.0, Style::default().fg(inode_str.1)),
             ]));
         }
     }
 
-    if !d.disk_entries.is_empty() {
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(inner, buf);
+}
+
+fn render_ops_containers(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" CONTAINERS ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER))
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let domains = &app.dashboard.data.domains;
+    let containers = &domains.containers;
+    let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(runtime) = &containers.runtime {
+        lines.push(Line::from(vec![
+            Span::styled("Runtime: ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                runtime.to_string(),
+                Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  {} total · {} running",
+                    containers.containers.len(),
+                    app.dashboard.data.running_containers
+                ),
+                Style::default().fg(OPS_MUTED),
+            ),
+        ]));
         lines.push(Line::from(Span::raw("")));
-        lines.push(Line::from(Span::styled(
-            "Quick summary:",
-            Style::default().fg(OPS_DIM),
-        )));
-        for entry in &d.disk_entries {
+    }
+
+    if containers.containers.is_empty() {
+        if containers.runtime.is_some() {
             lines.push(Line::from(Span::styled(
-                format!("  {entry}"),
+                "No containers found. Docker/Podman may need starting.",
+                Style::default().fg(OPS_MUTED),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "No container runtime detected (Docker or Podman).",
+                Style::default().fg(OPS_MUTED),
+            )));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                " NAME          ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " STATUS   ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " HEALTH  ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " RST ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " IMAGE",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        for c in containers.containers.iter().take(14) {
+            let name = c.name.chars().take(14).collect::<String>();
+            let status = &c.status;
+            let status_color = if status == "running" {
+                OPS_GREEN
+            } else if status.contains("restart") {
+                OPS_RED
+            } else {
+                OPS_YELLOW
+            };
+            let health = c.health.as_deref().unwrap_or("–");
+            let health_color = match health {
+                "healthy" => OPS_GREEN,
+                "unhealthy" | "failing" => OPS_RED,
+                "starting" => OPS_YELLOW,
+                _ => OPS_DIM,
+            };
+            let restarts = c
+                .restart_count
+                .map_or_else(|| "–".to_owned(), |r| r.to_string());
+            let rst_color = if c.restart_count.unwrap_or(0) > 3 {
+                OPS_RED
+            } else {
+                OPS_DIM
+            };
+            let image = c.image.chars().take(24).collect::<String>();
+
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {:<14} ", name), Style::default().fg(OPS_FG)),
+                Span::styled(format!("{:<9} ", status), Style::default().fg(status_color)),
+                Span::styled(format!("{:<8} ", health), Style::default().fg(health_color)),
+                Span::styled(format!(" {:<4} ", restarts), Style::default().fg(rst_color)),
+                Span::styled(image, Style::default().fg(OPS_MUTED)),
+            ]));
+        }
+    }
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(inner, buf);
+}
+
+fn render_ops_security(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" SECURITY ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER))
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let domains = &app.dashboard.data.domains;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Firewall
+    let fw = &domains.firewall;
+    lines.push(Line::from(vec![
+        Span::styled(
+            "FIREWALL ",
+            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            fw.firewall_tool.as_deref().unwrap_or("none"),
+            if fw.firewall_tool.is_some() {
+                Style::default().fg(OPS_BLUE)
+            } else {
+                Style::default().fg(OPS_YELLOW)
+            },
+        ),
+        Span::styled("  ufw:", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            match fw.ufw_active {
+                Some(true) => "active",
+                Some(false) => "inactive",
+                None => "absent",
+            },
+            if fw.ufw_active == Some(true) {
+                Style::default().fg(OPS_GREEN)
+            } else {
+                Style::default().fg(OPS_YELLOW)
+            },
+        ),
+        Span::styled("  fwld:", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            match fw.firewalld_active {
+                Some(true) => "active",
+                Some(false) => "inactive",
+                None => "absent",
+            },
+            if fw.firewalld_active == Some(true) {
+                Style::default().fg(OPS_GREEN)
+            } else {
+                Style::default().fg(OPS_MUTED)
+            },
+        ),
+    ]));
+    if let Some(count) = fw.iptables_rule_count {
+        lines.push(Line::from(vec![
+            Span::styled("  Rules: ", Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{count}"), Style::default().fg(OPS_MUTED)),
+            if fw.default_accept_input == Some(true) {
+                Span::styled(
+                    "  ⚠ DEFAULT ACCEPT on INPUT",
+                    Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled("", Style::default().fg(OPS_DIM))
+            },
+        ]));
+    }
+    lines.push(Line::from(Span::raw("")));
+
+    // Packages
+    let pkgs = &domains.packages;
+    lines.push(Line::from(vec![
+        Span::styled(
+            "UPDATES ",
+            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            pkgs.package_manager.as_deref().unwrap_or("?"),
+            Style::default().fg(OPS_BLUE),
+        ),
+        Span::styled("  available: ", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            format!("{}", pkgs.upgradable_count.unwrap_or(0)),
+            if pkgs.upgradable_count.unwrap_or(0) > 50 {
+                Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD)
+            } else if pkgs.upgradable_count.unwrap_or(0) > 10 {
+                Style::default().fg(OPS_YELLOW)
+            } else {
+                Style::default().fg(OPS_GREEN)
+            },
+        ),
+        if pkgs.security_count.is_some() {
+            Span::styled("  security: ", Style::default().fg(OPS_DIM))
+        } else {
+            Span::styled("", Style::default().fg(OPS_DIM))
+        },
+        if let Some(sec_count) = pkgs.security_count {
+            Span::styled(
+                format!("{sec_count}"),
+                if sec_count > 0 {
+                    Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(OPS_GREEN)
+                },
+            )
+        } else {
+            Span::styled("", Style::default().fg(OPS_DIM))
+        },
+    ]));
+    lines.push(Line::from(Span::raw("")));
+
+    // Exposed ports
+    let listeners = &domains.ports.listeners;
+    let public: Vec<_> = listeners
+        .iter()
+        .filter(|l| l.local_address.contains("0.0.0.0") || l.local_address.contains("::"))
+        .collect();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "EXPOSED PORTS ",
+            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} public", public.len()),
+            if public.is_empty() {
+                Style::default().fg(OPS_GREEN)
+            } else {
+                Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD)
+            },
+        ),
+        Span::styled(
+            format!("  {} total listening", listeners.len()),
+            Style::default().fg(OPS_MUTED),
+        ),
+    ]));
+    for lis in public.iter().take(8) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}:{:?} ", lis.protocol, lis.local_port),
+                Style::default().fg(OPS_RED),
+            ),
+            Span::styled(
+                lis.process_name.as_deref().unwrap_or("-"),
+                Style::default().fg(OPS_MUTED),
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::raw("")));
+
+    // Auth failures
+    if !domains.logs.auth_failures.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "AUTH FAILURES ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} recent", domains.logs.auth_failures.len()),
+                Style::default().fg(OPS_YELLOW),
+            ),
+        ]));
+        for af in domains.logs.auth_failures.iter().take(4) {
+            let short = af.chars().take(64).collect::<String>();
+            lines.push(Line::from(Span::styled(
+                format!("  {short}"),
                 Style::default().fg(OPS_MUTED),
             )));
         }
@@ -5802,18 +6278,17 @@ fn render_ops_assist(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .render(inner, buf);
 }
 
-fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let assist_hint = if _app.dashboard.active_tab == OpsTab::Assist || !_app.input.text.is_empty()
-    {
-        "  |  Enter ask"
-    } else {
-        ""
+fn render_ops_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let focus = match app.dashboard.pane {
+        DashboardFocus::Tabbar => "TABS",
+        DashboardFocus::Table => "QUEUE",
+        DashboardFocus::Detail => "DETAIL",
     };
-    let text = format!(
-        " Tab focus  |  F5 refresh  |  Enter select  |  Alt+G plan  |  Alt+E evidence  |  Alt+A apply  |  S suppress  |  R resolve  |  1-8 tabs{assist_hint}"
+    let help = format!(
+        " FOCUS:{focus} ▸F5 full refresh ▸Alt+G plan ▸Alt+E evidence ▸Alt+A apply ▸R resolve ▸1-0 tabs ",
     );
-    Paragraph::new(text)
-        .style(Style::default().fg(OPS_DIM).bg(OPS_BG))
+    Paragraph::new(Line::from(Span::styled(help, Style::default().fg(OPS_DIM))))
+        .style(Style::default().bg(OPS_BG))
         .render(area, buf);
 }
 
@@ -5931,7 +6406,7 @@ fn render_dash_finding_table(app: &TuiApp, visible: &[usize], area: Rect, buf: &
 #[allow(dead_code)]
 fn render_dash_footer(app: &TuiApp, visible: &[usize], area: Rect, buf: &mut Buffer) {
     let focus = match app.dashboard.pane {
-        DashboardFocus::Sidebar => "Filters",
+        DashboardFocus::Tabbar => "Tabs",
         DashboardFocus::Table => "Queue",
         DashboardFocus::Detail => "Detail",
     };
@@ -8579,6 +9054,186 @@ mod tests {
         assert!(
             s.contains("Hello"),
             "buf_to_string should capture rendered text"
+        );
+    }
+
+    // ── New tab renderer tests ─────────────────────────────────────────
+
+    #[test]
+    fn dash_containers_tab_renders_empty_state() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.active_tab = OpsTab::Containers;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(!rendered.is_empty(), "containers tab should render");
+        assert!(
+            rendered.contains("CONTAINERS") || rendered.contains("CTRS"),
+            "should show containers tab content"
+        );
+    }
+
+    #[test]
+    fn dash_security_tab_renders_firewall_and_packages() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.active_tab = OpsTab::Security;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(!rendered.is_empty(), "security tab should render");
+        assert!(
+            rendered.contains("SECURITY") || rendered.contains("SEC"),
+            "should show security tab content"
+        );
+    }
+
+    #[test]
+    fn dash_storage_tab_shows_disk_info() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.data.disk_bars = vec![("/".into(), 45), ("/home".into(), 12)];
+        app.dashboard.active_tab = OpsTab::Storage;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(!rendered.is_empty(), "storage tab should render");
+        assert!(
+            rendered.contains("STORAGE"),
+            "should show storage tab content"
+        );
+    }
+
+    #[test]
+    fn dash_services_hides_device_mount_noise() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+        data.domains.services.units = vec![
+            helm_monitor::SystemdUnit {
+                name: "nginx.service".into(),
+                load: "loaded".into(),
+                active: "active".into(),
+                sub: "running".into(),
+                description: "Nginx web server".into(),
+            },
+            helm_monitor::SystemdUnit {
+                name: "dev-sda1.device".into(),
+                load: "loaded".into(),
+                active: "active".into(),
+                sub: "plugged".into(),
+                description: "sda1 device".into(),
+            },
+            helm_monitor::SystemdUnit {
+                name: "var-lib-docker.mount".into(),
+                load: "loaded".into(),
+                active: "active".into(),
+                sub: "mounted".into(),
+                description: "Docker mount".into(),
+            },
+        ];
+        app.dashboard.data = data;
+        app.dashboard.active_tab = OpsTab::Services;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        // device and mount units should NOT appear
+        assert!(
+            !rendered.contains("dev-sda1"),
+            "device unit should be hidden: {rendered}"
+        );
+        assert!(
+            !rendered.contains("var-lib-docker"),
+            "mount unit should be hidden: {rendered}"
+        );
+        // .service unit should appear
+        assert!(
+            rendered.contains("nginx"),
+            "service unit should be shown: {rendered}"
+        );
+    }
+
+    #[test]
+    fn dash_cpu_is_valid_range() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+        data.cpu_percent = 45.0;
+        app.dashboard.data = data;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(rendered.contains("45%"), "CPU should show 45%: {rendered}");
+    }
+
+    #[test]
+    fn dash_focus_cycles_correctly() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.view = DashboardView::Overview;
+        assert_eq!(app.dashboard.pane, DashboardFocus::Table);
+        // Tab → Detail
+        let (tx, _rx) = mpsc::unbounded_channel();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(app.handle_ui_event(
+                UiEvent::Input(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))),
+                tx,
+            ))
+            .unwrap();
+        assert_eq!(app.dashboard.pane, DashboardFocus::Detail);
+    }
+
+    #[test]
+    fn dash_queue_visible_on_all_tabs() {
+        // Even on non-Alerts tabs, queue should still render
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.active_tab = OpsTab::Network;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("QUEUE"),
+            "queue should be visible on all tabs: {rendered}"
+        );
+    }
+
+    #[test]
+    fn dash_no_duplicate_footer() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        // Footer text should appear at most once
+        let footer_count = rendered.matches("full refresh").count();
+        assert!(
+            footer_count <= 1,
+            "footer should not be duplicated: {footer_count} found in\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn dash_header_shows_live_or_stale() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.error = None;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("LIVE") || rendered.contains("HELMOPS"),
+            "header should show LIVE status"
         );
     }
 }
