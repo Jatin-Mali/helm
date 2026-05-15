@@ -58,3 +58,52 @@ impl Detector for OomKillerDetector {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::*;
+
+    fn snapshot_with_kernel_errors(errors: Vec<String>) -> SystemSnapshot {
+        let mut domains = SnapshotDomains::default();
+        domains.logs.kernel_errors = errors;
+        SystemSnapshot {
+            id: "test".into(),
+            host: HostIdentity::default(),
+            collected_at: chrono::Utc::now(),
+            profile: MonitorProfile::Standard,
+            domains,
+            collector_errors: vec![],
+            redaction_version: "0.1.0".into(),
+        }
+    }
+
+    #[test]
+    fn detects_oom_killer_events() {
+        let snap = snapshot_with_kernel_errors(vec!["Out of memory: killed process".into()]);
+        let findings = OomKillerDetector.detect(&snap, None);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[0].confidence, Confidence::High);
+        assert!(findings[0].title.contains("1 time"));
+    }
+
+    #[test]
+    fn detects_multiple_oom_events() {
+        let snap = snapshot_with_kernel_errors(vec![
+            "Out of memory: killed process 123 (nginx)".into(),
+            "oom-kill: constraint=CONSTRAINT_MEMCG".into(),
+            "Killed process 456 (postgres)".into(),
+        ]);
+        let findings = OomKillerDetector.detect(&snap, None);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].title.contains("3 time"));
+    }
+
+    #[test]
+    fn skips_when_no_oom_events() {
+        let snap = snapshot_with_kernel_errors(vec![]);
+        let findings = OomKillerDetector.detect(&snap, None);
+        assert!(findings.is_empty());
+    }
+}
