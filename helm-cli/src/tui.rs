@@ -1140,7 +1140,7 @@ struct DashboardState {
     view: DashboardView,
     pane: DashboardFocus,
     active_tab: OpsTab,
-    selected_finding: usize,
+    selected_fingerprint: Option<String>,
     table_scroll: usize,
     detail_scroll: usize,
     finding_state_filter: DashboardFindingStateFilter,
@@ -1157,7 +1157,7 @@ impl DashboardState {
             view: DashboardView::Overview,
             pane: DashboardFocus::Table,
             active_tab: OpsTab::Alerts,
-            selected_finding: 0,
+            selected_fingerprint: None,
             table_scroll: 0,
             detail_scroll: 0,
             finding_state_filter: DashboardFindingStateFilter::default(),
@@ -4297,16 +4297,42 @@ Report the exit status and the concise output."
         });
     }
 
+    /// Resolve selected_fingerprint to an absolute index in data.findings (via visible list).
     fn dashboard_selected_finding_index(&self) -> Option<usize> {
         match self.dashboard.view {
             DashboardView::FindingDetail(idx)
             | DashboardView::EvidenceView(idx)
             | DashboardView::TroubleshootPlan(idx) => Some(idx),
-            _ => self
-                .dashboard_visible_finding_indices()
-                .get(self.dashboard.selected_finding)
-                .copied(),
+            _ => {
+                let visible = self.dashboard_visible_finding_indices();
+                let vpos = self.selected_visible_index()?;
+                visible.get(vpos).copied()
+            }
         }
+    }
+
+    /// Resolve selected_fingerprint to a position in the filtered visible list.
+    fn selected_visible_index(&self) -> Option<usize> {
+        let fp = self.dashboard.selected_fingerprint.as_ref()?;
+        let visible = self.dashboard_visible_finding_indices();
+        visible.iter().position(|&idx| {
+            self.dashboard
+                .data
+                .findings
+                .get(idx)
+                .map(|f| &f.fingerprint == fp)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Set selected_fingerprint from a visible-index position.
+    fn set_selected_from_visible_index(&mut self, vpos: usize) {
+        let visible = self.dashboard_visible_finding_indices();
+        let fp = visible
+            .get(vpos)
+            .and_then(|&idx| self.dashboard.data.findings.get(idx))
+            .map(|f| f.fingerprint.clone());
+        self.dashboard.selected_fingerprint = fp;
     }
 
     fn dashboard_visible_finding_indices(&self) -> Vec<usize> {
@@ -4348,38 +4374,47 @@ Report the exit status and the concise output."
     fn clamp_dashboard_selection(&mut self) {
         let visible = self.dashboard_visible_finding_indices();
         if visible.is_empty() {
-            self.dashboard.selected_finding = 0;
+            self.dashboard.selected_fingerprint = None;
             self.dashboard.table_scroll = 0;
             self.dashboard.detail_scroll = 0;
             return;
         }
-        if self.dashboard.selected_finding >= visible.len() {
-            self.dashboard.selected_finding = visible.len().saturating_sub(1);
+        // If current fingerprint not in visible list, select first visible.
+        if self.selected_visible_index().is_none() {
+            self.dashboard.selected_fingerprint = visible
+                .first()
+                .and_then(|&idx| self.dashboard.data.findings.get(idx))
+                .map(|f| f.fingerprint.clone());
         }
-        if self.dashboard.selected_finding < self.dashboard.table_scroll {
-            self.dashboard.table_scroll = self.dashboard.selected_finding;
+        // Keep scroll in bounds.
+        if let Some(vpos) = self.selected_visible_index() {
+            if vpos < self.dashboard.table_scroll {
+                self.dashboard.table_scroll = vpos;
+            }
         }
     }
 
     fn move_dashboard_selection(&mut self, delta: isize) {
         let visible = self.dashboard_visible_finding_indices();
         if visible.is_empty() {
-            self.dashboard.selected_finding = 0;
+            self.dashboard.selected_fingerprint = None;
             self.dashboard.table_scroll = 0;
             return;
         }
-        let current = self.dashboard.selected_finding as isize;
-        let next = (current + delta).clamp(0, visible.len().saturating_sub(1) as isize) as usize;
-        self.dashboard.selected_finding = next;
-        if self.dashboard.selected_finding < self.dashboard.table_scroll {
-            self.dashboard.table_scroll = self.dashboard.selected_finding;
+        let current_vpos = self.selected_visible_index().unwrap_or(0);
+        let next_vpos = ((current_vpos as isize) + delta)
+            .clamp(0, visible.len().saturating_sub(1) as isize) as usize;
+        self.set_selected_from_visible_index(next_vpos);
+        if let Some(vpos) = self.selected_visible_index() {
+            if vpos < self.dashboard.table_scroll {
+                self.dashboard.table_scroll = vpos;
+            }
         }
     }
 
     fn current_dashboard_finding(&self) -> Option<&FindingSummary> {
-        let visible = self.dashboard_visible_finding_indices();
-        let idx = visible.get(self.dashboard.selected_finding)?;
-        self.dashboard.data.findings.get(*idx)
+        let idx = self.dashboard_selected_finding_index()?;
+        self.dashboard.data.findings.get(idx)
     }
 
     fn cycle_dashboard_filter(&mut self, delta: isize) {
@@ -4394,7 +4429,7 @@ Report the exit status and the concise output."
             (current + 1).min(filters.len().saturating_sub(1))
         };
         self.dashboard.finding_state_filter = filters[next];
-        self.dashboard.selected_finding = 0;
+        self.dashboard.selected_fingerprint = None;
         self.dashboard.table_scroll = 0;
         self.dashboard.detail_scroll = 0;
     }
@@ -4807,6 +4842,12 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
     /// Reload dashboard data from the latest snapshot.
     fn refresh_dashboard(&mut self) {
         use helm_memory::SnapshotStore;
+
+        // Capture selected fingerprint before rebuilding the finding list.
+        let prev_fingerprint = self
+            .dashboard_selected_finding_index()
+            .and_then(|idx| self.dashboard.data.findings.get(idx))
+            .map(|f| f.fingerprint.clone());
 
         let db_path = match crate::default_db_path() {
             Ok(p) => p,
@@ -5272,6 +5313,18 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             audit_events,
             ..Default::default()
         };
+        // Restore previous fingerprint if it still exists in the new findings list.
+        if let Some(ref fp) = prev_fingerprint {
+            if self
+                .dashboard
+                .data
+                .findings
+                .iter()
+                .any(|f| &f.fingerprint == fp)
+            {
+                self.dashboard.selected_fingerprint = Some(fp.clone());
+            }
+        }
         self.clamp_dashboard_selection();
         self.dashboard.error = None;
     }
@@ -5905,20 +5958,16 @@ fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     let mut lines = Vec::new();
     let body_height = inner.height.saturating_sub(1) as usize;
-    let start = if app.dashboard.selected_finding >= app.dashboard.table_scroll + body_height
-        && body_height > 0
-    {
-        app.dashboard
-            .selected_finding
-            .saturating_sub(body_height.saturating_sub(1))
+    let sel_vpos = app.selected_visible_index().unwrap_or(0);
+    let start = if sel_vpos >= app.dashboard.table_scroll + body_height && body_height > 0 {
+        sel_vpos.saturating_sub(body_height.saturating_sub(1))
     } else {
         app.dashboard.table_scroll
     };
 
     for (i, actual_idx) in visible.iter().enumerate().skip(start).take(body_height) {
         let finding = &app.dashboard.data.findings[*actual_idx];
-        let selected =
-            i == app.dashboard.selected_finding && app.dashboard.pane == DashboardFocus::Table;
+        let selected = i == sel_vpos && app.dashboard.pane == DashboardFocus::Table;
         let bg = if selected { OPS_SURFACE } else { OPS_BG };
         let sev_color = match finding.severity.as_str() {
             "critical" => OPS_RED,
@@ -5976,14 +6025,13 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let visible = app.dashboard_visible_finding_indices();
-    let Some(actual_idx) = visible.get(app.dashboard.selected_finding) else {
+    let Some(actual_idx) = app.dashboard_selected_finding_index() else {
         Paragraph::new("Select an alert from the queue")
             .style(Style::default().fg(OPS_MUTED))
             .render(inner, buf);
         return;
     };
-    let finding = &app.dashboard.data.findings[*actual_idx];
+    let finding = &app.dashboard.data.findings[actual_idx];
 
     // Detection time formatting
     let detection_time = chrono::DateTime::from_timestamp(finding.first_seen, 0)
@@ -6175,14 +6223,13 @@ fn render_ops_evidence(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let visible = app.dashboard_visible_finding_indices();
-    let Some(actual_idx) = visible.get(app.dashboard.selected_finding) else {
+    let Some(actual_idx) = app.dashboard_selected_finding_index() else {
         Paragraph::new("Select an alert from the queue")
             .style(Style::default().fg(OPS_MUTED))
             .render(inner, buf);
         return;
     };
-    let finding = &app.dashboard.data.findings[*actual_idx];
+    let finding = &app.dashboard.data.findings[actual_idx];
     let mut text = format!(
         "{} · {}\n\nSnapshot   {}\nHost       {}\nStatus     {}\nRisk       {}\nRollback   {}\n\nSOURCES\n{}\n\nEVIDENCE\n{}\n\nEXACT COMMANDS\n{}\n",
         finding.kind,
@@ -6230,14 +6277,13 @@ fn render_ops_troubleshoot_plan(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let visible = app.dashboard_visible_finding_indices();
-    let Some(actual_idx) = visible.get(app.dashboard.selected_finding) else {
+    let Some(actual_idx) = app.dashboard_selected_finding_index() else {
         Paragraph::new("Select an alert from the queue")
             .style(Style::default().fg(OPS_MUTED))
             .render(inner, buf);
         return;
     };
-    let finding = &app.dashboard.data.findings[*actual_idx];
+    let finding = &app.dashboard.data.findings[actual_idx];
     let text = if let Some(plan) = &app.dashboard.active_plan {
         if plan.finding_id == finding.id {
             let header = format!(
@@ -7328,10 +7374,9 @@ fn render_ops_assist(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let visible = app.dashboard_visible_finding_indices();
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(actual_idx) = visible.get(app.dashboard.selected_finding) {
-        let finding = &app.dashboard.data.findings[*actual_idx];
+    if let Some(actual_idx) = app.dashboard_selected_finding_index() {
+        let finding = &app.dashboard.data.findings[actual_idx];
         lines.push(Line::from(Span::styled(
             format!("Talking about: {} · {}", finding.kind, finding.title),
             Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
@@ -9106,6 +9151,17 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::sync::{Mutex, OnceLock};
 
+    type AuditRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    );
+
     fn app_in_dir(dir: &tempfile::TempDir, choice: crate::ProviderChoice) -> TuiApp {
         let db = dir.path().join("helm.db");
         let memory = Arc::new(
@@ -9746,6 +9802,105 @@ mod tests {
         assert_eq!(d.finding_count, 0);
     }
 
+    /// T1.1.2: Selection stays pinned to the same finding after the findings list is reordered.
+    #[test]
+    fn fingerprint_selection_survives_reorder() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+
+        let fpa = "fp-aaa".to_string();
+        let fpb = "fp-bbb".to_string();
+        let fpc = "fp-ccc".to_string();
+        let fpd = "fp-ddd".to_string();
+
+        let mk = |fp: &str, title: &str| FindingSummary {
+            fingerprint: fp.into(),
+            title: title.into(),
+            ..Default::default()
+        };
+
+        // Initial: [A, B, C], select B.
+        app.dashboard.data = DashboardData {
+            findings: vec![mk(&fpa, "Alpha"), mk(&fpb, "Beta"), mk(&fpc, "Gamma")],
+            ..Default::default()
+        };
+        app.dashboard.selected_fingerprint = Some(fpb.clone());
+        app.clamp_dashboard_selection();
+
+        // Verify B is selected (position 1 in visible list).
+        assert_eq!(
+            app.selected_visible_index(),
+            Some(1),
+            "B should be at visible index 1"
+        );
+        assert_eq!(
+            app.current_dashboard_finding().map(|f| &f.title),
+            Some(&"Beta".to_string()),
+            "should be looking at Beta"
+        );
+
+        // Reorder + insert: [A, C, B, D].  B moves to position 2.
+        app.dashboard.data.findings = vec![
+            mk(&fpa, "Alpha"),
+            mk(&fpc, "Gamma"),
+            mk(&fpb, "Beta"),
+            mk(&fpd, "Delta"),
+        ];
+        // Fingerprint should survive — clamp verifies fp is still in list.
+        app.clamp_dashboard_selection();
+
+        assert_eq!(
+            app.selected_visible_index(),
+            Some(2),
+            "B moved to visible index 2 but fingerprint pinned it"
+        );
+        assert_eq!(
+            app.current_dashboard_finding().map(|f| &f.title),
+            Some(&"Beta".to_string()),
+            "selection should still be on Beta, not Gamma"
+        );
+    }
+
+    /// If the selected fingerprint disappears, clamp falls back to the first visible finding.
+    #[test]
+    fn fingerprint_selection_falls_back_when_gone() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+
+        let fp = "fp-zzz".to_string();
+        app.dashboard.data = DashboardData {
+            findings: vec![FindingSummary {
+                fingerprint: fp.clone(),
+                title: "Zulu".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        app.dashboard.selected_fingerprint = Some(fp);
+        app.clamp_dashboard_selection();
+        assert_eq!(app.selected_visible_index(), Some(0));
+
+        // Replace with a completely different list (fp-zzz gone).
+        let fp_new = "fp-new".to_string();
+        app.dashboard.data.findings = vec![FindingSummary {
+            fingerprint: fp_new.clone(),
+            title: "NewOne".into(),
+            ..Default::default()
+        }];
+        app.clamp_dashboard_selection();
+
+        // Should fall back to first visible, not crash or hold stale index.
+        assert!(
+            app.selected_visible_index().is_some(),
+            "should have selected first visible finding"
+        );
+        assert_eq!(
+            app.dashboard.selected_fingerprint,
+            Some(fp_new),
+            "should adopt first finding's fingerprint"
+        );
+    }
+
     // ── Dashboard render tests for varying terminal sizes ──────────────
 
     /// Build a DashboardData with realistic test data.
@@ -10375,8 +10530,8 @@ mod tests {
         ];
         app.dashboard.data = data;
         app.dashboard.active_tab = OpsTab::Logs;
-        // Push selected_finding past valid range so no finding is selected
-        app.dashboard.selected_finding = 999;
+        // Push selected_fingerprint to nonexistent value so no finding is selected
+        app.dashboard.selected_fingerprint = Some("nonexistent".into());
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
         render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
         let rendered = buf_to_string(&buf);
@@ -10421,7 +10576,7 @@ mod tests {
         app.dashboard.data = data;
         app.dashboard.active_tab = OpsTab::Logs;
         // Select finding-002: Nginx service, affected_resource = "nginx"
-        app.dashboard.selected_finding = 1;
+        app.dashboard.selected_fingerprint = Some("fp-002".into());
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
         render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
         let rendered = buf_to_string(&buf);
@@ -10480,7 +10635,7 @@ mod tests {
         app.dashboard.data = data;
         app.dashboard.active_tab = OpsTab::Logs;
         // Select finding-001: Disk /var, affected_resource = "/var" — no log entry mentions /var
-        app.dashboard.selected_finding = 0;
+        app.dashboard.selected_fingerprint = Some("fp-001".into());
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
         render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
         let rendered = buf_to_string(&buf);
@@ -10625,7 +10780,7 @@ mod tests {
         app.active_settings.api_key = None;
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.selected_finding = 0;
+        app.dashboard.selected_fingerprint = Some("fp-001".into());
 
         // verify is_llm_provider_configured returns false
         assert!(
@@ -10659,7 +10814,7 @@ mod tests {
         app.active_settings.api_key = None;
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.selected_finding = 0;
+        app.dashboard.selected_fingerprint = Some("fp-001".into());
         // Simulate text input
         app.input.text = "How do I fix this?".into();
         app.input.cursor = app.input.text.len();
@@ -10948,7 +11103,7 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.selected_finding = 0;
+        app.dashboard.selected_fingerprint = Some("fp-001".into());
         app.dashboard.active_plan = Some(DashboardPlan {
             finding_id: "finding-001".into(),
             plan_id: "plan-test".into(),
@@ -10975,7 +11130,7 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.selected_finding = 0;
+        app.dashboard.selected_fingerprint = Some("fp-001".into());
         app.dashboard.active_plan = Some(DashboardPlan {
             finding_id: "finding-001".into(),
             plan_id: "plan-test".into(),
@@ -11017,7 +11172,7 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.selected_finding = 0;
+        app.dashboard.selected_fingerprint = Some("fp-001".into());
         app.dashboard.active_plan = Some(DashboardPlan {
             finding_id: "finding-001".into(),
             plan_id: "plan-test".into(),
@@ -11046,7 +11201,7 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.selected_finding = 0;
+        app.dashboard.selected_fingerprint = Some("fp-001".into());
         app.dashboard.active_plan = Some(DashboardPlan {
             finding_id: "finding-001".into(),
             plan_id: "plan-test".into(),
@@ -11082,7 +11237,7 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.selected_finding = 0;
+        app.dashboard.selected_fingerprint = Some("fp-001".into());
         app.dashboard.active_plan = Some(DashboardPlan {
             finding_id: "finding-001".into(),
             plan_id: "plan-test".into(),
@@ -11111,7 +11266,7 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.selected_finding = 0;
+        app.dashboard.selected_fingerprint = Some("fp-001".into());
         let (_tx, rx) = tokio::sync::oneshot::channel::<PlanStatus>();
         app.dashboard.pending_plan_rx = Some(rx);
         // Switch tab while LLM is pending — should not panic or hang.
@@ -11274,16 +11429,7 @@ mod tests {
         let mut stmt = conn
             .prepare("SELECT tool_name, capability, decision, input_hash, output_hash, taint, cwd, target FROM audit_events")
             .unwrap();
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        )> = stmt
+        let rows: Vec<AuditRow> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -11344,16 +11490,7 @@ mod tests {
         let mut stmt = conn
             .prepare("SELECT tool_name, capability, decision, input_hash, output_hash, taint, cwd, target FROM audit_events ORDER BY timestamp")
             .unwrap();
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        )> = stmt
+        let rows: Vec<AuditRow> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -11434,16 +11571,7 @@ mod tests {
         let mut stmt = conn
             .prepare("SELECT tool_name, capability, decision, input_hash, output_hash, taint, cwd, target FROM audit_events ORDER BY timestamp")
             .unwrap();
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        )> = stmt
+        let rows: Vec<AuditRow> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
