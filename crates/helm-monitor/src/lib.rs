@@ -25,7 +25,9 @@ pub use snapshot::{
     SmartDevice, SnapshotDomains, SystemSnapshot, SystemdTimer, SystemdUnit, TimerSnapshot,
 };
 pub use troubleshoot::{
-    BlastRadius, CommandPreview, Hypothesis, PlanSource, PlanStep, RiskLevel, RollbackStatus,
-    TroubleshootingPlan, explain_finding, plan_from_finding, plan_from_problem,
+    BlastRadius, CommandPreview, CommandValidator, FindingSummaryFields, Hypothesis, LlmFixPlan,
+    LlmFixStep, LlmNarrative, LlmPlanStatus, MissingBinaryWarning, ParseError, PlanSource,
+    PlanStep, RiskLevel, RollbackStatus, TroubleshootingPlan, build_narrative_prompt,
+    explain_finding, parse_llm_response, plan_from_finding, plan_from_problem,
     plan_from_problem_with_snapshot,
 };

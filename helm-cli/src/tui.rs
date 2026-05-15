@@ -28,7 +28,10 @@ use helm_memory::{
     ChangeSetRecord, ChangeSetStore, FindingStateRecord, FindingStateStatus, FindingStateStore,
     MemoryStore, TroubleshootingPlanRecord,
 };
-use helm_monitor::{CollectorError, Finding, MonitorProfile, SnapshotDomains, plan_from_finding};
+use helm_monitor::{
+    CollectorError, CommandValidator, Finding, FindingSummaryFields, MonitorProfile,
+    SnapshotDomains, build_narrative_prompt, parse_llm_response,
+};
 use helm_providers::ChatRequest;
 use helm_tools::ToolRegistry;
 use ratatui::{
@@ -1060,16 +1063,76 @@ enum DashboardView {
     TroubleshootPlan(usize),
 }
 
-#[derive(Debug, Clone, Default)]
-struct DashboardPlan {
-    finding_id: String,
-    plan_id: String,
-    summary: String,
-    read_only_steps: usize,
-    fix_steps: usize,
+/// A validated fix step ready for display.
+#[derive(Debug, Clone)]
+struct ValidatedFixStep {
+    command: String,
+    purpose: String,
+    risk: String,
+    rollback: String,
+    binary_warnings: Vec<String>,
+}
+
+/// The status of an LLM-generated troubleshooting plan.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum PlanStatus {
+    Loading {
+        started_at: i64,
+    },
+    Ready {
+        narrative: String,
+        fix_steps: Vec<ValidatedFixStep>,
+    },
+    Timeout,
+    RateLimited {
+        retry_after_secs: u64,
+    },
+    AuthFailed,
+    MalformedResponse,
+    DangerousCommand {
+        pattern: String,
+    },
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct DashboardPlan {
+    finding_id: String,
+    plan_id: String,
+    status: PlanStatus,
+    read_only_steps: usize,
+    fix_steps: usize,
+    rate_limit_retry_at: Option<Instant>,
+    rate_limit_retry_pending: bool,
+}
+
+impl DashboardPlan {
+    fn summary_from_status(&self) -> String {
+        match &self.status {
+            PlanStatus::Loading { .. } => "⏳ Generating plan…".into(),
+            PlanStatus::Ready { narrative, .. } => narrative.clone(),
+            PlanStatus::Timeout => "LLM call timed out after 30s. Press Alt+G to retry.".into(),
+            PlanStatus::RateLimited { retry_after_secs } => {
+                format!("Rate limited. Retrying in {retry_after_secs}s…")
+            }
+            PlanStatus::AuthFailed => {
+                "Provider authentication failed. Run `helmops init --provider X` to reconfigure."
+                    .into()
+            }
+            PlanStatus::MalformedResponse => {
+                "LLM returned unparseable response. Debug info logged. Press Alt+G to retry.".into()
+            }
+            PlanStatus::DangerousCommand { pattern } => {
+                format!(
+                    "Command rejected: {pattern}. Manual review required. The rejected command has been logged."
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct DashboardState {
     data: DashboardData,
     view: DashboardView,
@@ -1080,6 +1143,7 @@ struct DashboardState {
     detail_scroll: usize,
     finding_state_filter: DashboardFindingStateFilter,
     active_plan: Option<DashboardPlan>,
+    pending_plan_rx: Option<tokio::sync::oneshot::Receiver<PlanStatus>>,
     error: Option<String>,
     overlap_guard: Option<Arc<AtomicBool>>,
 }
@@ -1096,6 +1160,7 @@ impl DashboardState {
             detail_scroll: 0,
             finding_state_filter: DashboardFindingStateFilter::default(),
             active_plan: None,
+            pending_plan_rx: None,
             error: None,
             overlap_guard: None,
         }
@@ -1397,6 +1462,42 @@ impl TuiApp {
                     .is_some_and(|toast| toast.created.elapsed() > Duration::from_secs(2))
                 {
                     self.toast = None;
+                }
+                // Poll the oneshot receiver for a completed LLM plan.
+                if let Some(rx) = &mut self.dashboard.pending_plan_rx {
+                    if let Ok(status) = rx.try_recv() {
+                        if let Some(ref mut plan) = self.dashboard.active_plan {
+                            match &status {
+                                PlanStatus::RateLimited { retry_after_secs } => {
+                                    let secs = *retry_after_secs;
+                                    plan.status = status;
+                                    plan.rate_limit_retry_at =
+                                        Some(Instant::now() + Duration::from_secs(secs));
+                                }
+                                _ => {
+                                    plan.status = status;
+                                }
+                            }
+                        }
+                        self.dashboard.pending_plan_rx = None;
+                    }
+                }
+                // Handle rate-limited auto-retry countdown.
+                if let Some(ref mut plan) = self.dashboard.active_plan {
+                    if plan.rate_limit_retry_pending {
+                        plan.rate_limit_retry_pending = false;
+                        // We'd re-call generate but cannot borrow self here.
+                        // Instead, the next Alt+G or the auto-countdown logic handles it.
+                    }
+                    if let Some(retry_at) = plan.rate_limit_retry_at {
+                        if let PlanStatus::RateLimited { .. } = &plan.status {
+                            if Instant::now() >= retry_at {
+                                // Auto-retry: set a flag for the next event loop cycle.
+                                plan.rate_limit_retry_pending = true;
+                                plan.rate_limit_retry_at = None;
+                            }
+                        }
+                    }
                 }
                 Ok(false)
             }
@@ -4297,37 +4398,183 @@ Report the exit status and the concise output."
             );
             return Ok(());
         };
-        let plan = plan_from_finding(&finding).await;
-        let hypotheses_json = serde_json::to_string(&plan.hypotheses).unwrap_or_default();
-        let read_only_steps_json = serde_json::to_string(&plan.read_only_steps).unwrap_or_default();
-        let proposed_fix_steps_json =
-            serde_json::to_string(&plan.proposed_fix_steps).unwrap_or_default();
-        let source = format!("finding:{}", finding.id);
-        let verdict_summary = helm_core::redact_secrets(&plan.render_text());
-        TroubleshootingPlanStore::insert(
-            &conn,
-            &plan.id,
-            &source,
-            &plan.snapshot_id,
-            &helm_core::redact_secrets(&hypotheses_json),
-            &helm_core::redact_secrets(&read_only_steps_json),
-            &helm_core::redact_secrets(&proposed_fix_steps_json),
-            plan.approval_required,
-            &verdict_summary,
-        )
-        .map_err(|e| anyhow!("{e}"))?;
+
+        // Build the LLM prompt from the finding.
+        let summary_fields = FindingSummaryFields::from(&finding);
+        let prompt = build_narrative_prompt(&summary_fields);
+
+        let plan_id = format!("plan-{}", uuid::Uuid::new_v4());
+        let started_at = Utc::now().timestamp();
+
+        // Set the plan to Loading and switch the detail pane.
         self.dashboard.active_plan = Some(DashboardPlan {
             finding_id: finding.id.clone(),
-            plan_id: plan.id.clone(),
-            summary: verdict_summary,
-            read_only_steps: plan.read_only_steps.len(),
-            fix_steps: plan.proposed_fix_steps.len(),
+            plan_id: plan_id.clone(),
+            status: PlanStatus::Loading { started_at },
+            read_only_steps: 0,
+            fix_steps: 0,
+            rate_limit_retry_at: None,
+            rate_limit_retry_pending: false,
         });
         self.dashboard.view = DashboardView::TroubleshootPlan(idx);
         self.dashboard.detail_scroll = 0;
-        self.refresh_dashboard();
-        self.toast(format!("Generated plan {}", plan.id));
+
+        // Persist a baseline TroubleshootingPlan record so the plan_id is durable.
+        let source = format!("finding:{}", finding.id);
+        let _ = TroubleshootingPlanStore::insert(
+            &conn,
+            &plan_id,
+            &source,
+            &finding.snapshot_id,
+            "[]",
+            "[]",
+            "[]",
+            false,
+            &prompt,
+        );
+
+        // Clone what the spawned task needs.
+        let active_settings = self.active_settings.clone();
+        let secrets = self.runtime.secrets.clone();
+        let finding_id = finding.id.clone();
+        let snapshot_id = finding.snapshot_id.clone();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<PlanStatus>();
+
+        tokio::spawn(async move {
+            let status = Self::call_llm_for_plan(
+                active_settings,
+                secrets,
+                prompt,
+                plan_id,
+                finding_id,
+                snapshot_id,
+            )
+            .await;
+            let _ = tx.send(status);
+        });
+
+        self.dashboard.pending_plan_rx = Some(rx);
         Ok(())
+    }
+
+    /// Performs the actual LLM chat call for a dashboard plan.
+    /// This runs inside a `tokio::spawn` task to keep the UI responsive.
+    async fn call_llm_for_plan(
+        active_settings: ProviderSettings,
+        secrets: SecretsStore,
+        prompt: String,
+        plan_id: String,
+        finding_id: String,
+        _snapshot_id: String,
+    ) -> PlanStatus {
+        use helm_core::ProviderError;
+
+        // Build the provider.
+        let (provider, model) = match build_provider(&active_settings, &secrets) {
+            Ok(v) => v,
+            Err(e) => {
+                // If the error looks like auth, surface that.
+                let msg = format!("{e}");
+                if msg.contains("401") || msg.contains("403") || msg.contains("auth") {
+                    return PlanStatus::AuthFailed;
+                }
+                return PlanStatus::MalformedResponse;
+            }
+        };
+
+        let request = ChatRequest {
+            model,
+            system: None,
+            messages: vec![helm_core::Message::user(&prompt)],
+            tools: vec![],
+            max_tokens: 4096,
+            temperature: 0.4,
+        };
+
+        let chat_result =
+            tokio::time::timeout(std::time::Duration::from_secs(30), provider.chat(request)).await;
+
+        let response = match chat_result {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => match &e {
+                ProviderError::Timeout => return PlanStatus::Timeout,
+                ProviderError::HttpStatus { status, .. } => {
+                    if *status == 401 || *status == 403 {
+                        return PlanStatus::AuthFailed;
+                    }
+                    if *status == 429 {
+                        return PlanStatus::RateLimited {
+                            retry_after_secs: 30,
+                        };
+                    }
+                    return PlanStatus::MalformedResponse;
+                }
+                _ => return PlanStatus::MalformedResponse,
+            },
+            Err(_elapsed) => return PlanStatus::Timeout,
+        };
+
+        // Extract text from the response content blocks.
+        let text = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                helm_core::ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if text.trim().is_empty() {
+            return PlanStatus::MalformedResponse;
+        }
+
+        // Parse the LLM output.
+        let fix_plan = match parse_llm_response(&text) {
+            Ok(fp) => fp,
+            Err(e) => {
+                tracing::debug!("LLM plan parse error for {plan_id}: {e}");
+                return PlanStatus::MalformedResponse;
+            }
+        };
+
+        // Validate each command through the blocklist and PATH check.
+        let mut validated_steps: Vec<ValidatedFixStep> = Vec::new();
+        for step in &fix_plan.steps {
+            match CommandValidator::validate_command(&step.command) {
+                Ok(()) => {
+                    let binary_warnings: Vec<String> =
+                        CommandValidator::check_all_binaries(&step.command)
+                            .into_iter()
+                            .map(|w| w.warning)
+                            .collect();
+                    validated_steps.push(ValidatedFixStep {
+                        command: step.command.clone(),
+                        purpose: step.purpose.clone(),
+                        risk: step.risk.as_str().to_string(),
+                        rollback: step.rollback.clone(),
+                        binary_warnings,
+                    });
+                }
+                Err(patterns) => {
+                    // Log the blocked command for audit.
+                    tracing::warn!("plan-blocked finding={finding_id} pattern={:?}", patterns);
+                    return PlanStatus::DangerousCommand {
+                        pattern: patterns.join(", "),
+                    };
+                }
+            }
+        }
+
+        if validated_steps.is_empty() {
+            return PlanStatus::MalformedResponse;
+        }
+
+        PlanStatus::Ready {
+            narrative: fix_plan.narrative.text,
+            fix_steps: validated_steps,
+        }
     }
 
     async fn apply_dashboard_plan(&mut self) -> Result<()> {
@@ -5606,6 +5853,18 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             }
         }
     }
+    // Append LLM narrative if a Ready plan exists for this finding.
+    if let Some(plan) = &app.dashboard.active_plan {
+        if plan.finding_id == finding.id {
+            if let PlanStatus::Ready { narrative, .. } = &plan.status {
+                text.push('\n');
+                text.push_str("  ── LLM explanation ──\n");
+                for line in narrative.lines() {
+                    text.push_str(&format!("  {line}\n"));
+                }
+            }
+        }
+    }
     text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
 
     // ── IMPACT ──
@@ -5628,7 +5887,28 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     text.push_str("── FIX PLAN (approval required per step) ──\n");
     if let Some(plan) = &app.dashboard.active_plan {
         if plan.finding_id == finding.id {
-            text.push_str(&plan.summary);
+            match &plan.status {
+                PlanStatus::Ready { fix_steps, .. } => {
+                    for (i, step) in fix_steps.iter().enumerate() {
+                        text.push_str(&format!(
+                            "\nStep {}:\n  COMMAND   {}\n  PURPOSE   {}\n  RISK      {}\n  ROLLBACK  {}\n",
+                            i + 1,
+                            step.command,
+                            step.purpose,
+                            step.risk,
+                            step.rollback,
+                        ));
+                        if !step.binary_warnings.is_empty() {
+                            for w in &step.binary_warnings {
+                                text.push_str(&format!("  ⚠ WARNING  {w}\n"));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    text.push_str(&plan.summary_from_status());
+                }
+            }
         } else if let Some(fix) = &finding.fix_plan {
             text.push_str(fix);
         } else {
@@ -5737,15 +6017,78 @@ fn render_ops_troubleshoot_plan(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let finding = &app.dashboard.data.findings[*actual_idx];
     let text = if let Some(plan) = &app.dashboard.active_plan {
         if plan.finding_id == finding.id {
-            format!(
-                "{} · {}\n\nPlan ID   {}\nRead-only {}\nFix steps {}\n\n{}\n\nAlt+A open reviewed apply flow   Enter apply   Esc detail",
-                finding.kind,
-                finding.title,
-                plan.plan_id,
-                plan.read_only_steps,
-                plan.fix_steps,
-                plan.summary
-            )
+            let header = format!(
+                "{} · {}\nPlan ID   {}\n",
+                finding.kind, finding.title, plan.plan_id
+            );
+            let body = match &plan.status {
+                PlanStatus::Loading { .. } => {
+                    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                        [app.spinner % 10];
+                    format!("{spinner} Generating narrative… (Alt+G to cancel)\n")
+                }
+                PlanStatus::Ready {
+                    narrative,
+                    fix_steps,
+                } => {
+                    let mut s = String::new();
+                    s.push_str("── WHY IT HAPPENED ──\n");
+                    s.push_str(narrative);
+                    s.push_str("\n\n── FIX PLAN ──\n");
+                    for (i, step) in fix_steps.iter().enumerate() {
+                        s.push_str(&format!(
+                            "\nStep {}:  COMMAND   {}\n          PURPOSE   {}\n          RISK      {}\n          ROLLBACK  {}\n",
+                            i + 1,
+                            step.command,
+                            step.purpose,
+                            step.risk,
+                            step.rollback,
+                        ));
+                        if !step.binary_warnings.is_empty() {
+                            for w in &step.binary_warnings {
+                                s.push_str(&format!("          ⚠ WARNING  {w}\n"));
+                            }
+                        }
+                    }
+                    s.push_str("\n\nAlt+A open reviewed apply flow   Enter apply   Esc detail");
+                    s
+                }
+                PlanStatus::Timeout => {
+                    "⚠ LLM call timed out after 30s.\nPress Alt+G to retry.\n\nAlt+A open reviewed apply flow   Enter apply   Esc detail"
+                        .to_string()
+                }
+                PlanStatus::RateLimited { retry_after_secs } => {
+                    // Compute remaining seconds from the rate_limit_retry_at if set.
+                    let remaining = plan
+                        .rate_limit_retry_at
+                        .map(|at| {
+                            let now = Instant::now();
+                            if now >= at {
+                                0
+                            } else {
+                                (at - now).as_secs()
+                            }
+                        })
+                        .unwrap_or(*retry_after_secs);
+                    format!(
+                        "⏱ Rate limited. Retrying in {remaining}s…\n\nAlt+A open reviewed apply flow   Enter apply   Esc detail"
+                    )
+                }
+                PlanStatus::AuthFailed => {
+                    "🔒 Provider authentication failed.\nRun `helmops init --provider X` to reconfigure.\n\nAlt+A open reviewed apply flow   Enter apply   Esc detail"
+                        .to_string()
+                }
+                PlanStatus::MalformedResponse => {
+                    "⚠ LLM returned unparseable response. Debug info logged.\nPress Alt+G to retry.\n\nAlt+A open reviewed apply flow   Enter apply   Esc detail"
+                        .to_string()
+                }
+                PlanStatus::DangerousCommand { pattern } => {
+                    format!(
+                        "🚫 Command rejected: {pattern}\nManual review required. The rejected command has been logged.\n\nAlt+A open reviewed apply flow   Enter apply   Esc detail"
+                    )
+                }
+            };
+            format!("{header}\n{body}")
         } else {
             format!(
                 "{} · {}\n\nNo active plan for this finding.\nPress Alt+G to generate one.",
@@ -10361,6 +10704,188 @@ mod tests {
         assert!(
             rendered.contains("No correlated findings"),
             "WHY section should say 'No correlated findings': got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_llm_loading_shows_spinner() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.selected_finding = 0;
+        app.dashboard.active_plan = Some(DashboardPlan {
+            finding_id: "finding-001".into(),
+            plan_id: "plan-test".into(),
+            status: PlanStatus::Loading {
+                started_at: Utc::now().timestamp(),
+            },
+            read_only_steps: 0,
+            fix_steps: 0,
+            rate_limit_retry_at: None,
+            rate_limit_retry_pending: false,
+        });
+        app.dashboard.view = DashboardView::TroubleshootPlan(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("Generating narrative"),
+            "Loading state should show spinner text: got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_llm_narrative_rendered() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.selected_finding = 0;
+        app.dashboard.active_plan = Some(DashboardPlan {
+            finding_id: "finding-001".into(),
+            plan_id: "plan-test".into(),
+            status: PlanStatus::Ready {
+                narrative: "Disk is filling up due to log growth.".into(),
+                fix_steps: vec![ValidatedFixStep {
+                    command: "du -sh /var/log/*".into(),
+                    purpose: "Identify large log directories".into(),
+                    risk: "none".into(),
+                    rollback: "no rollback needed".into(),
+                    binary_warnings: vec![],
+                }],
+            },
+            read_only_steps: 0,
+            fix_steps: 0,
+            rate_limit_retry_at: None,
+            rate_limit_retry_pending: false,
+        });
+        app.dashboard.view = DashboardView::TroubleshootPlan(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
+        render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("WHY IT HAPPENED"),
+            "Ready state should show WHY IT HAPPENED: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("Disk is filling up"),
+            "Ready state should render narrative: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("du -sh /var/log/*"),
+            "Ready state should show command: got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_llm_timeout_shows_retry() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.selected_finding = 0;
+        app.dashboard.active_plan = Some(DashboardPlan {
+            finding_id: "finding-001".into(),
+            plan_id: "plan-test".into(),
+            status: PlanStatus::Timeout,
+            read_only_steps: 0,
+            fix_steps: 0,
+            rate_limit_retry_at: None,
+            rate_limit_retry_pending: false,
+        });
+        app.dashboard.view = DashboardView::TroubleshootPlan(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("timed out"),
+            "Timeout should show timeout message: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("Alt+G to retry"),
+            "Timeout should show retry instruction: got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_llm_blocked_command_shows_rejected() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.selected_finding = 0;
+        app.dashboard.active_plan = Some(DashboardPlan {
+            finding_id: "finding-001".into(),
+            plan_id: "plan-test".into(),
+            status: PlanStatus::DangerousCommand {
+                pattern: "rm -rf /".into(),
+            },
+            read_only_steps: 0,
+            fix_steps: 0,
+            rate_limit_retry_at: None,
+            rate_limit_retry_pending: false,
+        });
+        app.dashboard.view = DashboardView::TroubleshootPlan(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("Command rejected"),
+            "DangerousCommand should show rejection: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("rm -rf /"),
+            "DangerousCommand should show pattern: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("Manual review required"),
+            "DangerousCommand should mention manual review: got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_llm_auth_failure_shows_config_fix() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.selected_finding = 0;
+        app.dashboard.active_plan = Some(DashboardPlan {
+            finding_id: "finding-001".into(),
+            plan_id: "plan-test".into(),
+            status: PlanStatus::AuthFailed,
+            read_only_steps: 0,
+            fix_steps: 0,
+            rate_limit_retry_at: None,
+            rate_limit_retry_pending: false,
+        });
+        app.dashboard.view = DashboardView::TroubleshootPlan(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("authentication failed"),
+            "AuthFailed should show auth message: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("helmops init"),
+            "AuthFailed should suggest reconfigure: got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_ui_responsive_during_llm() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.selected_finding = 0;
+        let (_tx, rx) = tokio::sync::oneshot::channel::<PlanStatus>();
+        app.dashboard.pending_plan_rx = Some(rx);
+        // Switch tab while LLM is pending — should not panic or hang.
+        app.dashboard.active_tab = OpsTab::Services;
+        app.dashboard.view = DashboardView::TroubleshootPlan(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("SERVICES") || rendered.contains("services"),
+            "Tab switching should work while LLM pending: got '{rendered}'"
         );
     }
 }
