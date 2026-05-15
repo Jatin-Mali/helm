@@ -2460,6 +2460,12 @@ Report the exit status and the concise output."
             return self.start_prepared_task(task, wrapped, tx).await;
         }
         if self.mode == AgentMode::Dashboard {
+            if !self.is_llm_provider_configured() {
+                self.toast(
+                    "No LLM provider configured. Run `helmops init --provider ollama` to enable AI-powered troubleshooting.",
+                );
+                return Ok(());
+            }
             let display_task = task.clone();
             let agent_task = self.dashboard_issue_chat_task(&task);
             self.dashboard.active_tab = OpsTab::Assist;
@@ -2911,6 +2917,19 @@ Report the exit status and the concise output."
             rusqlite::params!["tui-apply", "tui", ts, "apply-plan", &helm_memory::stable_hash_hex(plan_id), &helm_memory::stable_hash_hex(decision), "shell", "clean", "", decision, &prev, &hash],
         )?;
         Ok(())
+    }
+
+    /// Returns true when there is a usable LLM provider — either Ollama (local)
+    /// or a cloud provider with an API key available.
+    fn is_llm_provider_configured(&self) -> bool {
+        if self.active_settings.choice == ProviderChoice::Ollama {
+            // Ollama is local; always considered configured.
+            true
+        } else {
+            // Cloud providers (Groq, Anthropic, Gemini, OpenRouter, NvidiaNim,
+            // OpenaiCompat, Auto) need an API key.
+            self.active_settings.api_key.is_some()
+        }
     }
 
     fn toast(&mut self, text: impl Into<String>) {
@@ -4254,6 +4273,12 @@ Report the exit status and the concise output."
     }
 
     async fn generate_dashboard_plan(&mut self) -> Result<()> {
+        if !self.is_llm_provider_configured() {
+            self.toast(
+                "No LLM provider configured. Run `helmops init --provider ollama` to enable AI-powered troubleshooting.",
+            );
+            return Ok(());
+        }
         let Some(idx) = self.dashboard_selected_finding_index() else {
             self.toast("Select a finding first");
             return Ok(());
@@ -5948,8 +5973,13 @@ fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block_title = if app.current_dashboard_finding().is_some() {
+        " LOGS ◂ finding ▸ "
+    } else {
+        " LOGS "
+    };
     let block = Block::default()
-        .title(" LOGS ")
+        .title(block_title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(OPS_BORDER))
         .border_type(BorderType::Rounded);
@@ -5987,6 +6017,115 @@ fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     ]));
     lines.push(Line::from(Span::raw("")));
 
+    // ── Finding-scoped LOGS ──────────────────────────────────────────────
+    if let Some(finding) = app.current_dashboard_finding() {
+        let resource_lower = finding.affected_resource.to_lowercase();
+        let domain_is_services = finding.domain.eq_ignore_ascii_case("services");
+
+        // Filter kernel_errors by affected_resource
+        let filtered_kernel: Vec<&String> = domains
+            .logs
+            .kernel_errors
+            .iter()
+            .filter(|ke| {
+                ke.to_lowercase().contains(&resource_lower)
+                    || (domain_is_services && {
+                        // For services domain, also try matching just the
+                        // service name portion (strip .service suffix if present).
+                        let svc_name = finding
+                            .affected_resource
+                            .strip_suffix(".service")
+                            .unwrap_or(&finding.affected_resource);
+                        ke.to_lowercase().contains(&svc_name.to_lowercase())
+                    })
+            })
+            .collect();
+
+        // Filter auth_failures by affected_resource
+        let filtered_auth: Vec<&String> = domains
+            .logs
+            .auth_failures
+            .iter()
+            .filter(|af| af.to_lowercase().contains(&resource_lower))
+            .collect();
+
+        // Scoping header
+        lines.push(Line::from(vec![
+            Span::styled("▸ ", Style::default().fg(OPS_BLUE)),
+            Span::styled(
+                format!("Scoped to finding: {}", finding.title),
+                Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} kernel errors, {} auth failures",
+                filtered_kernel.len(),
+                filtered_auth.len(),
+            ),
+            Style::default().fg(OPS_MUTED),
+        )));
+        lines.push(Line::from(Span::raw("")));
+
+        // Show filtered kernel_errors
+        if !filtered_kernel.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "KERNEL  ",
+                    Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{} matching", filtered_kernel.len()),
+                    Style::default().fg(OPS_RED),
+                ),
+            ]));
+            for ke in filtered_kernel.iter().take(6) {
+                let short = ke.chars().take(64).collect::<String>();
+                lines.push(Line::from(Span::styled(
+                    format!("  {short}"),
+                    Style::default().fg(OPS_RED),
+                )));
+            }
+            lines.push(Line::from(Span::raw("")));
+        }
+
+        // Show filtered auth_failures
+        if !filtered_auth.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "AUTH    ",
+                    Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{} matching", filtered_auth.len()),
+                    Style::default().fg(OPS_YELLOW),
+                ),
+            ]));
+            for af in filtered_auth.iter().take(6) {
+                let short = af.chars().take(64).collect::<String>();
+                lines.push(Line::from(Span::styled(
+                    format!("  {short}"),
+                    Style::default().fg(OPS_YELLOW),
+                )));
+            }
+        }
+
+        // Empty state for filtered logs
+        if filtered_kernel.is_empty() && filtered_auth.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("No matching log entries for {}", finding.affected_resource,),
+                Style::default().fg(OPS_MUTED),
+            )));
+        }
+
+        Paragraph::new(lines)
+            .style(Style::default().bg(OPS_BG))
+            .scroll((app.dashboard.detail_scroll as u16, 0))
+            .render(inner, buf);
+        return;
+    }
+
+    // ── Generic LOGS view (no finding selected) ──────────────────────────
     if !domains.logs.kernel_errors.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(
@@ -9629,6 +9768,146 @@ mod tests {
         assert!(
             rendered.contains("4 consecutive skips"),
             "should show 4 at degraded: got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_logs_tab_generic_view_no_finding_selected() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        // No finding selected, LOGS tab should show full generic view
+        let mut data = test_dash_data();
+        data.domains.logs.kernel_errors = vec![
+            "Out of memory: killed process nginx (PID 1234)".into(),
+            "BUG: soft lockup - CPU#0 stuck".into(),
+        ];
+        data.domains.logs.auth_failures = vec![
+            "Failed password for root from 192.168.1.100".into(),
+            "authentication failure for user admin".into(),
+        ];
+        app.dashboard.data = data;
+        app.dashboard.active_tab = OpsTab::Logs;
+        // Push selected_finding past valid range so no finding is selected
+        app.dashboard.selected_finding = 999;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
+        render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
+        let rendered = buf_to_string(&buf);
+
+        assert!(
+            rendered.contains("2 entries"),
+            "should show 2 kernel entries: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("(latest shown)"),
+            "should show latest shown tag: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("out of memory") || rendered.contains("Out of memory"),
+            "should contain kernel oom entry"
+        );
+        assert!(
+            rendered.contains("Failed password") || rendered.contains("authentication failure"),
+            "should contain auth failure"
+        );
+        // Title should be plain LOGS (no finding marker)
+        assert!(
+            !rendered.contains("◂ finding ▸"),
+            "should NOT show finding marker when no finding selected"
+        );
+    }
+
+    #[test]
+    fn dash_logs_tab_scoped_view_shows_filtered_entries() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+        data.domains.logs.kernel_errors = vec![
+            "Out of memory: killed process nginx (PID 1234)".into(),
+            "BUG: soft lockup - CPU#0 stuck for 22s".into(),
+            "kernel: nginx segfault at 0 ip".into(),
+        ];
+        data.domains.logs.auth_failures = vec![
+            "Failed password for root from 192.168.1.100".into(),
+            "authentication failure for user nginx".into(),
+        ];
+        app.dashboard.data = data;
+        app.dashboard.active_tab = OpsTab::Logs;
+        // Select finding-002: Nginx service, affected_resource = "nginx"
+        app.dashboard.selected_finding = 1;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
+        render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
+        let rendered = buf_to_string(&buf);
+
+        // Scoping header
+        assert!(
+            rendered.contains("Scoped to finding: Nginx service failed"),
+            "should show scoping header with finding title: got '{rendered}'"
+        );
+        // Title should indicate finding context
+        assert!(
+            rendered.contains("◂ finding ▸"),
+            "should show finding marker in title"
+        );
+        // Count of filtered entries
+        assert!(
+            rendered.contains("2 kernel errors") || rendered.contains("2 kernel"),
+            "should show 2 matching kernel errors (nginx + nginx segfault): got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("1 auth failures") || rendered.contains("1 auth"),
+            "should show 1 matching auth failure (user nginx): got '{rendered}'"
+        );
+        // Matching entries visible
+        assert!(
+            rendered.contains("Out of memory") || rendered.contains("out of memory"),
+            "should show OOM entry with nginx mention: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("killed process nginx") || rendered.contains("killed process"),
+            "should show nginx OOM detail: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("nginx segfault") || rendered.contains("segfault"),
+            "should show nginx segfault entry"
+        );
+        assert!(
+            rendered.contains("user nginx"),
+            "should show nginx auth failure entry: got '{rendered}'"
+        );
+        // Non-matching entries should NOT appear
+        assert!(
+            !rendered.contains("root from 192") && !rendered.contains("192.168"),
+            "should NOT show non-matching auth failure (root, not nginx)"
+        );
+    }
+
+    #[test]
+    fn dash_logs_tab_empty_filter_shows_no_matching_message() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+        data.domains.logs.kernel_errors = vec!["BUG: soft lockup - CPU#0 stuck for 22s".into()];
+        data.domains.logs.auth_failures =
+            vec!["Failed password for root from 192.168.1.100".into()];
+        app.dashboard.data = data;
+        app.dashboard.active_tab = OpsTab::Logs;
+        // Select finding-001: Disk /var, affected_resource = "/var" — no log entry mentions /var
+        app.dashboard.selected_finding = 0;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
+        render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
+        let rendered = buf_to_string(&buf);
+
+        assert!(
+            rendered.contains("Scoped to finding: Disk /var 78% full"),
+            "should show scoping header"
+        );
+        assert!(
+            rendered.contains("No matching log entries for /var"),
+            "should show empty-state message with affected_resource: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("0 kernel errors, 0 auth failures"),
+            "should show 0 counts"
         );
     }
 }
