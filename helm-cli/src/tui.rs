@@ -833,6 +833,8 @@ struct FindingSummary {
     risk: String,
     rollback: String,
     command_preview: String,
+    detector_id: String,
+    correlated_finding_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -947,6 +949,45 @@ impl DashboardFindingState {
     }
 }
 
+/// Filter for finding queue by state (cycled with Left/Right when table focused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DashboardFindingStateFilter {
+    #[default]
+    Active,
+    All,
+    NewOnly,
+    OpenOnly,
+    RecurringOnly,
+    SuppressedOnly,
+    ResolvedOnly,
+}
+
+impl DashboardFindingStateFilter {
+    fn all() -> &'static [Self] {
+        &[
+            Self::Active,
+            Self::All,
+            Self::NewOnly,
+            Self::OpenOnly,
+            Self::RecurringOnly,
+            Self::SuppressedOnly,
+            Self::ResolvedOnly,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::All => "All",
+            Self::NewOnly => "New",
+            Self::OpenOnly => "Open",
+            Self::RecurringOnly => "Recurring",
+            Self::SuppressedOnly => "Suppressed",
+            Self::ResolvedOnly => "Resolved",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct DashboardMetrics {
     open: usize,
@@ -1037,6 +1078,7 @@ struct DashboardState {
     selected_finding: usize,
     table_scroll: usize,
     detail_scroll: usize,
+    finding_state_filter: DashboardFindingStateFilter,
     active_plan: Option<DashboardPlan>,
     error: Option<String>,
     overlap_guard: Option<Arc<AtomicBool>>,
@@ -1052,6 +1094,7 @@ impl DashboardState {
             selected_finding: 0,
             table_scroll: 0,
             detail_scroll: 0,
+            finding_state_filter: DashboardFindingStateFilter::default(),
             active_plan: None,
             error: None,
             overlap_guard: None,
@@ -1813,6 +1856,25 @@ impl TuiApp {
                     .unwrap_or(0);
                 let next = (current + 1).min(tabs.len().saturating_sub(1));
                 self.dashboard.active_tab = tabs[next];
+            }
+            // ── Dashboard filter cycling (Table or Detail focus) ──
+            KeyCode::Left
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.view == DashboardView::Overview
+                    && self.input.text.is_empty()
+                    && (self.dashboard.pane == DashboardFocus::Table
+                        || self.dashboard.pane == DashboardFocus::Detail) =>
+            {
+                self.cycle_dashboard_filter(-1);
+            }
+            KeyCode::Right
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.view == DashboardView::Overview
+                    && self.input.text.is_empty()
+                    && (self.dashboard.pane == DashboardFocus::Table
+                        || self.dashboard.pane == DashboardFocus::Detail) =>
+            {
+                self.cycle_dashboard_filter(1);
             }
             KeyCode::Up => self.input.previous_history(),
             KeyCode::Down => self.input.next_history(),
@@ -3977,12 +4039,26 @@ Report the exit status and the concise output."
     }
 
     fn finding_matches_dashboard_filters(&self, finding: &FindingSummary) -> bool {
-        matches!(
-            finding.status,
-            DashboardFindingState::Open
-                | DashboardFindingState::New
-                | DashboardFindingState::Recurring
-        )
+        match self.dashboard.finding_state_filter {
+            DashboardFindingStateFilter::Active => matches!(
+                finding.status,
+                DashboardFindingState::Open
+                    | DashboardFindingState::New
+                    | DashboardFindingState::Recurring
+            ),
+            DashboardFindingStateFilter::All => true,
+            DashboardFindingStateFilter::NewOnly => finding.status == DashboardFindingState::New,
+            DashboardFindingStateFilter::OpenOnly => finding.status == DashboardFindingState::Open,
+            DashboardFindingStateFilter::RecurringOnly => {
+                finding.status == DashboardFindingState::Recurring
+            }
+            DashboardFindingStateFilter::SuppressedOnly => {
+                finding.status == DashboardFindingState::Suppressed
+            }
+            DashboardFindingStateFilter::ResolvedOnly => {
+                finding.status == DashboardFindingState::Resolved
+            }
+        }
     }
 
     fn clamp_dashboard_selection(&mut self) {
@@ -4020,6 +4096,23 @@ Report the exit status and the concise output."
         let visible = self.dashboard_visible_finding_indices();
         let idx = visible.get(self.dashboard.selected_finding)?;
         self.dashboard.data.findings.get(*idx)
+    }
+
+    fn cycle_dashboard_filter(&mut self, delta: isize) {
+        let filters = DashboardFindingStateFilter::all();
+        let current = filters
+            .iter()
+            .position(|f| *f == self.dashboard.finding_state_filter)
+            .unwrap_or(0);
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(filters.len().saturating_sub(1))
+        };
+        self.dashboard.finding_state_filter = filters[next];
+        self.dashboard.selected_finding = 0;
+        self.dashboard.table_scroll = 0;
+        self.dashboard.detail_scroll = 0;
     }
 
     async fn handle_dashboard_enter(&mut self, tx: mpsc::UnboundedSender<UiEvent>) -> Result<()> {
@@ -4534,9 +4627,41 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                         .map(|_| "review generated plan before apply".to_owned())
                         .unwrap_or_else(|| "read-only / not applicable".to_owned()),
                     command_preview: aggregate.latest.read_only_checks.join("\n"),
+                    detector_id: aggregate.latest.detector_id.clone(),
+                    correlated_finding_ids: Vec::new(),
                 }
             })
             .collect();
+
+        // ── Correlation engine ──
+        // For each finding, find other findings where domains match OR
+        // affected_resource is a case-insensitive substring of the other's affected_resource.
+        {
+            let mut correlations: Vec<Vec<String>> = vec![Vec::new(); finding_summaries.len()];
+            for (i, left) in finding_summaries.iter().enumerate() {
+                for (j, right) in finding_summaries.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    let domain_match = left.domain == right.domain;
+                    let resource_match = left
+                        .affected_resource
+                        .to_lowercase()
+                        .contains(&right.affected_resource.to_lowercase())
+                        || right
+                            .affected_resource
+                            .to_lowercase()
+                            .contains(&left.affected_resource.to_lowercase());
+                    if domain_match || resource_match {
+                        correlations[i].push(right.id.clone());
+                    }
+                }
+            }
+            for (i, correlated) in correlations.into_iter().enumerate() {
+                finding_summaries[i].correlated_finding_ids = correlated;
+            }
+        }
+
         finding_summaries.sort_by(|left, right| {
             let status_rank = |state: DashboardFindingState| match state {
                 DashboardFindingState::New => 0,
@@ -4567,9 +4692,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         let collector_health: Vec<(String, bool, Option<String>)> = SnapshotDomains::domain_names()
             .iter()
             .map(|&domain| {
-                let err = collector_errors_raw
-                    .iter()
-                    .find(|e| e.domain == domain);
+                let err = collector_errors_raw.iter().find(|e| e.domain == domain);
                 match err {
                     Some(e) => (domain.to_string(), false, Some(e.message.clone())),
                     None => (domain.to_string(), true, None),
@@ -4797,7 +4920,10 @@ fn spawn_tick_task(tx: mpsc::UnboundedSender<UiEvent>) {
     });
 }
 
-fn spawn_dashboard_refresh_task(tx: mpsc::UnboundedSender<UiEvent>, overlap_guard: Arc<AtomicBool>) {
+fn spawn_dashboard_refresh_task(
+    tx: mpsc::UnboundedSender<UiEvent>,
+    overlap_guard: Arc<AtomicBool>,
+) {
     let tx2 = tx.clone();
     let tx3 = tx.clone();
     // Lightweight dashboard re-read every 5s (reads latest snapshot from DB)
@@ -5136,10 +5262,7 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     };
     let collector_line = if d.collector_errors.is_empty() {
         Line::from(Span::styled(
-            format!(
-                "collectors {}/{} ✓",
-                healthy_count, total_domains
-            ),
+            format!("collectors {}/{} ✓", healthy_count, total_domains),
             Style::default().fg(collector_color),
         ))
     } else {
@@ -5148,11 +5271,7 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             .iter()
             .find(|(_, h, _)| !*h)
             .map(|(domain, _, reason)| {
-                format!(
-                    "{}: {}",
-                    domain,
-                    reason.as_deref().unwrap_or("unknown")
-                )
+                format!("{}: {}", domain, reason.as_deref().unwrap_or("unknown"))
             })
             .unwrap_or_else(|| "unknown".to_string());
         Line::from(Span::styled(
@@ -5177,9 +5296,7 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         Line::from(Span::styled(
             format!(
                 "tick #{}  ⚠ last: {} skip(s) — tick {} skipped",
-                d.tick_count,
-                d.ticks_skipped,
-                d.consecutive_skips
+                d.tick_count, d.ticks_skipped, d.consecutive_skips
             ),
             Style::default().fg(OPS_YELLOW),
         ))
@@ -5275,7 +5392,12 @@ fn render_ops_body(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
 fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let visible = app.dashboard_visible_finding_indices();
-    let title = format!(" FINDING QUEUE  {} open ", visible.len());
+    let filter_label = app.dashboard.finding_state_filter.label();
+    let title = format!(
+        " FINDING QUEUE  {} found  [{}] ",
+        visible.len(),
+        filter_label
+    );
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -5284,7 +5406,7 @@ fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     block.render(area, buf);
 
     if visible.is_empty() {
-        Paragraph::new("No active alerts")
+        Paragraph::new(format!("No findings matching [{}]", filter_label))
             .style(Style::default().fg(OPS_MUTED))
             .render(inner, buf);
         return;
@@ -5367,43 +5489,118 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         return;
     };
     let finding = &app.dashboard.data.findings[*actual_idx];
+
+    // Detection time formatting
+    let detection_time = chrono::DateTime::from_timestamp(finding.first_seen, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let last_seen_time = chrono::DateTime::from_timestamp(finding.last_seen, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let duration_secs = finding.last_seen.saturating_sub(finding.first_seen);
+    let duration_str = if duration_secs < 60 {
+        format!("{}s", duration_secs)
+    } else if duration_secs < 3600 {
+        format!("{}m", duration_secs / 60)
+    } else if duration_secs < 86400 {
+        format!("{}h {}m", duration_secs / 3600, (duration_secs % 3600) / 60)
+    } else {
+        format!(
+            "{}d {}h",
+            duration_secs / 86400,
+            (duration_secs % 86400) / 3600
+        )
+    };
+
     let mut text = format!(
-        "● {} · {}  {}\n\nWhen      {}\nHost      {}\nStatus    {}\nCount     {} occurrence{}\n\n",
+        "● {} · {}  {}\n\n",
         finding.severity.to_ascii_uppercase(),
         finding.kind,
         finding.title,
-        finding.age_label,
-        finding.host,
-        finding.status.label(),
+    );
+
+    // ── WHAT HAPPENED ──
+    text.push_str("╔══ WHAT HAPPENED ═══════════════════════════════════════════╗\n");
+    text.push_str(&format!("  Detector ID  {}\n", finding.detector_id));
+    text.push_str(&format!("  Detected     {}\n", detection_time));
+    text.push_str(&format!("  Domain       {}\n", finding.domain));
+    text.push_str(&format!("  Kind         {}\n", finding.kind));
+    text.push_str(&format!("  Resource     {}\n", finding.affected_resource));
+    text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
+
+    // ── WHEN ──
+    text.push_str("╔══ WHEN ═══════════════════════════════════════════════════╗\n");
+    text.push_str(&format!("  First seen   {}\n", detection_time));
+    text.push_str(&format!("  Last seen    {}\n", last_seen_time));
+    text.push_str(&format!("  Duration     {}\n", duration_str));
+    text.push_str(&format!("  Age          {}\n", finding.age_label));
+    text.push_str(&format!(
+        "  Occurrences  {} time{}\n",
         finding.occurrence_count,
         if finding.occurrence_count == 1 {
             ""
         } else {
             "s"
         }
-    );
-    text.push_str("WHY IT HAPPENED\n");
-    if !finding.assumptions.is_empty() {
-        text.push_str(&finding.assumptions.join(" "));
-    } else if !finding.evidence_text.trim().is_empty() {
-        text.push_str(
-            &finding
-                .evidence_text
-                .lines()
-                .take(3)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-    } else {
-        text.push_str(&finding.sample);
+    ));
+    text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
+
+    // ── EVIDENCE ──
+    text.push_str("╔══ EVIDENCE ═══════════════════════════════════════════════╗\n");
+    if !finding.evidence_sources.is_empty() {
+        text.push_str(&format!(
+            "  Sources  {}\n",
+            finding.evidence_sources.join(", ")
+        ));
     }
-    text.push_str("\n\nIMPACT\n");
+    if finding.evidence_text.trim().is_empty() {
+        text.push_str("  (no evidence captured yet)\n");
+    } else {
+        for line in finding.evidence_text.lines() {
+            text.push_str(&format!("  {line}\n"));
+        }
+    }
+    text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
+
+    // ── WHY (correlation) ──
+    text.push_str("╔══ WHY ════════════════════════════════════════════════════╗\n");
+    if finding.correlated_finding_ids.is_empty() {
+        text.push_str("  No correlated findings\n");
+    } else {
+        text.push_str("  Correlated findings (same snapshot):\n");
+        for corr_id in &finding.correlated_finding_ids {
+            if let Some(corr) = app
+                .dashboard
+                .data
+                .findings
+                .iter()
+                .find(|f| f.id == *corr_id)
+            {
+                let sev = corr.severity.to_ascii_uppercase();
+                text.push_str(&format!("    ● {sev}  {}\n", corr.title));
+            }
+        }
+    }
+    text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
+
+    // ── IMPACT ──
+    text.push_str("╔══ IMPACT ═════════════════════════════════════════════════╗\n");
+    text.push_str(&format!(
+        "  Severity   {}\n",
+        finding.severity.to_ascii_uppercase()
+    ));
+    text.push_str(&format!("  Confidence {}\n", finding.confidence));
+    text.push_str(&format!("  Resource   {}\n", finding.affected_resource));
+    text.push_str(&format!("  Category   {}\n", finding.domain));
     if finding.impact.trim().is_empty() {
-        text.push_str("Impact not yet summarized.");
+        text.push_str("  Impact not yet summarized.\n");
     } else {
-        text.push_str(&finding.impact);
+        text.push_str(&format!("  {}\n", finding.impact));
     }
-    text.push_str("\n\nFIX PLAN (approval required per step)\n");
+    text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
+
+    // ── FIX PLAN ──
+    text.push_str("── FIX PLAN (approval required per step) ──\n");
     if let Some(plan) = &app.dashboard.active_plan {
         if plan.finding_id == finding.id {
             text.push_str(&plan.summary);
@@ -5417,7 +5614,9 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     } else {
         text.push_str("Press Alt+G to generate the guided troubleshooting plan.");
     }
-    text.push_str("\n\nEVIDENCE READ (read-only, already collected)\n");
+
+    // ── EVIDENCE READ ──
+    text.push_str("\n\n── EVIDENCE READ (read-only, already collected) ──\n");
     if finding.read_only_checks.is_empty() {
         text.push_str("No read-only checks stored yet.");
     } else {
@@ -5425,14 +5624,18 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             text.push_str(&format!("✓ {check}\n"));
         }
     }
-    text.push_str("\nROLLBACK\n");
+
+    // ── ROLLBACK ──
+    text.push_str("\n── ROLLBACK ──\n");
     text.push_str(&finding.rollback);
-    text.push_str("\n\nAlt+G Generate plan   Alt+E Evidence   Alt+F Follow-up   Alt+A Apply   S Suppress   R Resolve   8 Assist");
+
+    // ── Footer ──
+    text.push_str("\n\n◄ ► filter state   Alt+G Gen plan   Alt+E Evidence   Alt+F Follow-up   Alt+A Apply   S Suppress   R Resolve   8 Assist");
 
     Paragraph::new(text)
         .style(Style::default().fg(OPS_FG).bg(OPS_BG))
-        .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
+        .wrap(Wrap { trim: false })
         .render(inner, buf);
 }
 
@@ -8881,6 +9084,8 @@ mod tests {
                     risk: "medium".into(),
                     rollback: "not specified".into(),
                     command_preview: "clean old logs from /var/log".into(),
+                    detector_id: "disk-usage-detector".into(),
+                    correlated_finding_ids: vec!["finding-002".into()],
                 },
                 FindingSummary {
                     id: "finding-002".into(),
@@ -8910,6 +9115,8 @@ mod tests {
                     risk: "high".into(),
                     rollback: "systemctl start nginx".into(),
                     command_preview: "systemctl restart nginx".into(),
+                    detector_id: "service-status-detector".into(),
+                    correlated_finding_ids: vec!["finding-001".into()],
                 },
             ],
             hosts: vec!["testbox".into()],
@@ -9058,22 +9265,32 @@ mod tests {
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
         app.dashboard.view = DashboardView::FindingDetail(0);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
-        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
+        render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
         let rendered = buf_to_string(&buf);
+
         assert!(
             rendered.contains("Disk /var 78% full"),
             "detail should show title"
         );
         assert!(
-            rendered.contains("WHY IT HAPPENED"),
-            "detail should show root-cause section"
+            rendered.contains("WHAT HAPPENED"),
+            "detail should show what-happened section"
         );
         assert!(
-            rendered.contains("disk pressure may block writes"),
-            "detail should show impact"
+            rendered.contains("Detector ID"),
+            "detail should show detector_id in WHAT HAPPENED"
         );
-        assert!(rendered.contains("ROLLBACK"), "detail should show rollback");
+        assert!(
+            rendered.contains("EVIDENCE"),
+            "detail should show evidence section"
+        );
+        // Verify correlation engine added correlated_finding_ids
+        let finding0 = &app.dashboard.data.findings[0];
+        assert!(
+            !finding0.correlated_finding_ids.is_empty(),
+            "finding-001 should have correlated findings"
+        );
     }
 
     #[test]
