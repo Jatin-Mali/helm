@@ -53,6 +53,34 @@ use crate::{
 };
 use crate::{sandbox::ResolvedSandbox, secrets::SecretsStore};
 
+/// Sparkline / trend configuration loaded from thresholds.toml.
+#[derive(Debug, Clone, Deserialize)]
+struct ThresholdsConfig {
+    #[serde(default = "default_sparkline_depth")]
+    sparkline_history_depth: usize,
+}
+
+fn default_sparkline_depth() -> usize {
+    60
+}
+
+impl Default for ThresholdsConfig {
+    fn default() -> Self {
+        Self {
+            sparkline_history_depth: default_sparkline_depth(),
+        }
+    }
+}
+
+fn load_thresholds_config() -> ThresholdsConfig {
+    let config_path = crate::paths::config_dir().join("thresholds.toml");
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        toml::from_str(&content).unwrap_or_default()
+    } else {
+        ThresholdsConfig::default()
+    }
+}
+
 const APP_BG: Color = Color::Rgb(11, 19, 30);
 const APP_FG: Color = Color::Rgb(208, 214, 224);
 const HEADER_BG: Color = Color::Rgb(26, 41, 64);
@@ -1122,10 +1150,13 @@ struct DashboardState {
     pending_plan_rx: Option<tokio::sync::oneshot::Receiver<PlanStatus>>,
     error: Option<String>,
     overlap_guard: Option<Arc<AtomicBool>>,
+    /// Max history points for sparklines (loaded from thresholds.toml, default 60).
+    sparkline_history_depth: usize,
 }
 
 impl DashboardState {
     fn new() -> Self {
+        let thresholds = load_thresholds_config();
         Self {
             data: DashboardData::default(),
             view: DashboardView::Overview,
@@ -1140,6 +1171,7 @@ impl DashboardState {
             pending_plan_rx: None,
             error: None,
             overlap_guard: None,
+            sparkline_history_depth: thresholds.sparkline_history_depth.max(10).min(300),
         }
     }
 }
@@ -4933,7 +4965,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         age_distribution.sort_by(|left, right| left.0.cmp(&right.0));
 
         // Push history before reassigning.
-        let cap = 60;
+        let cap = self.dashboard.sparkline_history_depth;
         let mut push = |buf: &mut VecDeque<f64>, val: f64| {
             buf.push_back(val);
             if buf.len() > cap {
