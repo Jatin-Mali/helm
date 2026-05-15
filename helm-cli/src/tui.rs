@@ -2,7 +2,7 @@
 
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     path::PathBuf,
     sync::{
@@ -1048,6 +1048,7 @@ struct DashboardData {
 #[derive(Debug, Clone, Default)]
 struct DashboardAuditRow {
     time: String,
+    kind: String,
     capability: String,
     command: String,
     decision: String,
@@ -1277,6 +1278,7 @@ pub struct TuiApp {
     #[allow(dead_code)]
     theme: Theme,
     dashboard: DashboardState,
+    audited_transitions: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1390,6 +1392,7 @@ impl TuiApp {
             resume_context: None,
             theme: Theme::default(),
             dashboard: DashboardState::new(),
+            audited_transitions: HashSet::new(),
         };
         if mode == AgentMode::Dashboard {
             app.refresh_dashboard();
@@ -1779,6 +1782,16 @@ impl TuiApp {
                             &finding.id,
                         )
                         .map_err(|e| anyhow!("{e}"))?;
+                        self.write_dashboard_event(
+                            "finding-state",
+                            "monitor",
+                            "suppressed",
+                            &helm_memory::stable_hash_hex(&finding.fingerprint),
+                            &helm_memory::stable_hash_hex(&format!(
+                                "{}:{}",
+                                finding.snapshot_id, finding.id
+                            )),
+                        )?;
                         self.refresh_dashboard();
                         self.toast(format!("Suppressed {}", finding.id));
                     }
@@ -1800,6 +1813,16 @@ impl TuiApp {
                             &finding.id,
                         )
                         .map_err(|e| anyhow!("{e}"))?;
+                        self.write_dashboard_event(
+                            "finding-state",
+                            "monitor",
+                            "resolved",
+                            &helm_memory::stable_hash_hex(&finding.fingerprint),
+                            &helm_memory::stable_hash_hex(&format!(
+                                "{}:{}",
+                                finding.snapshot_id, finding.id
+                            )),
+                        )?;
                         self.refresh_dashboard();
                         self.toast(format!("Resolved {}", finding.id));
                     }
@@ -1813,6 +1836,16 @@ impl TuiApp {
                         let conn = rusqlite::Connection::open(&db_path)?;
                         FindingStateStore::clear(&conn, &finding.fingerprint)
                             .map_err(|e| anyhow!("{e}"))?;
+                        self.write_dashboard_event(
+                            "finding-state",
+                            "monitor",
+                            "reopened",
+                            &helm_memory::stable_hash_hex(&finding.fingerprint),
+                            &helm_memory::stable_hash_hex(&format!(
+                                "{}:{}",
+                                finding.snapshot_id, finding.id
+                            )),
+                        )?;
                         self.refresh_dashboard();
                         self.toast(format!("Reopened {}", finding.id));
                     }
@@ -3095,6 +3128,61 @@ Report the exit status and the concise output."
         Ok(())
     }
 
+    /// Write a hash-chained audit event for TUI dashboard actions
+    /// (collector runs, finding state transitions, approved commands,
+    /// rejected plans). Uses taint="clean", cwd="", target="tui",
+    /// episode_id=None.
+    fn write_dashboard_event(
+        &self,
+        tool_name: &str,
+        capability: &str,
+        decision: &str,
+        input_hash: &str,
+        output_hash: &str,
+    ) -> Result<()> {
+        let db_path = &self.runtime.db_path;
+        let conn = rusqlite::Connection::open(db_path)?;
+        let prev =
+            helm_memory::latest_audit_hash(&conn, None).unwrap_or_else(|_| "GENESIS".to_string());
+        let ts = chrono::Utc::now().timestamp_millis();
+        let hash = helm_memory::audit_hash(helm_memory::AuditHashParts {
+            previous_hash: &prev,
+            episode_id: None,
+            target: Some("tui"),
+            timestamp: ts,
+            tool_name,
+            input_hash,
+            output_hash,
+            capability,
+            taint: "clean",
+            cwd: "",
+            decision,
+        });
+        conn.execute(
+            "INSERT INTO audit_events (episode_id, target, timestamp, tool_name, input_hash, output_hash, capability, taint, cwd, decision, previous_hash, event_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                rusqlite::types::Null,
+                "tui",
+                ts,
+                tool_name,
+                input_hash,
+                output_hash,
+                capability,
+                "clean",
+                "",
+                decision,
+                &prev,
+                &hash,
+            ],
+        )?;
+        tracing::info!(
+            tool_name = tool_name,
+            event_hash = hash,
+            "dashboard audit event written"
+        );
+        Ok(())
+    }
+
     /// Tag a finding as `plan_rejected` in its in-memory state_note.
     fn tag_finding_rejected(&mut self, idx: usize) {
         if let Some(finding) = self.dashboard.data.findings.get_mut(idx) {
@@ -4373,6 +4461,19 @@ Report the exit status and the concise output."
         self.dashboard.data.tick_count += 1;
         self.dashboard.data.ticks_skipped = 0;
         self.dashboard.data.consecutive_skips = 0;
+        // Write audit event for the collector run before clearing the overlap guard.
+        let domain_count = SnapshotDomains::domain_names().len();
+        self.write_dashboard_event(
+            "collector-run",
+            "monitor",
+            &format!(
+                "domains:{} findings:{}",
+                domain_count,
+                report.findings.len()
+            ),
+            &helm_memory::stable_hash_hex(&report.snapshot.id),
+            &helm_memory::stable_hash_hex(&report.findings.len().to_string()),
+        )?;
         // Clear overlap guard after the live refresh completes
         if let Some(ref guard) = self.dashboard.overlap_guard {
             guard.store(false, Ordering::SeqCst);
@@ -4860,127 +4961,160 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         let mut metrics = DashboardMetrics::default();
         let mut kind_distribution: HashMap<String, u64> = HashMap::new();
         let mut age_distribution: HashMap<String, u64> = HashMap::new();
-        let mut finding_summaries: Vec<FindingSummary> = aggregates
-            .into_iter()
-            .map(|(fingerprint, aggregate)| {
-                let kind = infer_finding_kind(&aggregate.latest);
-                let state_record = state_map.get(&fingerprint);
-                let state = if aggregate.is_current {
-                    match state_record.map(|record| record.status) {
-                        Some(FindingStateStatus::Suppressed) => DashboardFindingState::Suppressed,
-                        Some(FindingStateStatus::Resolved) => DashboardFindingState::Resolved,
-                        _ if aggregate.occurrence_count == 1
-                            && age_bucket(aggregate.last_seen)
-                                == DashboardAgeFilter::UnderOneDay =>
-                        {
-                            DashboardFindingState::New
-                        }
-                        _ if aggregate.occurrence_count > 1 => DashboardFindingState::Recurring,
-                        _ => DashboardFindingState::Open,
+        let mut finding_summaries: Vec<FindingSummary> = Vec::with_capacity(aggregates.len());
+        for (fingerprint, aggregate) in aggregates {
+            let kind = infer_finding_kind(&aggregate.latest);
+            let state_record = state_map.get(&fingerprint);
+            let state = if aggregate.is_current {
+                match state_record.map(|record| record.status) {
+                    Some(FindingStateStatus::Suppressed) => DashboardFindingState::Suppressed,
+                    Some(FindingStateStatus::Resolved) => DashboardFindingState::Resolved,
+                    _ if aggregate.occurrence_count == 1
+                        && age_bucket(aggregate.last_seen) == DashboardAgeFilter::UnderOneDay =>
+                    {
+                        DashboardFindingState::New
                     }
-                } else {
-                    match state_record.map(|record| record.status) {
-                        Some(FindingStateStatus::Resolved) => DashboardFindingState::Resolved,
-                        Some(FindingStateStatus::Suppressed) => DashboardFindingState::Suppressed,
-                        _ => DashboardFindingState::SelfResolved,
-                    }
+                    _ if aggregate.occurrence_count > 1 => DashboardFindingState::Recurring,
+                    _ => DashboardFindingState::Open,
+                }
+            } else {
+                match state_record.map(|record| record.status) {
+                    Some(FindingStateStatus::Resolved) => DashboardFindingState::Resolved,
+                    Some(FindingStateStatus::Suppressed) => DashboardFindingState::Suppressed,
+                    _ => DashboardFindingState::SelfResolved,
+                }
+            };
+
+            // Write audit events for auto-detected finding state transitions.
+            if aggregate.is_current
+                && matches!(
+                    state,
+                    DashboardFindingState::New | DashboardFindingState::Recurring
+                )
+            {
+                let decision = match state {
+                    DashboardFindingState::New => "new",
+                    DashboardFindingState::Recurring => "recurring",
+                    _ => unreachable!(),
                 };
-                match state {
-                    DashboardFindingState::Open => metrics.open += 1,
-                    DashboardFindingState::New => {
-                        metrics.open += 1;
-                        metrics.new += 1;
+                let transition_key = format!("{}:{}", fingerprint, decision);
+                if !self.audited_transitions.contains(&transition_key) {
+                    if let Err(e) = self.write_dashboard_event(
+                        "finding-state",
+                        "monitor",
+                        decision,
+                        &helm_memory::stable_hash_hex(&fingerprint),
+                        &helm_memory::stable_hash_hex(&format!(
+                            "{}:{}",
+                            snapshot_id, aggregate.latest.id
+                        )),
+                    ) {
+                        tracing::warn!(
+                            fingerprint = %fingerprint,
+                            decision = decision,
+                            error = %e,
+                            "failed to write auto-detection audit event"
+                        );
                     }
-                    DashboardFindingState::Recurring => {
-                        metrics.open += 1;
-                        metrics.recurring += 1;
+                    self.audited_transitions.insert(transition_key);
+                }
+            }
+
+            match state {
+                DashboardFindingState::Open => metrics.open += 1,
+                DashboardFindingState::New => {
+                    metrics.open += 1;
+                    metrics.new += 1;
+                }
+                DashboardFindingState::Recurring => {
+                    metrics.open += 1;
+                    metrics.recurring += 1;
+                }
+                DashboardFindingState::Suppressed => metrics.suppressed += 1,
+                DashboardFindingState::Resolved => metrics.resolved += 1,
+                DashboardFindingState::SelfResolved => metrics.self_resolved += 1,
+            }
+            match aggregate.latest.severity.as_str() {
+                "critical" => metrics.critical += 1,
+                "warning" => metrics.warning += 1,
+                _ => {}
+            }
+            *kind_distribution.entry(kind.clone()).or_insert(0) += 1;
+            *age_distribution
+                .entry(age_bucket(aggregate.last_seen).label().to_owned())
+                .or_insert(0) += 1;
+            let sample = aggregate
+                .latest
+                .evidence
+                .first()
+                .map(|e| {
+                    if e.value.trim().is_empty() {
+                        e.note.clone()
+                    } else {
+                        e.value.clone()
                     }
-                    DashboardFindingState::Suppressed => metrics.suppressed += 1,
-                    DashboardFindingState::Resolved => metrics.resolved += 1,
-                    DashboardFindingState::SelfResolved => metrics.self_resolved += 1,
-                }
-                match aggregate.latest.severity.as_str() {
-                    "critical" => metrics.critical += 1,
-                    "warning" => metrics.warning += 1,
-                    _ => {}
-                }
-                *kind_distribution.entry(kind.clone()).or_insert(0) += 1;
-                *age_distribution
-                    .entry(age_bucket(aggregate.last_seen).label().to_owned())
-                    .or_insert(0) += 1;
-                let sample = aggregate
-                    .latest
-                    .evidence
-                    .first()
-                    .map(|e| {
-                        if e.value.trim().is_empty() {
-                            e.note.clone()
+                })
+                .unwrap_or_else(|| aggregate.latest.title.clone());
+            finding_summaries.push(FindingSummary {
+                id: aggregate.latest.id.clone(),
+                fingerprint,
+                severity: aggregate.latest.severity.as_str().to_string(),
+                confidence: aggregate.latest.confidence.as_str().to_string(),
+                title: aggregate.latest.title.clone(),
+                affected_resource: aggregate.latest.affected_resource.clone(),
+                snapshot_id: aggregate.latest.snapshot_id.clone(),
+                domain: aggregate.latest.category.as_str().to_string(),
+                kind,
+                host: aggregate.host,
+                status: state,
+                occurrence_count: aggregate.occurrence_count,
+                first_seen: aggregate.first_seen,
+                last_seen: aggregate.last_seen,
+                age_label: format_relative_age(aggregate.last_seen),
+                sample,
+                state_note: state_record
+                    .map(|record| {
+                        if !record.suppression_reason.is_empty() {
+                            record.suppression_reason.clone()
                         } else {
-                            e.value.clone()
+                            record.note.clone()
                         }
                     })
-                    .unwrap_or_else(|| aggregate.latest.title.clone());
-                FindingSummary {
-                    id: aggregate.latest.id.clone(),
-                    fingerprint,
-                    severity: aggregate.latest.severity.as_str().to_string(),
-                    confidence: aggregate.latest.confidence.as_str().to_string(),
-                    title: aggregate.latest.title.clone(),
-                    affected_resource: aggregate.latest.affected_resource.clone(),
-                    snapshot_id: aggregate.latest.snapshot_id.clone(),
-                    domain: aggregate.latest.category.as_str().to_string(),
-                    kind,
-                    host: aggregate.host,
-                    status: state,
-                    occurrence_count: aggregate.occurrence_count,
-                    first_seen: aggregate.first_seen,
-                    last_seen: aggregate.last_seen,
-                    age_label: format_relative_age(aggregate.last_seen),
-                    sample,
-                    state_note: state_record
-                        .map(|record| {
-                            if !record.suppression_reason.is_empty() {
-                                record.suppression_reason.clone()
-                            } else {
-                                record.note.clone()
-                            }
-                        })
-                        .unwrap_or_default(),
-                    evidence_text: aggregate
-                        .latest
-                        .evidence
-                        .iter()
-                        .map(|e| format!("{} = {} -- {}", e.source, e.value, e.note))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    evidence_sources: aggregate
-                        .latest
-                        .evidence
-                        .iter()
-                        .map(|e| e.source.clone())
-                        .collect(),
-                    impact: aggregate.latest.impact.clone(),
-                    assumptions: aggregate.latest.assumptions.clone(),
-                    missing_data: aggregate.latest.missing_data.clone(),
-                    read_only_checks: aggregate.latest.read_only_checks.clone(),
-                    fix_plan: aggregate.latest.fix_plan.clone(),
-                    risk: match aggregate.latest.severity.as_str() {
-                        "critical" => "high".to_owned(),
-                        "warning" => "medium".to_owned(),
-                        _ => "low".to_owned(),
-                    },
-                    rollback: aggregate
-                        .latest
-                        .fix_plan
-                        .as_ref()
-                        .map(|_| "review generated plan before apply".to_owned())
-                        .unwrap_or_else(|| "read-only / not applicable".to_owned()),
-                    command_preview: aggregate.latest.read_only_checks.join("\n"),
-                    detector_id: aggregate.latest.detector_id.clone(),
-                    correlated_finding_ids: Vec::new(),
-                }
-            })
-            .collect();
+                    .unwrap_or_default(),
+                evidence_text: aggregate
+                    .latest
+                    .evidence
+                    .iter()
+                    .map(|e| format!("{} = {} -- {}", e.source, e.value, e.note))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                evidence_sources: aggregate
+                    .latest
+                    .evidence
+                    .iter()
+                    .map(|e| e.source.clone())
+                    .collect(),
+                impact: aggregate.latest.impact.clone(),
+                assumptions: aggregate.latest.assumptions.clone(),
+                missing_data: aggregate.latest.missing_data.clone(),
+                read_only_checks: aggregate.latest.read_only_checks.clone(),
+                fix_plan: aggregate.latest.fix_plan.clone(),
+                risk: match aggregate.latest.severity.as_str() {
+                    "critical" => "high".to_owned(),
+                    "warning" => "medium".to_owned(),
+                    _ => "low".to_owned(),
+                },
+                rollback: aggregate
+                    .latest
+                    .fix_plan
+                    .as_ref()
+                    .map(|_| "review generated plan before apply".to_owned())
+                    .unwrap_or_else(|| "read-only / not applicable".to_owned()),
+                command_preview: aggregate.latest.read_only_checks.join("\n"),
+                detector_id: aggregate.latest.detector_id.clone(),
+                correlated_finding_ids: Vec::new(),
+            });
+        }
 
         // ── Correlation engine ──
         // For each finding, find other findings where domains match OR
@@ -5064,10 +5198,18 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                     let time = chrono::DateTime::from_timestamp_millis(timestamp)
                         .map(|dt| dt.format("%H:%M:%S").to_string())
                         .unwrap_or_else(|| "--:--:--".to_owned());
+                    let tool_name: String = row.get::<_, String>(2)?;
+                    let kind = if tool_name == "collector-run" || tool_name == "finding-state" {
+                        "auto"
+                    } else {
+                        "user"
+                    }
+                    .to_string();
                     Ok(DashboardAuditRow {
                         time,
+                        kind,
                         capability: row.get::<_, String>(1)?,
-                        command: row.get::<_, String>(2)?,
+                        command: tool_name,
                         decision: row.get::<_, String>(3)?,
                     })
                 })
@@ -7116,6 +7258,10 @@ fn render_ops_changes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
+                "kind   ",
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
                 "cap    ",
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
@@ -7132,14 +7278,23 @@ fn render_ops_changes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             } else {
                 OPS_GREEN
             };
+            let kind_color = if event.kind == "auto" {
+                OPS_GREEN
+            } else {
+                OPS_BLUE
+            };
             lines.push(Line::from(vec![
                 Span::styled(format!(" {:<8} ", event.time), Style::default().fg(OPS_DIM)),
+                Span::styled(
+                    format!("[{:<4}] ", event.kind),
+                    Style::default().fg(kind_color),
+                ),
                 Span::styled(
                     format!(" {:<6} ", event.capability),
                     Style::default().fg(cap_color),
                 ),
                 Span::styled(
-                    truncate_cell(&event.command, 52),
+                    truncate_cell(&event.command, 46),
                     Style::default().fg(OPS_FG),
                 ),
                 Span::styled(
@@ -11092,5 +11247,292 @@ mod tests {
         );
         assert_eq!(tool_name, "plan-blocked");
         assert_eq!(decision, "BLOCKED:curl_pipe_shell");
+    }
+
+    #[test]
+    fn dash_audit_collector_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+        let _guard = env_lock().lock().unwrap();
+
+        // Write a collector-run audit event using the new generic helper.
+        let snapshot_id = "snap-abc123";
+        let expected_input = helm_memory::stable_hash_hex(snapshot_id);
+        let expected_output = helm_memory::stable_hash_hex("5");
+        app.write_dashboard_event(
+            "collector-run",
+            "monitor",
+            "domains:13 findings:5",
+            &expected_input,
+            &expected_output,
+        )
+        .unwrap();
+
+        // Query the audit_events table.
+        let db = dir.path().join("helm.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT tool_name, capability, decision, input_hash, output_hash, taint, cwd, target FROM audit_events")
+            .unwrap();
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(rows.len(), 1, "expected exactly one audit event");
+        let (tool_name, capability, decision, input_hash, output_hash, taint, cwd, target) =
+            &rows[0];
+        assert_eq!(tool_name, "collector-run");
+        assert_eq!(capability, "monitor");
+        assert_eq!(decision, "domains:13 findings:5");
+        assert_eq!(*input_hash, expected_input);
+        assert_eq!(*output_hash, expected_output);
+        assert_eq!(taint, "clean");
+        assert_eq!(cwd, "");
+        assert_eq!(target, "tui");
+    }
+
+    #[test]
+    fn dash_audit_state_transition_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+        let _guard = env_lock().lock().unwrap();
+
+        let fingerprint = "fp-deadbeef";
+        let snapshot_id = "snap-abc123";
+        let finding_id = "find-01";
+        let expected_input = helm_memory::stable_hash_hex(fingerprint);
+        let expected_output =
+            helm_memory::stable_hash_hex(&format!("{}:{}", snapshot_id, finding_id));
+
+        // Test all three decision values.
+        for decision in &["suppressed", "resolved", "reopened"] {
+            app.write_dashboard_event(
+                "finding-state",
+                "monitor",
+                decision,
+                &expected_input,
+                &expected_output,
+            )
+            .unwrap();
+        }
+
+        // Query the audit_events table.
+        let db = dir.path().join("helm.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT tool_name, capability, decision, input_hash, output_hash, taint, cwd, target FROM audit_events ORDER BY timestamp")
+            .unwrap();
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(rows.len(), 3, "expected exactly three audit events");
+        let expected_decisions = ["suppressed", "resolved", "reopened"];
+        for (i, row) in rows.iter().enumerate() {
+            let (tool_name, capability, decision, input_hash, output_hash, taint, cwd, target) =
+                row;
+            assert_eq!(tool_name, "finding-state");
+            assert_eq!(capability, "monitor");
+            assert_eq!(decision, expected_decisions[i]);
+            assert_eq!(*input_hash, expected_input);
+            assert_eq!(*output_hash, expected_output);
+            assert_eq!(taint, "clean");
+            assert_eq!(cwd, "");
+            assert_eq!(target, "tui");
+        }
+    }
+
+    #[test]
+    fn dash_audit_state_transition_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+        let _guard = env_lock().lock().unwrap();
+
+        let fingerprint_a = "fp-new-finding";
+        let fingerprint_b = "fp-recurring-finding";
+        let snapshot_id = "snap-abc123";
+        let finding_id_a = "find-new";
+        let finding_id_b = "find-recur";
+
+        // Test "new" decision for a new finding.
+        {
+            let expected_input = helm_memory::stable_hash_hex(fingerprint_a);
+            let expected_output =
+                helm_memory::stable_hash_hex(&format!("{}:{}", snapshot_id, finding_id_a));
+            app.write_dashboard_event(
+                "finding-state",
+                "monitor",
+                "new",
+                &expected_input,
+                &expected_output,
+            )
+            .unwrap();
+        }
+
+        // Test "recurring" decision for a recurring finding.
+        {
+            let expected_input = helm_memory::stable_hash_hex(fingerprint_b);
+            let expected_output =
+                helm_memory::stable_hash_hex(&format!("{}:{}", snapshot_id, finding_id_b));
+            app.write_dashboard_event(
+                "finding-state",
+                "monitor",
+                "recurring",
+                &expected_input,
+                &expected_output,
+            )
+            .unwrap();
+        }
+
+        // Query the audit_events table.
+        let db = dir.path().join("helm.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT tool_name, capability, decision, input_hash, output_hash, taint, cwd, target FROM audit_events ORDER BY timestamp")
+            .unwrap();
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(rows.len(), 2, "expected exactly two audit events");
+        let expected_decisions = ["new", "recurring"];
+        let expected_inputs = [
+            helm_memory::stable_hash_hex(fingerprint_a),
+            helm_memory::stable_hash_hex(fingerprint_b),
+        ];
+        let expected_outputs = [
+            helm_memory::stable_hash_hex(&format!("{}:{}", snapshot_id, finding_id_a)),
+            helm_memory::stable_hash_hex(&format!("{}:{}", snapshot_id, finding_id_b)),
+        ];
+        for (i, row) in rows.iter().enumerate() {
+            let (tool_name, capability, decision, input_hash, output_hash, taint, cwd, target) =
+                row;
+            assert_eq!(tool_name, "finding-state");
+            assert_eq!(capability, "monitor");
+            assert_eq!(decision, expected_decisions[i]);
+            assert_eq!(*input_hash, expected_inputs[i]);
+            assert_eq!(*output_hash, expected_outputs[i]);
+            assert_eq!(taint, "clean");
+            assert_eq!(cwd, "");
+            assert_eq!(target, "tui");
+        }
+    }
+
+    #[test]
+    fn dash_changes_source_markers() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+
+        data.audit_events = vec![
+            DashboardAuditRow {
+                time: "14:30:01".into(),
+                kind: "auto".into(),
+                capability: "monitor".into(),
+                command: "collector-run".into(),
+                decision: "domains:13 findings:5".into(),
+            },
+            DashboardAuditRow {
+                time: "14:30:02".into(),
+                kind: "user".into(),
+                capability: "plan-exec".into(),
+                command: "shell".into(),
+                decision: "blocked".into(),
+            },
+        ];
+        app.dashboard.data = data;
+        app.dashboard.active_tab = OpsTab::Changes;
+
+        // Render at a width that gives enough room for the kind column.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 24));
+        render_dashboard(&app, Rect::new(0, 0, 120, 24), &mut buf);
+        let rendered = buf_to_string(&buf);
+
+        assert!(
+            rendered.contains("CHANGES"),
+            "should render CHANGES tab title"
+        );
+        assert!(
+            rendered.contains("kind"),
+            "header should include kind column"
+        );
+
+        // The collector-run row should show [auto] (kind = auto).
+        assert!(
+            rendered.contains("[auto]"),
+            "collector-run row should show [auto] badge: output was:\n{rendered}"
+        );
+
+        // The shell row should show [user] (kind = user).
+        assert!(
+            rendered.contains("[user]"),
+            "shell row should show [user] badge: output was:\n{rendered}"
+        );
     }
 }

@@ -176,10 +176,7 @@ fn danger_patterns() -> &'static [DangerPattern] {
                 description: "world-writable root (chmod 777 /)",
             },
             DangerPattern {
-                regex: regex::Regex::new(
-                    r":.*\(\)\s*\{\s*:\|:&\s*\}\s*;\s*:",
-                )
-                .unwrap(),
+                regex: regex::Regex::new(r":.*\(\)\s*\{\s*:\|:&\s*\}\s*;\s*:").unwrap(),
                 description: "fork bomb (:(){ :|:& };:)",
             },
             DangerPattern {
@@ -267,7 +264,11 @@ fn split_command_parts(cmd: &str) -> Vec<String> {
     for sep in &separators {
         parts = parts
             .into_iter()
-            .flat_map(|p| p.split(sep).map(|s| s.trim().to_string()).collect::<Vec<_>>())
+            .flat_map(|p| {
+                p.split(sep)
+                    .map(|s| s.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
             .collect();
     }
     parts
@@ -518,7 +519,10 @@ impl std::fmt::Display for ParseError {
             Self::MissingNarrative => write!(f, "LLM response missing ---NARRATIVE--- section"),
             Self::MissingFixPlan => write!(f, "LLM response missing ---FIX PLAN--- section"),
             Self::NoCommandsFound => write!(f, "Fix plan contains no COMMAND blocks"),
-            Self::InvalidRiskLevel(v) => write!(f, "Unknown risk level '{v}' — expected none|low|medium|high"),
+            Self::InvalidRiskLevel(v) => write!(
+                f,
+                "Unknown risk level '{v}' — expected none|low|medium|high"
+            ),
         }
     }
 }
@@ -546,7 +550,9 @@ pub fn parse_llm_response(text: &str) -> Result<LlmFixPlan, ParseError> {
         .to_string();
 
     // Extract the fix plan section (everything after ---FIX PLAN---).
-    let fix_plan_start = text.find("---FIX PLAN---").ok_or(ParseError::MissingFixPlan)?;
+    let fix_plan_start = text
+        .find("---FIX PLAN---")
+        .ok_or(ParseError::MissingFixPlan)?;
     let fix_plan_text = &text[fix_plan_start + "---FIX PLAN---".len()..];
 
     // Split into individual steps on "---" separators.
@@ -1365,30 +1371,12 @@ mod tests {
     #[test]
     fn command_validator_rejects_dangerous_patterns() {
         let dangerous = [
-            (
-                "rm -rf / --no-preserve-root",
-                "rm -rf /",
-            ),
-            (
-                "sudo mkfs.ext4 /dev/sda1",
-                "mkfs",
-            ),
-            (
-                "dd if=/dev/zero of=/dev/sda",
-                "dd",
-            ),
-            (
-                "chmod 777 /",
-                "chmod 777",
-            ),
-            (
-                ":(){ :|:& };:",
-                "fork bomb",
-            ),
-            (
-                "somecmd > /dev/sda",
-                "redirect to raw device",
-            ),
+            ("rm -rf / --no-preserve-root", "rm -rf /"),
+            ("sudo mkfs.ext4 /dev/sda1", "mkfs"),
+            ("dd if=/dev/zero of=/dev/sda", "dd"),
+            ("chmod 777 /", "chmod 777"),
+            (":(){ :|:& };:", "fork bomb"),
+            ("somecmd > /dev/sda", "redirect to raw device"),
         ];
         for (cmd, expected_keyword) in dangerous {
             let result = CommandValidator::validate_command(cmd);
@@ -1403,7 +1391,9 @@ mod tests {
             );
             let joined = errs.join(" ");
             assert!(
-                joined.to_lowercase().contains(&expected_keyword.to_lowercase()),
+                joined
+                    .to_lowercase()
+                    .contains(&expected_keyword.to_lowercase()),
                 "error for '{cmd}' should mention '{expected_keyword}', got: {joined}"
             );
         }
