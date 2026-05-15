@@ -5,7 +5,10 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -209,6 +212,7 @@ enum UiEvent {
     Tick,
     DashboardRefresh,
     DashboardLiveRefresh,
+    TickSkipped,
 }
 
 #[derive(Clone)]
@@ -994,6 +998,7 @@ struct DashboardData {
     last_tick_instant: Option<Instant>,
     tick_count: u64,
     ticks_skipped: u64,
+    consecutive_skips: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1034,6 +1039,7 @@ struct DashboardState {
     detail_scroll: usize,
     active_plan: Option<DashboardPlan>,
     error: Option<String>,
+    overlap_guard: Option<Arc<AtomicBool>>,
 }
 
 impl DashboardState {
@@ -1048,6 +1054,7 @@ impl DashboardState {
             detail_scroll: 0,
             active_plan: None,
             error: None,
+            overlap_guard: None,
         }
     }
 }
@@ -1283,9 +1290,11 @@ impl TuiApp {
 
     async fn run(mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+        let overlap_guard = Arc::new(AtomicBool::new(false));
+        self.dashboard.overlap_guard = Some(Arc::clone(&overlap_guard));
         spawn_input_thread(tx.clone());
         spawn_tick_task(tx.clone());
-        spawn_dashboard_refresh_task(tx.clone());
+        spawn_dashboard_refresh_task(tx.clone(), overlap_guard);
 
         let ready = if self.mode == AgentMode::Dashboard {
             "HELM triage dashboard ready. Press F5 to refresh, Tab to move between filters, queue, and detail, or type a task."
@@ -1350,13 +1359,29 @@ impl TuiApp {
             }
             UiEvent::DashboardRefresh => {
                 if self.mode == AgentMode::Dashboard {
+                    // Save tick-related fields before refresh_dashboard() zeroes them via Default
+                    let tick_instant = self.dashboard.data.last_tick_instant;
+                    let tick_count = self.dashboard.data.tick_count;
+                    let ticks_skipped = self.dashboard.data.ticks_skipped;
+                    let consecutive_skips = self.dashboard.data.consecutive_skips;
                     self.refresh_dashboard();
+                    self.dashboard.data.last_tick_instant = tick_instant;
+                    self.dashboard.data.tick_count = tick_count;
+                    self.dashboard.data.ticks_skipped = ticks_skipped;
+                    self.dashboard.data.consecutive_skips = consecutive_skips;
                 }
                 Ok(false)
             }
             UiEvent::DashboardLiveRefresh => {
                 if self.mode == AgentMode::Dashboard {
                     let _ = self.refresh_dashboard_live().await;
+                }
+                Ok(false)
+            }
+            UiEvent::TickSkipped => {
+                if self.mode == AgentMode::Dashboard {
+                    self.dashboard.data.ticks_skipped += 1;
+                    self.dashboard.data.consecutive_skips += 1;
                 }
                 Ok(false)
             }
@@ -4037,6 +4062,10 @@ Report the exit status and the concise output."
     }
 
     async fn refresh_dashboard_live(&mut self) -> Result<()> {
+        // Set overlap guard to prevent the 60s tick from firing again while we're running
+        if let Some(ref guard) = self.dashboard.overlap_guard {
+            guard.store(true, Ordering::SeqCst);
+        }
         let db_path = default_db_path()?;
         let conn = rusqlite::Connection::open(&db_path)
             .with_context(|| format!("failed to open db at {}", db_path.display()))?;
@@ -4054,6 +4083,11 @@ Report the exit status and the concise output."
         self.dashboard.data.last_tick_instant = Some(Instant::now());
         self.dashboard.data.tick_count += 1;
         self.dashboard.data.ticks_skipped = 0;
+        self.dashboard.data.consecutive_skips = 0;
+        // Clear overlap guard after the live refresh completes
+        if let Some(ref guard) = self.dashboard.overlap_guard {
+            guard.store(false, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -4763,8 +4797,9 @@ fn spawn_tick_task(tx: mpsc::UnboundedSender<UiEvent>) {
     });
 }
 
-fn spawn_dashboard_refresh_task(tx: mpsc::UnboundedSender<UiEvent>) {
+fn spawn_dashboard_refresh_task(tx: mpsc::UnboundedSender<UiEvent>, overlap_guard: Arc<AtomicBool>) {
     let tx2 = tx.clone();
+    let tx3 = tx.clone();
     // Lightweight dashboard re-read every 5s (reads latest snapshot from DB)
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -4778,13 +4813,24 @@ fn spawn_dashboard_refresh_task(tx: mpsc::UnboundedSender<UiEvent>) {
     // Full monitor cycle every 60s (collect + detect + persist)
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut _local_consecutive_skips: u64 = 0;
         loop {
             interval.tick().await;
-            if tx2.send(UiEvent::DashboardLiveRefresh).is_err() {
-                break;
+            if overlap_guard.load(Ordering::SeqCst) {
+                _local_consecutive_skips += 1;
+                if tx2.send(UiEvent::TickSkipped).is_err() {
+                    break;
+                }
+            } else {
+                _local_consecutive_skips = 0;
+                if tx2.send(UiEvent::DashboardLiveRefresh).is_err() {
+                    break;
+                }
             }
         }
     });
+    // Drop tx3 — held only to keep channel alive while tasks run
+    let _ = tx3;
 }
 
 fn render_app(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -5119,27 +5165,47 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     };
 
     // ── tick info ──────────────────────────────────────────────────────
-    let tick_line = match d.last_tick_instant {
-        Some(instant) => {
-            let age = instant.elapsed();
-            let age_secs = age.as_secs();
-            let age_str = if age_secs < 60 {
-                format!("{}s", age_secs)
-            } else {
-                format!("{}m{}s", age_secs / 60, age_secs % 60)
-            };
-            let stale = age_secs > 30;
-            let (prefix, color) = if stale {
-                ("⚠ ", OPS_YELLOW)
-            } else {
-                ("", OPS_DIM)
-            };
-            Line::from(Span::styled(
-                format!("{}tick #{}  last: {}", prefix, d.tick_count, age_str),
-                Style::default().fg(color),
-            ))
+    let tick_line = if d.consecutive_skips >= 3 {
+        Line::from(Span::styled(
+            format!(
+                "tick #{}  degraded — {} consecutive skips",
+                d.tick_count, d.consecutive_skips
+            ),
+            Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD),
+        ))
+    } else if d.ticks_skipped > 0 {
+        Line::from(Span::styled(
+            format!(
+                "tick #{}  ⚠ last: {} skip(s) — tick {} skipped",
+                d.tick_count,
+                d.ticks_skipped,
+                d.consecutive_skips
+            ),
+            Style::default().fg(OPS_YELLOW),
+        ))
+    } else {
+        match d.last_tick_instant {
+            Some(instant) => {
+                let age = instant.elapsed();
+                let age_secs = age.as_secs();
+                let age_str = if age_secs < 60 {
+                    format!("{}s", age_secs)
+                } else {
+                    format!("{}m{}s", age_secs / 60, age_secs % 60)
+                };
+                let stale = age_secs > 30;
+                let (prefix, color) = if stale {
+                    ("⚠ ", OPS_YELLOW)
+                } else {
+                    ("", OPS_DIM)
+                };
+                Line::from(Span::styled(
+                    format!("{}tick #{}  last: {}", prefix, d.tick_count, age_str),
+                    Style::default().fg(color),
+                ))
+            }
+            None => Line::from(Span::styled("tick: --", Style::default().fg(OPS_MUTED))),
         }
-        None => Line::from(Span::styled("tick: --", Style::default().fg(OPS_MUTED))),
     };
 
     Paragraph::new(vec![title, Line::from(summary), collector_line, tick_line])
@@ -9253,6 +9319,99 @@ mod tests {
         assert!(
             rendered.contains("LIVE") || rendered.contains("HELMOPS"),
             "header should show LIVE status"
+        );
+    }
+
+    #[test]
+    fn dash_tick() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+
+        // 1. Normal tick with no skips: "tick #3  last: Xs"
+        let mut data = test_dash_data();
+        data.last_tick_instant = Some(Instant::now());
+        data.tick_count = 3;
+        data.ticks_skipped = 0;
+        data.consecutive_skips = 0;
+        app.dashboard.data = data;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("tick #3"),
+            "should show normal tick #3: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("last:"),
+            "should show last: age with normal tick: got '{rendered}'"
+        );
+        assert!(
+            !rendered.contains("degraded"),
+            "should NOT show degraded when 0 skips: got '{rendered}'"
+        );
+        assert!(
+            !rendered.contains("skip(s)"),
+            "should NOT show skip(s) when 0 skips: got '{rendered}'"
+        );
+
+        // 2. One skip but not degraded: "tick #3  ⚠ last: 1 skip(s) ..."
+        app.dashboard.data.ticks_skipped = 1;
+        app.dashboard.data.consecutive_skips = 1;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("skip(s)"),
+            "should show skip count when ticks skipped: got '{rendered}'"
+        );
+        assert!(
+            !rendered.contains("degraded"),
+            "should NOT show degraded at 1 skip: got '{rendered}'"
+        );
+
+        // 3. Two skips but not yet degraded
+        app.dashboard.data.ticks_skipped = 2;
+        app.dashboard.data.consecutive_skips = 2;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("skip(s)"),
+            "should show skip count at 2 skips: got '{rendered}'"
+        );
+        assert!(
+            !rendered.contains("degraded"),
+            "should NOT show degraded at 2 skips: got '{rendered}'"
+        );
+
+        // 4. Three consecutive skips → degraded
+        app.dashboard.data.ticks_skipped = 3;
+        app.dashboard.data.consecutive_skips = 3;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("degraded"),
+            "should show degraded at 3 consecutive skips: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("3 consecutive skips"),
+            "should show count at degraded: got '{rendered}'"
+        );
+
+        // 5. Four skips — still degraded
+        app.dashboard.data.ticks_skipped = 4;
+        app.dashboard.data.consecutive_skips = 4;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("degraded"),
+            "should stay degraded at 4 skips: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("4 consecutive skips"),
+            "should show 4 at degraded: got '{rendered}'"
         );
     }
 }
