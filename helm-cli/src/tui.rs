@@ -41,7 +41,7 @@ use ratatui::{
     prelude::Widget,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, ListItem, Paragraph, Sparkline, Tabs, Wrap},
 };
 use serde::Deserialize;
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
@@ -5538,9 +5538,46 @@ fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         ]));
     }
 
+    // Split inner area: findings on top, sparkline strip at bottom (3 rows).
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(inner);
+
     Paragraph::new(lines)
         .style(Style::default().bg(OPS_BG))
-        .render(inner, buf);
+        .render(vert[0], buf);
+
+    // Sparkline strip: CPU | MEM | LOAD | DISK
+    let spark_areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+        ])
+        .split(vert[1]);
+
+    let d = &app.dashboard.data;
+    let spark = |label: &str, data: &VecDeque<f64>, color: Color, area: Rect, buf: &mut Buffer| {
+        let points: Vec<u64> = data.iter().map(|&v| v.round() as u64).collect();
+        Sparkline::default()
+            .data(&points)
+            .max(100)
+            .style(Style::default().fg(color))
+            .block(
+                Block::default()
+                    .title(label)
+                    .title_style(Style::default().fg(OPS_DIM))
+                    .borders(Borders::NONE),
+            )
+            .render(area, buf);
+    };
+    spark("cpu", &d.cpu_history, OPS_GREEN, spark_areas[0], buf);
+    spark("mem", &d.mem_history, OPS_YELLOW, spark_areas[1], buf);
+    spark("load", &d.load_history, OPS_BLUE, spark_areas[2], buf);
+    spark("disk", &d.disk_history, OPS_RED, spark_areas[3], buf);
 }
 
 fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
