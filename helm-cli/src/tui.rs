@@ -852,14 +852,39 @@ enum DashboardFocus {
 pub enum OpsTab {
     Alerts,
     Services,
-    Processes,
+    Resources,
     Logs,
+    Changes,
+}
+
+/// Sub-section toggle within the Resources tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourcesSubTab {
+    Processes,
     Network,
     Storage,
     Containers,
     Security,
-    Changes,
-    Assist,
+}
+
+impl ResourcesSubTab {
+    const ALL: &'static [Self] = &[
+        Self::Processes,
+        Self::Network,
+        Self::Storage,
+        Self::Containers,
+        Self::Security,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Processes => "PROCS",
+            Self::Network => "NET",
+            Self::Storage => "STORAGE",
+            Self::Containers => "CTRS",
+            Self::Security => "SEC",
+        }
+    }
 }
 
 impl OpsTab {
@@ -867,28 +892,18 @@ impl OpsTab {
         &[
             Self::Alerts,
             Self::Services,
-            Self::Processes,
+            Self::Resources,
             Self::Logs,
-            Self::Network,
-            Self::Storage,
-            Self::Containers,
-            Self::Security,
             Self::Changes,
-            Self::Assist,
         ]
     }
     fn label(self) -> &'static str {
         match self {
             Self::Alerts => "ALERTS",
             Self::Services => "SVCS",
-            Self::Processes => "PROCS",
+            Self::Resources => "RES",
             Self::Logs => "LOGS",
-            Self::Network => "NET",
-            Self::Storage => "STORAGE",
-            Self::Containers => "CTRS",
-            Self::Security => "SEC",
             Self::Changes => "CHG",
-            Self::Assist => "CHAT",
         }
     }
 }
@@ -1144,6 +1159,7 @@ struct DashboardState {
     table_scroll: usize,
     detail_scroll: usize,
     finding_state_filter: DashboardFindingStateFilter,
+    resources_sub_tab: ResourcesSubTab,
     active_plan: Option<DashboardPlan>,
     pending_plan_rx: Option<tokio::sync::oneshot::Receiver<PlanStatus>>,
     error: Option<String>,
@@ -1161,6 +1177,7 @@ impl DashboardState {
             table_scroll: 0,
             detail_scroll: 0,
             finding_state_filter: DashboardFindingStateFilter::default(),
+            resources_sub_tab: ResourcesSubTab::Processes,
             active_plan: None,
             pending_plan_rx: None,
             error: None,
@@ -1860,7 +1877,17 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('3') => {
-                    self.dashboard.active_tab = OpsTab::Processes;
+                    if self.dashboard.active_tab == OpsTab::Resources {
+                        // Cycle through Resources sub-tabs.
+                        let subs = ResourcesSubTab::ALL;
+                        let pos = subs
+                            .iter()
+                            .position(|s| *s == self.dashboard.resources_sub_tab)
+                            .unwrap_or(0);
+                        self.dashboard.resources_sub_tab = subs[(pos + 1) % subs.len()];
+                    } else {
+                        self.dashboard.active_tab = OpsTab::Resources;
+                    }
                     return Ok(false);
                 }
                 KeyCode::Char('4') => {
@@ -1868,27 +1895,7 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('5') => {
-                    self.dashboard.active_tab = OpsTab::Network;
-                    return Ok(false);
-                }
-                KeyCode::Char('6') => {
-                    self.dashboard.active_tab = OpsTab::Storage;
-                    return Ok(false);
-                }
-                KeyCode::Char('7') => {
-                    self.dashboard.active_tab = OpsTab::Containers;
-                    return Ok(false);
-                }
-                KeyCode::Char('8') => {
-                    self.dashboard.active_tab = OpsTab::Security;
-                    return Ok(false);
-                }
-                KeyCode::Char('9') => {
                     self.dashboard.active_tab = OpsTab::Changes;
-                    return Ok(false);
-                }
-                KeyCode::Char('0') => {
-                    self.dashboard.active_tab = OpsTab::Assist;
                     return Ok(false);
                 }
                 _ => {}
@@ -2075,12 +2082,7 @@ impl TuiApp {
                     self.dashboard.pane = match self.dashboard.pane {
                         DashboardFocus::Tabbar => DashboardFocus::Table,
                         DashboardFocus::Table => DashboardFocus::Detail,
-                        DashboardFocus::Detail => {
-                            if self.dashboard.active_tab == OpsTab::Assist {
-                                self.focus = PanelFocus::Input;
-                            }
-                            self.dashboard.pane
-                        }
+                        DashboardFocus::Detail => self.dashboard.pane,
                     };
                 } else {
                     self.focus = PanelFocus::Input
@@ -2107,9 +2109,6 @@ impl TuiApp {
                             self.dashboard.view = DashboardView::Overview;
                             self.dashboard.pane = DashboardFocus::Table;
                             self.dashboard.detail_scroll = 0;
-                            if self.dashboard.active_tab == OpsTab::Assist {
-                                self.focus = PanelFocus::Input;
-                            }
                         }
                         DashboardView::EvidenceView(idx) => {
                             self.dashboard.view = DashboardView::FindingDetail(idx);
@@ -2614,12 +2613,8 @@ Report the exit status and the concise output."
                 );
                 return Ok(());
             }
-            let display_task = task.clone();
             let agent_task = self.dashboard_issue_chat_task(&task);
-            self.dashboard.active_tab = OpsTab::Assist;
-            return self
-                .start_prepared_task_in_mode(display_task, agent_task, tx, AgentMode::Diagnose)
-                .await;
+            return self.start_task(agent_task, tx, true).await;
         }
         self.start_task(task, tx, true).await
     }
@@ -5516,7 +5511,7 @@ fn render_app(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .render(area, buf);
 
     if app.mode == AgentMode::Dashboard {
-        let show_input = app.dashboard.active_tab == OpsTab::Assist || !app.input.text.is_empty();
+        let show_input = !app.input.text.is_empty();
         let constraints = if show_input {
             vec![
                 Constraint::Min(10),
@@ -5666,7 +5661,7 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(8),
         ])
@@ -5685,191 +5680,60 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     } else {
         &d.hostname
     };
-    let profile = if d.profile.is_empty() {
-        "default"
-    } else {
-        &d.profile
-    };
     let time_str = if d.collected_at.is_empty() {
         "--:-- UTC"
     } else {
         &d.collected_at
     };
-    let load_str = format!("{:.2} {:.2} {:.2}", d.load_1m, d.load_5m, d.load_15m);
-    let mem_str = format!("{:.0}%", d.memory_used_pct);
-    let cpu_str = format!("{:.0}%", d.cpu_percent);
-
-    let live_status = if app.dashboard.error.is_some() {
-        " STALE "
-    } else {
-        " LIVE  "
-    };
-    let live_color = if app.dashboard.error.is_some() {
-        OPS_YELLOW
-    } else {
-        OPS_GREEN
-    };
-
-    let title = Line::from(vec![
+    let service_line = format!(
+        "svcs {} {} up",
+        d.total_services.saturating_sub(d.failed_services),
+        d.failed_services
+    );
+    let metric = |label: &str, value: usize, fg: Color| {
         Span::styled(
-            " HELMOPS ",
+            format!(" {}:{value} ", label),
+            Style::default().fg(fg).add_modifier(Modifier::BOLD),
+        )
+    };
+
+    let line = Line::from(vec![
+        Span::styled(
+            " HELMOPS",
             Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("│", Style::default().fg(OPS_BORDER)),
-        Span::styled(format!(" {} ", hostname), Style::default().fg(OPS_FG)),
-        Span::styled("│", Style::default().fg(OPS_BORDER)),
-        Span::styled(format!(" {} ", profile), Style::default().fg(OPS_MUTED)),
-        Span::styled("│", Style::default().fg(OPS_BORDER)),
+        Span::styled(format!("  host:{}", hostname), Style::default().fg(OPS_FG)),
         Span::styled(
-            live_status,
-            Style::default().fg(live_color).add_modifier(Modifier::BOLD),
+            format!("  {}", service_line),
+            Style::default().fg(OPS_MUTED),
         ),
-        Span::styled("│", Style::default().fg(OPS_BORDER)),
-        Span::styled(format!(" {} ", time_str), Style::default().fg(OPS_DIM)),
-        Span::styled("│", Style::default().fg(OPS_BORDER)),
-        Span::styled(format!(" load {} ", load_str), Style::default().fg(OPS_DIM)),
-        Span::styled("│", Style::default().fg(OPS_BORDER)),
+        metric("CRIT", m.critical, OPS_RED),
+        metric("WARN", m.warning, OPS_YELLOW),
+        metric("OPEN", m.open, OPS_BLUE),
         Span::styled(
-            format!(" mem {} ", mem_str),
-            Style::default().fg(if d.memory_used_pct > 80.0 {
+            format!("  load {:.1} {:.1} {:.1}", d.load_1m, d.load_5m, d.load_15m),
+            Style::default().fg(OPS_DIM),
+        ),
+        Span::styled(format!("  mem {:.0}%", d.memory_used_pct), {
+            let c = if d.memory_used_pct > 80.0 {
                 OPS_RED
             } else {
                 OPS_DIM
-            }),
-        ),
-        Span::styled("│", Style::default().fg(OPS_BORDER)),
-        Span::styled(
-            format!(" cpu {} ", cpu_str),
-            Style::default().fg(if d.cpu_percent > 80.0 {
+            };
+            Style::default().fg(c)
+        }),
+        Span::styled(format!("  cpu {:.0}%", d.cpu_percent), {
+            let c = if d.cpu_percent > 80.0 {
                 OPS_RED
-            } else if d.cpu_percent > 30.0 {
-                OPS_YELLOW
-            } else {
-                OPS_GREEN
-            }),
-        ),
-    ]);
-
-    let metric = |label: &str, value: usize, fg: Color, bg: Color| {
-        Span::styled(
-            format!(" {label} {value} "),
-            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
-        )
-    };
-    let mut summary = vec![
-        metric("CRIT", m.critical, OPS_RED, Color::Rgb(61, 26, 26)),
-        Span::raw(" "),
-        metric("WARN", m.warning, OPS_YELLOW, Color::Rgb(45, 32, 8)),
-        Span::raw(" "),
-        metric("INFO", m.open, OPS_BLUE, Color::Rgb(13, 33, 55)),
-    ];
-    if !d.disk_bars.is_empty() {
-        summary.push(Span::styled("    ", Style::default().bg(OPS_BG)));
-        for (mount, pct) in d.disk_bars.iter().take(2) {
-            let color = if *pct >= 85 {
-                OPS_RED
-            } else if *pct >= 70 {
-                OPS_YELLOW
             } else {
                 OPS_GREEN
             };
-            let filled = ((*pct as usize) * 10 / 100).min(10);
-            let empty = 10usize.saturating_sub(filled);
-            summary.push(Span::styled(
-                format!("{mount}: "),
-                Style::default().fg(OPS_DIM),
-            ));
-            summary.push(Span::styled(
-                format!("{pct}% "),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ));
-            summary.push(Span::styled(
-                format!("[{}{}] ", "■".repeat(filled), "·".repeat(empty)),
-                Style::default().fg(color),
-            ));
-        }
-    }
-    // ── collector health ──────────────────────────────────────────────
-    let total_domains = d.collector_health.len() as u64;
-    let healthy_count = d.collector_health.iter().filter(|(_, h, _)| *h).count() as u64;
-    let fail_ratio = if total_domains > 0 {
-        (total_domains - healthy_count) as f64 / total_domains as f64
-    } else {
-        0.0
-    };
-    let collector_color = if fail_ratio == 0.0 {
-        OPS_GREEN
-    } else if fail_ratio < 0.25 {
-        OPS_YELLOW
-    } else {
-        OPS_RED
-    };
-    let collector_line = if d.collector_errors.is_empty() {
-        Line::from(Span::styled(
-            format!("collectors {}/{} ✓", healthy_count, total_domains),
-            Style::default().fg(collector_color),
-        ))
-    } else {
-        let first_failing = d
-            .collector_health
-            .iter()
-            .find(|(_, h, _)| !*h)
-            .map(|(domain, _, reason)| {
-                format!("{}: {}", domain, reason.as_deref().unwrap_or("unknown"))
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-        Line::from(Span::styled(
-            format!(
-                "collectors {}/{} ⚠ {}",
-                healthy_count, total_domains, first_failing
-            ),
-            Style::default().fg(collector_color),
-        ))
-    };
+            Style::default().fg(c)
+        }),
+        Span::styled(format!("  {}", time_str), Style::default().fg(OPS_DIM)),
+    ]);
 
-    // ── tick info ──────────────────────────────────────────────────────
-    let tick_line = if d.consecutive_skips >= 3 {
-        Line::from(Span::styled(
-            format!(
-                "tick #{}  degraded — {} consecutive skips",
-                d.tick_count, d.consecutive_skips
-            ),
-            Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD),
-        ))
-    } else if d.ticks_skipped > 0 {
-        Line::from(Span::styled(
-            format!(
-                "tick #{}  ⚠ last: {} skip(s) — tick {} skipped",
-                d.tick_count, d.ticks_skipped, d.consecutive_skips
-            ),
-            Style::default().fg(OPS_YELLOW),
-        ))
-    } else {
-        match d.last_tick_instant {
-            Some(instant) => {
-                let age = instant.elapsed();
-                let age_secs = age.as_secs();
-                let age_str = if age_secs < 60 {
-                    format!("{}s", age_secs)
-                } else {
-                    format!("{}m{}s", age_secs / 60, age_secs % 60)
-                };
-                let stale = age_secs > 30;
-                let (prefix, color) = if stale {
-                    ("⚠ ", OPS_YELLOW)
-                } else {
-                    ("", OPS_DIM)
-                };
-                Line::from(Span::styled(
-                    format!("{}tick #{}  last: {}", prefix, d.tick_count, age_str),
-                    Style::default().fg(color),
-                ))
-            }
-            None => Line::from(Span::styled("tick: --", Style::default().fg(OPS_MUTED))),
-        }
-    };
-
-    Paragraph::new(vec![title, Line::from(summary), collector_line, tick_line])
+    Paragraph::new(line)
         .style(Style::default().bg(OPS_BG))
         .render(area, buf);
 }
@@ -5886,7 +5750,12 @@ fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             } else {
                 Style::default().fg(OPS_MUTED)
             };
-            Line::from(Span::styled(format!(" {} ", tab.label()), style))
+            let mut label = format!(" {} ", tab.label());
+            if *tab == OpsTab::Resources {
+                label.push_str(app.dashboard.resources_sub_tab.label());
+                label.push(' ');
+            }
+            Line::from(Span::styled(label, style))
         })
         .collect();
     let selected = OpsTab::all()
@@ -5923,14 +5792,15 @@ fn render_ops_body(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         }
         (OpsTab::Alerts, _) => render_ops_alerts(app, horiz[1], buf),
         (OpsTab::Services, _) => render_ops_services(app, horiz[1], buf),
-        (OpsTab::Processes, _) => render_ops_processes(app, horiz[1], buf),
+        (OpsTab::Resources, _) => match app.dashboard.resources_sub_tab {
+            ResourcesSubTab::Processes => render_ops_processes(app, horiz[1], buf),
+            ResourcesSubTab::Network => render_ops_network(app, horiz[1], buf),
+            ResourcesSubTab::Storage => render_ops_storage(app, horiz[1], buf),
+            ResourcesSubTab::Containers => render_ops_containers(app, horiz[1], buf),
+            ResourcesSubTab::Security => render_ops_security(app, horiz[1], buf),
+        },
         (OpsTab::Logs, _) => render_ops_logs(app, horiz[1], buf),
-        (OpsTab::Network, _) => render_ops_network(app, horiz[1], buf),
-        (OpsTab::Storage, _) => render_ops_storage(app, horiz[1], buf),
-        (OpsTab::Containers, _) => render_ops_containers(app, horiz[1], buf),
-        (OpsTab::Security, _) => render_ops_security(app, horiz[1], buf),
         (OpsTab::Changes, _) => render_ops_changes(app, horiz[1], buf),
-        (OpsTab::Assist, _) => render_ops_assist(app, horiz[1], buf),
     }
 }
 
@@ -5965,11 +5835,36 @@ fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         app.dashboard.table_scroll
     };
 
+    // Severity-group headers: CRIT / WARN / INFO.
+    let mut last_sev: Option<&str> = None;
+    let sev_group_header = |sev: &str| match sev {
+        "critical" => Line::from(Span::styled(
+            "── CRIT ──",
+            Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD),
+        )),
+        "warning" => Line::from(Span::styled(
+            "── WARN ──",
+            Style::default().fg(OPS_YELLOW).add_modifier(Modifier::BOLD),
+        )),
+        _ => Line::from(Span::styled(
+            "── INFO ──",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )),
+    };
+
     for (i, actual_idx) in visible.iter().enumerate().skip(start).take(body_height) {
         let finding = &app.dashboard.data.findings[*actual_idx];
+        let sev = finding.severity.as_str();
+
+        // Insert severity-group header when severity changes.
+        if last_sev != Some(sev) {
+            lines.push(sev_group_header(sev));
+            last_sev = Some(sev);
+        }
+
         let selected = i == sel_vpos && app.dashboard.pane == DashboardFocus::Table;
         let bg = if selected { OPS_SURFACE } else { OPS_BG };
-        let sev_color = match finding.severity.as_str() {
+        let sev_color = match sev {
             "critical" => OPS_RED,
             "warning" => OPS_YELLOW,
             _ => OPS_MUTED,
@@ -6236,7 +6131,7 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     text.push_str(&finding.rollback);
 
     // ── Footer ──
-    text.push_str("\n\n◄ ► filter state   Alt+G Gen plan   Alt+E Evidence   Alt+F Follow-up   Alt+A Apply   S Suppress   R Resolve   8 Assist");
+    text.push_str("\n\n◄ ► filter state   Alt+G Gen plan   Alt+E Evidence   Alt+F Follow-up   Alt+A Apply   S Suppress   R Resolve");
 
     Paragraph::new(text)
         .style(Style::default().fg(OPS_FG).bg(OPS_BG))
@@ -7396,58 +7291,6 @@ fn render_ops_changes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .render(inner, buf);
 }
 
-fn render_ops_assist(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" ISSUE CHAT ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER));
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(actual_idx) = app.dashboard_selected_finding_index() {
-        let finding = &app.dashboard.data.findings[actual_idx];
-        lines.push(Line::from(Span::styled(
-            format!("Talking about: {} · {}", finding.kind, finding.title),
-            Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "Host {}  Severity {}  Status {}",
-                finding.host,
-                finding.severity.to_ascii_uppercase(),
-                finding.status.label()
-            ),
-            Style::default().fg(OPS_MUTED),
-        )));
-        lines.push(Line::from(Span::raw("")));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "No finding selected. Pick an alert first.",
-            Style::default().fg(OPS_MUTED),
-        )));
-        lines.push(Line::from(Span::raw("")));
-    }
-    if app.session.chat.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Ask a focused question in the prompt below. HELMOPS will answer in read-only troubleshooting mode using the selected finding context.",
-            Style::default().fg(OPS_MUTED),
-        )));
-    } else {
-        for line in chat_lines(&app.session.chat) {
-            lines.push(line);
-        }
-    }
-    Paragraph::new(lines)
-        .style(Style::default().fg(OPS_FG).bg(OPS_BG))
-        .wrap(Wrap { trim: false })
-        .scroll((
-            app.session.transcript_scroll.min(u16::MAX as usize) as u16,
-            0,
-        ))
-        .render(inner, buf);
-}
-
 fn render_ops_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let focus = match app.dashboard.pane {
         DashboardFocus::Tabbar => "TABS",
@@ -7455,7 +7298,7 @@ fn render_ops_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         DashboardFocus::Detail => "DETAIL",
     };
     let help = format!(
-        " FOCUS:{focus} ▸F5 full refresh ▸Alt+G plan ▸Alt+E evidence ▸Alt+A apply ▸R resolve ▸1-0 tabs ",
+        " FOCUS:{focus} ▸1-5 switch tab ▸F5 refresh ▸Alt+G plan ▸Alt+E evidence ▸Alt+A apply ▸R resolve ",
     );
     Paragraph::new(Line::from(Span::styled(help, Style::default().fg(OPS_DIM))))
         .style(Style::default().bg(OPS_BG))
@@ -10052,11 +9895,8 @@ mod tests {
         assert!(rendered.contains("HELMOPS"), "should render HELMOPS header");
         assert!(rendered.contains("QUEUE"), "should render queue title");
         assert!(rendered.contains("testbox"), "should show hostname");
-        assert!(
-            rendered.contains("collectors"),
-            "should show collector health indicator"
-        );
-        assert!(rendered.contains("tick:"), "should show tick info");
+        assert!(rendered.contains("CRIT:"), "should show CRIT count");
+        assert!(rendered.contains("WARN:"), "should show WARN count");
         assert!(
             rendered.contains("Disk /var 78% full"),
             "should show selected finding detail"
@@ -10081,69 +9921,28 @@ mod tests {
     fn dash_collector_and_tick_rendering() {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
-        let mut data = test_dash_data();
-        // Default: no errors, no tick → "collectors 13/13 ✓", "tick: --"
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
-        app.dashboard.data = data.clone();
-        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
-        let rendered = buf_to_string(&buf);
-        assert!(
-            rendered.contains("collectors"),
-            "should show collector health when no errors: got '{rendered}'"
-        );
-        assert!(
-            rendered.contains("13/13"),
-            "should show all healthy count: got '{rendered}'"
-        );
-        assert!(
-            rendered.contains("tick:"),
-            "should show tick placeholder when no tick: got '{rendered}'"
-        );
-
-        // With collector errors: "collectors 11/13 ⚠ load: timeout"
-        data.collector_errors = vec!["load: timeout".into(), "disks: permission denied".into()];
-        data.collector_health = SnapshotDomains::domain_names()
-            .iter()
-            .map(|&d| {
-                let healthy = d != "load" && d != "disks";
-                let reason = if d == "load" {
-                    Some("timeout".to_string())
-                } else if d == "disks" {
-                    Some("permission denied".to_string())
-                } else {
-                    None
-                };
-                (d.to_string(), healthy, reason)
-            })
-            .collect();
+        let data = test_dash_data();
+        // Single-line header shows CRIT/WARN/OPEN counts.
         app.dashboard.data = data.clone();
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            rendered.contains("11/13"),
-            "should show healthy/total count: got '{rendered}'"
+            rendered.contains("CRIT:1"),
+            "should show CRIT count in header: got '{rendered}'"
         );
         assert!(
-            rendered.contains("load: timeout"),
-            "should show first failing domain with reason: got '{rendered}'"
-        );
-
-        // With a live tick: "tick #5  last: Xs"
-        data.last_tick_instant = Some(Instant::now());
-        data.tick_count = 5;
-        data.ticks_skipped = 0;
-        app.dashboard.data = data;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
-        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
-        let rendered = buf_to_string(&buf);
-        assert!(
-            rendered.contains("tick #5"),
-            "should show tick count: got '{rendered}'"
+            rendered.contains("WARN:1"),
+            "should show WARN count in header: got '{rendered}'"
         );
         assert!(
-            rendered.contains("last:"),
-            "should show last tick age: got '{rendered}'"
+            rendered.contains("OPEN:2"),
+            "should show OPEN count in header: got '{rendered}'"
+        );
+        // svcs line shows up/down counts.
+        assert!(
+            rendered.contains("svcs 30 2 up"),
+            "should show service count in header: got '{rendered}'"
         );
     }
 
@@ -10278,7 +10077,8 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.active_tab = OpsTab::Containers;
+        app.dashboard.active_tab = OpsTab::Resources;
+        app.dashboard.resources_sub_tab = ResourcesSubTab::Containers;
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
@@ -10294,7 +10094,8 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.active_tab = OpsTab::Security;
+        app.dashboard.active_tab = OpsTab::Resources;
+        app.dashboard.resources_sub_tab = ResourcesSubTab::Security;
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
@@ -10311,7 +10112,8 @@ mod tests {
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
         app.dashboard.data.disk_bars = vec![("/".into(), 45), ("/home".into(), 12)];
-        app.dashboard.active_tab = OpsTab::Storage;
+        app.dashboard.active_tab = OpsTab::Resources;
+        app.dashboard.resources_sub_tab = ResourcesSubTab::Storage;
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
@@ -10410,7 +10212,8 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.active_tab = OpsTab::Network;
+        app.dashboard.active_tab = OpsTab::Resources;
+        app.dashboard.resources_sub_tab = ResourcesSubTab::Network;
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
@@ -10453,94 +10256,23 @@ mod tests {
 
     #[test]
     fn dash_tick() {
+        // Header is now single-line; verify it shows essential data.
         let mut app = app();
         app.mode = AgentMode::Dashboard;
-
-        // 1. Normal tick with no skips: "tick #3  last: Xs"
         let mut data = test_dash_data();
         data.last_tick_instant = Some(Instant::now());
         data.tick_count = 3;
-        data.ticks_skipped = 0;
-        data.consecutive_skips = 0;
         app.dashboard.data = data;
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            rendered.contains("tick #3"),
-            "should show normal tick #3: got '{rendered}'"
+            rendered.contains("HELMOPS"),
+            "should render HELMOPS branding in header"
         );
         assert!(
-            rendered.contains("last:"),
-            "should show last: age with normal tick: got '{rendered}'"
-        );
-        assert!(
-            !rendered.contains("degraded"),
-            "should NOT show degraded when 0 skips: got '{rendered}'"
-        );
-        assert!(
-            !rendered.contains("skip(s)"),
-            "should NOT show skip(s) when 0 skips: got '{rendered}'"
-        );
-
-        // 2. One skip but not degraded: "tick #3  ⚠ last: 1 skip(s) ..."
-        app.dashboard.data.ticks_skipped = 1;
-        app.dashboard.data.consecutive_skips = 1;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
-        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
-        let rendered = buf_to_string(&buf);
-        assert!(
-            rendered.contains("skip(s)"),
-            "should show skip count when ticks skipped: got '{rendered}'"
-        );
-        assert!(
-            !rendered.contains("degraded"),
-            "should NOT show degraded at 1 skip: got '{rendered}'"
-        );
-
-        // 3. Two skips but not yet degraded
-        app.dashboard.data.ticks_skipped = 2;
-        app.dashboard.data.consecutive_skips = 2;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
-        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
-        let rendered = buf_to_string(&buf);
-        assert!(
-            rendered.contains("skip(s)"),
-            "should show skip count at 2 skips: got '{rendered}'"
-        );
-        assert!(
-            !rendered.contains("degraded"),
-            "should NOT show degraded at 2 skips: got '{rendered}'"
-        );
-
-        // 4. Three consecutive skips → degraded
-        app.dashboard.data.ticks_skipped = 3;
-        app.dashboard.data.consecutive_skips = 3;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
-        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
-        let rendered = buf_to_string(&buf);
-        assert!(
-            rendered.contains("degraded"),
-            "should show degraded at 3 consecutive skips: got '{rendered}'"
-        );
-        assert!(
-            rendered.contains("3 consecutive skips"),
-            "should show count at degraded: got '{rendered}'"
-        );
-
-        // 5. Four skips — still degraded
-        app.dashboard.data.ticks_skipped = 4;
-        app.dashboard.data.consecutive_skips = 4;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
-        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
-        let rendered = buf_to_string(&buf);
-        assert!(
-            rendered.contains("degraded"),
-            "should stay degraded at 4 skips: got '{rendered}'"
-        );
-        assert!(
-            rendered.contains("4 consecutive skips"),
-            "should show 4 at degraded: got '{rendered}'"
+            rendered.contains("testbox"),
+            "should show hostname in header"
         );
     }
 
