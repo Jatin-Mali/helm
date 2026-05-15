@@ -2,7 +2,7 @@
 
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     path::PathBuf,
     sync::{
@@ -1011,6 +1011,11 @@ struct DashboardData {
     tick_count: u64,
     ticks_skipped: u64,
     consecutive_skips: u64,
+    /// Ring buffers for sparkline rendering (cap 60 points each).
+    cpu_history: VecDeque<f64>,
+    mem_history: VecDeque<f64>,
+    load_history: VecDeque<f64>,
+    disk_history: VecDeque<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4927,6 +4932,23 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         let mut age_distribution = age_distribution.into_iter().collect::<Vec<_>>();
         age_distribution.sort_by(|left, right| left.0.cmp(&right.0));
 
+        // Push history before reassigning.
+        let cap = 60;
+        let mut push = |buf: &mut VecDeque<f64>, val: f64| {
+            buf.push_back(val);
+            if buf.len() > cap {
+                buf.pop_front();
+            }
+        };
+        push(&mut self.dashboard.data.cpu_history, cpu_percent);
+        push(&mut self.dashboard.data.mem_history, memory_used_pct);
+        push(&mut self.dashboard.data.load_history, load.load_average.one);
+        let max_disk_pct = disk_bars
+            .iter()
+            .map(|(_, pct)| *pct as f64)
+            .fold(0.0f64, f64::max);
+        push(&mut self.dashboard.data.disk_history, max_disk_pct);
+
         self.dashboard.data = DashboardData {
             hostname,
             snapshot_id,
@@ -4960,6 +4982,10 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             plans,
             change_sets,
             audit_events,
+            cpu_history: std::mem::take(&mut self.dashboard.data.cpu_history),
+            mem_history: std::mem::take(&mut self.dashboard.data.mem_history),
+            load_history: std::mem::take(&mut self.dashboard.data.load_history),
+            disk_history: std::mem::take(&mut self.dashboard.data.disk_history),
             ..Default::default()
         };
         // Restore previous fingerprint if it still exists in the new findings list.
