@@ -989,6 +989,9 @@ struct DashboardData {
     plans: Vec<TroubleshootingPlanRecord>,
     change_sets: Vec<ChangeSetRecord>,
     audit_events: Vec<DashboardAuditRow>,
+    last_tick_instant: Option<Instant>,
+    tick_count: u64,
+    ticks_skipped: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4046,6 +4049,9 @@ Report the exit status and the concise output."
             report.findings.len(),
             report.snapshot.host.hostname
         ));
+        self.dashboard.data.last_tick_instant = Some(Instant::now());
+        self.dashboard.data.tick_count += 1;
+        self.dashboard.data.ticks_skipped = 0;
         Ok(())
     }
 
@@ -4600,6 +4606,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             plans,
             change_sets,
             audit_events,
+            ..Default::default()
         };
         self.clamp_dashboard_selection();
         self.dashboard.error = None;
@@ -5050,7 +5057,48 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             ));
         }
     }
-    Paragraph::new(vec![title, Line::from(summary)])
+    // ── collector health ──────────────────────────────────────────────
+    let total_domains = 12u64; // SnapshotDomains has 12 domain fields
+    let collector_line = if d.collector_errors.is_empty() {
+        Line::from(Span::styled("collectors ✓", Style::default().fg(OPS_GREEN)))
+    } else {
+        let err_count = d.collector_errors.len() as u64;
+        let color = if err_count > total_domains / 2 {
+            OPS_RED
+        } else {
+            OPS_YELLOW
+        };
+        Line::from(Span::styled(
+            format!("collectors ⚠ {} err(s)", err_count),
+            Style::default().fg(color),
+        ))
+    };
+
+    // ── tick info ──────────────────────────────────────────────────────
+    let tick_line = match d.last_tick_instant {
+        Some(instant) => {
+            let age = instant.elapsed();
+            let age_secs = age.as_secs();
+            let age_str = if age_secs < 60 {
+                format!("{}s", age_secs)
+            } else {
+                format!("{}m{}s", age_secs / 60, age_secs % 60)
+            };
+            let stale = age_secs > 30;
+            let (prefix, color) = if stale {
+                ("⚠ ", OPS_YELLOW)
+            } else {
+                ("", OPS_DIM)
+            };
+            Line::from(Span::styled(
+                format!("{}tick #{}  last: {}", prefix, d.tick_count, age_str),
+                Style::default().fg(color),
+            ))
+        }
+        None => Line::from(Span::styled("tick: --", Style::default().fg(OPS_MUTED))),
+    };
+
+    Paragraph::new(vec![title, Line::from(summary), collector_line, tick_line])
         .style(Style::default().bg(OPS_BG))
         .render(area, buf);
 }
@@ -8781,6 +8829,11 @@ mod tests {
         assert!(rendered.contains("QUEUE"), "should render queue title");
         assert!(rendered.contains("testbox"), "should show hostname");
         assert!(
+            rendered.contains("collectors"),
+            "should show collector health indicator"
+        );
+        assert!(rendered.contains("tick:"), "should show tick info");
+        assert!(
             rendered.contains("Disk /var 78% full"),
             "should show selected finding detail"
         );
@@ -8797,6 +8850,54 @@ mod tests {
         assert!(
             rendered.contains("HELMOPS") || !rendered.contains("needs a larger terminal"),
             "should render HELMOPS or hint at 42x18"
+        );
+    }
+
+    #[test]
+    fn dash_collector_and_tick_rendering() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+        // Default: no errors, no tick → "collectors ✓", "tick: --"
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        app.dashboard.data = data.clone();
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("collectors"),
+            "should show collector health when no errors: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("tick:"),
+            "should show tick placeholder when no tick: got '{rendered}'"
+        );
+
+        // With collector errors: "collectors ⚠ N err(s)"
+        data.collector_errors = vec!["load: timeout".into(), "disks: permission denied".into()];
+        app.dashboard.data = data.clone();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("2 err(s)"),
+            "should show collector error count: got '{rendered}'"
+        );
+
+        // With a live tick: "tick #5  last: Xs"
+        data.last_tick_instant = Some(Instant::now());
+        data.tick_count = 5;
+        data.ticks_skipped = 0;
+        app.dashboard.data = data;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("tick #5"),
+            "should show tick count: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("last:"),
+            "should show last tick age: got '{rendered}'"
         );
     }
 
