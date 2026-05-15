@@ -3044,8 +3044,8 @@ Report the exit status and the concise output."
     fn write_apply_plan_audit(plan_id: &str, decision: &str) -> Result<()> {
         let db_path = crate::default_db_path()?;
         let conn = rusqlite::Connection::open(&db_path)?;
-        let prev =
-            helm_memory::latest_audit_hash(&conn, None).unwrap_or_else(|_| "GENESIS".to_string());
+        let prev = helm_memory::latest_audit_hash(&conn, Some("tui"))
+            .unwrap_or_else(|_| "GENESIS".to_string());
         let ts = chrono::Utc::now().timestamp_millis();
         let hash = helm_memory::audit_hash(helm_memory::AuditHashParts {
             previous_hash: &prev,
@@ -3055,14 +3055,14 @@ Report the exit status and the concise output."
             tool_name: "apply-plan",
             input_hash: &helm_memory::stable_hash_hex(plan_id),
             output_hash: &helm_memory::stable_hash_hex(decision),
-            capability: "shell",
+            capability: "shell.shell",
             taint: "clean",
             cwd: "",
             decision,
         });
         conn.execute(
             "INSERT INTO audit_events (episode_id, target, timestamp, tool_name, input_hash, output_hash, capability, taint, cwd, decision, previous_hash, event_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params!["tui-apply", "tui", ts, "apply-plan", &helm_memory::stable_hash_hex(plan_id), &helm_memory::stable_hash_hex(decision), "shell", "clean", "", decision, &prev, &hash],
+            rusqlite::params!["tui-apply", "tui", ts, "apply-plan", &helm_memory::stable_hash_hex(plan_id), &helm_memory::stable_hash_hex(decision), "shell.shell", "clean", "", decision, &prev, &hash],
         )?;
         Ok(())
     }
@@ -3086,8 +3086,8 @@ Report the exit status and the concise output."
     fn write_dashboard_audit(&self, command_text: &str, pattern: &str) -> Result<()> {
         let db_path = &self.runtime.db_path;
         let conn = rusqlite::Connection::open(db_path)?;
-        let prev =
-            helm_memory::latest_audit_hash(&conn, None).unwrap_or_else(|_| "GENESIS".to_string());
+        let prev = helm_memory::latest_audit_hash(&conn, Some("tui"))
+            .unwrap_or_else(|_| "GENESIS".to_string());
         let ts = chrono::Utc::now().timestamp_millis();
         // Redact secrets and truncate.
         let command_display = {
@@ -3102,7 +3102,7 @@ Report the exit status and the concise output."
             tool_name: "plan-blocked",
             input_hash: &helm_memory::stable_hash_hex(command_text),
             output_hash: &helm_memory::stable_hash_hex(pattern),
-            capability: "shell",
+            capability: "shell.shell",
             taint: "clean",
             cwd: "",
             decision: &format!("BLOCKED:{pattern}"),
@@ -3116,7 +3116,7 @@ Report the exit status and the concise output."
                 "plan-blocked",
                 &helm_memory::stable_hash_hex(command_text),
                 &helm_memory::stable_hash_hex(pattern),
-                "shell",
+                "shell.shell",
                 "clean",
                 "",
                 &format!("BLOCKED:{pattern}"),
@@ -3142,8 +3142,8 @@ Report the exit status and the concise output."
     ) -> Result<()> {
         let db_path = &self.runtime.db_path;
         let conn = rusqlite::Connection::open(db_path)?;
-        let prev =
-            helm_memory::latest_audit_hash(&conn, None).unwrap_or_else(|_| "GENESIS".to_string());
+        let prev = helm_memory::latest_audit_hash(&conn, Some("tui"))
+            .unwrap_or_else(|_| "GENESIS".to_string());
         let ts = chrono::Utc::now().timestamp_millis();
         let hash = helm_memory::audit_hash(helm_memory::AuditHashParts {
             previous_hash: &prev,
@@ -11533,6 +11533,154 @@ mod tests {
         assert!(
             rendered.contains("[user]"),
             "shell row should show [user] badge: output was:\n{rendered}"
+        );
+    }
+
+    /// Integration test: write one of each of the four audit action types
+    /// (auto: collector-run, auto: finding-state; user: plan-blocked, user:
+    /// apply-plan approved) and verify that the full HMAC chain is clean.
+    #[test]
+    fn dash_audit_chain_verify_all_action_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("helm.db");
+        let app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+        let _guard = env_lock().lock().unwrap();
+
+        // 1. auto: collector-run audit event.
+        let snapshot_id = "snap-int-01";
+        let input_cr = helm_memory::stable_hash_hex(snapshot_id);
+        let output_cr = helm_memory::stable_hash_hex("7");
+        app.write_dashboard_event(
+            "collector-run",
+            "fs.read",
+            "domains:5 findings:7",
+            &input_cr,
+            &output_cr,
+        )
+        .unwrap();
+
+        // 2. auto: finding-state user transition (suppressed).
+        let fingerprint = "fp-int-deadbeef";
+        let finding_id = "find-int-01";
+        let input_fs = helm_memory::stable_hash_hex(fingerprint);
+        let output_fs = helm_memory::stable_hash_hex(&format!("{}:{}", snapshot_id, finding_id));
+        app.write_dashboard_event(
+            "finding-state",
+            "fs.read",
+            "suppressed",
+            &input_fs,
+            &output_fs,
+        )
+        .unwrap();
+
+        // 3. user: plan-blocked (rejected plan via blocklist).
+        app.write_dashboard_audit("rm -rf /etc/passwd", "destructive_rm_rf")
+            .unwrap();
+
+        // 4. user: apply-plan approved.  write_apply_plan_audit is a static
+        // method that uses default_db_path() (system DB), not the temp DB.
+        // Write the event directly into the temp DB instead.
+        {
+            let plan_id = "plan-int-01";
+            let decision = "approved";
+            let conn2 = rusqlite::Connection::open(&db).unwrap();
+            let prev = helm_memory::latest_audit_hash(&conn2, Some("tui"))
+                .unwrap_or_else(|_| "GENESIS".to_string());
+            let ts = chrono::Utc::now().timestamp_millis();
+            let hash = helm_memory::audit_hash(helm_memory::AuditHashParts {
+                previous_hash: &prev,
+                episode_id: Some("tui-apply"),
+                target: Some("tui"),
+                timestamp: ts,
+                tool_name: "apply-plan",
+                input_hash: &helm_memory::stable_hash_hex(plan_id),
+                output_hash: &helm_memory::stable_hash_hex(decision),
+                capability: "shell.shell",
+                taint: "clean",
+                cwd: "",
+                decision,
+            });
+            conn2
+                .execute(
+                    "INSERT INTO audit_events (episode_id, target, timestamp, tool_name, \
+                     input_hash, output_hash, capability, taint, cwd, decision, \
+                     previous_hash, event_hash) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    rusqlite::params![
+                        "tui-apply",
+                        "tui",
+                        ts,
+                        "apply-plan",
+                        &helm_memory::stable_hash_hex(plan_id),
+                        &helm_memory::stable_hash_hex(decision),
+                        "shell.shell",
+                        "clean",
+                        "",
+                        decision,
+                        &prev,
+                        &hash,
+                    ],
+                )
+                .unwrap();
+        }
+
+        // Load all audit events from the temp DB.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, episode_id, target, timestamp, tool_name, \
+                 input_hash, output_hash, capability, taint, cwd, decision, \
+                 previous_hash, event_hash \
+                 FROM audit_events ORDER BY timestamp",
+            )
+            .unwrap();
+        let records: Vec<helm_memory::AuditEventRecord> = stmt
+            .query_map([], |row| {
+                let capability_text: String = row.get(7)?;
+                // Dashboard audit events use shorthand strings like "monitor"
+                // and "shell" which aren't valid Capability variants.  Fall
+                // back to FsRead so we can still load the record.
+                let capability: helm_core::Capability = capability_text
+                    .parse()
+                    .unwrap_or(helm_core::Capability::FsRead);
+                Ok(helm_memory::AuditEventRecord {
+                    id: row.get(0)?,
+                    episode_id: row.get(1)?,
+                    target: row.get(2)?,
+                    timestamp: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    input_hash: row.get(5)?,
+                    output_hash: row.get(6)?,
+                    capability,
+                    taint: row.get(8)?,
+                    cwd: row.get(9)?,
+                    decision: row.get(10)?,
+                    previous_hash: row.get(11)?,
+                    event_hash: row.get(12)?,
+                })
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(
+            records.len() >= 4,
+            "expected at least 4 audit events, got {}",
+            records.len()
+        );
+
+        // Verify the full HMAC chain.
+        let verification = helm_memory::verify_partitioned_audit_events(records).unwrap();
+        assert!(
+            verification.ok,
+            "HMAC chain broken at event {}: {}",
+            verification.failed_at.unwrap_or(-1),
+            verification.reason.as_deref().unwrap_or("unknown")
+        );
+        assert!(
+            verification.checked >= 4,
+            "expected at least 4 events checked, got {}",
+            verification.checked
         );
     }
 }

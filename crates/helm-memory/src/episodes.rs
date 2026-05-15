@@ -1015,7 +1015,7 @@ impl MemoryStore {
     }
 }
 
-fn verify_partitioned_audit_events(
+pub fn verify_partitioned_audit_events(
     events: Vec<AuditEventRecord>,
 ) -> Result<AuditVerification, MemoryError> {
     let mut previous_by_target: std::collections::HashMap<Option<String>, String> =

@@ -21,6 +21,7 @@ pub use episodes::{
     AuditEventInput, AuditEventRecord, AuditHashParts, AuditVerification, CapabilityGrantRecord,
     EpisodeId, EpisodeOutcome, EpisodeOutcomeCounts, EpisodeRecord, MemoryStore, RoutingStat,
     StepRecord, StepRole, audit_hash, latest_audit_hash, stable_hash_hex,
+    verify_partitioned_audit_events,
 };
 pub use finding_state::{FindingStateRecord, FindingStateStatus, FindingStateStore};
 pub use formal_skill::{
