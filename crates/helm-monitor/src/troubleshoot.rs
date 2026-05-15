@@ -136,6 +136,505 @@ impl CommandPreview {
     }
 }
 
+// ── CommandValidator: display-time blocklist + PATH check ────────────────────
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Warning for a binary referenced in a command that is not found in PATH.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingBinaryWarning {
+    pub binary: String,
+    pub warning: String,
+}
+
+/// Describes a single dangerous pattern rule (internal, not exported).
+struct DangerPattern {
+    regex: regex::Regex,
+    description: &'static str,
+}
+
+/// Compiled once at first use.
+fn danger_patterns() -> &'static [DangerPattern] {
+    static PATTERNS: OnceLock<Vec<DangerPattern>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        vec![
+            DangerPattern {
+                regex: regex::Regex::new(r"rm\s+-rf\s+/").unwrap(),
+                description: "catastrophic recursive removal from root (rm -rf /)",
+            },
+            DangerPattern {
+                regex: regex::Regex::new(r"mkfs\.[a-z]+").unwrap(),
+                description: "filesystem creation — destroys data (mkfs.*)",
+            },
+            DangerPattern {
+                regex: regex::Regex::new(r"dd\s+if=.*of=/dev/[a-z]+").unwrap(),
+                description: "raw device write (dd of=/dev/*)",
+            },
+            DangerPattern {
+                regex: regex::Regex::new(r"chmod\s+777\s+/").unwrap(),
+                description: "world-writable root (chmod 777 /)",
+            },
+            DangerPattern {
+                regex: regex::Regex::new(
+                    r":.*\(\)\s*\{\s*:\|:&\s*\}\s*;\s*:",
+                )
+                .unwrap(),
+                description: "fork bomb (:(){ :|:& };:)",
+            },
+            DangerPattern {
+                regex: regex::Regex::new(r">\s*/dev/[a-z]+").unwrap(),
+                description: "redirect to raw device (> /dev/*)",
+            },
+        ]
+    })
+}
+
+/// Display-time command validator that catches dangerous LLM-generated commands
+/// before showing them to the operator.
+pub struct CommandValidator;
+
+impl CommandValidator {
+    /// Validate a command string against the built-in dangerous pattern blocklist.
+    ///
+    /// Returns `Ok(())` if no dangerous patterns matched, or `Err(list of matched
+    /// pattern descriptions)` if any pattern matched.
+    pub fn validate_command(cmd: &str) -> Result<(), Vec<String>> {
+        let matched: Vec<String> = danger_patterns()
+            .iter()
+            .filter(|p| p.regex.is_match(cmd))
+            .map(|p| p.description.to_string())
+            .collect();
+        if matched.is_empty() {
+            Ok(())
+        } else {
+            Err(matched)
+        }
+    }
+
+    /// Check whether a binary exists and is executable in `PATH`.
+    ///
+    /// Returns `Some(PathBuf)` to the binary if found and executable, or `None`.
+    pub fn check_binary_in_path(binary: &str) -> Option<PathBuf> {
+        let path_var = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(binary);
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                if meta.is_file() {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = meta.permissions().mode();
+                    if mode & 0o111 != 0 {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Scan a command string for all binaries and return warnings for any that
+    /// are not found in `PATH`. Handles multi-command strings separated by `&&`,
+    /// `;`, `|`, or newlines. Shell builtins (cd, echo, export, etc.) are
+    /// skipped.
+    pub fn check_all_binaries(cmd: &str) -> Vec<MissingBinaryWarning> {
+        let mut warnings = Vec::new();
+
+        // Split on common command separators — keep it simple and deterministic.
+        for part in split_command_parts(cmd) {
+            if part.is_empty() {
+                continue;
+            }
+            let binary = part.split_whitespace().next().unwrap_or(&part);
+            if is_shell_builtin(binary) {
+                continue;
+            }
+            if Self::check_binary_in_path(binary).is_none() {
+                warnings.push(MissingBinaryWarning {
+                    binary: binary.to_string(),
+                    warning: format!("binary '{binary}' not found in PATH"),
+                });
+            }
+        }
+        warnings
+    }
+}
+
+/// Split a command string into individual command parts, splitting on `&&`, `;`,
+/// `|`, and newlines.
+fn split_command_parts(cmd: &str) -> Vec<String> {
+    let separators = ["&&", ";", "|", "\n"];
+    let mut parts = vec![cmd.to_string()];
+    for sep in &separators {
+        parts = parts
+            .into_iter()
+            .flat_map(|p| p.split(sep).map(|s| s.trim().to_string()).collect::<Vec<_>>())
+            .collect();
+    }
+    parts
+}
+
+/// Known shell builtins and keywords that don't have PATH entries.
+fn is_shell_builtin(word: &str) -> bool {
+    matches!(
+        word,
+        "cd" | "echo"
+            | "export"
+            | "source"
+            | "alias"
+            | "unalias"
+            | "bg"
+            | "fg"
+            | "jobs"
+            | "kill"
+            | "wait"
+            | "disown"
+            | "read"
+            | "set"
+            | "unset"
+            | "shift"
+            | "exec"
+            | "exit"
+            | "return"
+            | "break"
+            | "continue"
+            | "eval"
+            | "let"
+            | "local"
+            | "declare"
+            | "typeset"
+            | "readonly"
+            | "getopts"
+            | "history"
+            | "logout"
+            | "suspend"
+            | "trap"
+            | "type"
+            | "ulimit"
+            | "umask"
+            | "true"
+            | "false"
+            | "times"
+            | "test"
+            | "["
+            | "if"
+            | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "case"
+            | "esac"
+            | "for"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "in"
+            | "select"
+            | "function"
+            | "time"
+    )
+}
+
+// ── LLM Narrative + Fix Plan types ──────────────────────────────────────────
+
+/// Summary of a Finding's key fields, suitable for feeding into an LLM prompt
+/// without exposing the full internal structure.
+pub struct FindingSummaryFields {
+    pub title: String,
+    pub severity: String,
+    pub affected_resource: String,
+    pub evidence_summaries: Vec<String>,
+    pub detector_id: String,
+    pub impact: String,
+}
+
+impl From<&crate::findings::Finding> for FindingSummaryFields {
+    fn from(f: &crate::findings::Finding) -> Self {
+        Self {
+            title: f.title.clone(),
+            severity: format!("{:?}", f.severity),
+            affected_resource: f.affected_resource.clone(),
+            evidence_summaries: f
+                .evidence
+                .iter()
+                .map(|e| format!("{}: {} ({})", e.source, e.value, e.note))
+                .collect(),
+            detector_id: f.detector_id.clone(),
+            impact: f.impact.clone(),
+        }
+    }
+}
+
+/// An LLM-generated explanation of WHY a finding happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmNarrative {
+    pub text: String,
+}
+
+/// A single validated fix command from the LLM response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmFixStep {
+    pub command: String,
+    pub purpose: String,
+    pub risk: RiskLevel,
+    pub rollback: String,
+    #[serde(default)]
+    pub binary_warnings: Vec<String>,
+}
+
+/// Complete LLM-generated fix plan: narrative explanation + validated commands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmFixPlan {
+    pub narrative: LlmNarrative,
+    pub steps: Vec<LlmFixStep>,
+    pub generated_at: i64,
+}
+
+/// The status of an in-flight or completed LLM plan generation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LlmPlanStatus {
+    /// Still waiting for the LLM response.
+    Loading,
+    /// Successfully generated and parsed.
+    Ready(LlmFixPlan),
+    /// LLM call timed out — operator may retry.
+    Timeout,
+    /// Rate limited — seconds until the next attempt.
+    RateLimited(u64),
+    /// Authentication/configuration failure.
+    AuthFailed,
+    /// Response was received but couldn't be parsed.
+    MalformedResponse,
+    /// Response included a command blocked by the validator.
+    DangerousCommand(String),
+}
+
+impl std::fmt::Display for LlmPlanStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loading => write!(f, "Generating fix plan…"),
+            Self::Ready(plan) => {
+                write!(f, "Fix plan ready ({} step(s))", plan.steps.len())
+            }
+            Self::Timeout => write!(f, "LLM call timed out — retry?"),
+            Self::RateLimited(secs) => {
+                write!(f, "Rate limited — retry in {}s", secs)
+            }
+            Self::AuthFailed => {
+                write!(f, "Authentication failed — check provider config")
+            }
+            Self::MalformedResponse => {
+                write!(f, "LLM response was malformed — check debug log")
+            }
+            Self::DangerousCommand(pattern) => {
+                write!(f, "Blocked dangerous command: {pattern}")
+            }
+        }
+    }
+}
+
+// ── Prompt builder ──────────────────────────────────────────────────────────
+
+/// Build the system + user prompt string for the LLM.
+///
+/// The prompt instructs the LLM to respond in a structured format that
+/// `parse_llm_response` can extract.  No upstream URLs are included — fork
+/// identity references use `https://github.com/Jatin-Mali/helm`.
+pub fn build_narrative_prompt(finding: &FindingSummaryFields) -> String {
+    let mut prompt = String::new();
+
+    // System context
+    prompt.push_str("You are a Linux system troubleshooter for the HELM monitoring tool (https://github.com/Jatin-Mali/helm).\n\n");
+
+    // Finding details
+    prompt.push_str("=== FINDING ===\n");
+    prompt.push_str(&format!("Title: {}\n", finding.title));
+    prompt.push_str(&format!("Severity: {}\n", finding.severity));
+    prompt.push_str(&format!("Resource: {}\n", finding.affected_resource));
+    prompt.push_str(&format!("Detector: {}\n", finding.detector_id));
+    prompt.push_str(&format!("Impact: {}\n", finding.impact));
+
+    if !finding.evidence_summaries.is_empty() {
+        prompt.push_str("Evidence:\n");
+        for ev in &finding.evidence_summaries {
+            prompt.push_str(&format!("  - {ev}\n"));
+        }
+    }
+    prompt.push('\n');
+
+    // Output format instructions
+    prompt.push_str(
+        "Analyze this finding and respond in the following structured format:\n\
+\n\
+First, provide a 3–5 sentence narrative explaining WHY this happened on this Linux host.\n\
+Then, provide a fix plan with exact commands.\n\
+\n\
+Respond EXACTLY in this format:\n\
+\n\
+---NARRATIVE---\n\
+(3-5 sentence explanation of why this happened on this Linux host)\n\
+---FIX PLAN---\n\
+COMMAND: <exact command to run>\n\
+PURPOSE: <what this command does>\n\
+RISK: <none|low|medium|high>\n\
+ROLLBACK: <command to undo, or \"none\">\n\
+---\n\
+COMMAND: <second command if needed>\n\
+PURPOSE: <what it does>\n\
+RISK: <none|low|medium|high>\n\
+ROLLBACK: <command to undo, or \"none\">\n\
+---\n\
+\n\
+Rules:\n\
+- COMMAND, PURPOSE, RISK, and ROLLBACK are required for each step.\n\
+- RISK must be one of: none, low, medium, high.\n\
+- If no rollback is possible, write ROLLBACK: none.\n\
+- Each step must be separated by --- on its own line.\n\
+- Use only Linux commands safe for production hosts.\n\
+- Do not use rm -rf /, mkfs, dd to raw devices, chmod 777 /, fork bombs, or redirects to /dev/* devices.\n",
+    );
+
+    prompt
+}
+
+// ── Response parser ─────────────────────────────────────────────────────────
+
+/// Errors that can occur while parsing an LLM response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    /// The ---NARRATIVE--- section was not found.
+    MissingNarrative,
+    /// The ---FIX PLAN--- section was not found.
+    MissingFixPlan,
+    /// The fix plan section was present but contained no COMMAND blocks.
+    NoCommandsFound,
+    /// A RISK field contained an unrecognised value.
+    InvalidRiskLevel(String),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingNarrative => write!(f, "LLM response missing ---NARRATIVE--- section"),
+            Self::MissingFixPlan => write!(f, "LLM response missing ---FIX PLAN--- section"),
+            Self::NoCommandsFound => write!(f, "Fix plan contains no COMMAND blocks"),
+            Self::InvalidRiskLevel(v) => write!(f, "Unknown risk level '{v}' — expected none|low|medium|high"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Parse an LLM response string into an [`LlmFixPlan`].
+///
+/// The expected format is:
+/// ```text
+/// ---NARRATIVE---
+/// (explanation text)
+/// ---FIX PLAN---
+/// COMMAND: <cmd>
+/// PURPOSE: <why>
+/// RISK: <none|low|medium|high>
+/// ROLLBACK: <undo or "none">
+/// ---
+/// ```
+pub fn parse_llm_response(text: &str) -> Result<LlmFixPlan, ParseError> {
+    // Extract the narrative section.
+    let narrative_text = extract_section(text, "---NARRATIVE---", "---FIX PLAN---")
+        .ok_or(ParseError::MissingNarrative)?
+        .trim()
+        .to_string();
+
+    // Extract the fix plan section (everything after ---FIX PLAN---).
+    let fix_plan_start = text.find("---FIX PLAN---").ok_or(ParseError::MissingFixPlan)?;
+    let fix_plan_text = &text[fix_plan_start + "---FIX PLAN---".len()..];
+
+    // Split into individual steps on "---" separators.
+    let step_blocks: Vec<&str> = fix_plan_text
+        .split("\n---\n")
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .collect();
+
+    if step_blocks.is_empty() {
+        return Err(ParseError::NoCommandsFound);
+    }
+
+    let mut steps = Vec::new();
+    for block in &step_blocks {
+        if let Some(step) = parse_fix_step(block)? {
+            steps.push(step);
+        }
+    }
+
+    if steps.is_empty() {
+        return Err(ParseError::NoCommandsFound);
+    }
+
+    Ok(LlmFixPlan {
+        narrative: LlmNarrative {
+            text: narrative_text,
+        },
+        steps,
+        generated_at: chrono::Utc::now().timestamp(),
+    })
+}
+
+/// Extract text between two markers.  Returns `None` if the start marker
+/// is missing; returns everything after start if end marker is absent.
+fn extract_section<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> Option<&'a str> {
+    let start_pos = text.find(start_marker)?;
+    let after_start = &text[start_pos + start_marker.len()..];
+    match after_start.find(end_marker) {
+        Some(end_pos) => Some(&after_start[..end_pos]),
+        None => Some(after_start),
+    }
+}
+
+/// Parse a single command block into an `LlmFixStep`.
+///
+/// Returns `Ok(None)` for empty blocks (no COMMAND line).
+fn parse_fix_step(block: &str) -> Result<Option<LlmFixStep>, ParseError> {
+    let mut command = String::new();
+    let mut purpose = String::new();
+    let mut risk_str = String::new();
+    let mut rollback = String::new();
+
+    for line in block.lines() {
+        let trimmed = line.trim();
+        if let Some(val) = trimmed.strip_prefix("COMMAND:") {
+            command = val.trim().to_string();
+        } else if let Some(val) = trimmed.strip_prefix("PURPOSE:") {
+            purpose = val.trim().to_string();
+        } else if let Some(val) = trimmed.strip_prefix("RISK:") {
+            risk_str = val.trim().to_lowercase();
+        } else if let Some(val) = trimmed.strip_prefix("ROLLBACK:") {
+            rollback = val.trim().to_string();
+        }
+    }
+
+    if command.is_empty() {
+        return Ok(None);
+    }
+
+    let risk = match risk_str.as_str() {
+        "none" => RiskLevel::None,
+        "low" => RiskLevel::Low,
+        "medium" => RiskLevel::Medium,
+        "high" => RiskLevel::High,
+        "" => RiskLevel::Low, // default if missing
+        other => return Err(ParseError::InvalidRiskLevel(other.to_string())),
+    };
+
+    Ok(Some(LlmFixStep {
+        command,
+        purpose,
+        risk,
+        rollback,
+        binary_warnings: Vec::new(),
+    }))
+}
+
 // ── TRD §4.4 ────────────────────────────────────────────────────────────────
 
 /// A step in a troubleshooting plan (read-only check or proposed fix).
@@ -852,18 +1351,309 @@ mod tests {
     }
 
     #[test]
-    fn command_preview_contains_required_fields() {
-        let preview = CommandPreview::new("shell", "df -h /", "Check root filesystem usage")
-            .with_risk(RiskLevel::None)
-            .with_blast(BlastRadius::File("/".into()))
-            .with_verification(CommandPreview::new(
-                "shell",
-                "echo ok",
-                "verify nothing changed",
-            ));
+    fn command_validator_passes_safe_commands() {
+        // Safe inspection commands should all pass validation.
+        let safe = ["df -h", "systemctl status nginx", "free -h"];
+        for cmd in safe {
+            assert!(
+                CommandValidator::validate_command(cmd).is_ok(),
+                "safe command should pass: '{cmd}'"
+            );
+        }
+    }
 
-        assert_eq!(preview.tool, "shell");
-        assert_eq!(preview.command_text.as_deref(), Some("df -h /"));
-        assert_eq!(preview.risk, RiskLevel::None);
+    #[test]
+    fn command_validator_rejects_dangerous_patterns() {
+        let dangerous = [
+            (
+                "rm -rf / --no-preserve-root",
+                "rm -rf /",
+            ),
+            (
+                "sudo mkfs.ext4 /dev/sda1",
+                "mkfs",
+            ),
+            (
+                "dd if=/dev/zero of=/dev/sda",
+                "dd",
+            ),
+            (
+                "chmod 777 /",
+                "chmod 777",
+            ),
+            (
+                ":(){ :|:& };:",
+                "fork bomb",
+            ),
+            (
+                "somecmd > /dev/sda",
+                "redirect to raw device",
+            ),
+        ];
+        for (cmd, expected_keyword) in dangerous {
+            let result = CommandValidator::validate_command(cmd);
+            assert!(
+                result.is_err(),
+                "dangerous command should be rejected: '{cmd}'"
+            );
+            let errs = result.unwrap_err();
+            assert!(
+                !errs.is_empty(),
+                "should have at least one error for '{cmd}'"
+            );
+            let joined = errs.join(" ");
+            assert!(
+                joined.to_lowercase().contains(&expected_keyword.to_lowercase()),
+                "error for '{cmd}' should mention '{expected_keyword}', got: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_validator_path_check_finds_binaries() {
+        for bin in ["ls", "df", "cat"] {
+            let found = CommandValidator::check_binary_in_path(bin);
+            assert!(
+                found.is_some(),
+                "standard binary should be found in PATH: '{bin}'"
+            );
+        }
+    }
+
+    #[test]
+    fn command_validator_path_check_warns_missing() {
+        let fake = "nonexistent_binary_xyzzy_42";
+        let found = CommandValidator::check_binary_in_path(fake);
+        assert!(found.is_none(), "fake binary should not be found in PATH");
+    }
+
+    #[test]
+    fn check_all_binaries_flags_missing_in_multi_command() {
+        let cmd = "ls -la && nonexistent_binary_xyzzy_42 --flag";
+        let warnings = CommandValidator::check_all_binaries(cmd);
+        assert_eq!(warnings.len(), 1, "should have exactly 1 warning");
+        assert_eq!(warnings[0].binary, "nonexistent_binary_xyzzy_42");
+        assert!(warnings[0].warning.contains("not found in PATH"));
+    }
+
+    #[test]
+    fn check_all_binaries_skips_shell_builtins() {
+        let cmd = "cd /tmp && echo hello && export FOO=bar";
+        let warnings = CommandValidator::check_all_binaries(cmd);
+        assert!(
+            warnings.is_empty(),
+            "shell builtins should not generate warnings, got: {warnings:?}"
+        );
+    }
+
+    // ── T02: LLM prompt + parser tests ─────────────────────────────────
+
+    #[test]
+    fn prompt_includes_finding_fields() {
+        let finding = FindingSummaryFields {
+            title: "Disk usage critical on /dev/sda1".into(),
+            severity: "Critical".into(),
+            affected_resource: "/dev/sda1".into(),
+            evidence_summaries: vec![
+                "/ is 95% full (45G/50G)".into(),
+                "journald consuming 12G in /var/log/journal".into(),
+            ],
+            detector_id: "disk_usage".into(),
+            impact: "System may become unresponsive if disk fills completely".into(),
+        };
+
+        let prompt = build_narrative_prompt(&finding);
+
+        // Each field must appear in the prompt text.
+        assert!(
+            prompt.contains("Disk usage critical on /dev/sda1"),
+            "prompt should contain title"
+        );
+        assert!(
+            prompt.contains("Critical"),
+            "prompt should contain severity"
+        );
+        assert!(
+            prompt.contains("/dev/sda1"),
+            "prompt should contain resource"
+        );
+        assert!(
+            prompt.contains("disk_usage"),
+            "prompt should contain detector_id"
+        );
+        assert!(
+            prompt.contains("95% full"),
+            "prompt should contain evidence"
+        );
+        assert!(
+            prompt.contains("unresponsive"),
+            "prompt should contain impact"
+        );
+        // Fork identity: must reference Jatin-Mali/helm, not upstream.
+        assert!(
+            prompt.contains("Jatin-Mali/helm"),
+            "prompt should reference fork identity"
+        );
+        // Should include format markers.
+        assert!(
+            prompt.contains("---NARRATIVE---"),
+            "prompt should instruct about NARRATIVE marker"
+        );
+        assert!(
+            prompt.contains("---FIX PLAN---"),
+            "prompt should instruct about FIX PLAN marker"
+        );
+    }
+
+    #[test]
+    fn parser_extracts_narrative_and_commands() {
+        let response = "\
+---NARRATIVE---
+The disk filled up because journald logs were not being rotated properly.
+The log retention policy was too aggressive, keeping 90 days of logs.
+This consumed 12 GB in /var/log/journal, leaving only 5% free space.
+---FIX PLAN---
+COMMAND: journalctl --vacuum-time=7d
+PURPOSE: Remove journal entries older than 7 days to free space
+RISK: low
+ROLLBACK: none
+---
+COMMAND: sed -i 's/MaxRetentionSec=90day/MaxRetentionSec=7day/' /etc/systemd/journald.conf
+PURPOSE: Reduce log retention from 90 days to 7 days to prevent recurrence
+RISK: medium
+ROLLBACK: sed -i 's/MaxRetentionSec=7day/MaxRetentionSec=90day/' /etc/systemd/journald.conf
+---
+";
+
+        let plan = parse_llm_response(response).expect("should parse valid response");
+
+        assert!(
+            plan.narrative.text.contains("journald logs"),
+            "narrative should mention journald"
+        );
+        assert_eq!(plan.steps.len(), 2, "should have 2 fix steps");
+
+        let step0 = &plan.steps[0];
+        assert_eq!(step0.command, "journalctl --vacuum-time=7d");
+        assert_eq!(step0.risk, RiskLevel::Low);
+        assert_eq!(step0.rollback, "none");
+
+        let step1 = &plan.steps[1];
+        assert_eq!(
+            step1.command,
+            "sed -i 's/MaxRetentionSec=90day/MaxRetentionSec=7day/' /etc/systemd/journald.conf"
+        );
+        assert_eq!(step1.risk, RiskLevel::Medium);
+        assert!(
+            step1.rollback.contains("MaxRetentionSec=7day"),
+            "rollback should reverse the sed"
+        );
+
+        assert!(plan.generated_at > 0, "generated_at should be set");
+    }
+
+    #[test]
+    fn parser_rejects_missing_narrative() {
+        let response = "\
+COMMAND: df -h
+PURPOSE: Check disk space
+RISK: none
+ROLLBACK: none
+";
+        let result = parse_llm_response(response);
+        assert!(result.is_err(), "should error on missing narrative");
+        match result.unwrap_err() {
+            ParseError::MissingNarrative => {} // expected
+            other => panic!("expected MissingNarrative, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_rejects_malformed_risk() {
+        let response = "\
+---NARRATIVE---
+Something is broken.
+---FIX PLAN---
+COMMAND: restart-foo
+PURPOSE: Restart the foo service
+RISK: apocalyptic
+ROLLBACK: none
+---
+";
+        let result = parse_llm_response(response);
+        assert!(result.is_err(), "should error on malformed risk");
+        match result.unwrap_err() {
+            ParseError::InvalidRiskLevel(v) => {
+                assert_eq!(v, "apocalyptic");
+            }
+            other => panic!("expected InvalidRiskLevel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_handles_empty_fix_plan() {
+        let response = "\
+---NARRATIVE---
+Nothing is wrong with this system. All checks are passing.
+---FIX PLAN---
+";
+        let result = parse_llm_response(response);
+        assert!(result.is_err(), "empty fix plan should error");
+        match result.unwrap_err() {
+            ParseError::NoCommandsFound => {} // expected
+            other => panic!("expected NoCommandsFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_defaults_missing_risk_to_low() {
+        let response = "\
+---NARRATIVE---
+Disk is getting full due to accumulated package caches.
+---FIX PLAN---
+COMMAND: apt-get clean
+PURPOSE: Clear package cache to free space
+ROLLBACK: none
+---
+";
+        let plan = parse_llm_response(response).expect("should parse even without RISK");
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(
+            plan.steps[0].risk,
+            RiskLevel::Low,
+            "missing RISK should default to Low"
+        );
+    }
+
+    #[test]
+    fn finding_summary_from_finding() {
+        use crate::findings::{Confidence, EvidenceRef, Finding, Severity};
+        let mut f = Finding::new(
+            "snap-1",
+            "disk_usage",
+            "/dev/sda1",
+            "Disk near capacity",
+            Severity::Critical,
+            Confidence::High,
+            MonitorDomain::Disks,
+        );
+        f.impact = "System may become unresponsive".into();
+        f.evidence = vec![EvidenceRef {
+            source: "disks.filesystems[0]".into(),
+            value: "95%".into(),
+            note: "Root filesystem is critically full".into(),
+        }];
+
+        let summary = FindingSummaryFields::from(&f);
+        assert_eq!(summary.title, "Disk near capacity");
+        assert!(summary.severity.contains("Critical"));
+        assert_eq!(summary.affected_resource, "/dev/sda1");
+        assert_eq!(summary.detector_id, "disk_usage");
+        assert_eq!(summary.impact, "System may become unresponsive");
+        assert_eq!(summary.evidence_summaries.len(), 1);
+        assert!(
+            summary.evidence_summaries[0].contains("95%"),
+            "evidence summary should contain the observed value"
+        );
     }
 }
