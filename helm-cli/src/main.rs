@@ -1790,8 +1790,6 @@ fn unknown_subcommand_error(args: &[OsString]) -> Option<String> {
 
 /// Prints tool-start/finish lines to stderr while the agent runs.
 
-
-
 fn model_capability_warning_text() -> &'static str {
     "warning: the model emitted tool-shaped JSON in plain text. this usually means\n\
 the model does not support native tool calling. try a tools-capable model:\n\
@@ -3939,7 +3937,6 @@ async fn run_remote_command(args: RemoteArgs) -> Result<()> {
     Ok(())
 }
 
-
 async fn run_attach_session(target: &str, token: &str) -> Result<()> {
     attach_tui::run_attach_tui(target.to_string(), token.to_string()).await
 }
@@ -5136,14 +5133,25 @@ mod tests {
     use helm_tools::{ToolContext, ToolRegistry};
     use tempfile::tempdir;
 
+    fn response(content: Vec<ContentBlock>, stop_reason: StopReason) -> ChatResponse {
+        ChatResponse {
+            id: "msg".to_owned(),
+            content,
+            stop_reason,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        }
+    }
+
     use super::{
         DoctorCheck, DoctorEnvReport, DoctorMemoryReport, DoctorOllamaModel, DoctorOllamaReport,
         DoctorProviderReport, DoctorQuirksReport, DoctorReport, DoctorSecretsReport,
         DoctorToolReport, ProviderChoice, ProviderSource, classify_exit_code, format_audit_events,
         format_models, format_permissions, load_config, model_capability_warning_text,
         parse_capability_arg, parse_cli_from, parse_fallback_chain, parse_scope_arg, render_doctor,
-        render_replay, resolve_provider_choice,
-        resolve_provider_settings_with_env, supports_tools,
+        render_replay, resolve_provider_choice, resolve_provider_settings_with_env, supports_tools,
     };
 
     fn empty_env(_name: &str) -> Option<String> {
@@ -5159,7 +5167,6 @@ mod tests {
     }
 
     #[test]
-
     #[test]
     fn classify_config_edge_case() {
         let error = anyhow::anyhow!("ANTHROPIC_API_KEY is required");
@@ -5317,15 +5324,10 @@ mod tests {
     }
 
     #[test]
-
     #[test]
-
     #[test]
-
     #[test]
-
     #[test]
-
     #[test]
     fn no_args_opens_tui() {
         let parsed = parse_cli_from(["helm"]).unwrap();
@@ -5390,23 +5392,14 @@ mod tests {
     }
 
     #[test]
-
     #[test]
-
     #[test]
-
     #[test]
-
     #[test]
-
     #[test]
-
     #[test]
-
     #[test]
-
     #[test]
-
     #[test]
     fn trust_report_command_parses() {
         let parsed = parse_cli_from(["helm", "trust-report", "--json"]).unwrap();
@@ -5505,64 +5498,6 @@ mod tests {
         let error = parse_cli_from(["helm", "badcmd", "arg"]).unwrap_err();
 
         assert!(error.to_string().contains("unknown subcommand: badcmd"));
-    }
-
-    #[tokio::test]
-    async fn stdout_prints_final_message_happy_path() {
-        let result = run_with_mock(response(
-            vec![ContentBlock::Text("done".to_owned())],
-            StopReason::EndTurn,
-        ))
-        .await;
-
-        assert_eq!(render_run_stdout(&result), "done\n");
-    }
-
-    #[tokio::test]
-    async fn stdout_prints_last_assistant_message_error_path() {
-        let result = run_with_mock(response(
-            vec![ContentBlock::Text("partial text".to_owned())],
-            StopReason::MaxTokens,
-        ))
-        .await;
-        let mut result = result;
-        result.final_message.clear();
-
-        assert_eq!(
-            render_run_stdout(&result),
-            "[last assistant message]\npartial text\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn stdout_prints_no_text_edge_case() {
-        let result = run_with_mock(response(Vec::new(), StopReason::MaxTokens)).await;
-        let mut result = result;
-        result.final_message.clear();
-
-        assert!(render_run_stdout(&result).contains("no assistant text was produced"));
-    }
-
-    #[tokio::test]
-    async fn warning_text_is_available_for_tool_shaped_text() {
-        // Provider emits a bare-JSON tool call as text; format recovery executes it
-        // and then needs a second response to finish the run.
-        let result = run_with_mocks(vec![
-            response(
-                vec![ContentBlock::Text(
-                    r#"{"name":"shell","parameters":{"command":"echo","args":["hi"]}}"#.to_owned(),
-                )],
-                StopReason::EndTurn,
-            ),
-            response(
-                vec![ContentBlock::Text("done".to_owned())],
-                StopReason::EndTurn,
-            ),
-        ])
-        .await;
-
-        assert!(result.format_recovery_used);
-        assert!(model_capability_warning_text().contains("qwen3:4b"));
     }
 
     #[tokio::test]

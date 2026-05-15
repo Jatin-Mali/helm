@@ -208,7 +208,6 @@ enum UiEvent {
     TickSkipped,
 }
 
-#[derive(Clone)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MessageRole {
     User,
@@ -1240,7 +1239,6 @@ pub struct TuiApp {
     active_run_id: u64,
     agent_task: Option<JoinHandle<()>>,
     pending_auth_retry: Option<String>,
-    last_evidence: Option<EvidenceSnapshot>,
     task_started: Option<Instant>,
     tool_start_times: HashMap<String, Instant>,
     session_tokens_in: u32,
@@ -1347,7 +1345,6 @@ impl TuiApp {
             active_run_id: 0,
             agent_task: None,
             pending_auth_retry: None,
-            last_evidence: None,
             task_started: None,
             tool_start_times: HashMap::new(),
             session_tokens_in: 0,
@@ -1506,58 +1503,6 @@ impl TuiApp {
                 if self.mode == AgentMode::Dashboard {
                     self.dashboard.data.ticks_skipped += 1;
                     self.dashboard.data.consecutive_skips += 1;
-                }
-                Ok(false)
-            }                self.running = false;
-                self.task_started = None;
-                self.tool_start_times.clear();
-                self.agent_task = None;
-                self.pending_tool_summaries.clear();
-                self.active_tool_cells.clear();
-                match result {
-                    Ok(run) => {
-                        self.session.episode_id = Some(run.episode_id.clone());
-                        let final_text = if run.final_message.trim().is_empty() {
-                            run.last_assistant_text
-                                .unwrap_or_else(|| "(no assistant text)".to_owned())
-                        } else {
-                            run.final_message
-                        };
-                        if !final_text.trim().is_empty()
-                            && final_text != "(no final message)"
-                            && !self.chat_ends_with(MessageRole::Assistant, &final_text)
-                        {
-                            let redacted = helm_core::redact_secrets(&final_text);
-                            self.push_chat(MessageRole::Assistant, redacted);
-                        }
-                        self.record_tool_event(
-                            "done",
-                            "episode",
-                            format!(
-                                "{} iter(s), {} in / {} out tokens",
-                                run.iterations, run.tokens_in, run.tokens_out
-                            ),
-                        );
-                    }
-                    Err(error) => {
-                        self.status_note = "failed".to_owned();
-                        let msg = error.to_string();
-                        self.push_chat(MessageRole::Error, friendly_error(&msg));
-                        if is_auth_error(&msg) && self.runtime.tui_paste_key_modal {
-                            let env_name = default_api_key_env(self.active_settings.choice)
-                                .unwrap_or("API_KEY")
-                                .to_owned();
-                            self.pending_auth_retry = Some(task);
-                            self.modal = Some(ModalState::AuthRequired {
-                                provider_name: self.provider_name.clone(),
-                                env_name,
-                                input: String::new(),
-                                error: None,
-                            });
-                        } else {
-                            self.modal = Some(ModalState::Error(friendly_error(&msg)));
-                        }
-                    }
                 }
                 Ok(false)
             }
@@ -2751,7 +2696,6 @@ Report the exit status and the concise output."
         }
     }
 
-
     fn push_chat(&mut self, role: MessageRole, text: impl Into<String>) {
         let text: String = text.into();
         self.session.chat.push(ChatMessage { role, text });
@@ -3445,22 +3389,9 @@ Report the exit status and the concise output."
                         .to_owned(),
                 );
             }
-            CommandAction::Evidence => match &self.last_evidence {
-                Some(ev) => {
-                    self.push_chat(
-                        MessageRole::System,
-                        format!("Evidence report for {}:\n{}", ev.tool_name, ev.formatted),
-                    );
-                }
-                None => {
-                    self.push_chat(
-                        MessageRole::System,
-                        "No evidence report available yet. \
-                         Run a task with --evidence to see system state."
-                            .to_owned(),
-                    );
-                }
-            },
+            CommandAction::Evidence => {
+                self.toast("Evidence reports are not available in dashboard mode.");
+            }
             CommandAction::Quit => self.shutdown = true,
             CommandAction::Help => self.modal = Some(ModalState::Help),
             CommandAction::ApplyPlan => {
@@ -7035,28 +6966,10 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .task_started
         .map(|start| format_duration(start.elapsed()))
         .unwrap_or_default();
-    let mode_style = match app.mode {
-        AgentMode::Dashboard => Style::default()
-            .fg(Color::White)
-            .bg(HEADER_BORDER)
-            .add_modifier(Modifier::BOLD),
-        AgentMode::Dashboard => Style::default()
-            .fg(Color::White)
-            .bg(Color::Rgb(75, 85, 99))
-            .add_modifier(Modifier::BOLD),
-        AgentMode::Dashboard => Style::default()
-            .fg(Color::White)
-            .bg(SUCCESS_FG)
-            .add_modifier(Modifier::BOLD),
-        AgentMode::Dashboard => Style::default()
-            .fg(Color::White)
-            .bg(Color::Blue)
-            .add_modifier(Modifier::BOLD),
-        AgentMode::Dashboard => Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(80, 200, 120))
-            .add_modifier(Modifier::BOLD),
-    };
+    let mode_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Rgb(80, 200, 120))
+        .add_modifier(Modifier::BOLD);
     let mut line = Line::from(vec![
         Span::styled(
             format!(" {spinner} HELM "),
@@ -7299,15 +7212,7 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         }))
         .style(Style::default().fg(Color::White).bg(INPUT_BG));
     let body = if app.input.text.is_empty() {
-        let placeholder = match app.mode {
-            AgentMode::Dashboard => "Diagnose a system problem (read-only)...",
-            AgentMode::Dashboard => "Plan an approach (no writes yet)...",
-            AgentMode::Dashboard => "Run with auto-approved tools...",
-            AgentMode::Dashboard => "Ask HELM to do something...",
-            AgentMode::Dashboard => {
-                "Ask HELMOPS about the selected issue. Response stays read-only unless you later open apply."
-            }
-        };
+        let placeholder = "Ask about the selected finding. Type /help for commands.";
         vec![Line::from(vec![
             Span::styled(
                 "❯ ",
@@ -7343,22 +7248,8 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let mode_label = match _app.mode {
-        AgentMode::Dashboard => "CHAT",
-        AgentMode::Dashboard => "PLAN",
-        AgentMode::Dashboard => "AUTO",
-        AgentMode::Dashboard => "DIAGNOSE",
-        AgentMode::Dashboard => "DASHBOARD",
-    };
-    let mode_hint = match _app.mode {
-        AgentMode::Dashboard => "Ctrl+P palette | / commands | legacy conversational mode",
-        AgentMode::Dashboard => "READ-ONLY planning mode",
-        AgentMode::Dashboard => "AUTO-ACCEPT | dangerous legacy execution mode",
-        AgentMode::Dashboard => "DIAGNOSE | read-only reasoning mode",
-        AgentMode::Dashboard => {
-            "Tab panes | F5 refresh | Alt+E evidence | Alt+F check | Alt+G plan | Alt+A apply | 1-8 tabs"
-        }
-    };
+    let mode_label = "DASHBOARD";
+    let mode_hint = "Tab panes | F5 refresh | Alt+E evidence | Alt+F check | Alt+G plan | Alt+A apply | 1-5 tabs";
     let line = Line::from(vec![
         Span::styled(
             format!(" [{mode_label}] "),
@@ -8620,78 +8511,6 @@ fn friendly_error(error: &str) -> String {
     }
 }
 
-fn format_evidence_report(tool_name: &str, ev: &StructuredEvidence) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("[evidence] {tool_name}\n"));
-    out.push_str(&format!(
-        "  inspected sources: {}\n",
-        ev.inspected_sources.join(", ")
-    ));
-    if !ev.findings.is_empty() {
-        out.push_str("  findings:\n");
-        for f in &ev.findings {
-            out.push_str(&format!(
-                "    - {}: {} (source: {})\n",
-                f.label,
-                f.value.lines().next().unwrap_or(""),
-                f.source
-            ));
-        }
-    }
-    if !ev.assumptions.is_empty() {
-        out.push_str(&format!("  assumptions: {}\n", ev.assumptions.join("; ")));
-    }
-    out.push_str(&format!("  uncertainty: {:?}\n", ev.uncertainty));
-    if !ev.proposed_actions.is_empty() {
-        out.push_str("  proposed actions:\n");
-        for a in &ev.proposed_actions {
-            out.push_str(&format!(
-                "    - {} (tool: {}, input: {})\n",
-                a.description, a.tool, a.tool_input
-            ));
-        }
-    }
-    if !ev.blast_radius.paths.is_empty()
-        || !ev.blast_radius.services.is_empty()
-        || !ev.blast_radius.hosts.is_empty()
-    {
-        out.push_str("  blast radius:\n");
-        if !ev.blast_radius.paths.is_empty() {
-            out.push_str(&format!(
-                "    paths: {}\n",
-                ev.blast_radius.paths.join(", ")
-            ));
-        }
-        if !ev.blast_radius.services.is_empty() {
-            out.push_str(&format!(
-                "    services: {}\n",
-                ev.blast_radius.services.join(", ")
-            ));
-        }
-        if !ev.blast_radius.hosts.is_empty() {
-            out.push_str(&format!(
-                "    hosts: {}\n",
-                ev.blast_radius.hosts.join(", ")
-            ));
-        }
-    }
-    if ev.rollback.available {
-        out.push_str(&format!("  rollback: {}\n", ev.rollback.description));
-    } else {
-        out.push_str("  rollback: not available\n");
-    }
-    if !ev.exact_tool_calls.is_empty() {
-        out.push_str("  exact tool calls:\n");
-        for tc in &ev.exact_tool_calls {
-            out.push_str(&format!(
-                "    - {}: {}\n      input: {}\n",
-                tc.tool, tc.summary, tc.tool_input
-            ));
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8900,34 +8719,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_401_opens_modal_and_keeps_retry_task() {
-        let mut app = app();
-        app.active_settings.choice = ProviderChoice::Groq;
-        app.provider_name = "groq".to_owned();
-        let (tx, _rx) = mpsc::unbounded_channel();
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(app.handle_ui_event(
-                UiEvent::AgentDone {
-                    run_id: app.active_run_id,
-                    task: "check services".to_owned(),
-                    result: Err(HelmError::Provider(helm_core::ProviderError::HttpStatus {
-                        status: 401,
-                        body: "bad key".to_owned(),
-                    })),
-                },
-                tx,
-            ))
-            .unwrap();
-
-        assert!(matches!(app.modal, Some(ModalState::AuthRequired { .. })));
-        assert_eq!(app.pending_auth_retry, Some("check services".to_owned()));
-    }
-
-    #[test]
     fn auth_modal_escape_dismisses_cleanly() {
         let mut app = app();
         app.pending_auth_retry = Some("retry me".to_owned());
@@ -9003,79 +8794,6 @@ mod tests {
         assert_eq!(app.session.chat[0].role, MessageRole::Activity);
         assert_eq!(app.session.chat[0].text, "running shell");
         assert!(app.session.chat[1].text.contains("shell failed"));
-    }
-
-    #[test]
-    fn tool_activity_cell_mutates_from_running_to_completed() {
-        let mut app = app();
-        app.apply_agent_event(AgentEvent::ToolCallParsed {
-            id: "call_1".to_owned(),
-            name: "shell".to_owned(),
-            input: serde_json::json!({
-                "mode": "shell",
-                "command": "date && uname -a",
-                "redirect_stdout_to": "/tmp/helm.txt"
-            }),
-        });
-        app.apply_agent_event(AgentEvent::ToolCallStarted {
-            id: "call_1".to_owned(),
-            name: "shell".to_owned(),
-        });
-
-        assert_eq!(app.session.chat.len(), 1);
-        assert_eq!(
-            app.session.chat[0].text,
-            "◷ shell: shell `date && uname -a` -> /tmp/helm.txt ..."
-        );
-
-        app.apply_agent_event(AgentEvent::ToolCallFinished {
-            id: "call_1".to_owned(),
-            name: "shell".to_owned(),
-            success: true,
-            content: "STDOUT:\nLinux PHANTOM\nSTDERR:\n\n[exit code: 0]".to_owned(),
-        });
-
-        assert_eq!(app.session.chat.len(), 1);
-        assert_eq!(app.session.chat[0].role, MessageRole::Activity);
-        assert!(
-            app.session.chat[0]
-                .text
-                .contains("shell: shell `date && uname -a`")
-        );
-        assert!(app.session.chat[0].text.contains("Linux PHANTOM"));
-    }
-
-    #[test]
-    fn tool_activity_failure_updates_existing_cell() {
-        let mut app = app();
-        app.apply_agent_event(AgentEvent::ToolCallParsed {
-            id: "call_1".to_owned(),
-            name: "fs_read".to_owned(),
-            input: serde_json::json!({"path": "/etc/shadow"}),
-        });
-        app.apply_agent_event(AgentEvent::ToolCallStarted {
-            id: "call_1".to_owned(),
-            name: "fs_read".to_owned(),
-        });
-        app.apply_agent_event(AgentEvent::ToolCallFinished {
-            id: "call_1".to_owned(),
-            name: "fs_read".to_owned(),
-            success: false,
-            content: "path denied: /etc/shadow".to_owned(),
-        });
-
-        assert_eq!(app.session.chat.len(), 1);
-        assert_eq!(app.session.chat[0].role, MessageRole::Error);
-        assert!(
-            app.session.chat[0]
-                .text
-                .starts_with("✗ fs_read failed: read /etc/shadow")
-        );
-        assert!(
-            app.session.chat[0]
-                .text
-                .ends_with("path denied: /etc/shadow")
-        );
     }
 
     #[test]
