@@ -22,7 +22,6 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use helm_agent::{AgentEvent, AgentEventSink, Budget, ReactAgent, RunResult, StructuredEvidence};
 use helm_core::{Capability, HelmError, Message};
 use helm_memory::{
     ChangeSetRecord, ChangeSetStore, FindingStateRecord, FindingStateStatus, FindingStateStore,
@@ -203,15 +202,6 @@ pub(crate) async fn run_tui(runtime: TuiRuntime) -> Result<()> {
 #[derive(Debug)]
 enum UiEvent {
     Input(Event),
-    Agent {
-        run_id: u64,
-        event: AgentEvent,
-    },
-    AgentDone {
-        run_id: u64,
-        task: String,
-        result: Result<RunResult, HelmError>,
-    },
     Tick,
     DashboardRefresh,
     DashboardLiveRefresh,
@@ -219,22 +209,6 @@ enum UiEvent {
 }
 
 #[derive(Clone)]
-struct ChannelEventSink {
-    tx: mpsc::UnboundedSender<UiEvent>,
-    run_id: u64,
-}
-
-impl AgentEventSink for ChannelEventSink {
-    fn emit(&self, event: AgentEvent) {
-        self.tx
-            .send(UiEvent::Agent {
-                run_id: self.run_id,
-                event,
-            })
-            .ok();
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MessageRole {
     User,
@@ -775,32 +749,12 @@ impl CommandAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentMode {
-    Chat,
-    Plan,
-    AutoAccept,
-    Diagnose,
     Dashboard,
 }
 
 impl AgentMode {
-    fn next(self) -> Self {
-        match self {
-            Self::Chat => Self::Plan,
-            Self::Plan => Self::AutoAccept,
-            Self::AutoAccept => Self::Diagnose,
-            Self::Diagnose => Self::Dashboard,
-            Self::Dashboard => Self::Chat,
-        }
-    }
-
     fn as_str(self) -> &'static str {
-        match self {
-            Self::Chat => "Chat",
-            Self::Plan => "Plan",
-            Self::AutoAccept => "Auto-Accept",
-            Self::Diagnose => "Diagnose",
-            Self::Dashboard => "Dashboard",
-        }
+        "Dashboard"
     }
 }
 
@@ -1322,14 +1276,6 @@ struct TuiRuntimeInner {
     sandbox: Option<ResolvedSandbox>,
 }
 
-/// Stored evidence snapshot for later display via /evidence.
-#[allow(dead_code)]
-struct EvidenceSnapshot {
-    tool_name: String,
-    evidence: StructuredEvidence,
-    formatted: String,
-}
-
 impl TuiApp {
     fn new(runtime: TuiRuntime) -> Self {
         let config_path = runtime.config_path.clone();
@@ -1354,15 +1300,15 @@ impl TuiApp {
             .clone()
             .unwrap_or_else(|| "auto".to_owned());
         let mode = if runtime.read_only {
-            AgentMode::Plan
+            AgentMode::Dashboard
         } else if runtime.auto_approve {
-            AgentMode::AutoAccept
+            AgentMode::Dashboard
         } else if runtime.diagnose_mode {
-            AgentMode::Diagnose
+            AgentMode::Dashboard
         } else if runtime.dashboard_mode {
             AgentMode::Dashboard
         } else {
-            AgentMode::Chat
+            AgentMode::Dashboard
         };
 
         let mut app = Self {
@@ -1562,22 +1508,7 @@ impl TuiApp {
                     self.dashboard.data.consecutive_skips += 1;
                 }
                 Ok(false)
-            }
-            UiEvent::Agent { run_id, event } => {
-                if run_id == self.active_run_id {
-                    self.apply_agent_event(event);
-                }
-                Ok(false)
-            }
-            UiEvent::AgentDone {
-                run_id,
-                task,
-                result,
-            } => {
-                if run_id != self.active_run_id {
-                    return Ok(false);
-                }
-                self.running = false;
+            }                self.running = false;
                 self.task_started = None;
                 self.tool_start_times.clear();
                 self.agent_task = None;
@@ -2098,7 +2029,6 @@ impl TuiApp {
                         DashboardFocus::Detail => DashboardFocus::Table,
                     };
                 } else {
-                    self.mode = self.mode.next();
                     self.toast(format!("Mode changed to {}", self.mode.as_str()));
                 }
             }
@@ -2695,25 +2625,6 @@ Report the exit status and the concise output."
         let effective_task = wrap_for_remote(&contextual_task, self.active_remote.as_ref());
         let task_for_event = effective_task.clone();
         let remote_target = self.active_remote.clone();
-        self.agent_task = Some(tokio::spawn(async move {
-            let result = run_agent_task(
-                runtime,
-                settings,
-                effective_task,
-                tx.clone(),
-                run_id,
-                mode,
-                remote_target,
-            )
-            .await;
-            tx.send(UiEvent::AgentDone {
-                run_id,
-                task: task_for_event,
-                result,
-            })
-            .ok();
-        }));
-
         Ok(())
     }
 
@@ -2840,194 +2751,6 @@ Report the exit status and the concise output."
         }
     }
 
-    fn apply_agent_event(&mut self, event: AgentEvent) {
-        match event {
-            AgentEvent::RunStarted { episode_id, .. } => {
-                self.session.episode_id = Some(episode_id.clone());
-                self.record_tool_event("run", "episode", episode_id);
-            }
-            AgentEvent::ProviderCallStarted {
-                iteration,
-                provider,
-                model,
-            } => {
-                self.provider_name = provider.clone();
-                self.model = model.clone();
-                self.record_tool_event(
-                    "call",
-                    provider,
-                    format!("iteration {iteration}, model {model}"),
-                );
-            }
-            AgentEvent::ProviderCallFinished {
-                iteration,
-                stop_reason,
-                tokens_in,
-                tokens_out,
-            } => {
-                self.session_tokens_in = self.session_tokens_in.saturating_add(tokens_in);
-                self.session_tokens_out = self.session_tokens_out.saturating_add(tokens_out);
-                self.record_tool_event(
-                    "done",
-                    "provider",
-                    format!("{iteration:?} {stop_reason:?}, {tokens_in}/{tokens_out} tokens"),
-                );
-            }
-            AgentEvent::AssistantText { text } => {
-                if !text.trim().is_empty() {
-                    let redacted = helm_core::redact_secrets(&text);
-                    self.push_chat(MessageRole::Assistant, redacted);
-                }
-            }
-            AgentEvent::ToolCallParsed { id, name, input } => {
-                self.pending_tool_summaries
-                    .insert(id, tool_call_summary(&name, &input));
-            }
-            AgentEvent::ToolCallValidated { name, .. } => {
-                self.record_tool_event("valid", name, "input accepted");
-            }
-            AgentEvent::ToolCallStarted { id, name } => {
-                self.start_tool_cell(&id, &name);
-            }
-            AgentEvent::ToolCallFinished {
-                id,
-                name,
-                success,
-                content,
-                ..
-            } => {
-                let redacted = helm_core::redact_secrets(&content);
-                self.finish_tool_cell(&id, &name, success, &redacted);
-            }
-            AgentEvent::ToolCallDenied { name, reason, .. } => {
-                let redacted = helm_core::redact_secrets(&reason);
-                self.record_tool_event("deny", name, redacted.clone());
-                self.push_chat(MessageRole::Error, redacted);
-            }
-            AgentEvent::PermissionRequested {
-                capability,
-                tool_name,
-                taint,
-            } => {
-                self.modal = Some(ModalState::Permission {
-                    capability,
-                    tool_name,
-                    taint: format!("{taint:?}"),
-                    detail: "This action needs explicit approval before it can run.".to_owned(),
-                });
-            }
-            AgentEvent::FormatRecoveryUsed { format } => {
-                self.record_tool_event("recover", "parser", format);
-            }
-            AgentEvent::CorrectionUsed { count, tool_name } => {
-                self.record_tool_event("correct", tool_name, format!("correction {count}"));
-            }
-            AgentEvent::PostconditionWarning { warning } => {
-                self.push_chat(MessageRole::Error, warning.clone());
-                self.record_tool_event("warn", "verify", warning);
-            }
-            AgentEvent::SkillSuggested {
-                skill_id,
-                skill_name,
-                confidence,
-                ..
-            } => {
-                let msg = format!(
-                    "[skill] Suggested: {} (confidence: {:.0}%)",
-                    skill_name,
-                    confidence * 100.0
-                );
-                self.push_chat(MessageRole::Activity, msg.clone());
-                self.record_tool_event(
-                    "skill",
-                    skill_id,
-                    format!("{} ({})", skill_name, confidence),
-                );
-            }
-            AgentEvent::ProviderFailover { from, to, reason } => {
-                let msg = format!("[failover] {} → {} ({})", from, to, reason);
-                self.push_chat(MessageRole::Activity, msg.clone());
-                self.record_tool_event("failover", format!("{}->{}", from, to), reason);
-            }
-            AgentEvent::BudgetWarning {
-                spent_usd,
-                limit_usd,
-            } => {
-                let pct = ((spent_usd / limit_usd) * 100.0).round() as u32;
-                let msg = format!(
-                    "[budget warning] ${:.2} spent of ${:.2} ({pct}%)",
-                    spent_usd, limit_usd
-                );
-                self.push_chat(MessageRole::Error, msg.clone());
-                self.record_tool_event("budget", "warning", msg);
-            }
-            AgentEvent::BudgetExceeded {
-                spent_usd,
-                limit_usd,
-            } => {
-                let msg = format!(
-                    "[budget exceeded] ${:.2} spent exceeds limit ${:.2}",
-                    spent_usd, limit_usd
-                );
-                self.push_chat(MessageRole::Error, msg.clone());
-                self.record_tool_event("budget", "exceeded", msg);
-            }
-            AgentEvent::PromptCacheHit { tokens_saved } => {
-                let msg = format!("[cache hit] {} tokens saved", tokens_saved);
-                self.record_tool_event("cache", "prompt", msg);
-            }
-            AgentEvent::PermissionDenied {
-                tool_name,
-                role,
-                reason,
-            } => {
-                let msg = format!("[DENIED] {} ({}) — {}", tool_name, role, reason);
-                self.push_chat(MessageRole::Error, msg.clone());
-                self.record_tool_event("permission", "denied", msg);
-            }
-            AgentEvent::ValidationFailed { input: _, reason } => {
-                let msg = format!("[VALIDATION ERROR] {}", reason);
-                self.push_chat(MessageRole::Error, msg.clone());
-                self.record_tool_event("validation", "failed", msg);
-            }
-            AgentEvent::BreakpointHit {
-                step_index,
-                tool_name,
-            } => {
-                let msg = format!("[BREAKPOINT] step {} — {}", step_index, tool_name);
-                self.push_chat(MessageRole::Activity, msg.clone());
-                self.record_tool_event("breakpoint", "hit", msg);
-            }
-            AgentEvent::ToolDryRun {
-                id,
-                name,
-                synthetic_output,
-            } => {
-                self.push_chat(
-                    MessageRole::System,
-                    format!("[dry-run] {name} ({id}):\n{synthetic_output}"),
-                );
-            }
-            AgentEvent::EvidenceReport {
-                tool_name,
-                evidence,
-            } => {
-                let formatted = format_evidence_report(&tool_name, &evidence);
-                self.last_evidence = Some(EvidenceSnapshot {
-                    tool_name: tool_name.clone(),
-                    evidence: evidence.clone(),
-                    formatted: formatted.clone(),
-                });
-                self.push_chat(MessageRole::System, formatted);
-            }
-            AgentEvent::RunFinished { .. }
-            | AgentEvent::RunFailed { .. }
-            | AgentEvent::TextDelta { .. }
-            | AgentEvent::PlanCacheHit { .. }
-            | AgentEvent::PlanStarted { .. }
-            | AgentEvent::PlanFinished { .. } => {}
-        }
-    }
 
     fn push_chat(&mut self, role: MessageRole, text: impl Into<String>) {
         let text: String = text.into();
@@ -3714,7 +3437,7 @@ Report the exit status and the concise output."
             CommandAction::Redo => self.execute_undo_inline(true),
             CommandAction::Cost => self.open_cost_meter(),
             CommandAction::Diagnose => {
-                self.mode = AgentMode::Diagnose;
+                self.mode = AgentMode::Dashboard;
                 self.push_chat(
                     MessageRole::System,
                     "Diagnose mode enabled — only read-only tools available. \
@@ -4830,7 +4553,7 @@ Report the exit status and the concise output."
 Do not modify the system. Then explain what the result means for finding {}.\n\nCommand:\n{}",
             summary.id, check
         );
-        self.start_prepared_task_in_mode(display, agent_task, tx, AgentMode::Diagnose)
+        self.start_prepared_task_in_mode(display, agent_task, tx, AgentMode::Dashboard)
             .await
     }
 
@@ -5386,55 +5109,6 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
     fn render(&self, frame: &mut Frame<'_>) {
         render_app(self, frame.area(), frame.buffer_mut());
     }
-}
-
-async fn run_agent_task(
-    runtime: Arc<TuiRuntimeInner>,
-    settings: ProviderSettings,
-    task: String,
-    tx: mpsc::UnboundedSender<UiEvent>,
-    run_id: u64,
-    mode: AgentMode,
-    remote_target: Option<String>,
-) -> Result<RunResult, HelmError> {
-    let (provider, model) = build_provider(&settings, &runtime.secrets)
-        .map_err(|error| HelmError::Provider(helm_core::ProviderError::Other(error.to_string())))?;
-    let mut budget = Budget::default();
-    if let Some(max) = runtime.max_iterations {
-        budget.max_iterations = max;
-    }
-    budget.read_only = mode == AgentMode::Plan || mode == AgentMode::Diagnose;
-    budget.dry_run = false;
-    budget.auto_approve = mode == AgentMode::AutoAccept;
-    let mut tool_context = helm_tools::ToolContext::new(
-        runtime
-            .sandbox
-            .as_ref()
-            .map(|resolved| resolved.root_dir.clone())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
-    );
-    if let Some(policy) = runtime.sandbox.as_ref() {
-        tool_context = tool_context.with_sandbox(policy.policy());
-    }
-    if let Some(remote_target) = remote_target {
-        tool_context = tool_context.with_remote_target(remote_target);
-    }
-    let tool_registry = if mode == AgentMode::Diagnose {
-        tool_context = tool_context.with_diagnose_mode();
-        ToolRegistry::with_diagnose_tools()
-    } else {
-        ToolRegistry::default()
-    };
-    let agent = ReactAgent::with_tool_context(
-        provider,
-        tool_registry,
-        Arc::clone(&runtime.memory),
-        budget,
-        model,
-        tool_context,
-    );
-    let sink = ChannelEventSink { tx, run_id };
-    agent.run_with_events(&task, &sink).await
 }
 
 fn spawn_input_thread(tx: mpsc::UnboundedSender<UiEvent>) {
@@ -7362,19 +7036,19 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .map(|start| format_duration(start.elapsed()))
         .unwrap_or_default();
     let mode_style = match app.mode {
-        AgentMode::Chat => Style::default()
+        AgentMode::Dashboard => Style::default()
             .fg(Color::White)
             .bg(HEADER_BORDER)
             .add_modifier(Modifier::BOLD),
-        AgentMode::Plan => Style::default()
+        AgentMode::Dashboard => Style::default()
             .fg(Color::White)
             .bg(Color::Rgb(75, 85, 99))
             .add_modifier(Modifier::BOLD),
-        AgentMode::AutoAccept => Style::default()
+        AgentMode::Dashboard => Style::default()
             .fg(Color::White)
             .bg(SUCCESS_FG)
             .add_modifier(Modifier::BOLD),
-        AgentMode::Diagnose => Style::default()
+        AgentMode::Dashboard => Style::default()
             .fg(Color::White)
             .bg(Color::Blue)
             .add_modifier(Modifier::BOLD),
@@ -7626,10 +7300,10 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .style(Style::default().fg(Color::White).bg(INPUT_BG));
     let body = if app.input.text.is_empty() {
         let placeholder = match app.mode {
-            AgentMode::Diagnose => "Diagnose a system problem (read-only)...",
-            AgentMode::Plan => "Plan an approach (no writes yet)...",
-            AgentMode::AutoAccept => "Run with auto-approved tools...",
-            AgentMode::Chat => "Ask HELM to do something...",
+            AgentMode::Dashboard => "Diagnose a system problem (read-only)...",
+            AgentMode::Dashboard => "Plan an approach (no writes yet)...",
+            AgentMode::Dashboard => "Run with auto-approved tools...",
+            AgentMode::Dashboard => "Ask HELM to do something...",
             AgentMode::Dashboard => {
                 "Ask HELMOPS about the selected issue. Response stays read-only unless you later open apply."
             }
@@ -7670,17 +7344,17 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
 fn render_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let mode_label = match _app.mode {
-        AgentMode::Chat => "CHAT",
-        AgentMode::Plan => "PLAN",
-        AgentMode::AutoAccept => "AUTO",
-        AgentMode::Diagnose => "DIAGNOSE",
+        AgentMode::Dashboard => "CHAT",
+        AgentMode::Dashboard => "PLAN",
+        AgentMode::Dashboard => "AUTO",
+        AgentMode::Dashboard => "DIAGNOSE",
         AgentMode::Dashboard => "DASHBOARD",
     };
     let mode_hint = match _app.mode {
-        AgentMode::Chat => "Ctrl+P palette | / commands | legacy conversational mode",
-        AgentMode::Plan => "READ-ONLY planning mode",
-        AgentMode::AutoAccept => "AUTO-ACCEPT | dangerous legacy execution mode",
-        AgentMode::Diagnose => "DIAGNOSE | read-only reasoning mode",
+        AgentMode::Dashboard => "Ctrl+P palette | / commands | legacy conversational mode",
+        AgentMode::Dashboard => "READ-ONLY planning mode",
+        AgentMode::Dashboard => "AUTO-ACCEPT | dangerous legacy execution mode",
+        AgentMode::Dashboard => "DIAGNOSE | read-only reasoning mode",
         AgentMode::Dashboard => {
             "Tab panes | F5 refresh | Alt+E evidence | Alt+F check | Alt+G plan | Alt+A apply | 1-8 tabs"
         }

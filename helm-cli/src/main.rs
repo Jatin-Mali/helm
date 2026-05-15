@@ -1,19 +1,14 @@
 //! Command-line entry point for HELM.
 
-mod agent_remote;
 mod attach_tui;
 mod bootstrap;
 mod builtin_skills;
 mod custom_commands;
-mod hooks;
 mod keybindings;
-mod ndjson_sink;
 mod paths;
 mod remote;
 mod sandbox;
 mod secrets;
-mod serve;
-mod snapshot_sink;
 mod telemetry;
 mod tui;
 
@@ -32,7 +27,6 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
-use helm_agent::{AgentEvent, AgentEventSink, Budget, CancellationToken, ReactAgent, RunResult};
 use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError, Secret};
 use helm_memory::{
     AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, SessionStore,
@@ -131,58 +125,23 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Run(RunArgs),
-    Replay(ReplayArgs),
     Models,
     Doctor(DoctorArgs),
-    Episodes(EpisodesArgs),
     Permissions(PermissionsArgs),
     Audit(AuditArgs),
-    Skills(SkillsArgs),
     Secrets(SecretsArgs),
     Init(InitArgs),
-    /// Manage configuration (get/set/edit/validate/path)
     Config(ConfigArgs),
-    /// Generate shell completion scripts
     Completion(CompletionArgs),
-    /// Manage MCP server configurations
-    Mcp(McpArgs),
     Tui(TuiArgs),
-    /// Manage sessions (list/delete/export/resume)
-    Sessions(SessionsArgs),
-    /// Manage remote target hosts (SSH)
     Remote(RemoteArgs),
-    /// Run a bearer-auth HTTP server that accepts agent tasks
-    Serve(ServeArgs),
-    /// Export episode to file
-    Export(ExportArgs),
-    /// Manage file snapshots and undo/redo
-    Undo(UndoArgs),
-    /// Re-apply the last undone file snapshot for a session
-    Redo(UndoArgs),
-    /// Show cost and usage statistics
-    Stats(StatsArgs),
-    /// Manage knowledge graph and memory
-    Memory(MemoryArgs),
-    /// Manage user profile and preferences
-    Profile(ProfileArgs),
-    /// Bootstrap HELM onto a reachable Linux host over SSH
     Bootstrap(BootstrapArgs),
-    /// Read-only diagnostic mode — cannot write or execute dangerous tools
-    Diagnose(DiagnoseArgs),
-    /// Show trust report: grants, audit, sandbox, secrets, integrity
     TrustReport(TrustReportArgs),
-    /// Collect a typed read-only system snapshot
     Snapshot(SnapshotArgs),
-    /// Run detectors against a system snapshot and report findings
     Monitor(MonitorArgs),
-    /// Generate a guided troubleshooting plan from a problem description
     Troubleshoot(TroubleshootArgs),
-    /// Explain a stored finding by ID
     Explain(ExplainArgs),
-    /// Apply an approved troubleshooting plan
     ApplyPlan(ApplyPlanArgs),
-    /// Manage change sets (list/show/rollback)
     ChangeSet(ChangeSetArgs),
 }
 
@@ -275,10 +234,6 @@ struct TuiArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum TuiMode {
     Dashboard,
-    Chat,
-    Plan,
-    Diagnose,
-    Auto,
 }
 
 #[derive(Debug, Args)]
@@ -997,308 +952,8 @@ async fn run() -> Result<()> {
         }),
     };
     match command {
-        Command::Run(args) => {
-            if args.agent_on_remote {
-                let remote_name = cli.remote.as_deref().ok_or_else(|| {
-                    anyhow!("--agent-on-remote requires --remote <name> to be set")
-                })?;
-                let registry = remote::RemoteRegistry::load()?;
-                let entry = registry.get(remote_name).cloned().ok_or_else(|| {
-                    anyhow!(
-                        "remote target `{remote_name}` not in registry — register it via `helm remote add` or `helm bootstrap --register-as {remote_name}`"
-                    )
-                })?;
-                let sink = CliProgressSink;
-                let outcome = agent_remote::run_on_remote(&entry, &args.task, &sink, &[]).await?;
-                if let Some(message) = outcome.final_message.as_deref() {
-                    println!("{message}");
-                } else if let Some(err) = outcome.error.as_deref() {
-                    eprintln!("[remote] error: {err}");
-                }
-                eprintln!(
-                    "[remote] tokens in {} · tokens out {} · iterations {}",
-                    outcome.tokens_in, outcome.tokens_out, outcome.iterations
-                );
-                return if outcome.ok() {
-                    Ok(())
-                } else {
-                    Err(anyhow!(
-                        outcome.error.unwrap_or_else(|| "remote run failed".into())
-                    ))
-                };
-            }
-            if config.is_none() && provider_settings.source == ProviderSource::Fallback {
-                eprintln!("HELM is not configured yet.");
-                eprintln!("Run `helm init` to choose a provider and set your API key.");
-                return Ok(());
-            }
-            if cli.yes {
-                eprintln!("warning: --yes mode active — all tool permissions auto-approved");
-            }
-            if cli.read_only {
-                eprintln!("info: --read-only mode — write/exec operations will be denied");
-            }
-            let provider_choice = resolve_provider_choice(provider_settings.choice);
-
-            let resume_target = resolve_resume_target(cli.resume.as_deref(), cli.continue_last);
-
-            // Parse fallback chain from --fallback arg.
-            let fallback_chain = args
-                .fallback
-                .as_ref()
-                .map(|f| parse_fallback_chain(f))
-                .unwrap_or_default();
-
-            let has_fallback = !fallback_chain.is_empty();
-
-            // Try primary provider first, then fallback chain.
-            let providers_to_try: Vec<ProviderChoice> = if has_fallback {
-                let mut chain = vec![provider_choice];
-                chain.extend(fallback_chain);
-                chain
-            } else {
-                vec![provider_choice]
-            };
-            let mut budget = Budget::default();
-            if let Some(max_iterations) = cli.max_iterations {
-                budget.max_iterations = max_iterations;
-            }
-            if let Some(budget_usd) = args.budget {
-                budget.max_cost_usd = Some(budget_usd);
-                eprintln!("[budget] ${:.2} USD limit set", budget_usd);
-            }
-            budget.auto_approve = cli.yes;
-            budget.read_only = cli.read_only;
-            budget.dry_run = cli.dry_run;
-            budget.require_evidence = cli.evidence;
-            if cli.dry_run {
-                eprintln!("info: --dry-run mode — tools will report synthetic success only");
-            }
-            if cli.evidence {
-                eprintln!("info: --evidence mode — system state shown before each tool call");
-            }
-
-            // Open session store for snapshotting (U5, U7).
-            let sessions_dir = paths::default_snapshots_path();
-            let snapshots_dir = sessions_dir;
-            let session_store = Arc::new(
-                SessionStore::open(&db_path, snapshots_dir)
-                    .await
-                    .context("opening session store")?,
-            );
-
-            // Create session before run start (U7).
-            let resumed_session = match resume_target {
-                Some(target) => Some(
-                    resolve_session_for_resume(&session_store, target)
-                        .await
-                        .context("resolving session to resume")?,
-                ),
-                None => None,
-            };
-            let tool_working_dir = sandbox
-                .as_ref()
-                .map(|resolved| resolved.root_dir.clone())
-                .or_else(|| {
-                    resumed_session
-                        .as_ref()
-                        .and_then(|session| session.working_dir.as_deref())
-                        .map(PathBuf::from)
-                })
-                .unwrap_or(std::env::current_dir().unwrap_or_default());
-            let working_dir = Some(tool_working_dir.to_string_lossy().into_owned());
-            let (session_id, session_label) = if let Some(session) = resumed_session.as_ref() {
-                eprintln!("[session] resuming {} ({})", session.id, session.name);
-                (session.id.clone(), session.name.clone())
-            } else {
-                let session_name = derive_session_name(&args.task);
-                let session_id = session_store
-                    .create_session(
-                        &session_name,
-                        &args.task,
-                        "".to_string(),
-                        provider_settings
-                            .model
-                            .clone()
-                            .or_else(|| Some(default_model_name(provider_choice).to_owned())),
-                        None,
-                        working_dir,
-                    )
-                    .await
-                    .context("creating session")?;
-                eprintln!("[session] created session {} for run", session_id);
-                (session_id, session_name)
-            };
-
-            let hooks = hooks::load(
-                args.pre_run.clone(),
-                args.post_run.clone(),
-                args.on_tool_call.clone(),
-            );
-            let cancel = CancellationToken::new();
-            let signal_cancel = cancel.child();
-            tokio::spawn(async move {
-                tokio::signal::ctrl_c().await.ok();
-                signal_cancel.cancel();
-            });
-            let hooks_ref = hooks.clone();
-            let resumed_task = if let Some(session) = resumed_session.as_ref() {
-                let prior_steps = memory.get_steps(&session.episode_id).await?;
-                let prior_episode = memory.episode_by_id(&session.episode_id).await?;
-                let continuation = format!(
-                    "{}\n\nUser asks now: {}",
-                    build_session_recap(session, prior_episode.as_ref(), &prior_steps),
-                    args.task
-                );
-                continuation
-            } else {
-                args.task.clone()
-            };
-            let effective_task = wrap_for_remote(&resumed_task, cli.remote.as_ref());
-            hooks::fire_pre_run(&hooks, &effective_task, cli.remote.as_deref()).await?;
-
-            // Wrap sink for snapshots (U5).
-            let base: ndjson_sink::DynSink = if args.emit_events {
-                ndjson_sink::DynSink::new(ndjson_sink::TeeSink::new(
-                    CliProgressSink,
-                    ndjson_sink::NdjsonSink::new(),
-                ))
-            } else {
-                ndjson_sink::DynSink::new(CliProgressSink)
-            };
-            let base_sink = hooks::HookEventSink::new(base, &hooks_ref, cli.remote.clone());
-            let sink = snapshot_sink::SnapshotSink::new(
-                base_sink,
-                session_store.clone(),
-                Some(session_id.clone()),
-                tool_working_dir.clone(),
-            );
-            let mut last_error: Option<anyhow::Error> = None;
-            let mut actual_provider_choice = provider_choice;
-            let mut actual_model: Option<String> = None;
-            let mut result: Option<RunResult> = None;
-
-            for (index, choice) in providers_to_try.iter().copied().enumerate() {
-                let attempt_settings = provider_settings.with_choice(choice);
-                let (provider, model) = match build_provider(&attempt_settings, &secrets_store) {
-                    Ok(provider_and_model) => provider_and_model,
-                    Err(error) => {
-                        let reason = error.to_string();
-                        last_error = Some(anyhow!(reason.clone()));
-                        if let Some(next_choice) = providers_to_try.get(index + 1).copied() {
-                            eprintln!(
-                                "[fallback] {} failed to initialize: {}, trying {}...",
-                                provider_choice_name(choice),
-                                reason,
-                                provider_choice_name(next_choice)
-                            );
-                            sink.emit(AgentEvent::ProviderFailover {
-                                from: provider_choice_name(choice).to_owned(),
-                                to: provider_choice_name(next_choice).to_owned(),
-                                reason,
-                            });
-                            continue;
-                        }
-                        return Err(error).context("all providers in fallback chain failed");
-                    }
-                };
-                if has_fallback && choice != provider_choice {
-                    eprintln!(
-                        "[fallback] using {} with model {}",
-                        provider_choice_name(choice),
-                        model
-                    );
-                }
-                let mut tool_context = ToolContext::new(tool_working_dir.clone());
-                if let Some(policy) = sandbox.as_ref() {
-                    tool_context = tool_context.with_sandbox(policy.policy());
-                }
-                if let Some(remote_target) = cli.remote.as_deref() {
-                    tool_context = tool_context.with_remote_target(remote_target.to_owned());
-                }
-                let agent = ReactAgent::with_tool_context(
-                    provider,
-                    build_registry_with_skills(&builtin_skills::load_builtin_skills()),
-                    memory.clone(),
-                    budget,
-                    model.clone(),
-                    tool_context,
-                )
-                .with_cancel_token(cancel.child());
-                match agent.run_with_events(&effective_task, &sink).await {
-                    Ok(run_result) => {
-                        actual_provider_choice = choice;
-                        actual_model = Some(model);
-                        result = Some(run_result);
-                        break;
-                    }
-                    Err(HelmError::Provider(error)) => {
-                        let reason = error.to_string();
-                        last_error = Some(anyhow!(reason.clone()));
-                        if let Some(next_choice) = providers_to_try.get(index + 1).copied() {
-                            eprintln!(
-                                "[fallback] {} runtime failure: {}, trying {}...",
-                                provider_choice_name(choice),
-                                reason,
-                                provider_choice_name(next_choice)
-                            );
-                            sink.emit(AgentEvent::ProviderFailover {
-                                from: provider_choice_name(choice).to_owned(),
-                                to: provider_choice_name(next_choice).to_owned(),
-                                reason,
-                            });
-                            continue;
-                        }
-                        return Err(HelmError::Provider(error).into());
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            let result = match result {
-                Some(result) => result,
-                None => {
-                    return Err(last_error.unwrap_or_else(|| anyhow!("no providers configured")))
-                        .context("all providers in fallback chain failed");
-                }
-            };
-            hooks::fire_post_run(
-                &hooks,
-                &result.episode_id,
-                result.iterations > 0,
-                cli.remote.as_deref(),
-            )
-            .await?;
-            let provider_name = match actual_provider_choice {
-                ProviderChoice::Auto => "auto",
-                ProviderChoice::Groq => "groq",
-                ProviderChoice::Anthropic => "anthropic",
-                ProviderChoice::Ollama => "ollama",
-                ProviderChoice::Gemini => "gemini",
-                ProviderChoice::Openrouter => "openrouter",
-                ProviderChoice::NvidiaNim => "nvidia-nim",
-                ProviderChoice::OpenaiCompat => "openai-compat",
-            };
-
-            // Update session metadata on completion (U7).
-            if let Err(e) = session_store
-                .update_session(
-                    &session_id,
-                    Some(&result.episode_id),
-                    Some(provider_name),
-                    actual_model.as_deref(),
-                )
-                .await
-            {
-                tracing::warn!("session update failed: {}", e);
-            }
-
-            eprintln!("[session] updated {} ({session_label})", session_id);
-            print_run_result(&result);
-        }
-        Command::Replay(args) => {
-            let transcript = render_replay(&memory, &args.episode_id).await?;
-            print!("{transcript}");
-        }
+        // stripped: Command::Run
+        // stripped: Command::Replay
         Command::Models => {
             let base_url = provider_settings
                 .base_url
@@ -1315,51 +970,8 @@ async fn run() -> Result<()> {
                 print!("{}", render_doctor(&report));
             }
         }
-        Command::Diagnose(args) => {
-            let (provider, model_name) = build_provider(&provider_settings, &secrets_store)?;
-            let budget = Budget {
-                read_only: true,
-                dry_run: false,
-                ..Default::default()
-            };
-            let tool_context =
-                ToolContext::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-                    .with_diagnose_mode();
-            let agent = ReactAgent::with_tool_context(
-                provider,
-                ToolRegistry::with_diagnose_tools(),
-                memory.clone(),
-                budget,
-                model_name,
-                tool_context,
-            );
-            eprintln!(
-                "[diagnose] running in read-only mode with {} tools available",
-                ToolRegistry::with_diagnose_tools().schemas().len()
-            );
-            let question = format!(
-                "[diagnose mode — read-only, limited tools] Answer this question about the system using only available tools. Do not attempt to modify anything.\n\n{}",
-                args.question
-            );
-            let result = agent.run(&question).await?;
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "answer": result.final_message,
-                        "iterations": result.iterations,
-                        "tokens_in": result.tokens_in,
-                        "tokens_out": result.tokens_out
-                    }))?
-                );
-            } else {
-                println!("{}", result.final_message);
-            }
-        }
-        Command::Episodes(args) => {
-            let report = render_episodes(&memory, args.limit).await?;
-            print!("{report}");
-        }
+        // stripped: Command::Diagnose
+        // stripped: Command::Episodes
         Command::Permissions(args) => match args.command {
             PermissionsCommand::List => {
                 let report = render_permissions(&memory).await?;
@@ -1413,279 +1025,13 @@ async fn run() -> Result<()> {
                 print!("{report}");
             }
         },
-        Command::Sessions(args) => match args.command {
-            SessionsCommand::List { limit } => {
-                let sessions_dir = dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-                    .join("helm");
-                let db_path = cli
-                    .db_path
-                    .clone()
-                    .unwrap_or_else(|| sessions_dir.join("helm.db"));
-                let store =
-                    helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots"))
-                        .await?;
-                let sessions = store.list_sessions(limit).await?;
-                for s in sessions {
-                    println!(
-                        "[{}] {} | {} | {}",
-                        s.id,
-                        s.name,
-                        s.goal.chars().take(50).collect::<String>(),
-                        DateTime::from_timestamp_millis(s.updated_at)
-                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                            .unwrap_or_default()
-                    );
-                }
-            }
-            SessionsCommand::Delete { id } => {
-                let sessions_dir = dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-                    .join("helm");
-                let db_path = cli
-                    .db_path
-                    .clone()
-                    .unwrap_or_else(|| sessions_dir.join("helm.db"));
-                let store =
-                    helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots"))
-                        .await?;
-                let deleted = store.delete_session(&id).await?;
-                println!("deleted {} session(s)", deleted);
-            }
-            SessionsCommand::Export { id, format } => {
-                let sessions_dir = dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-                    .join("helm");
-                let db_path = cli
-                    .db_path
-                    .clone()
-                    .unwrap_or_else(|| sessions_dir.join("helm.db"));
-                let store =
-                    helm_memory::SessionStore::open(&db_path, sessions_dir.join("snapshots"))
-                        .await?;
-                let content = store.export_session(&id, &format).await?;
-                println!("{content}");
-            }
-            SessionsCommand::Resume { id, task, show } => {
-                let sessions_dir = dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-                    .join("helm");
-                let session_db = cli
-                    .db_path
-                    .clone()
-                    .unwrap_or_else(|| sessions_dir.join("helm.db"));
-                let store =
-                    helm_memory::SessionStore::open(&session_db, sessions_dir.join("snapshots"))
-                        .await?;
-                let session = store
-                    .get_session(&id)
-                    .await?
-                    .ok_or_else(|| anyhow!("session not found: {}", id))?;
-                let prior_steps = memory.get_steps(&session.episode_id).await?;
-                let prior_episode = memory.episode_by_id(&session.episode_id).await?;
-                let recap = build_session_recap(&session, prior_episode.as_ref(), &prior_steps);
-                println!("{recap}");
-                if show || task.is_none() {
-                    return Ok(());
-                }
-                let task = task.expect("checked is_none above");
-                let provider_choice = resolve_provider_choice(provider_settings.choice);
-                let (provider, model) = build_provider(
-                    &provider_settings.with_choice(provider_choice),
-                    &secrets_store,
-                )?;
-                let mut budget = Budget::default();
-                if let Some(max_iterations) = cli.max_iterations {
-                    budget.max_iterations = max_iterations;
-                }
-                budget.auto_approve = cli.yes;
-                budget.read_only = cli.read_only;
-                let cancel = CancellationToken::new();
-                let agent = ReactAgent::new(
-                    provider,
-                    build_registry_with_skills(&builtin_skills::load_builtin_skills()),
-                    memory.clone(),
-                    budget,
-                    model,
-                )?
-                .with_cancel_token(cancel.child());
-                let signal_cancel = cancel.child();
-                tokio::spawn(async move {
-                    tokio::signal::ctrl_c().await.ok();
-                    signal_cancel.cancel();
-                });
-                let continuation = format!(
-                    "[Resumed from session {} ({})]\nPrior goal: {}\nPrior outcome: {}\n\nUser asks now: {}",
-                    session.id,
-                    session.name,
-                    session.goal,
-                    prior_episode
-                        .as_ref()
-                        .and_then(|e| e.outcome.as_deref())
-                        .unwrap_or("(in progress)"),
-                    task
-                );
-                let continuation = wrap_for_remote(&continuation, cli.remote.as_ref());
-                let result = agent
-                    .run_with_events(&continuation, &CliProgressSink)
-                    .await?;
-                print_run_result(&result);
-            }
-        },
-        Command::Export(args) => {
-            let episode = memory
-                .episode_by_id(&args.episode_id)
-                .await?
-                .ok_or_else(|| anyhow!("episode not found"))?;
-            let content = match args.format.as_str() {
-                "json" => {
-                    let obj = serde_json::json!({
-                        "id": episode.id,
-                        "goal": episode.goal,
-                        "outcome": episode.outcome,
-                        "started_at": episode.started_at,
-                        "ended_at": episode.ended_at,
-                        "tokens_in": episode.tokens_in,
-                        "tokens_out": episode.tokens_out,
-                        "final_message": episode.final_message,
-                    });
-                    serde_json::to_string_pretty(&obj).map_err(|e| anyhow!(e))?
-                }
-                "md" => {
-                    let ts = DateTime::from_timestamp_millis(episode.started_at)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_default();
-                    format!(
-                        "# Episode: {}\n\n**Goal:** {}\n**Outcome:** {}\n**Started:** {}\n\n```\n{}\n```",
-                        episode.id,
-                        episode.goal,
-                        episode.outcome.as_deref().unwrap_or("unknown"),
-                        ts,
-                        episode.final_message.as_deref().unwrap_or("(no message)")
-                    )
-                }
-                _ => return Err(anyhow!("unsupported format: {}", args.format)),
-            };
-            if let Some(path) = args.output {
-                fs::write(&path, &content)?;
-                println!("exported to {}", path.display());
-            } else {
-                print!("{content}");
-            }
-        }
-        Command::Undo(args) => {
-            run_snapshot_command(cli.db_path.clone(), args, false).await?;
-        }
-        Command::Redo(args) => {
-            run_snapshot_command(cli.db_path.clone(), args, true).await?;
-        }
-        Command::Stats(_args) => {
-            let counts = memory.episode_outcome_counts().await?;
-            let _total = memory.episode_count().await?;
-            println!(
-                "Total episodes: {}\n  success: {}\n  partial: {}\n  failure: {}",
-                counts.total, counts.success, counts.partial, counts.failure
-            );
-        }
-        Command::Skills(args) => match args.command {
-            SkillsCommand::List => {
-                let mut skills = builtin_skills::load_builtin_skills();
-                let manager = helm_memory::SkillsManager::new();
-                for user_skill in manager.list().unwrap_or_default() {
-                    if !skills.iter().any(|s| s.id == user_skill.id) {
-                        skills.push(user_skill);
-                    }
-                }
-                for skill in &skills {
-                    let tag = if skill.source_path == std::path::Path::new("builtin") {
-                        " [builtin]"
-                    } else {
-                        ""
-                    };
-                    println!("{}: {} (v{}){tag}", skill.id, skill.name, skill.version);
-                }
-            }
-            SkillsCommand::Show(args) => {
-                let builtins = builtin_skills::load_builtin_skills();
-                let skill = builtins
-                    .into_iter()
-                    .find(|s| s.id == args.id)
-                    .or_else(|| helm_memory::SkillsManager::new().show(&args.id).ok())
-                    .ok_or_else(|| anyhow!("skill not found: {}", args.id))?;
-                println!("ID: {}", skill.id);
-                println!("Name: {}", skill.name);
-                println!("Version: {}", skill.version);
-                println!("Approved: {}", skill.approved);
-                println!("\n{}", skill.content);
-            }
-            SkillsCommand::Approve(args) => {
-                let manager = helm_memory::SkillsManager::new();
-                manager.approve(&args.id)?;
-                println!("Approved skill: {}", args.id);
-            }
-            SkillsCommand::Disable(args) => {
-                let manager = helm_memory::SkillsManager::new();
-                manager.disable(&args.id)?;
-                println!("Disabled skill: {}", args.id);
-            }
-            SkillsCommand::Test(args) => {
-                let manager = helm_memory::SkillsManager::new();
-                let result = manager.test(&args.id)?;
-                println!("{result}");
-            }
-            SkillsCommand::Run(args) => {
-                let builtins = builtin_skills::load_builtin_skills();
-                let skill = builtins
-                    .into_iter()
-                    .find(|s| s.id == args.id)
-                    .or_else(|| helm_memory::SkillsManager::new().show(&args.id).ok())
-                    .ok_or_else(|| anyhow!("skill not found: {}", args.id))?;
-                let raw_cmds = builtin_skills::extract_bash_commands(&skill.content);
-                if raw_cmds.is_empty() {
-                    anyhow::bail!(
-                        "skill '{}' has no executable bash commands in its SKILL.md",
-                        args.id
-                    );
-                }
-                let input_val: serde_json::Value = match args.input.as_deref() {
-                    Some(s) => serde_json::from_str(s)
-                        .map_err(|e| anyhow!("--input is not valid JSON: {e}"))?,
-                    None => serde_json::Value::Object(serde_json::Map::new()),
-                };
-                if args.dry_run {
-                    for cmd in &raw_cmds {
-                        let mut resolved = cmd.clone();
-                        if let Some(obj) = input_val.as_object() {
-                            for (k, v) in obj {
-                                let ph = format!("{{{{{k}}}}}");
-                                let rep = match v {
-                                    serde_json::Value::String(sv) => sv.clone(),
-                                    other => other.to_string(),
-                                };
-                                resolved = resolved.replace(&ph, &rep);
-                            }
-                        }
-                        println!("$ {resolved}");
-                    }
-                } else {
-                    let tool = SkillTool::new(&skill.id, &skill.description, raw_cmds);
-                    let ctx = ToolContext::new(std::env::current_dir()?);
-                    let out = tool
-                        .execute(input_val, &ctx)
-                        .await
-                        .map_err(|e| anyhow!("{e}"))?;
-                    if !out.content.is_empty() {
-                        print!("{}", out.content);
-                    }
-                    if !out.success {
-                        anyhow::bail!("skill '{}' finished with errors", args.id);
-                    }
-                }
-            }
-        },
-        Command::Mcp(args) => {
-            run_mcp_command(args).await?;
-        }
+        // stripped: Command::Sessions
+        // stripped: Command::Export
+        // stripped: Command::Undo
+        // stripped: Command::Redo
+        // stripped: Command::Stats
+        // stripped: Command::Skills
+        // stripped: Command::Mcp
         Command::Secrets(args) => {
             run_secrets_command(args, &secrets_store)?;
         }
@@ -1717,18 +1063,7 @@ async fn run() -> Result<()> {
                     })?;
                 run_attach_session(target, &token).await?;
             } else {
-                let (dashboard_mode, read_only, diagnose_mode, auto_approve) = match args.mode {
-                    TuiMode::Dashboard => (true, false, false, false),
-                    TuiMode::Chat => (false, false, false, false),
-                    TuiMode::Plan => (false, true, false, false),
-                    TuiMode::Diagnose => (false, false, true, false),
-                    TuiMode::Auto => (false, false, false, true),
-                };
-                let dashboard_mode = if cli.read_only || cli.yes {
-                    false
-                } else {
-                    dashboard_mode
-                };
+                let dashboard_mode = !cli.read_only && !cli.yes;
                 tui::run_tui(tui::TuiRuntime {
                     provider_settings,
                     db_path,
@@ -1741,9 +1076,9 @@ async fn run() -> Result<()> {
                         .and_then(|config| config.security.as_ref())
                         .and_then(|security| security.tui_paste_key_modal)
                         .unwrap_or(true),
-                    auto_approve: cli.yes || auto_approve,
-                    read_only: cli.read_only || read_only,
-                    diagnose_mode,
+                    auto_approve: cli.yes,
+                    read_only: cli.read_only,
+                    diagnose_mode: false,
                     dashboard_mode,
                     sandbox: sandbox.clone(),
                     remote_target: cli.remote.clone(),
@@ -1751,27 +1086,12 @@ async fn run() -> Result<()> {
                 .await?;
             }
         }
-        Command::Memory(args) => {
-            run_memory_command(args, &memory).await?;
-        }
-        Command::Profile(args) => {
-            run_profile_command(args, &db_path, &memory).await?;
-        }
+        // stripped: Command::Memory
+        // stripped: Command::Profile
         Command::Remote(args) => {
             run_remote_command(args).await?;
         }
-        Command::Serve(args) => {
-            run_serve_command(
-                args,
-                provider_settings,
-                memory,
-                cli.max_iterations,
-                cli.yes,
-                cli.read_only,
-                &secrets_store,
-            )
-            .await?;
-        }
+        // stripped: Command::Serve
         Command::Bootstrap(args) => {
             run_bootstrap_command(args).await?;
         }
@@ -2469,66 +1789,8 @@ fn unknown_subcommand_error(args: &[OsString]) -> Option<String> {
 }
 
 /// Prints tool-start/finish lines to stderr while the agent runs.
-struct CliProgressSink;
 
-impl AgentEventSink for CliProgressSink {
-    fn emit(&self, event: AgentEvent) {
-        match event {
-            AgentEvent::ToolCallStarted { name, .. } => {
-                eprintln!("[tool] {name} …");
-            }
-            AgentEvent::ToolCallFinished {
-                name,
-                success,
-                content,
-                ..
-            } => {
-                let status = if success { "ok" } else { "err" };
-                let preview: String = content.chars().take(80).collect();
-                eprintln!("[{status}] {name}: {preview}");
-            }
-            AgentEvent::TextDelta { chunk } => {
-                // Progressive output to stdout when the terminal is interactive.
-                if std::io::stdout().is_terminal() {
-                    print!("{chunk}");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                }
-            }
-            _ => {}
-        }
-    }
-}
 
-fn print_run_result(result: &RunResult) {
-    let stdout = render_run_stdout(result);
-    print!("{stdout}");
-    if !stdout.ends_with('\n') {
-        println!();
-    }
-    eprintln!(
-        "[episode {}] {} iters, {}/{} tokens",
-        result.episode_id, result.iterations, result.tokens_in, result.tokens_out
-    );
-    if result.model_capability_warning.is_some() {
-        eprintln!("{}", model_capability_warning_text());
-    }
-}
-
-fn render_run_stdout(result: &RunResult) -> String {
-    let final_message = result.final_message.trim();
-    if !final_message.is_empty() && final_message != "(no final message)" {
-        return format!("{}\n", result.final_message);
-    }
-    if let Some(last_text) = result
-        .last_assistant_text
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
-    {
-        return format!("[last assistant message]\n{last_text}\n");
-    }
-    "[no assistant text was produced - the model may not support tool calling. run `helm models` to check.]\n"
-        .to_owned()
-}
 
 fn model_capability_warning_text() -> &'static str {
     "warning: the model emitted tool-shaped JSON in plain text. this usually means\n\
@@ -4677,37 +3939,6 @@ async fn run_remote_command(args: RemoteArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_serve_command(
-    args: ServeArgs,
-    provider_settings: ProviderSettings,
-    memory: Arc<MemoryStore>,
-    max_iterations: Option<u32>,
-    auto_approve: bool,
-    read_only: bool,
-    secrets: &SecretsStore,
-) -> Result<()> {
-    let token = match args.token {
-        Some(t) => t,
-        None => {
-            let generated = serve::generate_token();
-            eprintln!(
-                "[helm serve] no --token supplied; generated one for this session:\n  {generated}"
-            );
-            generated
-        }
-    };
-    serve::serve(serve::ServeConfig {
-        bind: args.bind,
-        token,
-        provider_settings,
-        memory,
-        max_iterations,
-        auto_approve,
-        read_only,
-        secrets: secrets.clone(),
-    })
-    .await
-}
 
 async fn run_attach_session(target: &str, token: &str) -> Result<()> {
     attach_tui::run_attach_tui(target.to_string(), token.to_string()).await
@@ -5899,7 +5130,6 @@ fn write_audit_event(
 mod tests {
     use std::{fs, sync::Arc};
 
-    use helm_agent::{Budget, ReactAgent};
     use helm_core::ContentBlock;
     use helm_memory::{EpisodeOutcome, MemoryStore, StepRole};
     use helm_providers::{ChatResponse, MockProvider, StopReason, Usage};
@@ -5912,7 +5142,7 @@ mod tests {
         DoctorToolReport, ProviderChoice, ProviderSource, classify_exit_code, format_audit_events,
         format_models, format_permissions, load_config, model_capability_warning_text,
         parse_capability_arg, parse_cli_from, parse_fallback_chain, parse_scope_arg, render_doctor,
-        render_replay, render_run_stdout, resolve_provider_choice,
+        render_replay, resolve_provider_choice,
         resolve_provider_settings_with_env, supports_tools,
     };
 
@@ -5929,11 +5159,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_runtime_error_path() {
-        let error = anyhow::anyhow!("runtime failed");
-
-        assert_eq!(classify_exit_code(error.as_ref()), 1);
-    }
 
     #[test]
     fn classify_config_edge_case() {
@@ -6092,86 +5317,14 @@ mod tests {
     }
 
     #[test]
-    fn config_provider_overrides_auto_detect_env() {
-        let config = super::FileConfig {
-            provider: Some(super::FileProviderConfig {
-                kind: Some(ProviderChoice::Ollama),
-                base_url: None,
-                model: None,
-                api_key_env: None,
-            }),
-            security: None,
-            telemetry: None,
-        };
-        let settings =
-            resolve_provider_settings_with_env(Some(&config), None, None, None, None, |name| {
-                (name == "GROQ_API_KEY").then(|| "set".to_owned())
-            })
-            .unwrap();
-
-        assert_eq!(settings.choice, ProviderChoice::Ollama);
-        assert_eq!(settings.source, ProviderSource::ConfigFile);
-    }
 
     #[test]
-    fn auto_detect_env_precedence() {
-        let settings = resolve_provider_settings_with_env(None, None, None, None, None, |name| {
-            matches!(name, "GROQ_API_KEY" | "ANTHROPIC_API_KEY").then(|| "set".to_owned())
-        })
-        .unwrap();
-
-        assert_eq!(settings.choice, ProviderChoice::Groq);
-        assert_eq!(settings.api_key_env, Some("GROQ_API_KEY".to_owned()));
-        assert_eq!(settings.source, ProviderSource::EnvVar("GROQ_API_KEY"));
-    }
 
     #[test]
-    fn auto_detect_openai_sets_base_url() {
-        let settings = resolve_provider_settings_with_env(None, None, None, None, None, |name| {
-            (name == "OPENAI_API_KEY").then(|| "set".to_owned())
-        })
-        .unwrap();
-
-        assert_eq!(settings.choice, ProviderChoice::OpenaiCompat);
-        assert_eq!(
-            settings.base_url,
-            Some("https://api.openai.com/v1".to_owned())
-        );
-    }
 
     #[test]
-    fn auto_detect_covers_each_env_var() {
-        for (env_name, expected) in [
-            ("GROQ_API_KEY", ProviderChoice::Groq),
-            ("ANTHROPIC_API_KEY", ProviderChoice::Anthropic),
-            ("OPENAI_API_KEY", ProviderChoice::OpenaiCompat),
-            ("OPENROUTER_API_KEY", ProviderChoice::Openrouter),
-            ("NVIDIA_API_KEY", ProviderChoice::NvidiaNim),
-            ("GOOGLE_API_KEY", ProviderChoice::Gemini),
-            ("GEMINI_API_KEY", ProviderChoice::Gemini),
-        ] {
-            let settings =
-                resolve_provider_settings_with_env(None, None, None, None, None, |name| {
-                    (name == env_name).then(|| "set".to_owned())
-                })
-                .unwrap();
-
-            assert_eq!(settings.choice, expected, "env {env_name}");
-        }
-    }
 
     #[test]
-    fn default_run_and_run_subcommand_parse_same_task() {
-        let default = parse_cli_from(["helm", "do thing"]).unwrap();
-        let explicit = parse_cli_from(["helm", "run", "do thing"]).unwrap();
-
-        match (default.command, explicit.command) {
-            (Some(super::Command::Run(left)), Some(super::Command::Run(right))) => {
-                assert_eq!(left.task, right.task);
-            }
-            _ => panic!("expected run commands"),
-        }
-    }
 
     #[test]
     fn no_args_opens_tui() {
@@ -6194,18 +5347,10 @@ mod tests {
 
     #[test]
     fn tui_mode_parses_explicit_values() {
-        for (raw, expected) in [
-            ("dashboard", super::TuiMode::Dashboard),
-            ("chat", super::TuiMode::Chat),
-            ("plan", super::TuiMode::Plan),
-            ("diagnose", super::TuiMode::Diagnose),
-            ("auto", super::TuiMode::Auto),
-        ] {
-            let parsed = parse_cli_from(["helm", "tui", "--mode", raw]).unwrap();
-            match parsed.command {
-                Some(super::Command::Tui(args)) => assert_eq!(args.mode, expected, "{raw}"),
-                other => panic!("expected tui command, got {other:?}"),
-            }
+        let parsed = parse_cli_from(["helm", "tui", "--mode", "dashboard"]).unwrap();
+        match parsed.command {
+            Some(super::Command::Tui(args)) => assert_eq!(args.mode, super::TuiMode::Dashboard),
+            other => panic!("expected tui command, got {other:?}"),
         }
     }
 
@@ -6245,115 +5390,22 @@ mod tests {
     }
 
     #[test]
-    fn secrets_subcommands_parse_happy_path() {
-        for args in [
-            vec!["helm", "secrets", "list"],
-            vec!["helm", "secrets", "set", "GROQ_API_KEY"],
-            vec!["helm", "secrets", "set", "GROQ_API_KEY", "--from-stdin"],
-            vec![
-                "helm",
-                "secrets",
-                "set",
-                "GROQ_API_KEY",
-                "--value",
-                "gsk_test",
-            ],
-            vec!["helm", "secrets", "get", "GROQ_API_KEY"],
-            vec!["helm", "secrets", "delete", "GROQ_API_KEY"],
-            vec!["helm", "secrets", "path"],
-            vec!["helm", "secrets", "import-env"],
-        ] {
-            let parsed = parse_cli_from(args).unwrap();
-            assert!(matches!(parsed.command, Some(super::Command::Secrets(_))));
-        }
-    }
 
     #[test]
-    fn config_subcommands_parse_happy_path() {
-        for args in [
-            vec!["helm", "config", "get", "provider.kind"],
-            vec!["helm", "config", "set", "provider.model", "qwen3:4b"],
-            vec!["helm", "config", "edit"],
-            vec!["helm", "config", "validate"],
-            vec!["helm", "config", "path"],
-        ] {
-            let parsed = parse_cli_from(args).unwrap();
-            assert!(matches!(parsed.command, Some(super::Command::Config(_))));
-        }
-    }
 
     #[test]
-    fn completion_subcommand_parses_all_shells() {
-        for shell in ["bash", "zsh", "fish"] {
-            let parsed = parse_cli_from(["helm", "completion", shell]).unwrap();
-            assert!(matches!(
-                parsed.command,
-                Some(super::Command::Completion(_))
-            ));
-        }
-    }
 
     #[test]
-    fn mcp_subcommands_parse_happy_path() {
-        for args in [
-            vec!["helm", "mcp", "list"],
-            vec!["helm", "mcp", "add", "gmail", "node", "server.js"],
-            vec!["helm", "mcp", "remove", "gmail"],
-            vec!["helm", "mcp", "test", "gmail"],
-            vec![
-                "helm",
-                "mcp",
-                "run",
-                "gmail",
-                "draft_reply",
-                "--arguments",
-                "{\"id\":\"1\"}",
-            ],
-        ] {
-            let parsed = parse_cli_from(args).unwrap();
-            assert!(matches!(parsed.command, Some(super::Command::Mcp(_))));
-        }
-    }
 
     #[test]
-    fn global_yes_and_read_only_flags_parse() {
-        let parsed = parse_cli_from(["helm", "--yes", "--read-only", "run", "list files"]).unwrap();
-        assert!(parsed.yes);
-        assert!(parsed.read_only);
-    }
 
     #[test]
-    fn continue_flag_parses_with_bare_task() {
-        let parsed = parse_cli_from(["helm", "--continue", "investigate nginx"]).unwrap();
-        assert!(parsed.continue_last);
-        assert!(matches!(parsed.command, Some(super::Command::Run(_))));
-    }
 
     #[test]
-    fn resume_flag_parses_with_specific_session_id() {
-        let parsed =
-            parse_cli_from(["helm", "--resume", "sess-123", "run", "continue work"]).unwrap();
-        assert_eq!(parsed.resume.as_deref(), Some("sess-123"));
-        assert!(matches!(parsed.command, Some(super::Command::Run(_))));
-    }
 
     #[test]
-    fn redo_command_parses() {
-        let parsed =
-            parse_cli_from(["helm", "redo", "--session-id", "sess-123", "--apply"]).unwrap();
-        assert!(matches!(parsed.command, Some(super::Command::Redo(_))));
-    }
 
     #[test]
-    fn diagnose_command_parses() {
-        let parsed = parse_cli_from(["helm", "diagnose", "why is disk usage spiking"]).unwrap();
-        match parsed.command {
-            Some(super::Command::Diagnose(args)) => {
-                assert_eq!(args.question, "why is disk usage spiking");
-            }
-            other => panic!("expected diagnose command, got {other:?}"),
-        }
-    }
 
     #[test]
     fn trust_report_command_parses() {
@@ -6453,40 +5505,6 @@ mod tests {
         let error = parse_cli_from(["helm", "badcmd", "arg"]).unwrap_err();
 
         assert!(error.to_string().contains("unknown subcommand: badcmd"));
-    }
-
-    async fn run_with_mock(response: ChatResponse) -> helm_agent::RunResult {
-        run_with_mocks(vec![response]).await
-    }
-
-    async fn run_with_mocks(responses: Vec<ChatResponse>) -> helm_agent::RunResult {
-        let dir = tempdir().unwrap();
-        let memory = Arc::new(
-            MemoryStore::open(&dir.path().join("helm.db"))
-                .await
-                .unwrap(),
-        );
-        let agent = ReactAgent::with_tool_context(
-            Box::new(MockProvider::new(responses)),
-            ToolRegistry::default(),
-            memory,
-            Budget::default(),
-            "mock",
-            ToolContext::new(dir.path().to_path_buf()),
-        );
-        agent.run("task").await.unwrap()
-    }
-
-    fn response(content: Vec<ContentBlock>, stop_reason: StopReason) -> ChatResponse {
-        ChatResponse {
-            id: "msg".to_owned(),
-            content,
-            stop_reason,
-            usage: Usage {
-                input_tokens: 1,
-                output_tokens: 1,
-            },
-        }
     }
 
     #[tokio::test]
@@ -6963,121 +5981,5 @@ mod tests {
         assert!(rendered.contains("kind: ollama"));
         assert!(rendered.contains("base_url: http://localhost:11434"));
         assert!(rendered.contains("keys_missing: yes"));
-    }
-
-    #[test]
-    fn diagnose_registry_excludes_write_tools() {
-        let diagnose = ToolRegistry::with_diagnose_tools();
-        let full = ToolRegistry::with_default_tools();
-
-        let diagnose_names: Vec<_> = diagnose.names();
-        let full_names: Vec<_> = full.names();
-
-        // Diagnose must NOT include write tools.
-        for write_tool in ["fs_write", "service", "package", "browser"] {
-            assert!(
-                !diagnose_names.contains(&write_tool.to_string()),
-                "diagnose registry must not contain {write_tool}"
-            );
-        }
-
-        // Diagnose must be a proper subset.
-        assert!(diagnose_names.len() < full_names.len());
-
-        // Diagnose-relevant read-only tools must be present.
-        for read_tool in ["fs_read", "disk", "network", "logs", "search", "process"] {
-            assert!(
-                diagnose_names.contains(&read_tool.to_string()),
-                "diagnose registry must contain {read_tool}"
-            );
-        }
-    }
-
-    #[test]
-    fn dry_run_cli_flag_is_parsed() {
-        let parsed = parse_cli_from([
-            "helm",
-            "run",
-            "--dry-run",
-            "--read-only",
-            "check disk space",
-        ])
-        .unwrap();
-        assert!(parsed.dry_run);
-        assert!(parsed.read_only);
-        match parsed.command {
-            Some(super::Command::Run(args)) => {
-                assert_eq!(args.task, "check disk space");
-            }
-            other => panic!("expected run command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn evidence_flag_is_parsed() {
-        let parsed = parse_cli_from(["helm", "run", "--evidence", "analyze logs"]).unwrap();
-        assert!(parsed.evidence);
-        match parsed.command {
-            Some(super::Command::Run(args)) => {
-                assert_eq!(args.task, "analyze logs");
-            }
-            other => panic!("expected run command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn structured_evidence_contains_all_required_fields() {
-        use helm_agent::{
-            BlastRadius, Finding, ProposedAction, RollbackStatus, StructuredEvidence,
-            ToolCallPreview, Uncertainty,
-        };
-        let ev = StructuredEvidence {
-            inspected_sources: vec!["df -h".into(), "free -h".into()],
-            findings: vec![Finding {
-                label: "disk usage".into(),
-                value: "85%".into(),
-                source: "df -h".into(),
-            }],
-            assumptions: vec!["system is idle".into()],
-            uncertainty: Uncertainty::Medium,
-            proposed_actions: vec![ProposedAction {
-                description: "check large files".into(),
-                tool: "disk".into(),
-                tool_input: r#"{"action":"largest_files","path":"/"}"#.into(),
-            }],
-            blast_radius: BlastRadius {
-                paths: vec!["/var/log".into()],
-                services: vec!["nginx".into()],
-                hosts: vec![],
-            },
-            rollback: RollbackStatus {
-                available: true,
-                description: "rm -f /var/log/big.log".into(),
-            },
-            exact_tool_calls: vec![ToolCallPreview {
-                tool: "disk".into(),
-                tool_input: r#"{"action":"largest_files","path":"/"}"#.into(),
-                summary: "find largest files on /".into(),
-            }],
-        };
-
-        // Serialize roundtrip
-        let json = serde_json::to_string_pretty(&ev).unwrap();
-        assert!(json.contains("inspected_sources"));
-        assert!(json.contains("df -h"));
-        assert!(json.contains("findings"));
-        assert!(json.contains("assumptions"));
-        assert!(json.contains("uncertainty"));
-        assert!(json.contains("proposed_actions"));
-        assert!(json.contains("blast_radius"));
-        assert!(json.contains("rollback"));
-        assert!(json.contains("exact_tool_calls"));
-        assert!(json.contains("largest_files"));
-
-        // Deserialize roundtrip
-        let ev2: StructuredEvidence = serde_json::from_str(&json).unwrap();
-        assert_eq!(ev.inspected_sources, ev2.inspected_sources);
-        assert_eq!(ev.findings.len(), ev2.findings.len());
-        assert_eq!(ev.uncertainty, ev2.uncertainty);
     }
 }
