@@ -985,6 +985,8 @@ struct DashboardData {
     age_distribution: Vec<(String, u64)>,
     snapshot_id: String,
     collector_errors: Vec<String>,
+    /// Per-collector health: (domain_name, is_healthy, optional_error_reason).
+    collector_health: Vec<(String, bool, Option<String>)>,
     domains: SnapshotDomains,
     plans: Vec<TroubleshootingPlanRecord>,
     change_sets: Vec<ChangeSetRecord>,
@@ -4521,12 +4523,25 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                 .then(right.last_seen.cmp(&left.last_seen))
                 .then(right.occurrence_count.cmp(&left.occurrence_count))
         });
-        let collector_errors =
+        let collector_errors_raw =
             serde_json::from_str::<Vec<CollectorError>>(&record.collector_errors_json)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|e| format!("{}: {}", e.domain, e.message))
-                .collect::<Vec<_>>();
+                .unwrap_or_default();
+        let collector_errors: Vec<String> = collector_errors_raw
+            .iter()
+            .map(|e| format!("{}: {}", e.domain, e.message))
+            .collect();
+        let collector_health: Vec<(String, bool, Option<String>)> = SnapshotDomains::domain_names()
+            .iter()
+            .map(|&domain| {
+                let err = collector_errors_raw
+                    .iter()
+                    .find(|e| e.domain == domain);
+                match err {
+                    Some(e) => (domain.to_string(), false, Some(e.message.clone())),
+                    None => (domain.to_string(), true, None),
+                }
+            })
+            .collect();
         let plans = TroubleshootingPlanStore::list(&conn, 12).unwrap_or_default();
         let change_sets = ChangeSetStore::list(&conn, 12).unwrap_or_default();
         let audit_events = conn
@@ -4602,6 +4617,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             age_distribution,
             collected_at,
             collector_errors,
+            collector_health,
             domains,
             plans,
             change_sets,
@@ -5058,19 +5074,47 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         }
     }
     // ── collector health ──────────────────────────────────────────────
-    let total_domains = 12u64; // SnapshotDomains has 12 domain fields
-    let collector_line = if d.collector_errors.is_empty() {
-        Line::from(Span::styled("collectors ✓", Style::default().fg(OPS_GREEN)))
+    let total_domains = d.collector_health.len() as u64;
+    let healthy_count = d.collector_health.iter().filter(|(_, h, _)| *h).count() as u64;
+    let fail_ratio = if total_domains > 0 {
+        (total_domains - healthy_count) as f64 / total_domains as f64
     } else {
-        let err_count = d.collector_errors.len() as u64;
-        let color = if err_count > total_domains / 2 {
-            OPS_RED
-        } else {
-            OPS_YELLOW
-        };
+        0.0
+    };
+    let collector_color = if fail_ratio == 0.0 {
+        OPS_GREEN
+    } else if fail_ratio < 0.25 {
+        OPS_YELLOW
+    } else {
+        OPS_RED
+    };
+    let collector_line = if d.collector_errors.is_empty() {
         Line::from(Span::styled(
-            format!("collectors ⚠ {} err(s)", err_count),
-            Style::default().fg(color),
+            format!(
+                "collectors {}/{} ✓",
+                healthy_count, total_domains
+            ),
+            Style::default().fg(collector_color),
+        ))
+    } else {
+        let first_failing = d
+            .collector_health
+            .iter()
+            .find(|(_, h, _)| !*h)
+            .map(|(domain, _, reason)| {
+                format!(
+                    "{}: {}",
+                    domain,
+                    reason.as_deref().unwrap_or("unknown")
+                )
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        Line::from(Span::styled(
+            format!(
+                "collectors {}/{} ⚠ {}",
+                healthy_count, total_domains, first_failing
+            ),
+            Style::default().fg(collector_color),
         ))
     };
 
@@ -8738,6 +8782,10 @@ mod tests {
             finding_count: 2,
             finding_warnings: 1,
             collected_at: "14:30:00 UTC".into(),
+            collector_health: SnapshotDomains::domain_names()
+                .iter()
+                .map(|&d| (d.to_string(), true, None))
+                .collect(),
             findings: vec![
                 FindingSummary {
                     id: "finding-001".into(),
@@ -8858,7 +8906,7 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         let mut data = test_dash_data();
-        // Default: no errors, no tick → "collectors ✓", "tick: --"
+        // Default: no errors, no tick → "collectors 13/13 ✓", "tick: --"
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
         app.dashboard.data = data.clone();
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
@@ -8868,19 +8916,41 @@ mod tests {
             "should show collector health when no errors: got '{rendered}'"
         );
         assert!(
+            rendered.contains("13/13"),
+            "should show all healthy count: got '{rendered}'"
+        );
+        assert!(
             rendered.contains("tick:"),
             "should show tick placeholder when no tick: got '{rendered}'"
         );
 
-        // With collector errors: "collectors ⚠ N err(s)"
+        // With collector errors: "collectors 11/13 ⚠ load: timeout"
         data.collector_errors = vec!["load: timeout".into(), "disks: permission denied".into()];
+        data.collector_health = SnapshotDomains::domain_names()
+            .iter()
+            .map(|&d| {
+                let healthy = d != "load" && d != "disks";
+                let reason = if d == "load" {
+                    Some("timeout".to_string())
+                } else if d == "disks" {
+                    Some("permission denied".to_string())
+                } else {
+                    None
+                };
+                (d.to_string(), healthy, reason)
+            })
+            .collect();
         app.dashboard.data = data.clone();
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            rendered.contains("2 err(s)"),
-            "should show collector error count: got '{rendered}'"
+            rendered.contains("11/13"),
+            "should show healthy/total count: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("load: timeout"),
+            "should show first failing domain with reason: got '{rendered}'"
         );
 
         // With a live tick: "tick #5  last: Xs"

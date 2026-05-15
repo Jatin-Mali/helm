@@ -447,6 +447,27 @@ pub struct CollectorError {
     pub is_timeout: bool,
 }
 
+impl SnapshotDomains {
+    /// Return the 13 domain names in a stable order matching the struct fields.
+    pub fn domain_names() -> Vec<&'static str> {
+        vec![
+            "host",
+            "load",
+            "disks",
+            "services",
+            "containers",
+            "ports",
+            "logs",
+            "backups",
+            "packages",
+            "timers",
+            "network",
+            "processes",
+            "firewall",
+        ]
+    }
+}
+
 // ── Helper constructors ────────────────────────────────────────────────────
 
 impl SystemSnapshot {
