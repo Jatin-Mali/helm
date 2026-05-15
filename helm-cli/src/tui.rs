@@ -9404,8 +9404,8 @@ mod tests {
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
         app.dashboard.view = DashboardView::FindingDetail(0);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
-        render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 50));
+        render_dashboard(&app, Rect::new(0, 0, 100, 50), &mut buf);
         let rendered = buf_to_string(&buf);
 
         assert!(
@@ -9414,15 +9414,24 @@ mod tests {
         );
         assert!(
             rendered.contains("WHAT HAPPENED"),
-            "detail should show what-happened section"
+            "detail should show WHAT HAPPENED section"
         );
         assert!(
             rendered.contains("Detector ID"),
             "detail should show detector_id in WHAT HAPPENED"
         );
+        assert!(rendered.contains("WHEN"), "detail should show WHEN section");
         assert!(
             rendered.contains("EVIDENCE"),
-            "detail should show evidence section"
+            "detail should show EVIDENCE section"
+        );
+        assert!(
+            rendered.contains("WHY"),
+            "detail should show WHY (correlation) section"
+        );
+        assert!(
+            rendered.contains("IMPACT"),
+            "detail should show IMPACT section"
         );
         // Verify correlation engine added correlated_finding_ids
         let finding0 = &app.dashboard.data.findings[0];
@@ -9908,6 +9917,450 @@ mod tests {
         assert!(
             rendered.contains("0 kernel errors, 0 auth failures"),
             "should show 0 counts"
+        );
+    }
+
+    #[test]
+    fn dash_detail_shows_detector_id() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.view = DashboardView::FindingDetail(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 50));
+        render_dashboard(&app, Rect::new(0, 0, 100, 50), &mut buf);
+        let rendered = buf_to_string(&buf);
+
+        assert!(
+            rendered.contains("Detector ID  disk-usage-detector"),
+            "detail should show detector_id value in WHAT HAPPENED: got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_detail_shows_correlated_findings() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+        // Both findings already have correlated_finding_ids via test_dash_data(),
+        // but we set up a fresh pair with same domain to guarantee correlation.
+        data.findings = vec![
+            FindingSummary {
+                id: "finding-cor-001".into(),
+                fingerprint: "fp-c1".into(),
+                severity: "critical".into(),
+                confidence: "high".into(),
+                title: "OOM killer invoked".into(),
+                affected_resource: "system".into(),
+                snapshot_id: "snap-001".into(),
+                domain: "processes".into(),
+                kind: "Kernel".into(),
+                host: "testbox".into(),
+                status: DashboardFindingState::New,
+                occurrence_count: 1,
+                first_seen: Utc::now().timestamp() - 3600,
+                last_seen: Utc::now().timestamp() - 600,
+                age_label: "1h ago".into(),
+                sample: "OOM killed process".into(),
+                state_note: String::new(),
+                evidence_text: "kernel: Out of memory".into(),
+                evidence_sources: vec!["kernel.oom".into()],
+                impact: "process terminated".into(),
+                assumptions: vec![],
+                missing_data: vec![],
+                read_only_checks: vec!["dmesg | grep -i oom".into()],
+                fix_plan: Some("increase memory limit".into()),
+                risk: "high".into(),
+                rollback: "revert memory limits".into(),
+                command_preview: "sysctl vm.overcommit_memory=0".into(),
+                detector_id: "oom-detector".into(),
+                correlated_finding_ids: vec!["finding-cor-002".into()],
+            },
+            FindingSummary {
+                id: "finding-cor-002".into(),
+                fingerprint: "fp-c2".into(),
+                severity: "warning".into(),
+                confidence: "medium".into(),
+                title: "High memory pressure".into(),
+                affected_resource: "system".into(),
+                snapshot_id: "snap-001".into(),
+                domain: "processes".into(),
+                kind: "Memory".into(),
+                host: "testbox".into(),
+                status: DashboardFindingState::Open,
+                occurrence_count: 1,
+                first_seen: Utc::now().timestamp() - 3600,
+                last_seen: Utc::now().timestamp() - 900,
+                age_label: "1h ago".into(),
+                sample: "memory pressure".into(),
+                state_note: String::new(),
+                evidence_text: "mem_available below threshold".into(),
+                evidence_sources: vec!["memory.pressure".into()],
+                impact: "performance degradation".into(),
+                assumptions: vec![],
+                missing_data: vec![],
+                read_only_checks: vec!["free -h".into()],
+                fix_plan: Some("add swap".into()),
+                risk: "medium".into(),
+                rollback: "remove swap file".into(),
+                command_preview: "fallocate -l 2G /swapfile".into(),
+                detector_id: "memory-pressure-detector".into(),
+                correlated_finding_ids: vec!["finding-cor-001".into()],
+            },
+        ];
+        data.metrics = DashboardMetrics {
+            open: 1,
+            new: 1,
+            ..Default::default()
+        };
+        app.dashboard.data = data;
+        app.dashboard.view = DashboardView::FindingDetail(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 50));
+        render_dashboard(&app, Rect::new(0, 0, 100, 50), &mut buf);
+        let rendered = buf_to_string(&buf);
+
+        assert!(
+            rendered.contains("WHY"),
+            "detail should show WHY section: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("Correlated findings"),
+            "WHY section should mention correlated findings: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("High memory pressure"),
+            "WHY section should list correlated finding by title: got '{rendered}'"
+        );
+        // No "No correlated findings" message when correlations exist
+        assert!(
+            !rendered.contains("No correlated findings"),
+            "should NOT show 'No correlated findings' when correlations exist: got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_no_provider_guard_blocks_alt_g() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use Groq (cloud provider) WITHOUT an API key to trigger the guard.
+        let mut app = app_in_dir(&dir, ProviderChoice::Groq);
+        // Explicitly clear the API key in case env var leaked in.
+        app.active_settings.api_key = None;
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.selected_finding = 0;
+
+        // verify is_llm_provider_configured returns false
+        assert!(
+            !app.is_llm_provider_configured(),
+            "Groq without API key should not be configured"
+        );
+
+        // Call generate_dashboard_plan — should toast instead of proceeding
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(app.generate_dashboard_plan()).unwrap();
+        assert!(
+            app.toast.is_some(),
+            "should set toast when provider not configured"
+        );
+        let toast_text = app.toast.as_ref().unwrap().text.clone();
+        assert!(
+            toast_text.contains("No LLM provider configured"),
+            "toast should mention no provider: got '{toast_text}'"
+        );
+        assert!(
+            toast_text.contains("helmops init"),
+            "toast should suggest helmops init: got '{toast_text}'"
+        );
+    }
+
+    #[test]
+    fn dash_no_provider_guard_blocks_assist_submit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in_dir(&dir, ProviderChoice::Groq);
+        // Explicitly clear the API key in case env var leaked in.
+        app.active_settings.api_key = None;
+        app.mode = AgentMode::Dashboard;
+        app.dashboard.data = test_dash_data();
+        app.dashboard.selected_finding = 0;
+        // Simulate text input
+        app.input.text = "How do I fix this?".into();
+        app.input.cursor = app.input.text.len();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.block_on(app.submit(tx)).unwrap();
+        assert!(
+            app.toast.is_some(),
+            "should set toast when assist submit blocked"
+        );
+        let toast_text = app.toast.as_ref().unwrap().text.clone();
+        assert!(
+            toast_text.contains("No LLM provider configured"),
+            "toast should mention no provider: got '{toast_text}'"
+        );
+    }
+
+    #[test]
+    fn dash_no_provider_guard_ollama_is_always_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_in_dir(&dir, ProviderChoice::Ollama);
+        assert!(
+            app.is_llm_provider_configured(),
+            "Ollama (local provider) should always be considered configured"
+        );
+    }
+
+    #[test]
+    fn dash_filter_active_default() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+        // Mix of states: New, Recurring, and add a Resolved one
+        data.findings.push(FindingSummary {
+            id: "finding-003".into(),
+            fingerprint: "fp-003".into(),
+            severity: "info".into(),
+            confidence: "low".into(),
+            title: "Backup completed".into(),
+            affected_resource: "backup".into(),
+            snapshot_id: "snap-001".into(),
+            domain: "backups".into(),
+            kind: "Backup".into(),
+            host: "testbox".into(),
+            status: DashboardFindingState::Resolved,
+            occurrence_count: 1,
+            first_seen: Utc::now().timestamp() - 7200,
+            last_seen: Utc::now().timestamp() - 100,
+            age_label: "2h ago".into(),
+            sample: "backup ok".into(),
+            state_note: String::new(),
+            evidence_text: "backup completed successfully".into(),
+            evidence_sources: vec!["backups.status".into()],
+            impact: "none".into(),
+            assumptions: vec![],
+            missing_data: vec![],
+            read_only_checks: vec![],
+            fix_plan: None,
+            risk: "none".into(),
+            rollback: "n/a".into(),
+            command_preview: "n/a".into(),
+            detector_id: "backup-detector".into(),
+            correlated_finding_ids: vec![],
+        });
+        data.metrics = DashboardMetrics {
+            open: 1,
+            new: 1,
+            recurring: 1,
+            resolved: 1,
+            critical: 0,
+            warning: 1,
+            ..Default::default()
+        };
+        app.dashboard.data = data;
+
+        // Default filter is Active → should show New, Open, Recurring (NOT Resolved)
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+
+        assert!(
+            rendered.contains("[Active]"),
+            "queue header should show Active filter: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("2 found"),
+            "Active filter should show 2 findings (New+Recurring, resolved is hidden): got '{rendered}'"
+        );
+        // Resolved should be hidden
+        assert!(
+            !rendered.contains("Backup completed"),
+            "Resolved finding should be hidden under Active filter: got '{rendered}'"
+        );
+    }
+
+    #[test]
+    fn dash_filter_cycling_changes_label_and_visible() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+        data.metrics = DashboardMetrics {
+            open: 1,
+            new: 1,
+            recurring: 1,
+            resolved: 0,
+            critical: 1,
+            warning: 1,
+            ..Default::default()
+        };
+        app.dashboard.data = data;
+        app.dashboard.pane = DashboardFocus::Detail;
+
+        // Initial: Active filter (index 0)
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::Active
+        );
+
+        // Cycle right once → All (index 1)
+        app.cycle_dashboard_filter(1);
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::All
+        );
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("[All]"),
+            "queue header should show All filter: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("2 found"),
+            "All filter should show all 2 findings: got '{rendered}'"
+        );
+
+        // Cycle right again → NewOnly (index 2)
+        app.cycle_dashboard_filter(1);
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::NewOnly
+        );
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("[New]"),
+            "queue header should show New filter: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("1 found"),
+            "NewOnly filter should show 1 finding"
+        );
+
+        // Cycle right → OpenOnly (index 3)
+        app.cycle_dashboard_filter(1);
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::OpenOnly
+        );
+
+        // Cycle right → RecurringOnly (index 4)
+        app.cycle_dashboard_filter(1);
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::RecurringOnly
+        );
+
+        // Cycle left back to OpenOnly (index 3)
+        app.cycle_dashboard_filter(-1);
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::OpenOnly
+        );
+
+        // Cycle left to NewOnly (index 2)
+        app.cycle_dashboard_filter(-1);
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::NewOnly
+        );
+
+        // Cycle left to All (index 1)
+        app.cycle_dashboard_filter(-1);
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::All
+        );
+
+        // Cycle left to Active (index 0)
+        app.cycle_dashboard_filter(-1);
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::Active
+        );
+
+        // Clamping at left boundary: Active at index 0, left should stay at Active
+        app.cycle_dashboard_filter(-1);
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::Active,
+            "left from Active should stay at Active (saturating_sub)"
+        );
+
+        // Cycle all the way right to ResolvedOnly (last filter, index 6)
+        for _ in 0..6 {
+            app.cycle_dashboard_filter(1);
+        }
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::ResolvedOnly
+        );
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
+        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        let rendered = buf_to_string(&buf);
+        assert!(
+            rendered.contains("[Resolved]"),
+            "queue header should show Resolved filter: got '{rendered}'"
+        );
+
+        // Clamping at right boundary: ResolvedOnly at index 6, right should stay
+        app.cycle_dashboard_filter(1);
+        assert_eq!(
+            app.dashboard.finding_state_filter,
+            DashboardFindingStateFilter::ResolvedOnly,
+            "right from ResolvedOnly should stay at ResolvedOnly (clamped)"
+        );
+    }
+
+    #[test]
+    fn dash_detail_empty_correlation_shows_no_message() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+        // Finding with NO correlations
+        data.findings = vec![FindingSummary {
+            id: "finding-solo".into(),
+            fingerprint: "fp-solo".into(),
+            severity: "warning".into(),
+            confidence: "medium".into(),
+            title: "Standalone issue".into(),
+            affected_resource: "standalone".into(),
+            snapshot_id: "snap-001".into(),
+            domain: "network".into(),
+            kind: "Network".into(),
+            host: "testbox".into(),
+            status: DashboardFindingState::New,
+            occurrence_count: 1,
+            first_seen: Utc::now().timestamp() - 600,
+            last_seen: Utc::now().timestamp() - 100,
+            age_label: "10m ago".into(),
+            sample: "standalone".into(),
+            state_note: String::new(),
+            evidence_text: "no related findings".into(),
+            evidence_sources: vec!["network.status".into()],
+            impact: "none".into(),
+            assumptions: vec![],
+            missing_data: vec![],
+            read_only_checks: vec![],
+            fix_plan: None,
+            risk: "low".into(),
+            rollback: "n/a".into(),
+            command_preview: "n/a".into(),
+            detector_id: "network-detector".into(),
+            correlated_finding_ids: vec![],
+        }];
+        app.dashboard.data = data;
+        app.dashboard.view = DashboardView::FindingDetail(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 50));
+        render_dashboard(&app, Rect::new(0, 0, 100, 50), &mut buf);
+        let rendered = buf_to_string(&buf);
+
+        assert!(
+            rendered.contains("WHY"),
+            "detail should still show WHY section: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("No correlated findings"),
+            "WHY section should say 'No correlated findings': got '{rendered}'"
         );
     }
 }
