@@ -6111,6 +6111,15 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         text.push_str("  No correlated findings\n");
     } else {
         text.push_str("  Correlated findings (same snapshot):\n");
+        // Deduplicate by title; show ×count when many correlations share the same title,
+        // and keep the highest severity observed for that title.
+        let mut groups: std::collections::HashMap<String, (String, usize)> =
+            std::collections::HashMap::new();
+        let severity_rank = |s: &str| match s {
+            "critical" => 0u8,
+            "warning" => 1,
+            _ => 2,
+        };
         for corr_id in &finding.correlated_finding_ids {
             if let Some(corr) = app
                 .dashboard
@@ -6120,7 +6129,28 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 .find(|f| f.id == *corr_id)
             {
                 let sev = corr.severity.to_ascii_uppercase();
-                text.push_str(&format!("    ● {sev}  {}\n", corr.title));
+                let entry = groups
+                    .entry(corr.title.clone())
+                    .or_insert_with(|| (sev.clone(), 0));
+                entry.1 += 1;
+                // Keep the highest severity.
+                if severity_rank(&corr.severity) < severity_rank(&entry.0.to_ascii_lowercase()) {
+                    entry.0 = sev;
+                }
+            }
+        }
+        // Sort by severity then count, most important first.
+        let mut sorted: Vec<_> = groups.into_iter().collect();
+        sorted.sort_by(|a, b| {
+            severity_rank(&a.1.0.to_ascii_lowercase())
+                .cmp(&severity_rank(&b.1.0.to_ascii_lowercase()))
+                .then(b.1.1.cmp(&a.1.1))
+        });
+        for (title, (sev, count)) in &sorted {
+            if *count > 1 {
+                text.push_str(&format!("    ● {sev}  {title}  (×{count})\n"));
+            } else {
+                text.push_str(&format!("    ● {sev}  {title}\n"));
             }
         }
     }
@@ -10768,6 +10798,64 @@ mod tests {
         assert!(
             !rendered.contains("No correlated findings"),
             "should NOT show 'No correlated findings' when correlations exist: got '{rendered}'"
+        );
+    }
+
+    /// T1.2.2: 17 correlations with the same title collapse to one line with (×17).
+    #[test]
+    fn why_pane_dedup_17_duplicate_titles() {
+        let mut app = app();
+        app.mode = AgentMode::Dashboard;
+        let mut data = test_dash_data();
+        // Primary finding with 17 correlated ids, all pointing to the same duplicate title.
+        let mut corr_ids = Vec::new();
+        for i in 0..17 {
+            let id = format!("dup-{:02}", i);
+            corr_ids.push(id.clone());
+            data.findings.push(FindingSummary {
+                id,
+                fingerprint: format!("fp-dup-{:02}", i),
+                severity: if i < 3 { "critical" } else { "warning" }.into(),
+                confidence: "high".into(),
+                title: "nginx 5xx spike".into(), // same title for all 17
+                affected_resource: "nginx".into(),
+                snapshot_id: "snap-001".into(),
+                domain: "services".into(),
+                kind: "Nginx".into(),
+                host: "testbox".into(),
+                status: DashboardFindingState::Open,
+                occurrence_count: 1,
+                ..Default::default()
+            });
+        }
+        data.findings[0].correlated_finding_ids = corr_ids;
+        data.findings[0].id = "primary-001".into();
+        data.findings[0].fingerprint = "fp-primary".into();
+        app.dashboard.data = data;
+        app.dashboard.view = DashboardView::FindingDetail(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 50));
+        render_dashboard(&app, Rect::new(0, 0, 100, 50), &mut buf);
+        let rendered = buf_to_string(&buf);
+
+        // Should show exactly one line for "nginx 5xx spike" with ×17, not 17 lines.
+        assert!(
+            rendered.contains("×17"),
+            "expected dedup count ×17: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("nginx 5xx spike"),
+            "expected title nginx 5xx spike: got '{rendered}'"
+        );
+        // Verify the count appears only once (the line itself).
+        let count_x17 = rendered.matches("×17").count();
+        assert_eq!(
+            count_x17, 1,
+            "×17 should appear exactly once, got {count_x17}"
+        );
+        // The severest among the 17 (first 3 are critical) should show CRITICAL.
+        assert!(
+            rendered.contains("● CRITICAL"),
+            "should show CRITICAL (highest severity among duplicates): got '{rendered}'"
         );
     }
 
