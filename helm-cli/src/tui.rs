@@ -6085,6 +6085,34 @@ fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
+    // Split inner: sparklines on top (3 rows), table below.
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(inner);
+
+    let d = &app.dashboard.data;
+    let spark = |label: &str, data: &VecDeque<f64>, color: Color, area: Rect, buf: &mut Buffer| {
+        let points: Vec<u64> = data.iter().map(|&v| v.round() as u64).collect();
+        Sparkline::default()
+            .data(&points)
+            .max(100)
+            .style(Style::default().fg(color))
+            .block(
+                Block::default()
+                    .title(label)
+                    .title_style(Style::default().fg(OPS_DIM))
+                    .borders(Borders::NONE),
+            )
+            .render(area, buf);
+    };
+    let spark_areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(vert[0]);
+    spark("cpu", &d.cpu_history, OPS_GREEN, spark_areas[0], buf);
+    spark("mem", &d.mem_history, OPS_YELLOW, spark_areas[1], buf);
+
     let domains = &app.dashboard.data.domains;
     let mut lines: Vec<Line> = Vec::new();
 
@@ -6174,7 +6202,7 @@ fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines)
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(inner, buf);
+        .render(vert[1], buf);
 }
 
 fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -6492,6 +6520,26 @@ fn render_ops_storage(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
+    // Disk sparkline at top.
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(inner);
+
+    let d = &app.dashboard.data;
+    let points: Vec<u64> = d.disk_history.iter().map(|&v| v.round() as u64).collect();
+    Sparkline::default()
+        .data(&points)
+        .max(100)
+        .style(Style::default().fg(OPS_RED))
+        .block(
+            Block::default()
+                .title("disk %")
+                .title_style(Style::default().fg(OPS_DIM))
+                .borders(Borders::NONE),
+        )
+        .render(vert[0], buf);
+
     let domains = &app.dashboard.data.domains;
     let fses = &domains.disks.filesystems;
     let mut lines: Vec<Line> = Vec::new();
@@ -6583,7 +6631,7 @@ fn render_ops_storage(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines)
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(inner, buf);
+        .render(vert[1], buf);
 }
 
 fn render_ops_containers(app: &TuiApp, area: Rect, buf: &mut Buffer) {
