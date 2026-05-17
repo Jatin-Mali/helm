@@ -151,7 +151,7 @@
 |-------|--------|-----------|
 | 1. M1 — UX Foundation + Agent Strip | Complete | 2026-05-18 |
 | 2. M2 — Real-Time Trends | Complete | 2026-05-18 |
-| 3. M3 — Fleet (Multi-Host) | Not started | — |
+| 3. M3 — Fleet (Multi-Host) | Complete | 2026-05-18 |
 | 4. M4 — Kubernetes / VM / Compose | Not started | — |
 | 5. M5 — Alerting | Not started | — |
 | 6. M6 — AI Excellence | Not started | — |

@@ -1,7 +1,7 @@
 # HELMOPS Project State
 
 **Last Updated:** 2026-05-18  
-**Current Focus:** M3 Planning (Fleet)
+**Current Focus:** M4 — Kubernetes / VM / Compose
 
 ---
 
@@ -19,13 +19,13 @@
 
 ## Current Position
 
-**Milestone:** M1–M2 Complete | M3 (Fleet) Pending
+**Milestone:** M1–M3 Complete | M4 (K8s/VM/Compose) Next
 
 **Completion:**
 - M1 (UX Foundation + Agent Strip) ............................ ████████████████████ 100% ✓
 - M2 (Real-Time Trends) ...................................... ████████████████████ 100% ✓
-- M3 (Fleet) ................................................. ░░░░░░░░░░░░░░░░░░░░  0% (planning)
-- M4 (K8s/VM/Compose) ........................................ ░░░░░░░░░░░░░░░░░░░░  0% (pending)
+- M3 (Fleet) ................................................. ████████████████████ 100% ✓
+- M4 (K8s/VM/Compose) ........................................ ░░░░░░░░░░░░░░░░░░░░  0% (next)
 - M5 (Alerting) .............................................. ░░░░░░░░░░░░░░░░░░░░  0% (pending)
 - M6 (AI Excellence) ......................................... ░░░░░░░░░░░░░░░░░░░░  0% (pending)
 
