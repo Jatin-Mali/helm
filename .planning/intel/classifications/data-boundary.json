@@ -1,0 +1,23 @@
+{
+  "source_path": "/home/white_devil/code/helm/docs/data-boundary.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "Data Boundary",
+  "summary": "Defines hard boundaries between local state, external inputs, taint levels, and approved mutations in HELM.",
+  "scope": [
+    "data boundaries",
+    "taint levels",
+    "provider classification",
+    "mutation controls",
+    "audit logging",
+    "secret protection"
+  ],
+  "cross_refs": [
+    "helm trust-report",
+    "helm audit verify"
+  ],
+  "locked": false,
+  "precedence": 2,
+  "notes": "Manifest type SPEC with precedence 2 applied. Defines data flow contracts and security boundaries."
+}

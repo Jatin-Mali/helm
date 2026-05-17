@@ -1,0 +1,26 @@
+{
+  "source_path": "/home/white_devil/code/helm/docs/agent-on-remote.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "Agent-on-Remote Transport (NDJSON over SSH)",
+  "summary": "Design documentation for remote agent execution over SSH using NDJSON wire format, event types, version compatibility, and security model.",
+  "scope": [
+    "remote execution",
+    "SSH",
+    "NDJSON",
+    "wire format",
+    "AgentEvent",
+    "bootstrap",
+    "version compatibility",
+    "security"
+  ],
+  "cross_refs": [
+    "crates/helm-agent/src/react.rs",
+    "agent_remote.rs",
+    "bootstrap.rs"
+  ],
+  "locked": false,
+  "precedence": 4,
+  "notes": ""
+}

@@ -1,0 +1,22 @@
+{
+  "source_path": "/home/white_devil/code/helm/docs/troubleshooting.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "Troubleshooting",
+  "summary": "Troubleshooting guide covering common issues: missing findings, installer failures, provider detection, read-only flows, and permission problems.",
+  "scope": [
+    "troubleshooting",
+    "dashboard",
+    "installation",
+    "provider configuration",
+    "Ollama",
+    "Groq",
+    "permissions",
+    "rate limiting"
+  ],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": 4,
+  "notes": ""
+}

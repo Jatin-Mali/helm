@@ -1,0 +1,13 @@
+{
+  "source_path": "/home/white_devil/code/helm/docs/trust-ladder.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "Trust Ladder",
+  "summary": "Five-level capability hierarchy from read-only monitoring to governed automation with escalating approval requirements.",
+  "scope": ["trust model", "capability gates", "approval workflows", "sandbox", "remote execution", "audit", "taint tracking"],
+  "cross_refs": ["helm", "helm snapshot", "helm monitor", "helm troubleshoot", "helm explain", "helm apply-plan", "helm change-set list", "helm tui", "--sandbox"],
+  "locked": false,
+  "precedence": 2,
+  "notes": ""
+}

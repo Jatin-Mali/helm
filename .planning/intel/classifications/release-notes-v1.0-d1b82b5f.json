@@ -1,0 +1,19 @@
+{
+  "source_path": "/home/white_devil/code/helm/docs/release-notes-v1.0.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "HELM v1.0 Release Notes",
+  "summary": "Release notes documenting persistent provider key storage in secrets.toml and migration path for existing users.",
+  "scope": [
+    "HELM v1.0",
+    "provider keys",
+    "secrets management",
+    "XDG paths",
+    "API key storage"
+  ],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": 4,
+  "notes": ""
+}

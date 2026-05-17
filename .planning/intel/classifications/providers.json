@@ -1,0 +1,27 @@
+{
+  "source_path": "/home/white_devil/code/helm/docs/providers.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "Providers",
+  "summary": "Configuration guide for HELM provider setup including Groq, OpenRouter, Gemini, NVIDIA NIM, and Ollama.",
+  "scope": [
+    "provider resolution",
+    "CLI configuration",
+    "Groq setup",
+    "OpenRouter setup",
+    "Gemini setup",
+    "NVIDIA NIM setup",
+    "Ollama setup",
+    "local vs API boundary"
+  ],
+  "cross_refs": [
+    "HELM_PROVIDER",
+    "helm init",
+    "helm doctor",
+    "helm trust-report"
+  ],
+  "locked": false,
+  "precedence": 3,
+  "notes": "Manifest type DOC with precedence 3 applied. Tutorial-style configuration guide for multiple provider backends."
+}

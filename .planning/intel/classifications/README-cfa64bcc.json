@@ -1,0 +1,33 @@
+{
+  "source_path": "/home/white_devil/code/helm/README.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "HELM",
+  "summary": "Terminal-native Linux monitoring and troubleshooting assistant with read-only-first dashboard, findings detection, and reviewed execution.",
+  "scope": [
+    "HELM",
+    "dashboard",
+    "monitoring",
+    "troubleshooting",
+    "system inspection",
+    "provider configuration",
+    "remote SSH targets",
+    "TUI",
+    "CLI"
+  ],
+  "cross_refs": [
+    "docs/providers.md",
+    "docs/agent-on-remote.md",
+    "docs/threat-model.md",
+    "docs/trust-ladder.md",
+    "docs/data-boundary.md",
+    "docs/detector-review-checklist.md",
+    "docs/troubleshooting.md",
+    "docs/release-notes-v1.0.md",
+    "CONTRIBUTING.md"
+  ],
+  "locked": false,
+  "precedence": 3,
+  "notes": ""
+}

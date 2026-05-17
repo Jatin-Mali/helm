@@ -1,0 +1,30 @@
+{
+  "source_path": "/home/white_devil/code/helm/ROADMAP.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "HELM Roadmap - Monitoring-First DevOps Assistant",
+  "summary": "Strategic product roadmap for HELM DevOps assistant, defining monitoring-first architecture, core observability domains, and phased releases from v1.6 through v3.0 with strict safety principles.",
+  "scope": [
+    "HELM DevOps platform",
+    "system monitoring",
+    "diagnostics and troubleshooting",
+    "change execution",
+    "TUI dashboard",
+    "remote monitoring",
+    "backup verification",
+    "fleet management"
+  ],
+  "cross_refs": [
+    "AGENTS.md",
+    "crates/helm-tools/src/registry.rs",
+    "crates/helm-tools/src/capability.rs",
+    "crates/helm-tools/src/quirks.rs",
+    "helm-cli/src/main.rs",
+    "helm-cli/src/tui.rs",
+    "crates/helm-memory/src/episodes.rs"
+  ],
+  "locked": false,
+  "precedence": 1,
+  "notes": "Manifest override applied: MANIFEST_TYPE=SPEC, MANIFEST_PRECEDENCE=1. Document contains product principles, architecture requirements, and release specifications for technical implementation constraints across all product phases. Treated as authoritative specification per manifest declaration."
+}

@@ -1,0 +1,31 @@
+{
+  "source_path": "/home/white_devil/code/helm/PROJECT_PROMISE.md",
+  "type": "PRD",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "HELM — Project Promise",
+  "summary": "Public commitment documenting HELM v0.1 user-visible features, non-goals, and development history through v1.",
+  "scope": [
+    "helm CLI",
+    "natural-language task execution",
+    "Anthropic API",
+    "shell execution tool",
+    "filesystem read tool",
+    "filesystem write tool",
+    "SQLite episode log",
+    "ReAct loop",
+    "TUI interface",
+    "browser automation",
+    "multi-provider support",
+    "capability system",
+    "audit logging",
+    "security hardening"
+  ],
+  "cross_refs": [
+    "HELM GitHub repository",
+    "Anthropic API"
+  ],
+  "locked": false,
+  "precedence": 1,
+  "notes": "Manifest declared PRD with precedence 1. Document serves as public project commitment with versioned feature roadmap. Contains development history (v0.1–v1) with feature descriptions but also includes conflict markers from git merge, which does not affect classification. Features listed are user-visible requirements and acceptance criteria."
+}

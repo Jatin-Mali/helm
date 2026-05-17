@@ -1,0 +1,13 @@
+{
+  "source_path": "/home/white_devil/code/helm/docs/threat-model.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "Threat Model",
+  "summary": "Security boundaries, trust zones, asset inventory, and controls for HELM local machine-control agent.",
+  "scope": ["HELM", "threat model", "trust boundaries", "API key storage", "security controls", "audit log"],
+  "cross_refs": ["$XDG_CONFIG_HOME/helm/secrets.toml", "helm secrets get", "helm secrets set", "helm secrets import-env", "helm init"],
+  "locked": false,
+  "precedence": 2,
+  "notes": ""
+}

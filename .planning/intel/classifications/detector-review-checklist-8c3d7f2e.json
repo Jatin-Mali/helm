@@ -1,0 +1,24 @@
+{
+  "source_path": "/home/white_devil/code/helm/docs/detector-review-checklist.md",
+  "type": "DOC",
+  "confidence": "high",
+  "manifest_override": true,
+  "title": "Detector False-Positive Review Checklist — v1.8",
+  "summary": "v1.8 detector review tracking false-positive risks across disk, service, container, and system detectors with mitigations and release approval.",
+  "scope": [
+    "detectors",
+    "false-positive analysis",
+    "SMART health",
+    "disk usage",
+    "service health",
+    "container health",
+    "load monitoring",
+    "memory pressure",
+    "security updates",
+    "backup verification"
+  ],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": 4,
+  "notes": ""
+}
