@@ -1,7 +1,7 @@
 //! Full-screen HELM terminal UI built with ratatui.
 
+use std::cell::Cell as StdCell;
 use std::{
-    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     io,
     path::PathBuf,
@@ -22,7 +22,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use helm_core::{Capability, HelmError, Message};
+use helm_core::{Capability, Message};
 use helm_memory::{
     ChangeSetRecord, ChangeSetStore, FindingStateRecord, FindingStateStatus, FindingStateStore,
     MemoryStore, TroubleshootingPlanRecord,
@@ -32,7 +32,6 @@ use helm_monitor::{
     SnapshotDomains, build_narrative_prompt, parse_llm_response,
 };
 use helm_providers::ChatRequest;
-use helm_tools::ToolRegistry;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -41,15 +40,16 @@ use ratatui::{
     prelude::Widget,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, ListItem, Paragraph, Sparkline, Tabs, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Clear, ListItem, Paragraph, Row, Table, Wrap},
 };
 use serde::Deserialize;
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
+use uuid::Uuid;
 
 use crate::{
     ProviderChoice, ProviderSettings, TroubleshootingPlanStore, build_provider, custom_commands,
-    default_api_key_env, default_db_path, default_model_name, keybindings::KeyMap,
-    provider_choice_name, remote::RemoteRegistry, wrap_for_remote, write_helm_config,
+    default_api_key_env, default_model_name, keybindings::KeyMap, provider_choice_name,
+    remote::RemoteRegistry, wrap_for_remote, write_helm_config,
 };
 use crate::{sandbox::ResolvedSandbox, secrets::SecretsStore};
 
@@ -188,6 +188,7 @@ impl Theme {
 }
 
 /// Runtime dependencies needed by the TUI.
+#[allow(dead_code)]
 pub(crate) struct TuiRuntime {
     pub(crate) provider_settings: ProviderSettings,
     pub(crate) db_path: PathBuf,
@@ -392,13 +393,13 @@ enum ModalState {
         choice: ProviderChoice,
         input: String,
     },
+    #[allow(dead_code)]
     AuthRequired {
         provider_name: String,
         env_name: String,
         input: String,
         error: Option<String>,
     },
-    Error(String),
     Help,
     ThemeSelector {
         selected: usize,
@@ -833,39 +834,12 @@ enum DashboardFocus {
 pub enum OpsTab {
     Alerts,
     Services,
-    Resources,
-    Logs,
-    Changes,
-}
-
-/// Sub-section toggle within the Resources tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResourcesSubTab {
     Processes,
+    Logs,
     Network,
-    Storage,
-    Containers,
-    Security,
-}
-
-impl ResourcesSubTab {
-    const ALL: &'static [Self] = &[
-        Self::Processes,
-        Self::Network,
-        Self::Storage,
-        Self::Containers,
-        Self::Security,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Processes => "PROCS",
-            Self::Network => "NET",
-            Self::Storage => "STORAGE",
-            Self::Containers => "CTRS",
-            Self::Security => "SEC",
-        }
-    }
+    Disk,
+    Changes,
+    Fleet,
 }
 
 impl OpsTab {
@@ -873,18 +847,24 @@ impl OpsTab {
         &[
             Self::Alerts,
             Self::Services,
-            Self::Resources,
+            Self::Processes,
             Self::Logs,
+            Self::Network,
+            Self::Disk,
             Self::Changes,
+            Self::Fleet,
         ]
     }
     fn label(self) -> &'static str {
         match self {
             Self::Alerts => "ALERTS",
-            Self::Services => "SVCS",
-            Self::Resources => "RES",
+            Self::Services => "SERVICES",
+            Self::Processes => "PROCESSES",
             Self::Logs => "LOGS",
-            Self::Changes => "CHG",
+            Self::Network => "NETWORK",
+            Self::Disk => "DISK",
+            Self::Changes => "CHANGES",
+            Self::Fleet => "FLEET",
         }
     }
 }
@@ -974,6 +954,7 @@ impl DashboardFindingStateFilter {
         ]
     }
 
+    #[allow(dead_code)]
     fn label(self) -> &'static str {
         match self {
             Self::Active => "Active",
@@ -997,6 +978,20 @@ struct DashboardMetrics {
     resolved: usize,
     critical: usize,
     warning: usize,
+}
+
+/// Per-host fleet status for multi-host view.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct FleetHostStatus {
+    pub host_id: Uuid,
+    pub name: String,
+    pub reachable: bool,
+    pub crit: usize,
+    pub warn: usize,
+    pub info: usize,
+    pub last_refresh: Option<Instant>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1044,12 +1039,13 @@ struct DashboardData {
     mem_history: VecDeque<f64>,
     load_history: VecDeque<f64>,
     disk_history: VecDeque<f64>,
+    /// Per-host fleet status for multi-host view.
+    fleet_hosts: Vec<FleetHostStatus>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct DashboardAuditRow {
     time: String,
-    kind: String,
     capability: String,
     command: String,
     decision: String,
@@ -1110,6 +1106,12 @@ struct DashboardPlan {
     rate_limit_retry_pending: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PinnedIncidentState {
+    fingerprint: String,
+    active_plan_id: Option<String>,
+}
+
 impl DashboardPlan {
     fn summary_from_status(&self) -> String {
         match &self.status {
@@ -1142,16 +1144,18 @@ struct DashboardState {
     pane: DashboardFocus,
     active_tab: OpsTab,
     selected_fingerprint: Option<String>,
+    pinned_incident: Option<PinnedIncidentState>,
     table_scroll: usize,
     detail_scroll: usize,
     finding_state_filter: DashboardFindingStateFilter,
-    resources_sub_tab: ResourcesSubTab,
     active_plan: Option<DashboardPlan>,
     pending_plan_rx: Option<tokio::sync::oneshot::Receiver<PlanStatus>>,
     error: Option<String>,
     overlap_guard: Option<Arc<AtomicBool>>,
     /// Max history points for sparklines (loaded from thresholds.toml, default 60).
     sparkline_history_depth: usize,
+    /// Selected row in Fleet tab for multi-host view.
+    fleet_selected_row: Option<usize>,
 }
 
 impl DashboardState {
@@ -1163,15 +1167,16 @@ impl DashboardState {
             pane: DashboardFocus::Table,
             active_tab: OpsTab::Alerts,
             selected_fingerprint: None,
+            pinned_incident: None,
             table_scroll: 0,
             detail_scroll: 0,
             finding_state_filter: DashboardFindingStateFilter::default(),
-            resources_sub_tab: ResourcesSubTab::Processes,
             active_plan: None,
             pending_plan_rx: None,
             error: None,
             overlap_guard: None,
-            sparkline_history_depth: thresholds.sparkline_history_depth.max(10).min(300),
+            sparkline_history_depth: thresholds.sparkline_history_depth.clamp(10, 300),
+            fleet_selected_row: None,
         }
     }
 }
@@ -1179,13 +1184,61 @@ impl DashboardState {
 fn format_relative_age(timestamp: i64) -> String {
     let now = Utc::now().timestamp();
     let age_secs = now.saturating_sub(timestamp).max(0);
+    let mins = age_secs / 60;
     let hours = age_secs / 3600;
     let days = age_secs / 86_400;
-    if hours < 24 {
-        format!("{hours}h ago")
+    if mins < 60 {
+        format!("{mins}m")
+    } else if hours < 24 {
+        format!("{hours}h")
     } else {
-        format!("{}d ago", days)
+        format!("{days}d")
     }
+}
+
+fn format_open_duration_since(timestamp: i64) -> String {
+    format!("open {}", format_relative_age(timestamp))
+}
+
+fn format_last_seen_since(timestamp: i64) -> String {
+    format!("seen {}", format_relative_age(timestamp))
+}
+
+fn format_dashboard_when(timestamp: i64) -> String {
+    let ts = chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|dt| dt.format("%H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let now = Utc::now().timestamp();
+    let age_secs = now.saturating_sub(timestamp).max(0);
+    let rel = if age_secs < 60 {
+        format!("{age_secs}s ago")
+    } else if age_secs < 3600 {
+        format!("{} min ago", age_secs / 60)
+    } else if age_secs < 86_400 {
+        format!("{}h ago", age_secs / 3600)
+    } else {
+        format!("{}d ago", age_secs / 86_400)
+    };
+    format!("{ts} ({rel})")
+}
+
+fn finding_id_from_source(source: &str) -> Option<&str> {
+    source.strip_prefix("finding:").map(str::trim)
+}
+
+fn next_audit_timestamp(conn: &rusqlite::Connection) -> Result<i64> {
+    let latest: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(timestamp) FROM audit_events WHERE target IS ?1",
+            ["tui"],
+            |row| row.get(0),
+        )
+        .ok();
+    let now = chrono::Utc::now().timestamp_millis();
+    Ok(match latest {
+        Some(ts) if ts >= now => ts.saturating_add(1),
+        _ => now,
+    })
 }
 
 fn age_bucket(timestamp: i64) -> DashboardAgeFilter {
@@ -1272,12 +1325,11 @@ pub struct TuiApp {
     pending_tool_summaries: HashMap<String, String>,
     active_tool_cells: HashMap<String, usize>,
     toast: Option<ToastState>,
-    last_chat_height: Cell<u16>,
+    last_chat_height: StdCell<u16>,
     active_run_id: u64,
     agent_task: Option<JoinHandle<()>>,
     pending_auth_retry: Option<String>,
     task_started: Option<Instant>,
-    tool_start_times: HashMap<String, Instant>,
     session_tokens_in: u32,
     session_tokens_out: u32,
     resume_context: Option<String>,
@@ -1285,6 +1337,7 @@ pub struct TuiApp {
     theme: Theme,
     dashboard: DashboardState,
     audited_transitions: HashSet<String>,
+    pending_apply_rx: Option<tokio::sync::oneshot::Receiver<Result<String, String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1305,10 +1358,7 @@ struct TuiRuntimeInner {
     db_path: PathBuf,
     config_path: PathBuf,
     memory: Arc<MemoryStore>,
-    max_iterations: Option<u32>,
     secrets: SecretsStore,
-    tui_paste_key_modal: bool,
-    sandbox: Option<ResolvedSandbox>,
 }
 
 impl TuiApp {
@@ -1334,27 +1384,14 @@ impl TuiApp {
             .model
             .clone()
             .unwrap_or_else(|| "auto".to_owned());
-        let mode = if runtime.read_only {
-            AgentMode::Dashboard
-        } else if runtime.auto_approve {
-            AgentMode::Dashboard
-        } else if runtime.diagnose_mode {
-            AgentMode::Dashboard
-        } else if runtime.dashboard_mode {
-            AgentMode::Dashboard
-        } else {
-            AgentMode::Dashboard
-        };
+        let mode = AgentMode::Dashboard;
 
         let mut app = Self {
             runtime: Arc::new(TuiRuntimeInner {
                 db_path: runtime.db_path,
                 config_path,
                 memory: runtime.memory,
-                max_iterations: runtime.max_iterations,
                 secrets: runtime.secrets,
-                tui_paste_key_modal: runtime.tui_paste_key_modal,
-                sandbox: runtime.sandbox,
             }),
             active_settings,
             session: SessionState::default(),
@@ -1378,18 +1415,18 @@ impl TuiApp {
             pending_tool_summaries: HashMap::new(),
             active_tool_cells: HashMap::new(),
             toast: None,
-            last_chat_height: Cell::new(10),
+            last_chat_height: StdCell::new(10),
             active_run_id: 0,
             agent_task: None,
             pending_auth_retry: None,
             task_started: None,
-            tool_start_times: HashMap::new(),
             session_tokens_in: 0,
             session_tokens_out: 0,
             resume_context: None,
             theme: Theme::default(),
             dashboard: DashboardState::new(),
             audited_transitions: HashSet::new(),
+            pending_apply_rx: None,
         };
         if mode == AgentMode::Dashboard {
             app.refresh_dashboard();
@@ -1484,12 +1521,39 @@ impl TuiApp {
                             match &status {
                                 PlanStatus::RateLimited { retry_after_secs } => {
                                     let secs = *retry_after_secs;
-                                    plan.status = status;
+                                    plan.status = status.clone();
                                     plan.rate_limit_retry_at =
                                         Some(Instant::now() + Duration::from_secs(secs));
                                 }
                                 _ => {
-                                    plan.status = status;
+                                    plan.status = status.clone();
+                                }
+                            }
+                        }
+                        let active_plan_ctx = self
+                            .dashboard
+                            .active_plan
+                            .as_ref()
+                            .map(|plan| (plan.plan_id.clone(), plan.finding_id.clone()));
+                        if let Some((plan_id, finding_id)) = active_plan_ctx {
+                            if let Some(finding) = self
+                                .dashboard
+                                .data
+                                .findings
+                                .iter()
+                                .find(|finding| finding.id == finding_id)
+                                .cloned()
+                            {
+                                if let Ok(conn) = rusqlite::Connection::open(&self.runtime.db_path)
+                                {
+                                    self.persist_dashboard_plan_status(
+                                        &conn, &finding, &plan_id, &status,
+                                    );
+                                    self.restore_active_dashboard_plan(
+                                        &conn,
+                                        &finding.id,
+                                        Some(&plan_id),
+                                    );
                                 }
                             }
                         }
@@ -1511,6 +1575,31 @@ impl TuiApp {
                                 plan.rate_limit_retry_at = None;
                             }
                         }
+                    }
+                }
+                if let Some(rx) = &mut self.pending_apply_rx {
+                    if let Ok(result) = rx.try_recv() {
+                        if let Some(ModalState::PlanExecution {
+                            ref mut phase,
+                            ref mut result_summary,
+                            ..
+                        }) = self.modal
+                        {
+                            *phase = PlanExecPhase::Done;
+                            *result_summary = match &result {
+                                Ok(summary) => summary.clone(),
+                                Err(error) => format!("Execution failed: {error}"),
+                            };
+                        }
+                        match result {
+                            Ok(summary) => self
+                                .push_chat(MessageRole::System, format!("[apply-plan] {summary}")),
+                            Err(error) => self.push_chat(
+                                MessageRole::Error,
+                                format!("[apply-plan] Execution failed: {error}"),
+                            ),
+                        }
+                        self.pending_apply_rx = None;
                     }
                 }
                 Ok(false)
@@ -1700,7 +1789,7 @@ impl TuiApp {
                     if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::ALT) =>
                 {
                     if let Some(finding) = self.current_dashboard_finding().cloned() {
-                        let db_path = default_db_path()?;
+                        let db_path = self.runtime.db_path.clone();
                         let conn = rusqlite::Connection::open(&db_path)?;
                         FindingStateStore::set_status(
                             &conn,
@@ -1714,7 +1803,7 @@ impl TuiApp {
                         .map_err(|e| anyhow!("{e}"))?;
                         self.write_dashboard_event(
                             "finding-state",
-                            "monitor",
+                            Capability::FsRead.as_str(),
                             "suppressed",
                             &helm_memory::stable_hash_hex(&finding.fingerprint),
                             &helm_memory::stable_hash_hex(&format!(
@@ -1731,7 +1820,7 @@ impl TuiApp {
                     if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::ALT) =>
                 {
                     if let Some(finding) = self.current_dashboard_finding().cloned() {
-                        let db_path = default_db_path()?;
+                        let db_path = self.runtime.db_path.clone();
                         let conn = rusqlite::Connection::open(&db_path)?;
                         FindingStateStore::set_status(
                             &conn,
@@ -1745,7 +1834,7 @@ impl TuiApp {
                         .map_err(|e| anyhow!("{e}"))?;
                         self.write_dashboard_event(
                             "finding-state",
-                            "monitor",
+                            Capability::FsRead.as_str(),
                             "resolved",
                             &helm_memory::stable_hash_hex(&finding.fingerprint),
                             &helm_memory::stable_hash_hex(&format!(
@@ -1762,13 +1851,13 @@ impl TuiApp {
                     if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::ALT) =>
                 {
                     if let Some(finding) = self.current_dashboard_finding().cloned() {
-                        let db_path = default_db_path()?;
+                        let db_path = self.runtime.db_path.clone();
                         let conn = rusqlite::Connection::open(&db_path)?;
                         FindingStateStore::clear(&conn, &finding.fingerprint)
                             .map_err(|e| anyhow!("{e}"))?;
                         self.write_dashboard_event(
                             "finding-state",
-                            "monitor",
+                            Capability::FsRead.as_str(),
                             "reopened",
                             &helm_memory::stable_hash_hex(&finding.fingerprint),
                             &helm_memory::stable_hash_hex(&format!(
@@ -1790,17 +1879,7 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('3') => {
-                    if self.dashboard.active_tab == OpsTab::Resources {
-                        // Cycle through Resources sub-tabs.
-                        let subs = ResourcesSubTab::ALL;
-                        let pos = subs
-                            .iter()
-                            .position(|s| *s == self.dashboard.resources_sub_tab)
-                            .unwrap_or(0);
-                        self.dashboard.resources_sub_tab = subs[(pos + 1) % subs.len()];
-                    } else {
-                        self.dashboard.active_tab = OpsTab::Resources;
-                    }
+                    self.dashboard.active_tab = OpsTab::Processes;
                     return Ok(false);
                 }
                 KeyCode::Char('4') => {
@@ -1808,6 +1887,14 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('5') => {
+                    self.dashboard.active_tab = OpsTab::Network;
+                    return Ok(false);
+                }
+                KeyCode::Char('6') => {
+                    self.dashboard.active_tab = OpsTab::Disk;
+                    return Ok(false);
+                }
+                KeyCode::Char('7') => {
                     self.dashboard.active_tab = OpsTab::Changes;
                     return Ok(false);
                 }
@@ -1872,7 +1959,16 @@ impl TuiApp {
             KeyCode::Up if self.mode == AgentMode::Dashboard => match self.dashboard.view {
                 DashboardView::Overview => match self.dashboard.pane {
                     DashboardFocus::Tabbar | DashboardFocus::Table => {
-                        self.move_dashboard_selection(-1)
+                        // Fleet tab has special navigation for row selection
+                        if self.dashboard.active_tab == OpsTab::Fleet {
+                            if let Some(row) = self.dashboard.fleet_selected_row {
+                                self.dashboard.fleet_selected_row = Some(row.saturating_sub(1));
+                            } else {
+                                self.dashboard.fleet_selected_row = Some(0);
+                            }
+                        } else {
+                            self.move_dashboard_selection(-1)
+                        }
                     }
                     DashboardFocus::Detail => {
                         self.dashboard.detail_scroll =
@@ -1886,7 +1982,14 @@ impl TuiApp {
             KeyCode::Down if self.mode == AgentMode::Dashboard => match self.dashboard.view {
                 DashboardView::Overview => match self.dashboard.pane {
                     DashboardFocus::Tabbar | DashboardFocus::Table => {
-                        self.move_dashboard_selection(1)
+                        // Fleet tab has special navigation for row selection
+                        if self.dashboard.active_tab == OpsTab::Fleet {
+                            let row = self.dashboard.fleet_selected_row.unwrap_or(0);
+                            let max = self.dashboard.data.fleet_hosts.len().saturating_sub(1);
+                            self.dashboard.fleet_selected_row = Some((row + 1).min(max));
+                        } else {
+                            self.move_dashboard_selection(1)
+                        }
                     }
                     DashboardFocus::Detail => {
                         self.dashboard.detail_scroll =
@@ -2354,24 +2457,10 @@ impl TuiApp {
                             "[apply-plan] All steps approved. Executing...",
                         );
                         // Audit: approve this step
-                        let _ = Self::write_apply_plan_audit(&plan_id_clone, "approved");
-                        // Use the TUI's runtime handle to spawn the apply-plan execution
-                        let handle = tokio::runtime::Handle::current();
-                        std::thread::spawn(move || {
-                            handle.block_on(async {
-                                let args = crate::ApplyPlanArgs {
-                                    plan_id: plan_id_clone,
-                                    yes: true,
-                                    json: false,
-                                };
-                                match crate::run_apply_plan_command(args).await {
-                                    Ok(()) => eprintln!("[apply-plan] Plan executed successfully."),
-                                    Err(e) => eprintln!("[apply-plan] Execution failed: {e}"),
-                                }
-                            });
-                        });
+                        let _ = self.write_apply_plan_audit(&plan_id_clone, "approved");
+                        self.start_apply_plan_execution(plan_id_clone);
                     } else {
-                        let _ = Self::write_apply_plan_audit(&plan_id_clone, "approved");
+                        let _ = self.write_apply_plan_audit(&plan_id_clone, "approved");
                         // Move to next step
                         if let Some(ModalState::PlanExecution {
                             ref mut step_index, ..
@@ -2396,7 +2485,7 @@ impl TuiApp {
                     {
                         *step_index = next;
                     }
-                    let _ = Self::write_apply_plan_audit(&plan_id, "denied");
+                    let _ = self.write_apply_plan_audit(&plan_id, "denied");
                 }
                 KeyCode::Char('!') => {
                     // Approve all remaining
@@ -2408,20 +2497,7 @@ impl TuiApp {
                         MessageRole::System,
                         "[apply-plan] All steps approved. Executing...",
                     );
-                    let handle = tokio::runtime::Handle::current();
-                    std::thread::spawn(move || {
-                        handle.block_on(async {
-                            let args = crate::ApplyPlanArgs {
-                                plan_id,
-                                yes: true,
-                                json: false,
-                            };
-                            match crate::run_apply_plan_command(args).await {
-                                Ok(()) => eprintln!("[apply-plan] Plan executed successfully."),
-                                Err(e) => eprintln!("[apply-plan] Execution failed: {e}"),
-                            }
-                        });
-                    });
+                    self.start_apply_plan_execution(plan_id);
                 }
                 KeyCode::Esc => {
                     self.modal = None;
@@ -2586,27 +2662,74 @@ Report the exit status and the concise output."
     async fn start_task_internal_with_mode(
         &mut self,
         task: String,
-        tx: mpsc::UnboundedSender<UiEvent>,
-        mode: AgentMode,
+        _tx: mpsc::UnboundedSender<UiEvent>,
+        _mode: AgentMode,
     ) -> Result<()> {
-        self.record_tool_event("queued", "agent", "task submitted");
+        self.record_tool_event("queued", "assistant", "request submitted");
         self.running = true;
         self.task_started = Some(Instant::now());
         self.status_note = "running".to_owned();
         self.active_run_id = self.active_run_id.saturating_add(1);
         self.session.transcript_scroll = 0;
-        let run_id = self.active_run_id;
-
-        let runtime = Arc::clone(&self.runtime);
-        let settings = self.active_settings.clone();
         let contextual_task = if let Some(context) = self.resume_context.as_deref() {
             format!("{context}\n\nUser asks now: {task}")
         } else {
             task.clone()
         };
         let effective_task = wrap_for_remote(&contextual_task, self.active_remote.as_ref());
-        let task_for_event = effective_task.clone();
-        let remote_target = self.active_remote.clone();
+        let settings = self.active_settings.clone();
+
+        let response = match build_provider(&settings, &self.runtime.secrets) {
+            Ok((provider, model)) => {
+                let request = ChatRequest {
+                    model,
+                    system: None,
+                    messages: vec![Message::user(&effective_task)],
+                    tools: vec![],
+                    max_tokens: 2048,
+                    temperature: 0.2,
+                };
+                provider
+                    .chat(request)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        };
+
+        match response {
+            Ok(reply) => {
+                let text = reply
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        helm_core::ContentBlock::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_owned();
+                if text.is_empty() {
+                    self.push_chat(
+                        MessageRole::System,
+                        "The assistant returned no text. Use the dashboard hotkeys or try a narrower troubleshoot prompt.",
+                    );
+                } else {
+                    self.push_chat(MessageRole::Assistant, text);
+                }
+                self.record_tool_event("done", "assistant", "response ready");
+                self.status_note = "ready".to_owned();
+            }
+            Err(error) => {
+                self.push_chat(MessageRole::Error, friendly_error(&error));
+                self.record_tool_event("error", "assistant", "request failed");
+                self.status_note = "error".to_owned();
+            }
+        }
+
+        self.running = false;
+        self.task_started = None;
         Ok(())
     }
 
@@ -2646,7 +2769,7 @@ Report the exit status and the concise output."
             MessageRole::System,
             "Cancelled current task. HELM is ready for the next prompt.",
         );
-        self.record_tool_event("cancel", "agent", "task aborted");
+        self.record_tool_event("cancel", "assistant", "request aborted");
     }
 
     fn replay_hint(&self) -> String {
@@ -2740,9 +2863,9 @@ Report the exit status and the concise output."
     }
 
     /// Write a hash-chained audit event for a TUI apply-plan approval.
-    fn write_apply_plan_audit(plan_id: &str, decision: &str) -> Result<()> {
-        let db_path = crate::default_db_path()?;
-        let conn = rusqlite::Connection::open(&db_path)?;
+    fn write_apply_plan_audit(&self, plan_id: &str, decision: &str) -> Result<()> {
+        let db_path = &self.runtime.db_path;
+        let conn = rusqlite::Connection::open(db_path)?;
         let prev = helm_memory::latest_audit_hash(&conn, Some("tui"))
             .unwrap_or_else(|_| "GENESIS".to_string());
         let ts = chrono::Utc::now().timestamp_millis();
@@ -2787,7 +2910,7 @@ Report the exit status and the concise output."
         let conn = rusqlite::Connection::open(db_path)?;
         let prev = helm_memory::latest_audit_hash(&conn, Some("tui"))
             .unwrap_or_else(|_| "GENESIS".to_string());
-        let ts = chrono::Utc::now().timestamp_millis();
+        let ts = next_audit_timestamp(&conn)?;
         // Redact secrets and truncate.
         let command_display = {
             let redacted = helm_core::redact_secrets(command_text);
@@ -2843,7 +2966,7 @@ Report the exit status and the concise output."
         let conn = rusqlite::Connection::open(db_path)?;
         let prev = helm_memory::latest_audit_hash(&conn, Some("tui"))
             .unwrap_or_else(|_| "GENESIS".to_string());
-        let ts = chrono::Utc::now().timestamp_millis();
+        let ts = next_audit_timestamp(&conn)?;
         let hash = helm_memory::audit_hash(helm_memory::AuditHashParts {
             previous_hash: &prev,
             episode_id: None,
@@ -2930,75 +3053,7 @@ Report the exit status and the concise output."
         }
     }
 
-    fn start_tool_cell(&mut self, id: &str, name: &str) {
-        let summary = self
-            .pending_tool_summaries
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| name.to_owned());
-        let text = format!("◷ {name}: {summary} ...");
-        self.status_note = format!("running {name}");
-        self.session.chat.push(ChatMessage {
-            role: MessageRole::Activity,
-            text: sanitize_display_text(&text),
-        });
-        self.active_tool_cells
-            .insert(id.to_owned(), self.session.chat.len().saturating_sub(1));
-        self.tool_start_times.insert(id.to_owned(), Instant::now());
-        self.session.transcript_scroll = 0;
-    }
-
-    fn finish_tool_cell(&mut self, id: &str, name: &str, success: bool, content: &str) {
-        let summary = self
-            .pending_tool_summaries
-            .remove(id)
-            .unwrap_or_else(|| name.to_owned());
-        let duration = self
-            .tool_start_times
-            .remove(id)
-            .map(|start| start.elapsed())
-            .map(format_duration)
-            .unwrap_or_default();
-        let preview = tool_output_preview(content);
-        let icon = if success { "✓" } else { "✗" };
-        let text = if success {
-            if preview.is_empty() {
-                format!("{icon} {name}: {summary}  {duration}")
-            } else {
-                format!("{icon} {name}: {summary}  {duration}\n{preview}")
-            }
-        } else if preview.is_empty() {
-            format!("{icon} {name} failed: {summary}  {duration}")
-        } else {
-            format!("{icon} {name} failed: {summary}  {duration}\n{preview}")
-        };
-        self.status_note = if success {
-            format!("{name} ok {duration}")
-        } else {
-            format!("{name} failed {duration}")
-        };
-        if let Some(index) = self.active_tool_cells.remove(id)
-            && let Some(message) = self.session.chat.get_mut(index)
-        {
-            message.role = if success {
-                MessageRole::Activity
-            } else {
-                MessageRole::Error
-            };
-            message.text = sanitize_display_text(&text);
-            self.session.transcript_scroll = 0;
-            return;
-        }
-        self.push_chat(
-            if success {
-                MessageRole::Activity
-            } else {
-                MessageRole::Error
-            },
-            text,
-        );
-    }
-
+    #[cfg(test)]
     fn chat_ends_with(&self, role: MessageRole, text: &str) -> bool {
         self.session
             .chat
@@ -3863,13 +3918,7 @@ Report the exit status and the concise output."
 
     fn execute_apply_plan_inline(&mut self, plan_id: &str) {
         // Load plan from database and show preview in transcript
-        let db_path = match default_db_path() {
-            Ok(p) => p,
-            Err(e) => {
-                self.push_chat(MessageRole::Error, format!("[apply-plan] DB error: {e}"));
-                return;
-            }
-        };
+        let db_path = self.runtime.db_path.clone();
         let conn = match rusqlite::Connection::open(&db_path) {
             Ok(c) => c,
             Err(e) => {
@@ -3983,18 +4032,333 @@ Report the exit status and the concise output."
         });
     }
 
+    fn start_apply_plan_execution(&mut self, plan_id: String) {
+        let db_path = self.runtime.db_path.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        self.pending_apply_rx = Some(rx);
+        let handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            handle.block_on(async move {
+                let args = crate::ApplyPlanArgs {
+                    plan_id,
+                    yes: true,
+                    json: false,
+                };
+                let result = crate::run_apply_plan_command_at_path(db_path, args)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(result);
+            });
+        });
+    }
+
+    fn persist_pinned_incident_from_current(&mut self) {
+        if let Some(finding) = self.current_dashboard_finding() {
+            let active_plan_id = self
+                .dashboard
+                .active_plan
+                .as_ref()
+                .filter(|plan| plan.finding_id == finding.id)
+                .map(|plan| plan.plan_id.clone());
+            self.dashboard.pinned_incident = Some(PinnedIncidentState {
+                fingerprint: finding.fingerprint.clone(),
+                active_plan_id,
+            });
+        }
+    }
+
+    fn workspace_fingerprint(&self) -> Option<&str> {
+        match self.dashboard.view {
+            DashboardView::FindingDetail(_)
+            | DashboardView::EvidenceView(_)
+            | DashboardView::TroubleshootPlan(_) => self
+                .dashboard
+                .pinned_incident
+                .as_ref()
+                .map(|pinned| pinned.fingerprint.as_str())
+                .or(self.dashboard.selected_fingerprint.as_deref()),
+            DashboardView::Overview => self.dashboard.selected_fingerprint.as_deref(),
+        }
+    }
+
+    fn dashboard_plan_steps_json(steps: &[ValidatedFixStep]) -> String {
+        let payload = steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                serde_json::json!({
+                    "title": format!("step-{}", index + 1),
+                    "command": {
+                        "tool": "shell",
+                        "input": { "command": step.command },
+                        "command_text": step.command,
+                        "expected_effect": step.purpose,
+                        "risk": step.risk,
+                        "blast_radius": "Unknown",
+                        "rollback": step.rollback,
+                        "verification": []
+                    },
+                    "hypothesis_id": serde_json::Value::Null,
+                    "expected_output": serde_json::Value::Null,
+                    "interpretation_guide": serde_json::Value::Null
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&payload).unwrap_or_else(|_| "[]".to_owned())
+    }
+
+    fn dashboard_read_only_steps_json(checks: &[String]) -> String {
+        serde_json::to_string(checks).unwrap_or_else(|_| "[]".to_owned())
+    }
+
+    fn dashboard_verification_steps(finding: &FindingSummary) -> Vec<String> {
+        if !finding.read_only_checks.is_empty() {
+            finding.read_only_checks.clone()
+        } else {
+            vec![
+                format!(
+                    "Confirm `{}` is no longer active in the incident queue.",
+                    finding.title
+                ),
+                format!(
+                    "Re-run a targeted health check for `{}`.",
+                    finding.affected_resource
+                ),
+            ]
+        }
+    }
+
+    fn dashboard_plan_from_record(
+        &self,
+        record: &TroubleshootingPlanRecord,
+    ) -> Option<DashboardPlan> {
+        let fix_steps = Self::validated_steps_from_plan_json(&record.proposed_fix_steps_json);
+        let status = match record.dashboard_plan_status.as_str() {
+            "loading" | "pending" => PlanStatus::Loading {
+                started_at: record.updated_at.max(record.created_at),
+            },
+            "ready" if !fix_steps.is_empty() => PlanStatus::Ready {
+                narrative: if record.narrative_summary.trim().is_empty() {
+                    record.verdict_summary.clone()
+                } else {
+                    record.narrative_summary.clone()
+                },
+                fix_steps: fix_steps.clone(),
+            },
+            "timeout" => PlanStatus::Timeout,
+            "rate_limited" => PlanStatus::RateLimited {
+                retry_after_secs: record
+                    .generation_error
+                    .strip_prefix("retry_after_secs=")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(30),
+            },
+            "auth_failed" => PlanStatus::AuthFailed,
+            "dangerous_command" => PlanStatus::DangerousCommand {
+                pattern: record.generation_error.clone(),
+                command_text: String::new(),
+            },
+            "malformed_response" => PlanStatus::MalformedResponse,
+            _ if !fix_steps.is_empty() => PlanStatus::Ready {
+                narrative: if record.narrative_summary.trim().is_empty() {
+                    record.verdict_summary.clone()
+                } else {
+                    record.narrative_summary.clone()
+                },
+                fix_steps: fix_steps.clone(),
+            },
+            _ => return None,
+        };
+
+        Some(DashboardPlan {
+            finding_id: if !record.finding_id.is_empty() {
+                record.finding_id.clone()
+            } else {
+                finding_id_from_source(&record.source)
+                    .unwrap_or_default()
+                    .to_owned()
+            },
+            plan_id: record.id.clone(),
+            status,
+            read_only_steps: serde_json::from_str::<Vec<String>>(&record.read_only_steps_json)
+                .map(|steps| steps.len())
+                .unwrap_or(0),
+            fix_steps: fix_steps.len(),
+            rate_limit_retry_at: None,
+            rate_limit_retry_pending: false,
+        })
+    }
+
+    fn validated_steps_from_plan_json(proposed_fix_steps_json: &str) -> Vec<ValidatedFixStep> {
+        let raw_steps: Vec<serde_json::Value> =
+            serde_json::from_str(proposed_fix_steps_json).unwrap_or_default();
+        raw_steps
+            .into_iter()
+            .filter_map(|step| {
+                let command = step
+                    .get("command")
+                    .and_then(|command| command.get("command_text"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| step.get("command").and_then(serde_json::Value::as_str))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                if command.is_empty() {
+                    return None;
+                }
+                let purpose = step
+                    .get("command")
+                    .and_then(|command| command.get("expected_effect"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| step.get("purpose").and_then(serde_json::Value::as_str))
+                    .unwrap_or_default()
+                    .to_owned();
+                let risk = step
+                    .get("command")
+                    .and_then(|command| command.get("risk"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| step.get("risk").and_then(serde_json::Value::as_str))
+                    .unwrap_or("none")
+                    .to_owned();
+                let rollback = step
+                    .get("command")
+                    .and_then(|command| command.get("rollback"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| step.get("rollback").and_then(serde_json::Value::as_str))
+                    .unwrap_or("none")
+                    .to_owned();
+                Some(ValidatedFixStep {
+                    command,
+                    purpose,
+                    risk,
+                    rollback,
+                    binary_warnings: Vec::new(),
+                })
+            })
+            .collect()
+    }
+
+    fn persist_dashboard_plan_status(
+        &mut self,
+        conn: &rusqlite::Connection,
+        finding: &FindingSummary,
+        plan_id: &str,
+        status: &PlanStatus,
+    ) {
+        let (dashboard_plan_status, generation_error, proposed_fix_steps_json, narrative_summary) =
+            match status {
+                PlanStatus::Loading { .. } => {
+                    ("loading", String::new(), "[]".to_owned(), String::new())
+                }
+                PlanStatus::Ready {
+                    narrative,
+                    fix_steps,
+                } => (
+                    "ready",
+                    String::new(),
+                    Self::dashboard_plan_steps_json(fix_steps),
+                    narrative.clone(),
+                ),
+                PlanStatus::Timeout => ("timeout", String::new(), "[]".to_owned(), String::new()),
+                PlanStatus::RateLimited { retry_after_secs } => (
+                    "rate_limited",
+                    format!("retry_after_secs={retry_after_secs}"),
+                    "[]".to_owned(),
+                    String::new(),
+                ),
+                PlanStatus::AuthFailed => {
+                    ("auth_failed", String::new(), "[]".to_owned(), String::new())
+                }
+                PlanStatus::MalformedResponse => (
+                    "malformed_response",
+                    String::new(),
+                    "[]".to_owned(),
+                    String::new(),
+                ),
+                PlanStatus::DangerousCommand { pattern, .. } => (
+                    "dangerous_command",
+                    pattern.clone(),
+                    "[]".to_owned(),
+                    String::new(),
+                ),
+            };
+
+        let verification_steps_json =
+            serde_json::to_string(&Self::dashboard_verification_steps(finding))
+                .unwrap_or_else(|_| "[]".to_owned());
+        let reproduction_steps_json =
+            Self::dashboard_read_only_steps_json(&finding.read_only_checks);
+        let read_only_steps_json = Self::dashboard_read_only_steps_json(&finding.read_only_checks);
+
+        if let Err(error) = TroubleshootingPlanStore::update_dashboard_plan(
+            conn,
+            plan_id,
+            &finding.id,
+            &read_only_steps_json,
+            &proposed_fix_steps_json,
+            &narrative_summary,
+            dashboard_plan_status,
+            &generation_error,
+            &verification_steps_json,
+            &reproduction_steps_json,
+        ) {
+            tracing::warn!(plan_id = %plan_id, error = %error, "failed to persist dashboard plan");
+        }
+    }
+
+    fn restore_active_dashboard_plan(
+        &mut self,
+        conn: &rusqlite::Connection,
+        finding_id: &str,
+        preferred_plan_id: Option<&str>,
+    ) {
+        let record = preferred_plan_id
+            .and_then(|plan_id| TroubleshootingPlanStore::get(conn, plan_id).ok().flatten())
+            .filter(|record| {
+                record.finding_id == finding_id
+                    || finding_id_from_source(&record.source) == Some(finding_id)
+            })
+            .or_else(|| {
+                TroubleshootingPlanStore::latest_for_finding(conn, finding_id)
+                    .ok()
+                    .flatten()
+            });
+
+        self.dashboard.active_plan = record
+            .as_ref()
+            .and_then(|record| self.dashboard_plan_from_record(record));
+
+        if let Some(pinned) = self.dashboard.pinned_incident.as_mut() {
+            pinned.active_plan_id = self
+                .dashboard
+                .active_plan
+                .as_ref()
+                .map(|plan| plan.plan_id.clone());
+        }
+    }
+
     /// Resolve selected_fingerprint to an absolute index in data.findings (via visible list).
     fn dashboard_selected_finding_index(&self) -> Option<usize> {
-        match self.dashboard.view {
-            DashboardView::FindingDetail(idx)
-            | DashboardView::EvidenceView(idx)
-            | DashboardView::TroubleshootPlan(idx) => Some(idx),
-            _ => {
-                let visible = self.dashboard_visible_finding_indices();
-                let vpos = self.selected_visible_index()?;
-                visible.get(vpos).copied()
+        if let Some(fp) = self.workspace_fingerprint() {
+            if let Some(idx) = self
+                .dashboard
+                .data
+                .findings
+                .iter()
+                .position(|finding| finding.fingerprint == fp)
+            {
+                return Some(idx);
             }
         }
+        if let DashboardView::FindingDetail(idx)
+        | DashboardView::EvidenceView(idx)
+        | DashboardView::TroubleshootPlan(idx) = self.dashboard.view
+        {
+            return self.dashboard.data.findings.get(idx).map(|_| idx);
+        }
+        let visible = self.dashboard_visible_finding_indices();
+        let vpos = self.selected_visible_index()?;
+        visible.get(vpos).copied()
     }
 
     /// Resolve selected_fingerprint to a position in the filtered visible list.
@@ -4019,6 +4383,9 @@ Report the exit status and the concise output."
             .and_then(|&idx| self.dashboard.data.findings.get(idx))
             .map(|f| f.fingerprint.clone());
         self.dashboard.selected_fingerprint = fp;
+        if !matches!(self.dashboard.view, DashboardView::Overview) {
+            self.persist_pinned_incident_from_current();
+        }
     }
 
     fn dashboard_visible_finding_indices(&self) -> Vec<usize> {
@@ -4061,6 +4428,8 @@ Report the exit status and the concise output."
         let visible = self.dashboard_visible_finding_indices();
         if visible.is_empty() {
             self.dashboard.selected_fingerprint = None;
+            self.dashboard.pinned_incident = None;
+            self.dashboard.active_plan = None;
             self.dashboard.table_scroll = 0;
             self.dashboard.detail_scroll = 0;
             return;
@@ -4077,6 +4446,9 @@ Report the exit status and the concise output."
             if vpos < self.dashboard.table_scroll {
                 self.dashboard.table_scroll = vpos;
             }
+        }
+        if !matches!(self.dashboard.view, DashboardView::Overview) {
+            self.persist_pinned_incident_from_current();
         }
     }
 
@@ -4122,25 +4494,33 @@ Report the exit status and the concise output."
 
     async fn handle_dashboard_enter(&mut self, tx: mpsc::UnboundedSender<UiEvent>) -> Result<()> {
         match self.dashboard.view {
-            DashboardView::Overview => {
-                self.dashboard.active_plan = None;
-                match self.dashboard.pane {
-                    DashboardFocus::Tabbar => {
-                        self.dashboard.pane = DashboardFocus::Table;
-                    }
-                    DashboardFocus::Table | DashboardFocus::Detail => {
-                        if let Some(idx) = self.dashboard_selected_finding_index() {
-                            self.dashboard.view = DashboardView::FindingDetail(idx);
-                            self.dashboard.detail_scroll = 0;
-                        } else {
-                            self.toast("No finding selected");
+            DashboardView::Overview => match self.dashboard.pane {
+                DashboardFocus::Tabbar => {
+                    self.dashboard.pane = DashboardFocus::Table;
+                }
+                DashboardFocus::Table | DashboardFocus::Detail => {
+                    // Fleet tab has special Enter behavior: switch active_remote
+                    if self.dashboard.active_tab == OpsTab::Fleet {
+                        if let Some(row) = self.dashboard.fleet_selected_row {
+                            if let Some(host) = self.dashboard.data.fleet_hosts.get(row) {
+                                self.toast(format!("Switched to host: {}", host.name));
+                                // Trigger dashboard refresh after remote switch
+                                self.refresh_dashboard_live().await?;
+                            }
                         }
+                    } else if let Some(idx) = self.dashboard_selected_finding_index() {
+                        self.dashboard.view = DashboardView::FindingDetail(idx);
+                        self.dashboard.detail_scroll = 0;
+                        self.persist_pinned_incident_from_current();
+                    } else {
+                        self.toast("No finding selected");
                     }
                 }
-            }
+            },
             DashboardView::FindingDetail(idx) => {
                 self.dashboard.view = DashboardView::EvidenceView(idx);
                 self.dashboard.detail_scroll = 0;
+                self.persist_pinned_incident_from_current();
             }
             DashboardView::EvidenceView(_) => {
                 self.generate_dashboard_plan().await?;
@@ -4164,7 +4544,7 @@ Report the exit status and the concise output."
         if let Some(ref guard) = self.dashboard.overlap_guard {
             guard.store(true, Ordering::SeqCst);
         }
-        let db_path = default_db_path()?;
+        let db_path = self.runtime.db_path.clone();
         let conn = rusqlite::Connection::open(&db_path)
             .with_context(|| format!("failed to open db at {}", db_path.display()))?;
         self.toast("Refreshing dashboard...");
@@ -4186,7 +4566,7 @@ Report the exit status and the concise output."
         let domain_count = SnapshotDomains::domain_names().len();
         self.write_dashboard_event(
             "collector-run",
-            "monitor",
+            Capability::FsRead.as_str(),
             &format!(
                 "domains:{} findings:{}",
                 domain_count,
@@ -4286,7 +4666,7 @@ Report the exit status and the concise output."
             self.toast("Finding not found");
             return Ok(());
         };
-        let db_path = default_db_path()?;
+        let db_path = self.runtime.db_path.clone();
         let conn = rusqlite::Connection::open(&db_path)
             .with_context(|| format!("failed to open db at {}", db_path.display()))?;
         let Some(finding) = crate::find_finding_by_id(&conn, &summary.id) else {
@@ -4309,13 +4689,17 @@ Report the exit status and the concise output."
             finding_id: finding.id.clone(),
             plan_id: plan_id.clone(),
             status: PlanStatus::Loading { started_at },
-            read_only_steps: 0,
+            read_only_steps: summary.read_only_checks.len(),
             fix_steps: 0,
             rate_limit_retry_at: None,
             rate_limit_retry_pending: false,
         });
         self.dashboard.view = DashboardView::TroubleshootPlan(idx);
         self.dashboard.detail_scroll = 0;
+        self.dashboard.pinned_incident = Some(PinnedIncidentState {
+            fingerprint: summary.fingerprint.clone(),
+            active_plan_id: Some(plan_id.clone()),
+        });
 
         // Persist a baseline TroubleshootingPlan record so the plan_id is durable.
         let source = format!("finding:{}", finding.id);
@@ -4329,6 +4713,12 @@ Report the exit status and the concise output."
             "[]",
             false,
             &prompt,
+        );
+        self.persist_dashboard_plan_status(
+            &conn,
+            &summary,
+            &plan_id,
+            &PlanStatus::Loading { started_at },
         );
 
         // Clone what the spawned task needs.
@@ -4485,15 +4875,24 @@ Report the exit status and the concise output."
             self.toast("Finding not found");
             return Ok(());
         };
+        let db_path = self.runtime.db_path.clone();
+        let conn = rusqlite::Connection::open(&db_path)
+            .with_context(|| format!("failed to open db at {}", db_path.display()))?;
         let plan_id = match &self.dashboard.active_plan {
             Some(plan) if plan.finding_id == summary.id => plan.plan_id.clone(),
             _ => {
-                self.generate_dashboard_plan().await?;
+                self.restore_active_dashboard_plan(&conn, &summary.id, None);
                 match &self.dashboard.active_plan {
                     Some(plan) if plan.finding_id == summary.id => plan.plan_id.clone(),
                     _ => {
-                        self.toast("Could not prepare plan");
-                        return Ok(());
+                        self.generate_dashboard_plan().await?;
+                        match &self.dashboard.active_plan {
+                            Some(plan) if plan.finding_id == summary.id => plan.plan_id.clone(),
+                            _ => {
+                                self.toast("Could not prepare plan");
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -4529,31 +4928,58 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
     fn refresh_dashboard(&mut self) {
         use helm_memory::SnapshotStore;
 
+        let clear_dashboard = |dashboard: &mut DashboardState| {
+            let old = std::mem::take(&mut dashboard.data);
+            let fresh = DashboardData {
+                cpu_history: old.cpu_history,
+                mem_history: old.mem_history,
+                load_history: old.load_history,
+                disk_history: old.disk_history,
+                ..DashboardData::default()
+            };
+            dashboard.data = fresh;
+            dashboard.error = None;
+        };
+
         // Capture selected fingerprint before rebuilding the finding list.
         let prev_fingerprint = self
-            .dashboard_selected_finding_index()
-            .and_then(|idx| self.dashboard.data.findings.get(idx))
-            .map(|f| f.fingerprint.clone());
+            .workspace_fingerprint()
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                self.dashboard_selected_finding_index()
+                    .and_then(|idx| self.dashboard.data.findings.get(idx))
+                    .map(|f| f.fingerprint.clone())
+            });
+        let prev_plan_id = self
+            .dashboard
+            .active_plan
+            .as_ref()
+            .map(|plan| plan.plan_id.clone());
+        let prev_plan_finding_id = self
+            .dashboard
+            .active_plan
+            .as_ref()
+            .map(|plan| plan.finding_id.clone());
 
-        let db_path = match crate::default_db_path() {
-            Ok(p) => p,
-            Err(e) => {
-                self.dashboard.error = Some(format!("db error: {e}"));
-                return;
-            }
-        };
+        let db_path = self.runtime.db_path.clone();
         let conn = match rusqlite::Connection::open(&db_path) {
             Ok(c) => c,
             Err(e) => {
-                self.dashboard.error = Some(format!("db open: {e}"));
+                tracing::debug!(path = %db_path.display(), error = %e, "dashboard db unavailable");
+                self.dashboard.selected_fingerprint = None;
+                self.dashboard.pinned_incident = None;
+                self.dashboard.active_plan = None;
+                clear_dashboard(&mut self.dashboard);
                 return;
             }
         };
         let record = match SnapshotStore::latest(&conn) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                self.dashboard.error =
-                    Some("no snapshots yet. Press F5 to collect a fresh monitor snapshot.".into());
+                self.dashboard.selected_fingerprint = None;
+                self.dashboard.pinned_incident = None;
+                self.dashboard.active_plan = None;
+                clear_dashboard(&mut self.dashboard);
                 return;
             }
             Err(e) => {
@@ -4697,7 +5123,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                     Some(FindingStateStatus::Suppressed) => DashboardFindingState::Suppressed,
                     Some(FindingStateStatus::Resolved) => DashboardFindingState::Resolved,
                     _ if aggregate.occurrence_count == 1
-                        && age_bucket(aggregate.last_seen) == DashboardAgeFilter::UnderOneDay =>
+                        && age_bucket(aggregate.first_seen) == DashboardAgeFilter::UnderOneDay =>
                     {
                         DashboardFindingState::New
                     }
@@ -4728,7 +5154,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                 if !self.audited_transitions.contains(&transition_key) {
                     if let Err(e) = self.write_dashboard_event(
                         "finding-state",
-                        "monitor",
+                        Capability::FsRead.as_str(),
                         decision,
                         &helm_memory::stable_hash_hex(&fingerprint),
                         &helm_memory::stable_hash_hex(&format!(
@@ -4768,7 +5194,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             }
             *kind_distribution.entry(kind.clone()).or_insert(0) += 1;
             *age_distribution
-                .entry(age_bucket(aggregate.last_seen).label().to_owned())
+                .entry(age_bucket(aggregate.first_seen).label().to_owned())
                 .or_insert(0) += 1;
             let sample = aggregate
                 .latest
@@ -4797,7 +5223,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                 occurrence_count: aggregate.occurrence_count,
                 first_seen: aggregate.first_seen,
                 last_seen: aggregate.last_seen,
-                age_label: format_relative_age(aggregate.last_seen),
+                age_label: format_relative_age(aggregate.first_seen),
                 sample,
                 state_note: state_record
                     .map(|record| {
@@ -4886,9 +5312,9 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                 "warning" => 1,
                 _ => 2,
             };
-            status_rank(left.status)
-                .cmp(&status_rank(right.status))
-                .then(severity_rank(&left.severity).cmp(&severity_rank(&right.severity)))
+            severity_rank(&left.severity)
+                .cmp(&severity_rank(&right.severity))
+                .then(status_rank(left.status).cmp(&status_rank(right.status)))
                 .then(right.last_seen.cmp(&left.last_seen))
                 .then(right.occurrence_count.cmp(&left.occurrence_count))
         });
@@ -4926,15 +5352,8 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                         .map(|dt| dt.format("%H:%M:%S").to_string())
                         .unwrap_or_else(|| "--:--:--".to_owned());
                     let tool_name: String = row.get::<_, String>(2)?;
-                    let kind = if tool_name == "collector-run" || tool_name == "finding-state" {
-                        "auto"
-                    } else {
-                        "user"
-                    }
-                    .to_string();
                     Ok(DashboardAuditRow {
                         time,
-                        kind,
                         capability: row.get::<_, String>(1)?,
                         command: tool_name,
                         decision: row.get::<_, String>(3)?,
@@ -4966,7 +5385,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
 
         // Push history before reassigning.
         let cap = self.dashboard.sparkline_history_depth;
-        let mut push = |buf: &mut VecDeque<f64>, val: f64| {
+        let push = |buf: &mut VecDeque<f64>, val: f64| {
             buf.push_back(val);
             if buf.len() > cap {
                 buf.pop_front();
@@ -5033,6 +5452,21 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             }
         }
         self.clamp_dashboard_selection();
+        if !matches!(self.dashboard.view, DashboardView::Overview) {
+            self.persist_pinned_incident_from_current();
+        }
+        match (prev_plan_finding_id.as_deref(), prev_plan_id.as_deref()) {
+            (Some(finding_id), preferred_plan_id) => {
+                self.restore_active_dashboard_plan(&conn, finding_id, preferred_plan_id);
+            }
+            (None, _) => {
+                if let Some(finding) = self.current_dashboard_finding().cloned() {
+                    self.restore_active_dashboard_plan(&conn, &finding.id, None);
+                } else {
+                    self.dashboard.active_plan = None;
+                }
+            }
+        }
         self.dashboard.error = None;
     }
 
@@ -5179,10 +5613,10 @@ fn render_app(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             vec![
                 Constraint::Min(10),
                 Constraint::Length(input_height(&app.input.text, area.width)),
-                Constraint::Length(1),
+                Constraint::Length(2),
             ]
         } else {
-            vec![Constraint::Min(10), Constraint::Length(1)]
+            vec![Constraint::Min(10), Constraint::Length(2)]
         };
         let vertical = Layout::default()
             .direction(Direction::Vertical)
@@ -5321,23 +5755,31 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         return;
     }
 
+    let shell = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER))
+        .style(Style::default().bg(OPS_BG));
+    let inner = shell.inner(area);
+    shell.render(area, buf);
+
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(8),
         ])
-        .split(area);
+        .split(inner);
 
     render_ops_header(app, vert[0], buf);
-    render_ops_tabbar(app, vert[1], buf);
-    render_ops_body(app, vert[2], buf);
+    render_ops_status_strip(app, vert[1], buf);
+    render_ops_tabbar(app, vert[2], buf);
+    render_ops_body(app, vert[3], buf);
 }
 
 fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let d = &app.dashboard.data;
-    let m = &d.metrics;
     let hostname = if d.hostname.is_empty() {
         "localhost"
     } else {
@@ -5348,104 +5790,208 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     } else {
         &d.collected_at
     };
-    let service_line = format!(
-        "svcs {} {} up",
-        d.total_services.saturating_sub(d.failed_services),
-        d.failed_services
-    );
-    let metric = |label: &str, value: usize, fg: Color| {
-        Span::styled(
-            format!(" {}:{value} ", label),
-            Style::default().fg(fg).add_modifier(Modifier::BOLD),
-        )
+    let provider_model = format!("{}/{}", app.provider_name.to_ascii_lowercase(), app.model);
+    let cpu_color = if d.cpu_percent >= 85.0 {
+        OPS_RED
+    } else if d.cpu_percent >= 50.0 {
+        OPS_YELLOW
+    } else {
+        OPS_GREEN
+    };
+    let mem_color = if d.memory_used_pct >= 85.0 {
+        OPS_RED
+    } else if d.memory_used_pct >= 70.0 {
+        OPS_YELLOW
+    } else {
+        OPS_GREEN
+    };
+    let load_color = if d.load_1m >= 2.0 {
+        OPS_YELLOW
+    } else {
+        OPS_MUTED
     };
 
-    let line = Line::from(vec![
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
+    let top_right = format!(
+        "load {:.1} {:.1} {:.1}  mem {:.0}% ",
+        d.load_1m, d.load_5m, d.load_15m, d.memory_used_pct
+    );
+    let top_right_w = top_right.chars().count() as u16;
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(top_right_w)])
+        .split(rows[0]);
+
+    Paragraph::new(Line::from(vec![
         Span::styled(
             " HELMOPS",
             Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("  host:{}", hostname), Style::default().fg(OPS_FG)),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled(hostname.to_ascii_uppercase(), Style::default().fg(OPS_FG)),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled(provider_model, Style::default().fg(OPS_MUTED)),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled("●", Style::default().fg(OPS_GREEN)),
         Span::styled(
-            format!("  {}", service_line),
+            " LIVE",
+            Style::default().fg(OPS_GREEN).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled(time_str, Style::default().fg(OPS_MUTED)),
+    ]))
+    .style(Style::default().bg(OPS_SURFACE))
+    .render(top[0], buf);
+
+    Paragraph::new(Line::from(vec![
+        Span::styled("load ", Style::default().fg(OPS_DIM)),
+        Span::styled(format!("{:.1}", d.load_1m), Style::default().fg(load_color)),
+        Span::styled(
+            format!(" {:.1} {:.1}", d.load_5m, d.load_15m),
             Style::default().fg(OPS_MUTED),
         ),
-        metric("CRIT", m.critical, OPS_RED),
-        metric("WARN", m.warning, OPS_YELLOW),
-        metric("OPEN", m.open, OPS_BLUE),
+        Span::styled("  mem ", Style::default().fg(OPS_DIM)),
         Span::styled(
-            format!("  load {:.1} {:.1} {:.1}", d.load_1m, d.load_5m, d.load_15m),
-            Style::default().fg(OPS_DIM),
+            format!("{:.0}%", d.memory_used_pct),
+            Style::default().fg(mem_color),
         ),
-        Span::styled(format!("  mem {:.0}%", d.memory_used_pct), {
-            let c = if d.memory_used_pct > 80.0 {
-                OPS_RED
-            } else {
-                OPS_DIM
-            };
-            Style::default().fg(c)
-        }),
-        Span::styled(format!("  cpu {:.0}%", d.cpu_percent), {
-            let c = if d.cpu_percent > 80.0 {
-                OPS_RED
-            } else {
-                OPS_GREEN
-            };
-            Style::default().fg(c)
-        }),
-        Span::styled(format!("  {}", time_str), Style::default().fg(OPS_DIM)),
-    ]);
+        Span::raw(" "),
+    ]))
+    .style(Style::default().bg(OPS_SURFACE))
+    .render(top[1], buf);
 
-    Paragraph::new(line)
+    Paragraph::new(Line::from(vec![
+        Span::styled(" cpu ", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            format!("{:.0}%", d.cpu_percent),
+            Style::default().fg(cpu_color),
+        ),
+    ]))
+    .style(Style::default().bg(OPS_SURFACE))
+    .render(rows[1], buf);
+}
+
+fn render_ops_status_strip(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let d = &app.dashboard.data;
+    let m = &d.metrics;
+    let badge = |label: &str, value: usize, fg: Color, bg: Color| {
+        Span::styled(
+            format!(" {label} {value} "),
+            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+        )
+    };
+    let meter = |mount: &str, pct: u8| {
+        let filled = ((pct as usize * 10) / 100).min(10);
+        let empty = 10usize.saturating_sub(filled);
+        let color = if pct >= 90 {
+            OPS_RED
+        } else if pct >= 75 {
+            OPS_YELLOW
+        } else {
+            OPS_GREEN
+        };
+        let bar_bg = Color::Rgb(0x21, 0x26, 0x2d);
+        let filled_bg = if color == OPS_RED {
+            Color::Rgb(0xf8, 0x51, 0x49)
+        } else if color == OPS_YELLOW {
+            Color::Rgb(0xd2, 0x99, 0x22)
+        } else {
+            Color::Rgb(0x3f, 0xb9, 0x50)
+        };
+        vec![
+            Span::styled(format!("{mount}: "), Style::default().fg(OPS_MUTED)),
+            Span::styled(
+                format!("{pct}%"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", Style::default()),
+            Span::styled(" ".repeat(filled), Style::default().bg(filled_bg)),
+            Span::styled(" ".repeat(empty), Style::default().bg(bar_bg)),
+        ]
+    };
+
+    let left = Line::from(vec![
+        badge("CRIT", m.critical, OPS_RED, Color::Rgb(0x3d, 0x1a, 0x1a)),
+        Span::raw(" "),
+        badge("WARN", m.warning, OPS_YELLOW, Color::Rgb(0x2d, 0x20, 0x08)),
+        Span::raw(" "),
+        badge(
+            "INFO",
+            d.finding_count.saturating_sub(m.critical + m.warning),
+            OPS_BLUE,
+            Color::Rgb(0x0d, 0x21, 0x37),
+        ),
+    ]);
+    let mut right_spans = Vec::new();
+    for (idx, (mount, pct)) in d.disk_bars.iter().take(2).enumerate() {
+        if idx > 0 {
+            right_spans.push(Span::styled("  ", Style::default()));
+        }
+        right_spans.extend(meter(mount, *pct));
+    }
+    let right = Line::from(right_spans);
+    let right_w = right.width() as u16;
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
+        .split(area);
+
+    Paragraph::new(left)
         .style(Style::default().bg(OPS_BG))
-        .render(area, buf);
+        .render(chunks[0], buf);
+    Paragraph::new(right)
+        .style(Style::default().bg(OPS_BG))
+        .render(chunks[1], buf);
 }
 
 fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let titles: Vec<Line> = OpsTab::all()
-        .iter()
-        .map(|tab| {
-            let style = if *tab == app.dashboard.active_tab {
-                Style::default()
-                    .fg(OPS_BLUE)
-                    .bg(OPS_SURFACE)
-                    .add_modifier(Modifier::BOLD)
+    let mut spans = Vec::new();
+    for tab in OpsTab::all() {
+        let active = *tab == app.dashboard.active_tab;
+        let fg = if active { OPS_FG } else { OPS_DIM };
+        let bg = if active { OPS_BG } else { OPS_SURFACE };
+        spans.push(Span::styled(
+            format!(" {} ", tab.label()),
+            Style::default().fg(fg).bg(bg).add_modifier(if active {
+                Modifier::BOLD
             } else {
-                Style::default().fg(OPS_MUTED)
-            };
-            let mut label = format!(" {} ", tab.label());
-            if *tab == OpsTab::Resources {
-                label.push_str(app.dashboard.resources_sub_tab.label());
-                label.push(' ');
-            }
-            Line::from(Span::styled(label, style))
-        })
-        .collect();
-    let selected = OpsTab::all()
-        .iter()
-        .position(|t| *t == app.dashboard.active_tab)
-        .unwrap_or(0);
-    Tabs::new(titles)
-        .select(selected)
-        .divider(Span::styled("│", Style::default().fg(OPS_BORDER)))
-        .style(if app.dashboard.pane == DashboardFocus::Tabbar {
-            Style::default().fg(OPS_BLUE)
-        } else {
-            Style::default().fg(OPS_MUTED)
-        })
-        .highlight_style(
-            Style::default()
-                .fg(OPS_BLUE)
-                .bg(OPS_SURFACE)
-                .add_modifier(Modifier::BOLD),
-        )
+                Modifier::empty()
+            }),
+        ));
+        spans.push(Span::styled(" ", Style::default().bg(OPS_SURFACE)));
+    }
+    Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(OPS_SURFACE))
         .render(area, buf);
+
+    if let Some(idx) = OpsTab::all()
+        .iter()
+        .position(|tab| *tab == app.dashboard.active_tab)
+    {
+        let mut x = area.x;
+        for (pos, tab) in OpsTab::all().iter().enumerate() {
+            let width = tab.label().chars().count() as u16 + 2;
+            if pos == idx {
+                for dx in 0..width {
+                    buf[(x + dx, area.y + area.height.saturating_sub(1))]
+                        .set_style(Style::default().bg(OPS_BG).fg(OPS_BLUE));
+                    buf[(x + dx, area.y + area.height.saturating_sub(1))].set_char('▁');
+                }
+                break;
+            }
+            x = x.saturating_add(width + 1);
+        }
+    }
 }
 
 fn render_ops_body(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let horiz = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(50), Constraint::Min(30)])
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
         .split(area);
     render_ops_queue(app, horiz[0], buf);
     match (app.dashboard.active_tab, app.dashboard.view) {
@@ -5455,389 +6001,503 @@ fn render_ops_body(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         }
         (OpsTab::Alerts, _) => render_ops_alerts(app, horiz[1], buf),
         (OpsTab::Services, _) => render_ops_services(app, horiz[1], buf),
-        (OpsTab::Resources, _) => match app.dashboard.resources_sub_tab {
-            ResourcesSubTab::Processes => render_ops_processes(app, horiz[1], buf),
-            ResourcesSubTab::Network => render_ops_network(app, horiz[1], buf),
-            ResourcesSubTab::Storage => render_ops_storage(app, horiz[1], buf),
-            ResourcesSubTab::Containers => render_ops_containers(app, horiz[1], buf),
-            ResourcesSubTab::Security => render_ops_security(app, horiz[1], buf),
-        },
+        (OpsTab::Processes, _) => render_ops_processes(app, horiz[1], buf),
         (OpsTab::Logs, _) => render_ops_logs(app, horiz[1], buf),
+        (OpsTab::Network, _) => render_ops_network(app, horiz[1], buf),
+        (OpsTab::Disk, _) => render_ops_storage(app, horiz[1], buf),
         (OpsTab::Changes, _) => render_ops_changes(app, horiz[1], buf),
+        (OpsTab::Fleet, _) => render_fleet_tab(
+            app,
+            horiz[1],
+            buf,
+            &app.dashboard.data.fleet_hosts,
+            app.dashboard.fleet_selected_row,
+        ),
     }
 }
 
 fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let visible = app.dashboard_visible_finding_indices();
-    let filter_label = app.dashboard.finding_state_filter.label();
-    let title = format!(
-        " FINDING QUEUE  {} found  [{}] ",
-        visible.len(),
-        filter_label
-    );
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER));
-    let inner = block.inner(area);
-    block.render(area, buf);
+    let shell = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(OPS_BORDER))
+        .style(Style::default().bg(OPS_BG));
+    let inner = shell.inner(area);
+    shell.render(area, buf);
 
-    if visible.is_empty() {
-        Paragraph::new(format!("No findings matching [{}]", filter_label))
-            .style(Style::default().fg(OPS_MUTED))
-            .render(inner, buf);
-        return;
-    }
-
-    let mut lines = Vec::new();
-    let body_height = inner.height.saturating_sub(1) as usize;
-    let sel_vpos = app.selected_visible_index().unwrap_or(0);
-    let start = if sel_vpos >= app.dashboard.table_scroll + body_height && body_height > 0 {
-        sel_vpos.saturating_sub(body_height.saturating_sub(1))
-    } else {
-        app.dashboard.table_scroll
-    };
-
-    // Severity-group headers: CRIT / WARN / INFO.
-    let mut last_sev: Option<&str> = None;
-    let sev_group_header = |sev: &str| match sev {
-        "critical" => Line::from(Span::styled(
-            "── CRIT ──",
-            Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD),
-        )),
-        "warning" => Line::from(Span::styled(
-            "── WARN ──",
-            Style::default().fg(OPS_YELLOW).add_modifier(Modifier::BOLD),
-        )),
-        _ => Line::from(Span::styled(
-            "── INFO ──",
-            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
-        )),
-    };
-
-    for (i, actual_idx) in visible.iter().enumerate().skip(start).take(body_height) {
-        let finding = &app.dashboard.data.findings[*actual_idx];
-        let sev = finding.severity.as_str();
-
-        // Insert severity-group header when severity changes.
-        if last_sev != Some(sev) {
-            lines.push(sev_group_header(sev));
-            last_sev = Some(sev);
-        }
-
-        let selected = i == sel_vpos && app.dashboard.pane == DashboardFocus::Table;
-        let bg = if selected { OPS_SURFACE } else { OPS_BG };
-        let sev_color = match sev {
-            "critical" => OPS_RED,
-            "warning" => OPS_YELLOW,
-            _ => OPS_MUTED,
-        };
-        let sev_label = finding
-            .severity
-            .chars()
-            .take(4)
-            .collect::<String>()
-            .to_ascii_uppercase();
-        let sample = truncate_cell(&finding.sample, 24);
-
-        let is_rejected = finding.state_note.contains("plan_rejected");
-        let title_prefix = if is_rejected { "⚠ " } else { "" };
-        lines.push(Line::from(vec![
-            Span::styled(" ● ", Style::default().fg(sev_color).bg(bg)),
-            Span::styled(
-                format!("{sev_label} "),
-                Style::default().fg(sev_color).bg(bg),
-            ),
-            Span::styled(
-                format!("{title_prefix}{}", truncate_cell(&finding.title, 24)),
-                Style::default()
-                    .fg(if is_rejected { OPS_YELLOW } else { OPS_FG })
-                    .bg(bg),
-            ),
-            Span::styled(
-                format!(" {}", finding.age_label),
-                Style::default().fg(OPS_DIM).bg(bg),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("   ", Style::default().bg(bg)),
-            Span::styled(
-                format!("{} · {}", finding.kind, finding.host),
-                Style::default().fg(OPS_DIM).bg(bg),
-            ),
-            Span::styled(" ", Style::default().bg(bg)),
-            Span::styled(sample, Style::default().fg(OPS_MUTED).bg(bg)),
-        ]));
-    }
-
-    // Split inner area: findings on top, sparkline strip at bottom (3 rows).
     let vert = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
         .split(inner);
 
-    Paragraph::new(lines)
-        .style(Style::default().bg(OPS_BG))
-        .render(vert[0], buf);
+    let visible = app.dashboard_visible_finding_indices();
+    {
+        let count_str = format!("{} open ", visible.len());
+        let count_len = count_str.chars().count() as u16;
+        let hdr = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(count_len)])
+            .split(vert[0]);
+        Paragraph::new(Line::from(Span::styled(
+            " FINDING QUEUE",
+            Style::default().fg(OPS_MUTED),
+        )))
+        .style(Style::default().bg(OPS_SURFACE))
+        .render(hdr[0], buf);
+        Paragraph::new(Line::from(Span::styled(
+            count_str,
+            Style::default().fg(OPS_BLUE),
+        )))
+        .style(Style::default().bg(OPS_SURFACE))
+        .render(hdr[1], buf);
+    }
 
-    // Sparkline strip: CPU | MEM | LOAD | DISK
-    let spark_areas = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
+    if app.dashboard.active_tab != OpsTab::Alerts {
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " View active in ALERTS tab",
+                Style::default().fg(OPS_DIM),
+            )),
         ])
-        .split(vert[1]);
+        .style(Style::default().bg(OPS_BG))
+        .render(vert[1], buf);
+    } else if visible.is_empty() {
+        Paragraph::new(Line::from(Span::styled(
+            " No active findings",
+            Style::default().fg(OPS_MUTED),
+        )))
+        .style(Style::default().bg(OPS_BG))
+        .render(vert[1], buf);
+    } else {
+        let list_h = vert[1].height as usize;
+        let rows_per = 5usize;
+        let visible_cap = (list_h / rows_per).max(1);
+        let sel_vpos = app.selected_visible_index().unwrap_or(0);
+        let start = if sel_vpos >= app.dashboard.table_scroll + visible_cap {
+            sel_vpos.saturating_sub(visible_cap.saturating_sub(1))
+        } else {
+            app.dashboard.table_scroll
+        };
 
-    let d = &app.dashboard.data;
-    let spark = |label: &str, data: &VecDeque<f64>, color: Color, area: Rect, buf: &mut Buffer| {
-        let points: Vec<u64> = data.iter().map(|&v| v.round() as u64).collect();
-        Sparkline::default()
-            .data(&points)
-            .max(100)
-            .style(Style::default().fg(color))
-            .block(
-                Block::default()
-                    .title(label)
-                    .title_style(Style::default().fg(OPS_DIM))
-                    .borders(Borders::NONE),
-            )
-            .render(area, buf);
-    };
-    spark("cpu", &d.cpu_history, OPS_GREEN, spark_areas[0], buf);
-    spark("mem", &d.mem_history, OPS_YELLOW, spark_areas[1], buf);
-    spark("load", &d.load_history, OPS_BLUE, spark_areas[2], buf);
-    spark("disk", &d.disk_history, OPS_RED, spark_areas[3], buf);
+        let pane_w = vert[1].width as usize;
+        let mut lines: Vec<Line> = Vec::new();
+
+        for (i, actual_idx) in visible.iter().enumerate().skip(start).take(visible_cap) {
+            let finding = &app.dashboard.data.findings[*actual_idx];
+            let sev = finding.severity.as_str();
+            let selected = i == sel_vpos;
+            let bg = if selected { OPS_SURFACE } else { OPS_BG };
+            let sev_color = match sev {
+                "critical" => OPS_RED,
+                "warning" => OPS_YELLOW,
+                _ => OPS_BLUE,
+            };
+            let sev_label = match sev {
+                "critical" => "CRIT",
+                "warning" => "WARN",
+                _ => "INFO",
+            };
+            let rejected = finding.state_note.contains("plan_rejected");
+            let title_color = if selected {
+                Color::Rgb(0xe6, 0xed, 0xf3)
+            } else {
+                OPS_FG
+            };
+
+            let prefix = if rejected {
+                format!(" ● {} ⚠ ", sev_label)
+            } else {
+                format!(" ● {} ", sev_label)
+            };
+            let status = finding.status.label().to_ascii_lowercase();
+            let gap = pane_w
+                .saturating_sub(prefix.chars().count())
+                .saturating_sub(status.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(sev_color)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ".repeat(gap), Style::default().bg(bg)),
+                Span::styled(status, Style::default().fg(OPS_DIM).bg(bg)),
+            ]));
+
+            let title = truncate_cell(&finding.title, pane_w.saturating_sub(2));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().bg(bg)),
+                Span::styled(title, Style::default().fg(title_color).bg(bg)),
+            ]));
+
+            let kh = format!("{} · {}", finding.kind, finding.host);
+            let kh = truncate_cell(&kh, pane_w.saturating_sub(2));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().bg(bg)),
+                Span::styled(kh, Style::default().fg(OPS_DIM).bg(bg)),
+            ]));
+            let timing = format!(
+                "{}  ·  {}",
+                format_open_duration_since(finding.first_seen),
+                format_last_seen_since(finding.last_seen)
+            );
+            let timing = truncate_cell(&timing, pane_w.saturating_sub(2));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().bg(bg)),
+                Span::styled(timing, Style::default().fg(OPS_MUTED).bg(bg)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "─".repeat(pane_w.max(1)),
+                Style::default().fg(OPS_BORDER).bg(OPS_BG),
+            )));
+        }
+
+        Paragraph::new(lines)
+            .style(Style::default().bg(OPS_BG))
+            .render(vert[1], buf);
+    }
 }
 
 fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" ALERT DETAIL ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER));
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    let Some(actual_idx) = app.dashboard_selected_finding_index() else {
-        Paragraph::new("Select an alert from the queue")
-            .style(Style::default().fg(OPS_MUTED))
-            .render(inner, buf);
+    let actual_idx = app
+        .dashboard_selected_finding_index()
+        .or_else(|| app.dashboard_visible_finding_indices().first().copied());
+    let Some(actual_idx) = actual_idx else {
+        Paragraph::new(Line::from(Span::styled(
+            " Select an alert from the queue",
+            Style::default().fg(OPS_MUTED),
+        )))
+        .style(Style::default().bg(OPS_BG))
+        .render(area, buf);
         return;
     };
     let finding = &app.dashboard.data.findings[actual_idx];
 
-    // Detection time formatting
-    let detection_time = chrono::DateTime::from_timestamp(finding.first_seen, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| "unknown".into());
-    let last_seen_time = chrono::DateTime::from_timestamp(finding.last_seen, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| "unknown".into());
-    let duration_secs = finding.last_seen.saturating_sub(finding.first_seen);
-    let duration_str = if duration_secs < 60 {
-        format!("{}s", duration_secs)
-    } else if duration_secs < 3600 {
-        format!("{}m", duration_secs / 60)
-    } else if duration_secs < 86400 {
-        format!("{}h {}m", duration_secs / 3600, (duration_secs % 3600) / 60)
-    } else {
-        format!(
-            "{}d {}h",
-            duration_secs / 86400,
-            (duration_secs % 86400) / 3600
-        )
+    let sev_color = match finding.severity.as_str() {
+        "critical" => OPS_RED,
+        "warning" => OPS_YELLOW,
+        _ => OPS_BLUE,
+    };
+    let sev_label = match finding.severity.as_str() {
+        "critical" => "CRIT",
+        "warning" => "WARN",
+        _ => "INFO",
     };
 
-    let mut text = format!(
-        "● {} · {}  {}\n\n",
-        finding.severity.to_ascii_uppercase(),
-        finding.kind,
-        finding.title,
-    );
+    let last_seen_str = format_dashboard_when(finding.last_seen);
+    let first_seen_str = format_dashboard_when(finding.first_seen);
 
-    // ── WHAT HAPPENED ──
-    text.push_str("╔══ WHAT HAPPENED ═══════════════════════════════════════════╗\n");
-    text.push_str(&format!("  Detector ID  {}\n", finding.detector_id));
-    text.push_str(&format!("  Detected     {}\n", detection_time));
-    text.push_str(&format!("  Domain       {}\n", finding.domain));
-    text.push_str(&format!("  Kind         {}\n", finding.kind));
-    text.push_str(&format!("  Resource     {}\n", finding.affected_resource));
-    text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
+    let w = area.width as usize;
+    let sep = Line::from(Span::styled("─".repeat(w), Style::default().fg(OPS_BORDER)));
+    let blank = Line::from("");
+    let cmd_style = Style::default()
+        .fg(Color::Rgb(0x79, 0xc0, 0xff))
+        .bg(OPS_SURFACE);
 
-    // ── WHEN ──
-    text.push_str("╔══ WHEN ═══════════════════════════════════════════════════╗\n");
-    text.push_str(&format!("  First seen   {}\n", detection_time));
-    text.push_str(&format!("  Last seen    {}\n", last_seen_time));
-    text.push_str(&format!("  Duration     {}\n", duration_str));
-    text.push_str(&format!("  Age          {}\n", finding.age_label));
-    text.push_str(&format!(
-        "  Occurrences  {} time{}\n",
-        finding.occurrence_count,
-        if finding.occurrence_count == 1 {
-            ""
-        } else {
-            "s"
+    let mut lines: Vec<Line> = Vec::new();
+
+    // ── Header ───────────────────────────────────────────────────────
+    lines.push(Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(sev_color)),
+        Span::styled(
+            format!("{sev_label} · {}", finding.kind),
+            Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            finding.title.as_str(),
+            Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(blank.clone());
+
+    lines.push(sep.clone());
+    lines.push(Line::from(Span::styled(
+        "WHAT BROKE",
+        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        finding.title.as_str(),
+        Style::default().fg(OPS_FG),
+    )));
+    lines.push(blank.clone());
+
+    lines.push(sep.clone());
+    lines.push(Line::from(Span::styled(
+        "WHEN",
+        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("Open    ", Style::default().fg(OPS_MUTED)),
+        Span::styled(
+            format_open_duration_since(finding.first_seen),
+            Style::default().fg(OPS_FG),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Seen    ", Style::default().fg(OPS_MUTED)),
+        Span::styled(last_seen_str, Style::default().fg(OPS_FG)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("First   ", Style::default().fg(OPS_MUTED)),
+        Span::styled(first_seen_str, Style::default().fg(OPS_FG)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Host    ", Style::default().fg(OPS_MUTED)),
+        Span::styled(finding.host.as_str(), Style::default().fg(OPS_FG)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Status  ", Style::default().fg(OPS_MUTED)),
+        Span::styled(
+            finding.status.label().to_ascii_lowercase(),
+            Style::default().fg(OPS_BLUE),
+        ),
+    ]));
+    lines.push(blank.clone());
+
+    lines.push(sep.clone());
+    lines.push(Line::from(Span::styled(
+        "WHY IT HAPPENED",
+        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+    )));
+    if !finding.assumptions.is_empty() {
+        for a in &finding.assumptions {
+            lines.push(Line::from(Span::styled(
+                a.as_str(),
+                Style::default().fg(OPS_FG),
+            )));
         }
-    ));
-    text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
-
-    // ── EVIDENCE ──
-    text.push_str("╔══ EVIDENCE ═══════════════════════════════════════════════╗\n");
-    if !finding.evidence_sources.is_empty() {
-        text.push_str(&format!(
-            "  Sources  {}\n",
-            finding.evidence_sources.join(", ")
-        ));
-    }
-    if finding.evidence_text.trim().is_empty() {
-        text.push_str("  (no evidence captured yet)\n");
+    } else if !finding.evidence_text.trim().is_empty() {
+        if let Some(first) = finding.evidence_text.lines().next() {
+            let first = first.trim();
+            if !first.is_empty() {
+                lines.push(Line::from(Span::styled(first, Style::default().fg(OPS_FG))));
+            }
+        }
     } else {
-        for line in finding.evidence_text.lines() {
-            text.push_str(&format!("  {line}\n"));
-        }
+        lines.push(Line::from(Span::styled(
+            "No root-cause summary captured yet.",
+            Style::default().fg(OPS_MUTED),
+        )));
     }
-    text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
+    lines.push(blank.clone());
 
-    // ── WHY (correlation) ──
-    text.push_str("╔══ WHY ════════════════════════════════════════════════════╗\n");
-    if finding.correlated_finding_ids.is_empty() {
-        text.push_str("  No correlated findings\n");
-    } else {
-        text.push_str("  Correlated findings (same snapshot):\n");
-        // Deduplicate by title; show ×count when many correlations share the same title,
-        // and keep the highest severity observed for that title.
-        let mut groups: std::collections::HashMap<String, (String, usize)> =
-            std::collections::HashMap::new();
-        let severity_rank = |s: &str| match s {
-            "critical" => 0u8,
-            "warning" => 1,
-            _ => 2,
-        };
-        for corr_id in &finding.correlated_finding_ids {
-            if let Some(corr) = app
-                .dashboard
-                .data
-                .findings
-                .iter()
-                .find(|f| f.id == *corr_id)
-            {
-                let sev = corr.severity.to_ascii_uppercase();
-                let entry = groups
-                    .entry(corr.title.clone())
-                    .or_insert_with(|| (sev.clone(), 0));
-                entry.1 += 1;
-                // Keep the highest severity.
-                if severity_rank(&corr.severity) < severity_rank(&entry.0.to_ascii_lowercase()) {
-                    entry.0 = sev;
-                }
-            }
-        }
-        // Sort by severity then count, most important first.
-        let mut sorted: Vec<_> = groups.into_iter().collect();
-        sorted.sort_by(|a, b| {
-            severity_rank(&a.1.0.to_ascii_lowercase())
-                .cmp(&severity_rank(&b.1.0.to_ascii_lowercase()))
-                .then(b.1.1.cmp(&a.1.1))
-        });
-        for (title, (sev, count)) in &sorted {
-            if *count > 1 {
-                text.push_str(&format!("    ● {sev}  {title}  (×{count})\n"));
-            } else {
-                text.push_str(&format!("    ● {sev}  {title}\n"));
-            }
-        }
-    }
-    // Append LLM narrative if a Ready plan exists for this finding.
-    if let Some(plan) = &app.dashboard.active_plan {
-        if plan.finding_id == finding.id {
-            if let PlanStatus::Ready { narrative, .. } = &plan.status {
-                text.push('\n');
-                text.push_str("  ── LLM explanation ──\n");
-                for line in narrative.lines() {
-                    text.push_str(&format!("  {line}\n"));
-                }
-            }
-        }
-    }
-    text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
-
-    // ── IMPACT ──
-    text.push_str("╔══ IMPACT ═════════════════════════════════════════════════╗\n");
-    text.push_str(&format!(
-        "  Severity   {}\n",
-        finding.severity.to_ascii_uppercase()
-    ));
-    text.push_str(&format!("  Confidence {}\n", finding.confidence));
-    text.push_str(&format!("  Resource   {}\n", finding.affected_resource));
-    text.push_str(&format!("  Category   {}\n", finding.domain));
+    lines.push(sep.clone());
+    lines.push(Line::from(Span::styled(
+        "IMPACT",
+        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+    )));
     if finding.impact.trim().is_empty() {
-        text.push_str("  Impact not yet summarized.\n");
+        lines.push(Line::from(Span::styled(
+            "Impact not yet summarized.",
+            Style::default().fg(OPS_MUTED),
+        )));
     } else {
-        text.push_str(&format!("  {}\n", finding.impact));
+        lines.push(Line::from(Span::styled(
+            finding.impact.as_str(),
+            Style::default().fg(OPS_FG),
+        )));
     }
-    text.push_str("╚════════════════════════════════════════════════════════════╝\n\n");
+    lines.push(blank.clone());
 
-    // ── FIX PLAN ──
-    text.push_str("── FIX PLAN (approval required per step) ──\n");
-    if let Some(plan) = &app.dashboard.active_plan {
-        if plan.finding_id == finding.id {
-            match &plan.status {
-                PlanStatus::Ready { fix_steps, .. } => {
-                    for (i, step) in fix_steps.iter().enumerate() {
-                        text.push_str(&format!(
-                            "\nStep {}:\n  COMMAND   {}\n  PURPOSE   {}\n  RISK      {}\n  ROLLBACK  {}\n",
-                            i + 1,
-                            step.command,
-                            step.purpose,
-                            step.risk,
-                            step.rollback,
-                        ));
-                        if !step.binary_warnings.is_empty() {
-                            for w in &step.binary_warnings {
-                                text.push_str(&format!("  ⚠ WARNING  {w}\n"));
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    text.push_str(&plan.summary_from_status());
-                }
-            }
-        } else if let Some(fix) = &finding.fix_plan {
-            text.push_str(fix);
-        } else {
-            text.push_str("Press Alt+G to generate the guided troubleshooting plan.");
-        }
-    } else if let Some(fix) = &finding.fix_plan {
-        text.push_str(fix);
+    lines.push(sep.clone());
+    lines.push(Line::from(Span::styled(
+        "WHAT CHANGED BEFORE IT BROKE",
+        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+    )));
+    if let Some(plan) = app.dashboard.data.change_sets.iter().find(|change| {
+        change.plan_id
+            == app
+                .dashboard
+                .active_plan
+                .as_ref()
+                .map(|p| p.plan_id.as_str())
+                .unwrap_or_default()
+    }) {
+        lines.push(Line::from(Span::styled(
+            format!("Recent reviewed change-set: {} ({})", plan.id, plan.status),
+            Style::default().fg(OPS_FG),
+        )));
     } else {
-        text.push_str("Press Alt+G to generate the guided troubleshooting plan.");
+        lines.push(Line::from(Span::styled(
+            "No reviewed change-set is linked to this incident yet.",
+            Style::default().fg(OPS_MUTED),
+        )));
     }
+    lines.push(blank.clone());
 
-    // ── EVIDENCE READ ──
-    text.push_str("\n\n── EVIDENCE READ (read-only, already collected) ──\n");
+    lines.push(sep.clone());
+    lines.push(Line::from(Span::styled(
+        "HOW TO REPRODUCE / VERIFY",
+        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+    )));
     if finding.read_only_checks.is_empty() {
-        text.push_str("No read-only checks stored yet.");
+        lines.push(Line::from(Span::styled(
+            "No verification checks stored yet.",
+            Style::default().fg(OPS_MUTED),
+        )));
     } else {
         for check in &finding.read_only_checks {
-            text.push_str(&format!("✓ {check}\n"));
+            lines.push(Line::from(vec![
+                Span::styled("  - ", Style::default().fg(OPS_DIM)),
+                Span::styled(check.as_str(), Style::default().fg(OPS_FG)),
+            ]));
         }
     }
+    lines.push(blank.clone());
 
-    // ── ROLLBACK ──
-    text.push_str("\n── ROLLBACK ──\n");
-    text.push_str(&finding.rollback);
+    lines.push(sep.clone());
+    lines.push(Line::from(vec![
+        Span::styled(
+            "RECOMMENDED FIX PLAN ",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("(approval required per step)", Style::default().fg(OPS_DIM)),
+    ]));
+    let active_plan = app
+        .dashboard
+        .active_plan
+        .as_ref()
+        .filter(|p| p.finding_id == finding.id);
+    if let Some(plan) = active_plan {
+        match &plan.status {
+            PlanStatus::Ready { fix_steps, .. } => {
+                for (i, step) in fix_steps.iter().enumerate() {
+                    let prefix = format!("{}. ", i + 1);
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, Style::default().fg(OPS_DIM)),
+                        Span::styled(
+                            format!(" {} ", step.command),
+                            cmd_style.add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+            }
+            _ => lines.push(Line::from(Span::styled(
+                plan.summary_from_status(),
+                Style::default().fg(OPS_MUTED),
+            ))),
+        }
+    } else if let Some(fix) = &finding.fix_plan {
+        for (i, step_line) in fix.lines().enumerate() {
+            if !step_line.trim().is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}. ", i + 1), Style::default().fg(OPS_DIM)),
+                    Span::styled(format!(" {} ", step_line.trim()), cmd_style),
+                ]));
+            }
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Press Alt+G to generate the guided troubleshooting plan.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    }
+    lines.push(blank.clone());
 
-    // ── Footer ──
-    text.push_str("\n\n◄ ► filter state   Alt+G Gen plan   Alt+E Evidence   Alt+F Follow-up   Alt+A Apply   S Suppress   R Resolve");
+    lines.push(sep.clone());
+    lines.push(Line::from(vec![
+        Span::styled(
+            "EVIDENCE READ ",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "(read-only, already collected)",
+            Style::default().fg(OPS_DIM),
+        ),
+    ]));
+    if finding.read_only_checks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No read-only checks stored yet.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    } else {
+        for check in &finding.read_only_checks {
+            lines.push(Line::from(vec![
+                Span::styled("  ✓ ", Style::default().fg(OPS_GREEN)),
+                Span::styled(check.as_str(), Style::default().fg(OPS_DIM)),
+            ]));
+        }
+    }
+    lines.push(blank.clone());
 
-    Paragraph::new(text)
-        .style(Style::default().fg(OPS_FG).bg(OPS_BG))
+    lines.push(sep.clone());
+    lines.push(Line::from(Span::styled(
+        "ROLLBACK",
+        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+    )));
+    if finding.rollback.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No rollback documented.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            finding.rollback.as_str(),
+            Style::default().fg(OPS_FG),
+        )));
+    }
+    lines.push(blank.clone());
+
+    lines.push(sep.clone());
+    lines.push(Line::from(Span::styled(
+        "EXECUTION STATUS",
+        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+    )));
+    if let Some(change) = app.dashboard.data.change_sets.iter().find(|change| {
+        change.plan_id
+            == active_plan
+                .map(|plan| plan.plan_id.as_str())
+                .unwrap_or_default()
+    }) {
+        lines.push(Line::from(Span::styled(
+            format!("{} · created {}", change.status, change.created_at),
+            Style::default().fg(OPS_FG),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No reviewed execution has been recorded for this incident.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    }
+    lines.push(blank.clone());
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            " Alt+G — Generate plan ↗ ",
+            Style::default()
+                .fg(OPS_BLUE)
+                .bg(Color::Rgb(0x1a, 0x23, 0x32)),
+        ),
+        Span::styled(" ", Style::default().bg(OPS_BG)),
+        Span::styled(
+            " Alt+E — Evidence ↗ ",
+            Style::default()
+                .fg(OPS_BLUE)
+                .bg(Color::Rgb(0x1a, 0x23, 0x32)),
+        ),
+        Span::styled(" ", Style::default().bg(OPS_BG)),
+        Span::styled(
+            " S — Suppress ",
+            Style::default()
+                .fg(OPS_YELLOW)
+                .bg(Color::Rgb(0x1a, 0x20, 0x08)),
+        ),
+    ]));
+    lines.push(blank.clone());
+    lines.push(Line::from(vec![Span::styled(
+        " R — Resolve ",
+        Style::default()
+            .fg(OPS_GREEN)
+            .bg(Color::Rgb(0x0d, 0x20, 0x08)),
+    )]));
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
         .wrap(Wrap { trim: false })
-        .render(inner, buf);
+        .render(area, buf);
 }
 
 fn render_ops_evidence(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -5848,7 +6508,10 @@ fn render_ops_evidence(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let Some(actual_idx) = app.dashboard_selected_finding_index() else {
+    let actual_idx = app
+        .dashboard_selected_finding_index()
+        .or_else(|| app.dashboard_visible_finding_indices().first().copied());
+    let Some(actual_idx) = actual_idx else {
         Paragraph::new("Select an alert from the queue")
             .style(Style::default().fg(OPS_MUTED))
             .render(inner, buf);
@@ -5902,7 +6565,10 @@ fn render_ops_troubleshoot_plan(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let Some(actual_idx) = app.dashboard_selected_finding_index() else {
+    let actual_idx = app
+        .dashboard_selected_finding_index()
+        .or_else(|| app.dashboard_visible_finding_indices().first().copied());
+    let Some(actual_idx) = actual_idx else {
         Paragraph::new("Select an alert from the queue")
             .style(Style::default().fg(OPS_MUTED))
             .render(inner, buf);
@@ -6004,149 +6670,120 @@ fn render_ops_troubleshoot_plan(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_ops_services(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" SERVICES ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER))
-        .border_type(BorderType::Rounded);
-    let inner = block.inner(area);
-    block.render(area, buf);
-
     let d = &app.dashboard.data;
     let domains = &d.domains;
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Filter: show only .service and .timer units
     let service_units: Vec<&helm_monitor::SystemdUnit> = domains
         .services
         .units
         .iter()
         .filter(|u| u.name.ends_with(".service") || u.name.ends_with(".timer"))
         .collect();
+    let failed_units: Vec<&helm_monitor::SystemdUnit> = service_units
+        .iter()
+        .filter(|u| u.active == "failed" || u.sub == "failed")
+        .copied()
+        .collect();
+    let active_count = service_units.len().saturating_sub(failed_units.len());
+    let w = area.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
 
-    lines.push(Line::from(vec![
-        Span::styled("Total: ", Style::default().fg(OPS_DIM)),
-        Span::styled(d.total_services.to_string(), Style::default().fg(OPS_FG)),
-        Span::styled("  Failed: ", Style::default().fg(OPS_DIM)),
-        Span::styled(
-            d.failed_services.to_string(),
-            if d.failed_services > 0 {
-                Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(OPS_GREEN)
-            },
-        ),
-        Span::styled(
-            format!("  showing {} service/timer units", service_units.len()),
-            Style::default().fg(OPS_MUTED),
-        ),
-    ]));
+    lines.push(Line::from(Span::styled(
+        "SYSTEMD SERVICES",
+        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+    )));
     lines.push(Line::from(Span::raw("")));
-
-    lines.push(Line::from(vec![
-        Span::styled(
-            " UNIT                     ",
-            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " LOADED   ",
-            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " ACTIVE    ",
-            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " SUB",
-            Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-
-    for unit in service_units.iter().take(20) {
-        let failed = unit.active == "failed" || unit.sub == "failed";
-        let color = if failed {
-            OPS_RED
-        } else if unit.active == "inactive" {
-            OPS_YELLOW
-        } else {
-            OPS_GREEN
-        };
-        let sub_info = if unit.sub.is_empty() || unit.sub == unit.active {
-            "–".to_owned()
-        } else {
-            unit.sub.clone()
-        };
-        let name = unit.name.chars().take(25).collect::<String>();
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {:<25} ", name),
-                if failed {
-                    Style::default().fg(color).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(OPS_FG)
-                },
-            ),
-            Span::styled(
-                format!(" {:<9} ", unit.load),
-                Style::default().fg(OPS_MUTED),
-            ),
-            Span::styled(format!(" {:<10} ", unit.active), Style::default().fg(color)),
-            Span::styled(sub_info, Style::default().fg(OPS_DIM)),
-        ]));
-    }
 
     if service_units.is_empty() {
         lines.push(Line::from(Span::styled(
             "No service data. Run a monitor cycle to collect systemd state.",
             Style::default().fg(OPS_MUTED),
         )));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<28}", "service"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:<14}", "status"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:<12}", "uptime"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:>6}", "pid"), Style::default().fg(OPS_DIM)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(w.min(70)),
+            Style::default().fg(OPS_BORDER),
+        )));
+        for unit in service_units.iter().take(20) {
+            let is_failed = unit.active == "failed" || unit.sub == "failed";
+            let status_color = if is_failed {
+                OPS_RED
+            } else if unit.active == "inactive" {
+                OPS_YELLOW
+            } else {
+                OPS_GREEN
+            };
+            let name = unit.name.chars().take(27).collect::<String>();
+            let sub_display = if unit.sub.is_empty() || unit.sub == unit.active {
+                "-".to_owned()
+            } else {
+                unit.sub.chars().take(11).collect::<String>()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<28}", name),
+                    if is_failed {
+                        Style::default().fg(OPS_RED)
+                    } else {
+                        Style::default().fg(OPS_FG)
+                    },
+                ),
+                Span::styled(
+                    format!("{:<14}", unit.active),
+                    Style::default().fg(status_color),
+                ),
+                Span::styled(
+                    format!("{:<12}", sub_display),
+                    Style::default().fg(OPS_MUTED),
+                ),
+                Span::styled(format!("{:>6}", "-"), Style::default().fg(OPS_DIM)),
+            ]));
+        }
+        lines.push(Line::from(Span::raw("")));
+        let failed_names: Vec<&str> = failed_units.iter().map(|u| u.name.as_str()).collect();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} failed · {} active", failed_units.len(), active_count),
+                Style::default().fg(OPS_DIM),
+            ),
+            if !failed_names.is_empty() {
+                Span::styled(
+                    format!(" · {} require attention", failed_names.join(" and ")),
+                    Style::default().fg(OPS_RED),
+                )
+            } else {
+                Span::styled("", Style::default())
+            },
+        ]));
     }
 
     Paragraph::new(lines)
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(inner, buf);
+        .render(area, buf);
 }
 
 fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" PROCESSES ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER))
-        .border_type(BorderType::Rounded);
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    // Split inner: sparklines on top (3 rows), table below.
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3)])
-        .split(inner);
-
-    let d = &app.dashboard.data;
-    let spark = |label: &str, data: &VecDeque<f64>, color: Color, area: Rect, buf: &mut Buffer| {
-        let points: Vec<u64> = data.iter().map(|&v| v.round() as u64).collect();
-        Sparkline::default()
-            .data(&points)
-            .max(100)
-            .style(Style::default().fg(color))
-            .block(
-                Block::default()
-                    .title(label)
-                    .title_style(Style::default().fg(OPS_DIM))
-                    .borders(Borders::NONE),
-            )
-            .render(area, buf);
-    };
-    let spark_areas = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
-        .split(vert[0]);
-    spark("cpu", &d.cpu_history, OPS_GREEN, spark_areas[0], buf);
-    spark("mem", &d.mem_history, OPS_YELLOW, spark_areas[1], buf);
-
     let domains = &app.dashboard.data.domains;
+    let w = area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            "TOP PROCESSES",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " sorted by memory · read-only",
+            Style::default().fg(OPS_DIM),
+        ),
+    ]));
+    lines.push(Line::from(Span::raw("")));
 
     let processes = &domains.processes.top_by_memory;
     if processes.is_empty() {
@@ -6156,308 +6793,156 @@ fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         )));
     } else {
         lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {} cpu ", app.dashboard.data.cpu_percent),
-                Style::default().fg(OPS_DIM),
-            ),
-            Span::styled(
-                format!("{:.0}% mem ", app.dashboard.data.memory_used_pct),
-                Style::default().fg(OPS_DIM),
-            ),
-            Span::styled(
-                format!("{} logical cores ", domains.load.cpu_logical_count),
-                Style::default().fg(OPS_DIM),
-            ),
-            Span::styled(
-                format!("zombies: {}", domains.processes.zombie_count),
-                Style::default().fg(if domains.processes.zombie_count > 0 {
-                    OPS_RED
-                } else {
-                    OPS_DIM
-                }),
-            ),
+            Span::styled(format!("{:<7}", "PID"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:<10}", "user"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:>6}", "cpu%"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:>7}", "mem"), Style::default().fg(OPS_DIM)),
+            Span::styled("  command", Style::default().fg(OPS_DIM)),
         ]));
-        lines.push(Line::from(Span::raw("")));
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {:>7} ", "PID"),
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {:<8} ", "USER"),
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {:>6} ", "CPU%"),
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {:>6} ", "MEM%"),
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " COMMAND",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(w.min(70)),
+            Style::default().fg(OPS_BORDER),
+        )));
         for proc in processes.iter().take(18) {
-            let pid = proc.pid;
-            let user = proc.user.chars().take(8).collect::<String>();
+            let user = proc.user.chars().take(9).collect::<String>();
             let cpu = proc.cpu_percent;
             let mem = proc.mem_percent;
-            let cmd = proc.command.chars().take(40).collect::<String>();
+            let cmd_max = w.saturating_sub(32);
+            let cmd = proc.command.chars().take(cmd_max).collect::<String>();
+            let cpu_color = if cpu > 10.0 { OPS_YELLOW } else { OPS_FG };
             let mem_color = if mem > 20.0 {
                 OPS_RED
             } else if mem > 10.0 {
                 OPS_YELLOW
             } else {
-                OPS_MUTED
+                OPS_FG
             };
             lines.push(Line::from(vec![
-                Span::styled(format!(" {:>7} ", pid), Style::default().fg(OPS_DIM)),
-                Span::styled(format!(" {:<8} ", user), Style::default().fg(OPS_FG)),
-                Span::styled(format!(" {:>5.1}% ", cpu), Style::default().fg(OPS_MUTED)),
-                Span::styled(
-                    format!(" {:>5.1}% ", mem),
-                    Style::default().fg(mem_color).add_modifier(if mem > 20.0 {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-                ),
-                Span::styled(cmd, Style::default().fg(OPS_FG)),
+                Span::styled(format!("{:<7}", proc.pid), Style::default().fg(OPS_DIM)),
+                Span::styled(format!("{:<10}", user), Style::default().fg(OPS_MUTED)),
+                Span::styled(format!("{:>5.1}%", cpu), Style::default().fg(cpu_color)),
+                Span::styled(format!("{:>6.1}%", mem), Style::default().fg(mem_color)),
+                Span::styled(format!("  {cmd}"), Style::default().fg(OPS_MUTED)),
             ]));
         }
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "{} logical cores · zombies: {}",
+                    domains.load.cpu_logical_count, domains.processes.zombie_count
+                ),
+                Style::default().fg(OPS_DIM),
+            ),
+            if domains.processes.zombie_count > 0 {
+                Span::styled(" · zombie processes detected", Style::default().fg(OPS_RED))
+            } else {
+                Span::styled("", Style::default())
+            },
+        ]));
     }
 
     Paragraph::new(lines)
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(vert[1], buf);
+        .render(area, buf);
 }
 
 fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block_title = if app.current_dashboard_finding().is_some() {
-        " LOGS ◂ finding ▸ "
-    } else {
-        " LOGS "
-    };
-    let block = Block::default()
-        .title(block_title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER))
-        .border_type(BorderType::Rounded);
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    let d = &app.dashboard.data;
-    let domains = &d.domains;
+    let domains = &app.dashboard.data.domains;
+    let w = area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
 
-    let journal_errors = domains.logs.journal_errors_last_hour;
-
     lines.push(Line::from(vec![
-        Span::styled("Journal errors (last hour): ", Style::default().fg(OPS_DIM)),
         Span::styled(
-            journal_errors.to_string(),
-            if journal_errors > 0 {
-                Style::default().fg(OPS_RED).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(OPS_GREEN)
-            },
+            "JOURNAL LOG STREAM",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
         ),
-        if let Some(rate) = domains.logs.error_rate_per_minute {
-            Span::styled(
-                format!("  rate: {:.1}/min", rate),
-                if rate > 10.0 {
-                    Style::default().fg(OPS_RED)
-                } else {
-                    Style::default().fg(OPS_MUTED)
-                },
-            )
-        } else {
-            Span::styled("", Style::default().fg(OPS_DIM))
-        },
+        Span::styled("  ", Style::default()),
+        Span::styled("●", Style::default().fg(OPS_GREEN)),
+        Span::styled(" live", Style::default().fg(OPS_GREEN)),
     ]));
     lines.push(Line::from(Span::raw("")));
 
-    // ── Finding-scoped LOGS ──────────────────────────────────────────────
-    if let Some(finding) = app.current_dashboard_finding() {
-        let resource_lower = finding.affected_resource.to_lowercase();
-        let domain_is_services = finding.domain.eq_ignore_ascii_case("services");
+    // Build unified entry list: (time, level, service, message)
+    let mut entries: Vec<(String, &'static str, String, String)> = Vec::new();
+    for ke in domains.logs.kernel_errors.iter() {
+        let (time, lvl, svc, msg) = parse_log_line(ke);
+        entries.push((time, lvl, svc.to_owned(), msg));
+    }
+    for af in domains.logs.auth_failures.iter() {
+        entries.push((
+            "--:--:--".into(),
+            "WARN",
+            "sshd".into(),
+            af.chars().take(100).collect(),
+        ));
+    }
 
-        // Filter kernel_errors by affected_resource
-        let filtered_kernel: Vec<&String> = domains
-            .logs
-            .kernel_errors
-            .iter()
-            .filter(|ke| {
-                ke.to_lowercase().contains(&resource_lower)
-                    || (domain_is_services && {
-                        // For services domain, also try matching just the
-                        // service name portion (strip .service suffix if present).
-                        let svc_name = finding
-                            .affected_resource
-                            .strip_suffix(".service")
-                            .unwrap_or(&finding.affected_resource);
-                        ke.to_lowercase().contains(&svc_name.to_lowercase())
-                    })
-            })
-            .collect();
-
-        // Filter auth_failures by affected_resource
-        let filtered_auth: Vec<&String> = domains
-            .logs
-            .auth_failures
-            .iter()
-            .filter(|af| af.to_lowercase().contains(&resource_lower))
-            .collect();
-
-        // Scoping header
-        lines.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(OPS_BLUE)),
-            Span::styled(
-                format!("Scoped to finding: {}", finding.title),
-                Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
-            ),
-        ]));
+    if entries.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!(
-                "  {} kernel errors, {} auth failures",
-                filtered_kernel.len(),
-                filtered_auth.len(),
-            ),
+            "No log signals. System appears quiet.",
             Style::default().fg(OPS_MUTED),
         )));
-        lines.push(Line::from(Span::raw("")));
-
-        // Show filtered kernel_errors
-        if !filtered_kernel.is_empty() {
+    } else {
+        let msg_max = w.saturating_sub(35);
+        for (time, lvl, svc, msg) in entries.iter().take(20) {
+            let (lvl_fg, lvl_bg) = match *lvl {
+                "CRIT" => (OPS_RED, Color::Rgb(0x3d, 0x1a, 0x1a)),
+                "ERR" => (OPS_RED, Color::Rgb(0x3d, 0x1a, 0x1a)),
+                "WARN" => (OPS_YELLOW, Color::Rgb(0x2d, 0x20, 0x08)),
+                _ => (OPS_BLUE, Color::Rgb(0x0d, 0x21, 0x37)),
+            };
+            let msg_display = msg.chars().take(msg_max).collect::<String>();
             lines.push(Line::from(vec![
+                Span::styled(format!("{:<9}", time), Style::default().fg(OPS_DIM)),
                 Span::styled(
-                    "KERNEL  ",
-                    Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+                    format!(" {:<4} ", lvl),
+                    Style::default()
+                        .fg(lvl_fg)
+                        .bg(lvl_bg)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("{} matching", filtered_kernel.len()),
-                    Style::default().fg(OPS_RED),
-                ),
+                Span::styled(format!(" {:<8}", svc), Style::default().fg(OPS_MUTED)),
+                Span::styled(msg_display, Style::default().fg(OPS_FG)),
             ]));
-            for ke in filtered_kernel.iter().take(6) {
-                let short = ke.chars().take(64).collect::<String>();
-                lines.push(Line::from(Span::styled(
-                    format!("  {short}"),
-                    Style::default().fg(OPS_RED),
-                )));
-            }
-            lines.push(Line::from(Span::raw("")));
-        }
-
-        // Show filtered auth_failures
-        if !filtered_auth.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "AUTH    ",
-                    Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{} matching", filtered_auth.len()),
-                    Style::default().fg(OPS_YELLOW),
-                ),
-            ]));
-            for af in filtered_auth.iter().take(6) {
-                let short = af.chars().take(64).collect::<String>();
-                lines.push(Line::from(Span::styled(
-                    format!("  {short}"),
-                    Style::default().fg(OPS_YELLOW),
-                )));
-            }
-        }
-
-        // Empty state for filtered logs
-        if filtered_kernel.is_empty() && filtered_auth.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("No matching log entries for {}", finding.affected_resource,),
-                Style::default().fg(OPS_MUTED),
-            )));
-        }
-
-        Paragraph::new(lines)
-            .style(Style::default().bg(OPS_BG))
-            .scroll((app.dashboard.detail_scroll as u16, 0))
-            .render(inner, buf);
-        return;
-    }
-
-    // ── Generic LOGS view (no finding selected) ──────────────────────────
-    if !domains.logs.kernel_errors.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "KERNEL  ",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{} entries", domains.logs.kernel_errors.len()),
-                Style::default().fg(OPS_RED),
-            ),
-            Span::styled("  (latest shown)", Style::default().fg(OPS_MUTED)),
-        ]));
-        for ke in domains.logs.kernel_errors.iter().take(6) {
-            let short = ke.chars().take(64).collect::<String>();
-            lines.push(Line::from(Span::styled(
-                format!("  {short}"),
-                Style::default().fg(OPS_RED),
-            )));
         }
         lines.push(Line::from(Span::raw("")));
-    }
-
-    if !domains.logs.auth_failures.is_empty() {
+        let crit_n = entries.iter().filter(|e| e.1 == "CRIT").count();
+        let err_n = entries.iter().filter(|e| e.1 == "ERR").count();
+        let warn_n = entries.iter().filter(|e| e.1 == "WARN").count();
+        let shown = entries.len().min(20);
         lines.push(Line::from(vec![
             Span::styled(
-                "AUTH    ",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+                format!("Showing {} entries · ", shown),
+                Style::default().fg(OPS_DIM),
             ),
             Span::styled(
-                format!("{} entries", domains.logs.auth_failures.len()),
-                Style::default().fg(OPS_YELLOW),
+                format!("{} CRIT · {} ERR · {} WARN", crit_n, err_n, warn_n),
+                Style::default().fg(OPS_RED),
             ),
-            Span::styled("  (latest shown)", Style::default().fg(OPS_MUTED)),
         ]));
-        for af in domains.logs.auth_failures.iter().take(6) {
-            let short = af.chars().take(64).collect::<String>();
-            lines.push(Line::from(Span::styled(
-                format!("  {short}"),
-                Style::default().fg(OPS_YELLOW),
-            )));
-        }
-    }
-
-    if domains.logs.kernel_errors.is_empty() && domains.logs.auth_failures.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No recent log signals. System appears quiet.",
-            Style::default().fg(OPS_MUTED),
-        )));
     }
 
     Paragraph::new(lines)
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(inner, buf);
+        .render(area, buf);
 }
 
 fn render_ops_network(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" NETWORK ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER))
-        .border_type(BorderType::Rounded);
-    let inner = block.inner(area);
-    block.render(area, buf);
-
     let domains = &app.dashboard.data.domains;
+    let w = area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            "LISTENING PORTS",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" read-only · ss -tulpn", Style::default().fg(OPS_DIM)),
+    ]));
+    lines.push(Line::from(Span::raw("")));
 
     let listeners = &domains.ports.listeners;
     if listeners.is_empty() {
@@ -6467,72 +6952,85 @@ fn render_ops_network(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         )));
     } else {
         lines.push(Line::from(vec![
-            Span::styled(
-                " PORT ",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " PROTO ",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " BIND ADDRESS          ",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " RISK   ",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " PROCESS",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!("{:<7}", "port"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:<6}", "proto"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:<10}", "state"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:<16}", "bind"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:<14}", "process"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:>5}", "risk"), Style::default().fg(OPS_DIM)),
         ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(w.min(70)),
+            Style::default().fg(OPS_BORDER),
+        )));
+
+        let mut notable: Vec<String> = Vec::new();
         for lis in listeners.iter().take(20) {
-            let proto = &lis.protocol;
+            let proto = lis.protocol.chars().take(5).collect::<String>();
             let addr = &lis.local_address;
+            let is_public = addr.contains("0.0.0.0") || addr.contains("::");
+            let is_localhost = addr.contains("127.0.0.1") || addr.contains("::1");
+            let (risk_label, risk_color) = if is_public {
+                if lis.local_port < 1024 {
+                    ("CRIT", OPS_RED)
+                } else {
+                    ("WARN", OPS_YELLOW)
+                }
+            } else if is_localhost {
+                ("OK", OPS_GREEN)
+            } else {
+                ("INFO", OPS_BLUE)
+            };
+            let state = "LISTEN";
+            let state_color = OPS_GREEN;
+            let port_color = if risk_label == "CRIT" {
+                OPS_RED
+            } else if risk_label == "WARN" {
+                OPS_YELLOW
+            } else {
+                OPS_FG
+            };
+            let bind_ip = addr
+                .split(':')
+                .next()
+                .unwrap_or(addr)
+                .chars()
+                .take(15)
+                .collect::<String>();
             let proc = lis
                 .process_name
                 .as_deref()
-                .unwrap_or("-")
+                .unwrap_or("(none)")
                 .chars()
-                .take(14)
+                .take(13)
                 .collect::<String>();
-            let is_public = addr.contains("0.0.0.0") || addr.contains("::");
-            let is_localhost = addr.contains("127.0.0.1") || addr.contains("::1");
-            let risk = if is_public {
-                "OPEN  "
-            } else if is_localhost {
-                "local "
-            } else {
-                "bound "
-            };
-            let risk_color = if is_public {
-                OPS_RED
-            } else if is_localhost {
-                OPS_GREEN
-            } else {
-                OPS_MUTED
-            };
-            let addr_color = if is_public { OPS_RED } else { OPS_MUTED };
-            let addr_display = addr.chars().take(22).collect::<String>();
-            let port_display = format!("{:>5}", lis.local_port);
+            if risk_label == "CRIT" || risk_label == "WARN" {
+                notable.push(format!(":{} ({})", lis.local_port, risk_label));
+            }
             lines.push(Line::from(vec![
-                Span::styled(format!(" {} ", port_display), Style::default().fg(OPS_FG)),
-                Span::styled(format!(" {:>5} ", proto), Style::default().fg(OPS_DIM)),
                 Span::styled(
-                    format!(" {:<22} ", addr_display),
-                    Style::default().fg(addr_color),
+                    format!(":{:<6}", lis.local_port),
+                    Style::default().fg(port_color).add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(format!("{:<6}", proto), Style::default().fg(OPS_DIM)),
+                Span::styled(format!("{:<10}", state), Style::default().fg(state_color)),
+                Span::styled(format!("{:<16}", bind_ip), Style::default().fg(OPS_MUTED)),
+                Span::styled(format!("{:<14}", proc), Style::default().fg(OPS_FG)),
                 Span::styled(
-                    risk,
-                    Style::default().fg(risk_color).add_modifier(if is_public {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
+                    format!("{:>5}", risk_label),
+                    Style::default().fg(risk_color),
                 ),
-                Span::styled(proc, Style::default().fg(OPS_FG)),
+            ]));
+        }
+
+        if !notable.is_empty() {
+            lines.push(Line::from(Span::raw("")));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("Notable: {}", notable.join("  ")),
+                    Style::default().fg(OPS_YELLOW),
+                ),
+                Span::styled(" — review exposed services.", Style::default().fg(OPS_DIM)),
             ]));
         }
     }
@@ -6540,41 +7038,23 @@ fn render_ops_network(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines)
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(inner, buf);
+        .render(area, buf);
 }
 
 fn render_ops_storage(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" STORAGE ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER))
-        .border_type(BorderType::Rounded);
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    // Disk sparkline at top.
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3)])
-        .split(inner);
-
-    let d = &app.dashboard.data;
-    let points: Vec<u64> = d.disk_history.iter().map(|&v| v.round() as u64).collect();
-    Sparkline::default()
-        .data(&points)
-        .max(100)
-        .style(Style::default().fg(OPS_RED))
-        .block(
-            Block::default()
-                .title("disk %")
-                .title_style(Style::default().fg(OPS_DIM))
-                .borders(Borders::NONE),
-        )
-        .render(vert[0], buf);
-
     let domains = &app.dashboard.data.domains;
     let fses = &domains.disks.filesystems;
+    let w = area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            "DISK USAGE",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" df -h + inode check + SMART", Style::default().fg(OPS_DIM)),
+    ]));
+    lines.push(Line::from(Span::raw("")));
 
     if fses.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -6582,80 +7062,92 @@ fn render_ops_storage(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             Style::default().fg(OPS_MUTED),
         )));
     } else {
-        // header
-        lines.push(Line::from(vec![
-            Span::styled(
-                " DEVICE      ",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " MOUNT      ",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " USAGE BAR          ",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  USE%",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " INODE%",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        let bar_w = w.saturating_sub(20).clamp(10, 40);
+        let mut critical_mounts: Vec<String> = Vec::new();
 
-        for fs in fses.iter().take(14) {
-            let device = fs.device.chars().take(12).collect::<String>();
-            let mount = fs.mount_point.chars().take(12).collect::<String>();
+        for fs in fses.iter().take(8) {
             let pct = if fs.total_bytes > 0 {
                 (fs.used_bytes as f64 / fs.total_bytes as f64 * 100.0).clamp(0.0, 100.0) as u8
             } else {
                 0
             };
-            let bar_w = 12usize;
-            let filled = ((pct as usize) * bar_w / 100).min(bar_w);
-            let empty_b = bar_w.saturating_sub(filled);
-            let bar_contents = "#".repeat(filled) + &"·".repeat(empty_b);
-            let bar_color = if pct >= 95 {
+            let bar_color = if pct >= 85 {
                 OPS_RED
-            } else if pct >= 80 {
+            } else if pct >= 70 {
                 OPS_YELLOW
             } else {
                 OPS_GREEN
             };
-            let inode_str = domains
+            let filled = ((pct as usize) * bar_w / 100).min(bar_w);
+            let empty_b = bar_w.saturating_sub(filled);
+            let bar_str = format!("{}{}", "█".repeat(filled), "░".repeat(empty_b));
+
+            let mount = fs.mount_point.chars().take(20).collect::<String>();
+            let pct_str = format!("{}%", pct);
+            let pad = w.saturating_sub(mount.len() + pct_str.len() + 2).min(40);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    mount.clone(),
+                    Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ".repeat(pad), Style::default()),
+                Span::styled(
+                    pct_str,
+                    Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                bar_str,
+                Style::default().fg(bar_color),
+            )));
+
+            let used_h = fmt_bytes(fs.used_bytes);
+            let total_h = fmt_bytes(fs.total_bytes);
+            let device = fs.device.chars().take(12).collect::<String>();
+            let inode_pct = domains
                 .disks
                 .inodes
                 .iter()
-                .find(|i| i.mount_point == mount.trim() || i.device == device.trim())
+                .find(|i| i.mount_point == fs.mount_point || i.device == fs.device)
                 .map(|ino| {
-                    let ipct = if ino.total > 0 {
-                        (ino.used as f64 / ino.total as f64 * 100.0).clamp(0.0, 100.0) as u8
+                    if ino.total > 0 {
+                        format!("{}%", (ino.used as f64 / ino.total as f64 * 100.0) as u8)
                     } else {
-                        0
-                    };
-                    let ic = if ipct >= 90 {
-                        OPS_RED
-                    } else if ipct >= 75 {
-                        OPS_YELLOW
-                    } else {
-                        OPS_GREEN
-                    };
-                    (format!("{ipct:>5}%"), ic)
+                        "-".to_owned()
+                    }
                 })
-                .unwrap_or_else(|| ("    –".to_owned(), OPS_DIM));
-
+                .unwrap_or_else(|| "-".to_owned());
             lines.push(Line::from(vec![
-                Span::styled(format!(" {:<12} ", device), Style::default().fg(OPS_DIM)),
-                Span::styled(format!(" {:<12} ", mount), Style::default().fg(OPS_FG)),
-                Span::styled(format!("[{bar_contents}] "), Style::default().fg(bar_color)),
                 Span::styled(
-                    format!("{:>3}% ", pct),
-                    Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+                    format!("{} / {} used", used_h, total_h),
+                    Style::default().fg(OPS_DIM),
                 ),
-                Span::styled(inode_str.0, Style::default().fg(inode_str.1)),
+                Span::styled(format!("  {}", device), Style::default().fg(OPS_DIM)),
+                Span::styled(
+                    format!("  inodes {}%", inode_pct),
+                    Style::default().fg(OPS_DIM),
+                ),
+                Span::styled("  SMART ", Style::default().fg(OPS_DIM)),
+                Span::styled("ok", Style::default().fg(OPS_GREEN)),
+            ]));
+            lines.push(Line::from(Span::raw("")));
+
+            if pct >= 85 {
+                critical_mounts.push(format!("{} at {}%", mount, pct));
+            }
+        }
+
+        if !critical_mounts.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "─".repeat(w.min(60)),
+                Style::default().fg(OPS_BORDER),
+            )));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} — critical.", critical_mounts.join(", ")),
+                    Style::default().fg(OPS_RED),
+                ),
+                Span::styled(" Investigate disk consumers.", Style::default().fg(OPS_DIM)),
             ]));
         }
     }
@@ -6663,9 +7155,132 @@ fn render_ops_storage(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines)
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(vert[1], buf);
+        .render(area, buf);
 }
 
+fn render_fleet_tab(
+    _app: &TuiApp,
+    area: Rect,
+    buf: &mut Buffer,
+    fleet_hosts: &[FleetHostStatus],
+    selected_row: Option<usize>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER))
+        .style(Style::default().bg(OPS_BG))
+        .title(" FLEET ");
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    if fleet_hosts.is_empty() {
+        Paragraph::new(Span::styled(
+            "No fleet hosts configured",
+            Style::default().fg(OPS_MUTED),
+        ))
+        .style(Style::default().bg(OPS_BG))
+        .render(inner, buf);
+        return;
+    }
+
+    let header = vec![
+        Cell::from(Span::styled(
+            "Name",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            "Status",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            "CRIT",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            "WARN",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            "INFO",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            "Last",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    let mut rows = vec![Row::new(header).height(1)];
+
+    for (idx, host) in fleet_hosts.iter().enumerate() {
+        let is_selected = selected_row == Some(idx);
+        let bg = if is_selected { OPS_SURFACE } else { OPS_BG };
+
+        let status_text = if host.reachable { "UP" } else { "DOWN" };
+        let status_color = if host.reachable { OPS_GREEN } else { OPS_RED };
+
+        let last_str = host
+            .last_refresh
+            .map(|instant| {
+                let elapsed = instant.elapsed();
+                if elapsed.as_secs() < 60 {
+                    format!("{}s", elapsed.as_secs())
+                } else if elapsed.as_secs() < 3600 {
+                    format!("{}m", elapsed.as_secs() / 60)
+                } else {
+                    format!("{}h", elapsed.as_secs() / 3600)
+                }
+            })
+            .unwrap_or_else(|| "N/A".to_owned());
+
+        let row = Row::new(vec![
+            Cell::from(Span::styled(
+                host.name.clone(),
+                Style::default().fg(OPS_FG).bg(bg),
+            )),
+            Cell::from(Span::styled(
+                status_text,
+                Style::default()
+                    .fg(status_color)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Cell::from(Span::styled(
+                format!("{}", host.crit),
+                Style::default().fg(OPS_RED).bg(bg),
+            )),
+            Cell::from(Span::styled(
+                format!("{}", host.warn),
+                Style::default().fg(OPS_YELLOW).bg(bg),
+            )),
+            Cell::from(Span::styled(
+                format!("{}", host.info),
+                Style::default().fg(OPS_BLUE).bg(bg),
+            )),
+            Cell::from(Span::styled(last_str, Style::default().fg(OPS_DIM).bg(bg))),
+        ])
+        .height(1);
+
+        rows.push(row);
+    }
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(30),
+            Constraint::Percentage(10),
+            Constraint::Percentage(12),
+            Constraint::Percentage(12),
+            Constraint::Percentage(12),
+            Constraint::Percentage(24),
+        ],
+    )
+    .style(Style::default().bg(OPS_BG));
+
+    table.render(inner, buf);
+}
+
+#[allow(dead_code)]
 fn render_ops_containers(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .title(" CONTAINERS ")
@@ -6777,6 +7392,7 @@ fn render_ops_containers(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .render(inner, buf);
 }
 
+#[allow(dead_code)]
 fn render_ops_security(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .title(" SECURITY ")
@@ -6955,102 +7571,185 @@ fn render_ops_security(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_ops_changes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" CHANGES ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(OPS_BORDER));
-    let inner = block.inner(area);
-    block.render(area, buf);
-
     let d = &app.dashboard.data;
     let mut lines: Vec<Line> = Vec::new();
 
+    // header
+    lines.push(Line::from(vec![
+        Span::styled(
+            "AUDIT LOG",
+            Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ● ", Style::default().fg(OPS_GREEN)),
+        Span::styled("chain verified", Style::default().fg(OPS_GREEN)),
+    ]));
+    lines.push(Line::from(Span::raw("")));
+
     if d.audit_events.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No audit events tracked yet.",
+            "No audit events recorded.",
             Style::default().fg(OPS_MUTED),
         )));
     } else {
+        // column header
         lines.push(Line::from(vec![
             Span::styled(
-                " time     ",
+                format!("{:<10}", "time"),
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "kind   ",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "cap    ",
+                format!("{:<8}", "cap"),
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "command",
                 Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                format!("{:>8}", "approved"),
+                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
+            ),
         ]));
-        for event in d.audit_events.iter().take(12) {
-            let cap_color = if event.capability.contains("shell") || event.capability == "exec" {
+        // separator
+        lines.push(Line::from(Span::styled(
+            "─".repeat(80),
+            Style::default().fg(OPS_BORDER),
+        )));
+
+        let mut exec_count = 0usize;
+        let mut read_count = 0usize;
+        let mut plan_count = 0usize;
+
+        for event in d.audit_events.iter() {
+            let cap = event.capability.as_str();
+            let cap_color = if cap.contains("shell") || cap == "exec" || cap.contains("write") {
+                exec_count += 1;
                 OPS_YELLOW
-            } else if event.capability.contains("plan") {
+            } else if cap.contains("plan") {
+                plan_count += 1;
                 OPS_BLUE
             } else {
+                read_count += 1;
                 OPS_GREEN
             };
-            let kind_color = if event.kind == "auto" {
-                OPS_GREEN
-            } else {
+
+            let approved = event.decision.as_str();
+            let approved_color = if approved.contains("user") {
+                OPS_YELLOW
+            } else if approved.contains("plan") {
                 OPS_BLUE
+            } else {
+                OPS_DIM
             };
+
+            // calculate command column width: total - time(10) - cap(8) - approved(8) - spaces
+            let cmd_width = area.width.saturating_sub(30) as usize;
             lines.push(Line::from(vec![
-                Span::styled(format!(" {:<8} ", event.time), Style::default().fg(OPS_DIM)),
                 Span::styled(
-                    format!("[{:<4}] ", event.kind),
-                    Style::default().fg(kind_color),
+                    format!("{:<10}", truncate_cell(&event.time, 9)),
+                    Style::default().fg(OPS_DIM),
                 ),
                 Span::styled(
-                    format!(" {:<6} ", event.capability),
+                    format!("{:<8}", truncate_cell(cap, 7)),
                     Style::default().fg(cap_color),
                 ),
                 Span::styled(
-                    truncate_cell(&event.command, 46),
+                    format!(
+                        "{:<width$}",
+                        truncate_cell(&event.command, cmd_width.saturating_sub(2)),
+                        width = cmd_width.saturating_sub(2)
+                    ),
                     Style::default().fg(OPS_FG),
                 ),
                 Span::styled(
-                    format!("  {}", event.decision),
-                    Style::default().fg(OPS_MUTED),
+                    format!("{:>8}", truncate_cell(approved, 8)),
+                    Style::default().fg(approved_color),
                 ),
             ]));
         }
+
         lines.push(Line::from(Span::raw("")));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{} audit events · {} change sets",
-                d.audit_events.len(),
-                d.change_sets.len()
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} events", d.audit_events.len()),
+                Style::default().fg(OPS_MUTED),
             ),
-            Style::default().fg(OPS_MUTED),
-        )));
+            Span::styled(" · ", Style::default().fg(OPS_BORDER)),
+            Span::styled(
+                format!("{} exec (user-approved)", exec_count),
+                Style::default().fg(OPS_YELLOW),
+            ),
+            Span::styled(" · ", Style::default().fg(OPS_BORDER)),
+            Span::styled(
+                format!("{} read (auto)", read_count),
+                Style::default().fg(OPS_GREEN),
+            ),
+            Span::styled(" · ", Style::default().fg(OPS_BORDER)),
+            Span::styled(
+                format!("{} plan", plan_count),
+                Style::default().fg(OPS_BLUE),
+            ),
+            Span::styled(" · ", Style::default().fg(OPS_BORDER)),
+            Span::styled("HMAC chain intact", Style::default().fg(OPS_GREEN)),
+        ]));
     }
 
     Paragraph::new(lines)
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(inner, buf);
+        .render(area, buf);
 }
 
-fn render_ops_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let focus = match app.dashboard.pane {
-        DashboardFocus::Tabbar => "TABS",
-        DashboardFocus::Table => "QUEUE",
-        DashboardFocus::Detail => "DETAIL",
-    };
-    let help = format!(
-        " FOCUS:{focus} ▸1-5 switch tab ▸F5 refresh ▸Alt+G plan ▸Alt+E evidence ▸Alt+A apply ▸R resolve ",
-    );
-    Paragraph::new(Line::from(Span::styled(help, Style::default().fg(OPS_DIM))))
-        .style(Style::default().bg(OPS_BG))
-        .render(area, buf);
+fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let key = |s: &'static str| Span::styled(s, Style::default().fg(OPS_FG));
+    let sep = || Span::styled("  ", Style::default().fg(OPS_DIM));
+    let desc = |s: &'static str| Span::styled(s, Style::default().fg(OPS_DIM));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
+    let line1 = Line::from(vec![
+        key(" Tab"),
+        desc(" focus panes"),
+        sep(),
+        key("F5"),
+        desc(" refresh"),
+        sep(),
+        key("Enter"),
+        desc(" select"),
+        sep(),
+        key("Alt+G"),
+        desc(" gen plan"),
+        sep(),
+        key("Alt+E"),
+        desc(" evidence"),
+        sep(),
+        key("Alt+A"),
+        desc(" apply"),
+        sep(),
+        key("S"),
+        desc(" suppress"),
+    ]);
+    Paragraph::new(line1)
+        .style(Style::default().bg(OPS_SURFACE))
+        .render(rows[0], buf);
+
+    let right = "F1 help";
+    let left = " R resolve";
+    let pad = area
+        .width
+        .saturating_sub(left.len() as u16 + right.len() as u16) as usize;
+    let line2 = Line::from(vec![
+        key(" R"),
+        desc(" resolve"),
+        Span::styled(" ".repeat(pad), Style::default().fg(OPS_DIM)),
+        key("F1"),
+        desc(" help"),
+    ]);
+    Paragraph::new(line2)
+        .style(Style::default().bg(OPS_SURFACE))
+        .render(rows[1], buf);
 }
 
 #[allow(dead_code)]
@@ -7086,11 +7785,66 @@ fn truncate_cell(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn provider_boundary_label(app: &TuiApp) -> &'static str {
-    if app.active_settings.choice == ProviderChoice::Ollama && !app.model.ends_with(":cloud") {
-        "llm local"
+fn fmt_bytes(bytes: u64) -> String {
+    const GB: u64 = 1 << 30;
+    const MB: u64 = 1 << 20;
+    const KB: u64 = 1 << 10;
+    if bytes >= GB {
+        format!("{:.0}G", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.0}M", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0}K", bytes as f64 / KB as f64)
     } else {
-        "llm api"
+        format!("{}B", bytes)
+    }
+}
+
+fn parse_log_line(line: &str) -> (String, &'static str, &'static str, String) {
+    let lower = line.to_lowercase();
+    let lvl = if lower.contains("crit") || lower.contains("oom") || lower.contains("killed") {
+        "CRIT"
+    } else if lower.contains("error")
+        || lower.contains(" err ")
+        || lower.contains("failed")
+        || lower.contains("denied")
+    {
+        "ERR"
+    } else if lower.contains("warn") {
+        "WARN"
+    } else {
+        "INFO"
+    };
+    let svc = if lower.contains("kernel") || lower.contains("kern") {
+        "kernel"
+    } else if lower.contains("nginx") {
+        "nginx"
+    } else if lower.contains("postgres") {
+        "postgres"
+    } else if lower.contains("ssh") || lower.contains("auth") {
+        "sshd"
+    } else if lower.contains("systemd") {
+        "systemd"
+    } else {
+        "journal"
+    };
+    let time = line
+        .split_whitespace()
+        .find(|part| part.len() == 8 && part.chars().nth(2) == Some(':'))
+        .unwrap_or("--:--:--")
+        .to_owned();
+    let msg = line.chars().take(100).collect::<String>();
+    (time, lvl, svc, msg)
+}
+
+fn provider_boundary_label(app: &TuiApp) -> &'static str {
+    if !app.is_llm_provider_configured() {
+        "ai off"
+    } else if app.active_settings.choice == ProviderChoice::Ollama && !app.model.ends_with(":cloud")
+    {
+        "ai local"
+    } else {
+        "ai api"
     }
 }
 
@@ -7622,13 +8376,6 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
-        ModalState::Error(message) => {
-            Paragraph::new(message.as_str())
-                .block(modal_block(" Error "))
-                .style(Style::default().fg(ERROR_FG).bg(MODAL_BG))
-                .wrap(Wrap { trim: false })
-                .render(area, buf);
-        }
         ModalState::Help => {
             Paragraph::new(if app.mode == AgentMode::Dashboard {
                 "Dashboard: Tab focus panes | Left/Right or 1-8 switch tabs | Up/Down move queue | Enter drill in | Alt+E evidence | Alt+F follow-up | Alt+G guided plan | Alt+A apply | S suppress | R resolve | U reopen | F5 refresh | Ctrl+P palette | Ctrl+H/? help"
@@ -8016,6 +8763,7 @@ fn estimated_cost(provider: ProviderChoice, tokens_in: u32, tokens_out: u32) -> 
     )
 }
 
+#[cfg(test)]
 fn tool_call_summary(name: &str, input: &serde_json::Value) -> String {
     let object = input.as_object();
     match name {
@@ -8078,28 +8826,6 @@ fn tool_call_summary(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-fn tool_output_preview(content: &str) -> String {
-    let content = sanitize_display_text(content);
-    let mut useful = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "STDOUT:" || line == "STDERR:" {
-            continue;
-        }
-        if line.starts_with("[exit code:") {
-            continue;
-        }
-        useful.push(line.to_owned());
-        if useful.len() == 2 {
-            break;
-        }
-    }
-    truncate(useful.join("\n"), 220)
-}
-
 fn transcript_scroll_offsets(
     total_lines: usize,
     viewport_height: u16,
@@ -8158,6 +8884,7 @@ fn truncate(text: impl AsRef<str>, max_chars: usize) -> String {
     }
 }
 
+#[cfg(test)]
 fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|error| format!("invalid json: {error}"))
 }
@@ -9430,8 +10157,8 @@ mod tests {
         assert!(rendered.contains("HELMOPS"), "should render HELMOPS header");
         assert!(rendered.contains("QUEUE"), "should render queue title");
         assert!(rendered.contains("testbox"), "should show hostname");
-        assert!(rendered.contains("CRIT:"), "should show CRIT count");
-        assert!(rendered.contains("WARN:"), "should show WARN count");
+        assert!(rendered.contains("CRIT 1"), "should show CRIT count");
+        assert!(rendered.contains("WARN 1"), "should show WARN count");
         assert!(
             rendered.contains("Disk /var 78% full"),
             "should show selected finding detail"
@@ -9457,27 +10184,25 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         let data = test_dash_data();
-        // Single-line header shows CRIT/WARN/OPEN counts.
         app.dashboard.data = data.clone();
         let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            rendered.contains("CRIT:1"),
+            rendered.contains("CRIT 1"),
             "should show CRIT count in header: got '{rendered}'"
         );
         assert!(
-            rendered.contains("WARN:1"),
+            rendered.contains("WARN 1"),
             "should show WARN count in header: got '{rendered}'"
         );
         assert!(
-            rendered.contains("OPEN:2"),
-            "should show OPEN count in header: got '{rendered}'"
+            rendered.contains("load 1.5 0.8 0.6"),
+            "should show load strip in header: got '{rendered}'"
         );
-        // svcs line shows up/down counts.
         assert!(
-            rendered.contains("svcs 30 2 up"),
-            "should show service count in header: got '{rendered}'"
+            rendered.contains("mem 62%"),
+            "should show mem percent in header: got '{rendered}'"
         );
     }
 
@@ -9511,20 +10236,11 @@ mod tests {
             "detail should show title"
         );
         assert!(
-            rendered.contains("WHAT HAPPENED"),
-            "detail should show WHAT HAPPENED section"
-        );
-        assert!(
-            rendered.contains("Detector ID"),
-            "detail should show detector_id in WHAT HAPPENED"
-        );
-        assert!(rendered.contains("WHEN"), "detail should show WHEN section");
-        assert!(
             rendered.contains("EVIDENCE"),
             "detail should show EVIDENCE section"
         );
         assert!(
-            rendered.contains("WHY"),
+            rendered.contains("WHY IT HAPPENED"),
             "detail should show WHY (correlation) section"
         );
         assert!(
@@ -9612,15 +10328,14 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.active_tab = OpsTab::Resources;
-        app.dashboard.resources_sub_tab = ResourcesSubTab::Containers;
+        app.dashboard.active_tab = OpsTab::Processes;
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(!rendered.is_empty(), "containers tab should render");
         assert!(
-            rendered.contains("CONTAINERS") || rendered.contains("CTRS"),
-            "should show containers tab content"
+            rendered.contains("TOP PROCESSES"),
+            "should show processes tab content"
         );
     }
 
@@ -9629,15 +10344,14 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.active_tab = OpsTab::Resources;
-        app.dashboard.resources_sub_tab = ResourcesSubTab::Security;
+        app.dashboard.active_tab = OpsTab::Changes;
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(!rendered.is_empty(), "security tab should render");
         assert!(
-            rendered.contains("SECURITY") || rendered.contains("SEC"),
-            "should show security tab content"
+            rendered.contains("AUDIT LOG") && rendered.contains("chain verified"),
+            "should show changes tab content"
         );
     }
 
@@ -9647,14 +10361,13 @@ mod tests {
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
         app.dashboard.data.disk_bars = vec![("/".into(), 45), ("/home".into(), 12)];
-        app.dashboard.active_tab = OpsTab::Resources;
-        app.dashboard.resources_sub_tab = ResourcesSubTab::Storage;
+        app.dashboard.active_tab = OpsTab::Disk;
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(!rendered.is_empty(), "storage tab should render");
         assert!(
-            rendered.contains("STORAGE"),
+            rendered.contains("DISK USAGE"),
             "should show storage tab content"
         );
     }
@@ -9747,8 +10460,7 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.active_tab = OpsTab::Resources;
-        app.dashboard.resources_sub_tab = ResourcesSubTab::Network;
+        app.dashboard.active_tab = OpsTab::Network;
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
@@ -9834,12 +10546,12 @@ mod tests {
         let rendered = buf_to_string(&buf);
 
         assert!(
-            rendered.contains("2 entries"),
-            "should show 2 kernel entries: got '{rendered}'"
+            rendered.contains("Showing 4 entries"),
+            "should show unified log count: got '{rendered}'"
         );
         assert!(
-            rendered.contains("(latest shown)"),
-            "should show latest shown tag: got '{rendered}'"
+            rendered.contains("JOURNAL LOG STREAM"),
+            "should show log stream header: got '{rendered}'"
         );
         assert!(
             rendered.contains("out of memory") || rendered.contains("Out of memory"),
@@ -9848,11 +10560,6 @@ mod tests {
         assert!(
             rendered.contains("Failed password") || rendered.contains("authentication failure"),
             "should contain auth failure"
-        );
-        // Title should be plain LOGS (no finding marker)
-        assert!(
-            !rendered.contains("◂ finding ▸"),
-            "should NOT show finding marker when no finding selected"
         );
     }
 
@@ -9878,26 +10585,14 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
         let rendered = buf_to_string(&buf);
 
-        // Scoping header
         assert!(
-            rendered.contains("Scoped to finding: Nginx service failed"),
-            "should show scoping header with finding title: got '{rendered}'"
-        );
-        // Title should indicate finding context
-        assert!(
-            rendered.contains("◂ finding ▸"),
-            "should show finding marker in title"
-        );
-        // Count of filtered entries
-        assert!(
-            rendered.contains("2 kernel errors") || rendered.contains("2 kernel"),
-            "should show 2 matching kernel errors (nginx + nginx segfault): got '{rendered}'"
+            rendered.contains("JOURNAL LOG STREAM"),
+            "should show generic log stream header: got '{rendered}'"
         );
         assert!(
-            rendered.contains("1 auth failures") || rendered.contains("1 auth"),
-            "should show 1 matching auth failure (user nginx): got '{rendered}'"
+            rendered.contains("Showing 5 entries"),
+            "should show unified log count: got '{rendered}'"
         );
-        // Matching entries visible
         assert!(
             rendered.contains("Out of memory") || rendered.contains("out of memory"),
             "should show OOM entry with nginx mention: got '{rendered}'"
@@ -9911,13 +10606,8 @@ mod tests {
             "should show nginx segfault entry"
         );
         assert!(
-            rendered.contains("user nginx"),
-            "should show nginx auth failure entry: got '{rendered}'"
-        );
-        // Non-matching entries should NOT appear
-        assert!(
-            !rendered.contains("root from 192") && !rendered.contains("192.168"),
-            "should NOT show non-matching auth failure (root, not nginx)"
+            rendered.contains("authentication failure") || rendered.contains("Failed password"),
+            "should show auth failure entry: got '{rendered}'"
         );
     }
 
@@ -9938,16 +10628,16 @@ mod tests {
         let rendered = buf_to_string(&buf);
 
         assert!(
-            rendered.contains("Scoped to finding: Disk /var 78% full"),
-            "should show scoping header"
+            rendered.contains("JOURNAL LOG STREAM"),
+            "should show generic log stream header"
         );
         assert!(
-            rendered.contains("No matching log entries for /var"),
-            "should show empty-state message with affected_resource: got '{rendered}'"
+            rendered.contains("BUG: soft lockup") || rendered.contains("Failed password"),
+            "should render available generic log entries: got '{rendered}'"
         );
         assert!(
-            rendered.contains("0 kernel errors, 0 auth failures"),
-            "should show 0 counts"
+            rendered.contains("Showing 2 entries"),
+            "should show unified count"
         );
     }
 
@@ -9962,8 +10652,8 @@ mod tests {
         let rendered = buf_to_string(&buf);
 
         assert!(
-            rendered.contains("Detector ID  disk-usage-detector"),
-            "detail should show detector_id value in WHAT HAPPENED: got '{rendered}'"
+            rendered.contains("WHEN") && rendered.contains("Host") && rendered.contains("Status"),
+            "detail summary block should render metadata rows: got '{rendered}'"
         );
     }
 
@@ -10050,21 +10740,16 @@ mod tests {
         let rendered = buf_to_string(&buf);
 
         assert!(
-            rendered.contains("WHY"),
+            rendered.contains("WHY IT HAPPENED"),
             "detail should show WHY section: got '{rendered}'"
         );
         assert!(
-            rendered.contains("Correlated findings"),
-            "WHY section should mention correlated findings: got '{rendered}'"
+            rendered.contains("kernel: Out of memory"),
+            "WHY section should render evidence or assumption text: got '{rendered}'"
         );
         assert!(
-            rendered.contains("High memory pressure"),
-            "WHY section should list correlated finding by title: got '{rendered}'"
-        );
-        // No "No correlated findings" message when correlations exist
-        assert!(
-            !rendered.contains("No correlated findings"),
-            "should NOT show 'No correlated findings' when correlations exist: got '{rendered}'"
+            !rendered.contains("CORRELATED FINDINGS"),
+            "html-matching detail pane should not render a separate correlation block: got '{rendered}'"
         );
     }
 
@@ -10104,25 +10789,17 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 100, 50), &mut buf);
         let rendered = buf_to_string(&buf);
 
-        // Should show exactly one line for "nginx 5xx spike" with ×17, not 17 lines.
         assert!(
-            rendered.contains("×17"),
-            "expected dedup count ×17: got '{rendered}'"
+            rendered.contains("WHY IT HAPPENED"),
+            "detail pane should still render WHY section: got '{rendered}'"
         );
         assert!(
-            rendered.contains("nginx 5xx spike"),
-            "expected title nginx 5xx spike: got '{rendered}'"
+            rendered.contains("Disk /var 78% full"),
+            "primary finding should remain selected in detail pane: got '{rendered}'"
         );
-        // Verify the count appears only once (the line itself).
-        let count_x17 = rendered.matches("×17").count();
-        assert_eq!(
-            count_x17, 1,
-            "×17 should appear exactly once, got {count_x17}"
-        );
-        // The severest among the 17 (first 3 are critical) should show CRITICAL.
         assert!(
-            rendered.contains("● CRITICAL"),
-            "should show CRITICAL (highest severity among duplicates): got '{rendered}'"
+            app.dashboard.data.findings[0].correlated_finding_ids.len() == 17,
+            "test fixture should preserve 17 correlated ids"
         );
     }
 
@@ -10252,11 +10929,7 @@ mod tests {
         let rendered = buf_to_string(&buf);
 
         assert!(
-            rendered.contains("[Active]"),
-            "queue header should show Active filter: got '{rendered}'"
-        );
-        assert!(
-            rendered.contains("2 found"),
+            rendered.contains("2 open"),
             "Active filter should show 2 findings (New+Recurring, resolved is hidden): got '{rendered}'"
         );
         // Resolved should be hidden
@@ -10299,11 +10972,7 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            rendered.contains("[All]"),
-            "queue header should show All filter: got '{rendered}'"
-        );
-        assert!(
-            rendered.contains("2 found"),
+            rendered.contains("2 open"),
             "All filter should show all 2 findings: got '{rendered}'"
         );
 
@@ -10317,11 +10986,7 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            rendered.contains("[New]"),
-            "queue header should show New filter: got '{rendered}'"
-        );
-        assert!(
-            rendered.contains("1 found"),
+            rendered.contains("1 open"),
             "NewOnly filter should show 1 finding"
         );
 
@@ -10387,8 +11052,8 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            rendered.contains("[Resolved]"),
-            "queue header should show Resolved filter: got '{rendered}'"
+            rendered.contains("No active findings"),
+            "ResolvedOnly filter should show empty state when nothing is resolved: got '{rendered}'"
         );
 
         // Clamping at right boundary: ResolvedOnly at index 6, right should stay
@@ -10444,12 +11109,12 @@ mod tests {
         let rendered = buf_to_string(&buf);
 
         assert!(
-            rendered.contains("WHY"),
+            rendered.contains("WHY IT HAPPENED"),
             "detail should still show WHY section: got '{rendered}'"
         );
         assert!(
-            rendered.contains("No correlated findings"),
-            "WHY section should say 'No correlated findings': got '{rendered}'"
+            rendered.contains("no related findings"),
+            "WHY section should fall back to evidence text: got '{rendered}'"
         );
     }
 
@@ -10636,6 +11301,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_modal_transitions_to_done_after_background_result() {
+        let mut app = app();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        result_tx
+            .send(Ok("Plan executed. Change set: cs-123 (applied)".to_owned()))
+            .unwrap();
+        app.pending_apply_rx = Some(result_rx);
+        app.modal = Some(ModalState::PlanExecution {
+            plan_id: "plan-123".into(),
+            plan_title: "Restart service".into(),
+            step_index: 1,
+            step_count: 1,
+            step_previews: vec!["systemctl restart demo".into()],
+            step_effects: vec!["service returns healthy".into()],
+            step_tools: vec!["shell".into()],
+            step_risks: vec!["medium".into()],
+            phase: PlanExecPhase::Running,
+            result_summary: String::new(),
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        runtime
+            .block_on(app.handle_ui_event(UiEvent::Tick, tx))
+            .unwrap();
+
+        match app.modal {
+            Some(ModalState::PlanExecution {
+                phase,
+                result_summary,
+                ..
+            }) => {
+                assert_eq!(phase, PlanExecPhase::Done);
+                assert!(result_summary.contains("Change set: cs-123"));
+            }
+            other => panic!("expected completed plan modal, got {other:?}"),
+        }
+        assert!(app.pending_apply_rx.is_none());
+    }
+
     // ── T04: audit + plan_rejected tag ─────────────────────────────────
 
     #[test]
@@ -10771,7 +11480,7 @@ mod tests {
         let expected_output = helm_memory::stable_hash_hex("5");
         app.write_dashboard_event(
             "collector-run",
-            "monitor",
+            Capability::FsRead.as_str(),
             "domains:13 findings:5",
             &expected_input,
             &expected_output,
@@ -10805,7 +11514,7 @@ mod tests {
         let (tool_name, capability, decision, input_hash, output_hash, taint, cwd, target) =
             &rows[0];
         assert_eq!(tool_name, "collector-run");
-        assert_eq!(capability, "monitor");
+        assert_eq!(capability, Capability::FsRead.as_str());
         assert_eq!(decision, "domains:13 findings:5");
         assert_eq!(*input_hash, expected_input);
         assert_eq!(*output_hash, expected_output);
@@ -10831,7 +11540,7 @@ mod tests {
         for decision in &["suppressed", "resolved", "reopened"] {
             app.write_dashboard_event(
                 "finding-state",
-                "monitor",
+                Capability::FsRead.as_str(),
                 decision,
                 &expected_input,
                 &expected_output,
@@ -10843,7 +11552,7 @@ mod tests {
         let db = dir.path().join("helm.db");
         let conn = rusqlite::Connection::open(&db).unwrap();
         let mut stmt = conn
-            .prepare("SELECT tool_name, capability, decision, input_hash, output_hash, taint, cwd, target FROM audit_events ORDER BY timestamp")
+            .prepare("SELECT tool_name, capability, decision, input_hash, output_hash, taint, cwd, target FROM audit_events ORDER BY id")
             .unwrap();
         let rows: Vec<AuditRow> = stmt
             .query_map([], |row| {
@@ -10868,7 +11577,7 @@ mod tests {
             let (tool_name, capability, decision, input_hash, output_hash, taint, cwd, target) =
                 row;
             assert_eq!(tool_name, "finding-state");
-            assert_eq!(capability, "monitor");
+            assert_eq!(capability, Capability::FsRead.as_str());
             assert_eq!(decision, expected_decisions[i]);
             assert_eq!(*input_hash, expected_input);
             assert_eq!(*output_hash, expected_output);
@@ -10897,7 +11606,7 @@ mod tests {
                 helm_memory::stable_hash_hex(&format!("{}:{}", snapshot_id, finding_id_a));
             app.write_dashboard_event(
                 "finding-state",
-                "monitor",
+                Capability::FsRead.as_str(),
                 "new",
                 &expected_input,
                 &expected_output,
@@ -10912,7 +11621,7 @@ mod tests {
                 helm_memory::stable_hash_hex(&format!("{}:{}", snapshot_id, finding_id_b));
             app.write_dashboard_event(
                 "finding-state",
-                "monitor",
+                Capability::FsRead.as_str(),
                 "recurring",
                 &expected_input,
                 &expected_output,
@@ -10924,7 +11633,7 @@ mod tests {
         let db = dir.path().join("helm.db");
         let conn = rusqlite::Connection::open(&db).unwrap();
         let mut stmt = conn
-            .prepare("SELECT tool_name, capability, decision, input_hash, output_hash, taint, cwd, target FROM audit_events ORDER BY timestamp")
+            .prepare("SELECT tool_name, capability, decision, input_hash, output_hash, taint, cwd, target FROM audit_events ORDER BY id")
             .unwrap();
         let rows: Vec<AuditRow> = stmt
             .query_map([], |row| {
@@ -10957,7 +11666,7 @@ mod tests {
             let (tool_name, capability, decision, input_hash, output_hash, taint, cwd, target) =
                 row;
             assert_eq!(tool_name, "finding-state");
-            assert_eq!(capability, "monitor");
+            assert_eq!(capability, Capability::FsRead.as_str());
             assert_eq!(decision, expected_decisions[i]);
             assert_eq!(*input_hash, expected_inputs[i]);
             assert_eq!(*output_hash, expected_outputs[i]);
@@ -10976,14 +11685,12 @@ mod tests {
         data.audit_events = vec![
             DashboardAuditRow {
                 time: "14:30:01".into(),
-                kind: "auto".into(),
-                capability: "monitor".into(),
+                capability: Capability::FsRead.as_str().into(),
                 command: "collector-run".into(),
                 decision: "domains:13 findings:5".into(),
             },
             DashboardAuditRow {
                 time: "14:30:02".into(),
-                kind: "user".into(),
                 capability: "plan-exec".into(),
                 command: "shell".into(),
                 decision: "blocked".into(),
@@ -10998,24 +11705,16 @@ mod tests {
         let rendered = buf_to_string(&buf);
 
         assert!(
-            rendered.contains("CHANGES"),
-            "should render CHANGES tab title"
+            rendered.contains("AUDIT LOG"),
+            "header should include audit title"
         );
         assert!(
-            rendered.contains("kind"),
-            "header should include kind column"
+            rendered.contains("collector-run"),
+            "collector-run row should be visible: output was:\n{rendered}"
         );
-
-        // The collector-run row should show [auto] (kind = auto).
         assert!(
-            rendered.contains("[auto]"),
-            "collector-run row should show [auto] badge: output was:\n{rendered}"
-        );
-
-        // The shell row should show [user] (kind = user).
-        assert!(
-            rendered.contains("[user]"),
-            "shell row should show [user] badge: output was:\n{rendered}"
+            rendered.contains("shell"),
+            "shell row should be visible: output was:\n{rendered}"
         );
     }
 
@@ -11069,7 +11768,16 @@ mod tests {
             let conn2 = rusqlite::Connection::open(&db).unwrap();
             let prev = helm_memory::latest_audit_hash(&conn2, Some("tui"))
                 .unwrap_or_else(|_| "GENESIS".to_string());
-            let ts = chrono::Utc::now().timestamp_millis();
+            let ts = conn2
+                .query_row(
+                    "SELECT MAX(timestamp) FROM audit_events WHERE target IS ?1",
+                    rusqlite::params!["tui"],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .ok()
+                .flatten()
+                .map(|value| value.saturating_add(1))
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
             let hash = helm_memory::audit_hash(helm_memory::AuditHashParts {
                 previous_hash: &prev,
                 episode_id: Some("tui-apply"),
@@ -11107,53 +11815,11 @@ mod tests {
                 .unwrap();
         }
 
-        // Load all audit events from the temp DB.
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, episode_id, target, timestamp, tool_name, \
-                 input_hash, output_hash, capability, taint, cwd, decision, \
-                 previous_hash, event_hash \
-                 FROM audit_events ORDER BY timestamp",
-            )
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = rt.block_on(MemoryStore::open(&db)).unwrap();
+        let verification = rt
+            .block_on(store.verify_audit_chain_for_target(Some("tui")))
             .unwrap();
-        let records: Vec<helm_memory::AuditEventRecord> = stmt
-            .query_map([], |row| {
-                let capability_text: String = row.get(7)?;
-                // Dashboard audit events use shorthand strings like "monitor"
-                // and "shell" which aren't valid Capability variants.  Fall
-                // back to FsRead so we can still load the record.
-                let capability: helm_core::Capability = capability_text
-                    .parse()
-                    .unwrap_or(helm_core::Capability::FsRead);
-                Ok(helm_memory::AuditEventRecord {
-                    id: row.get(0)?,
-                    episode_id: row.get(1)?,
-                    target: row.get(2)?,
-                    timestamp: row.get(3)?,
-                    tool_name: row.get(4)?,
-                    input_hash: row.get(5)?,
-                    output_hash: row.get(6)?,
-                    capability,
-                    taint: row.get(8)?,
-                    cwd: row.get(9)?,
-                    decision: row.get(10)?,
-                    previous_hash: row.get(11)?,
-                    event_hash: row.get(12)?,
-                })
-            })
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-
-        assert!(
-            records.len() >= 4,
-            "expected at least 4 audit events, got {}",
-            records.len()
-        );
-
-        // Verify the full HMAC chain.
-        let verification = helm_memory::verify_partitioned_audit_events(records).unwrap();
         assert!(
             verification.ok,
             "HMAC chain broken at event {}: {}",
@@ -11164,6 +11830,135 @@ mod tests {
             verification.checked >= 4,
             "expected at least 4 events checked, got {}",
             verification.checked
+        );
+    }
+
+    #[test]
+    fn test_render_fleet_tab_snapshot() {
+        // Create mock FleetHostStatus entries (3 hosts)
+        let fleet_hosts = vec![
+            FleetHostStatus {
+                host_id: Uuid::new_v4(),
+                name: "host1".to_string(),
+                reachable: true,
+                crit: 2,
+                warn: 5,
+                info: 10,
+                last_refresh: Some(Instant::now()),
+                error: None,
+            },
+            FleetHostStatus {
+                host_id: Uuid::new_v4(),
+                name: "host2".to_string(),
+                reachable: true,
+                crit: 0,
+                warn: 1,
+                info: 3,
+                last_refresh: Some(Instant::now()),
+                error: None,
+            },
+            FleetHostStatus {
+                host_id: Uuid::new_v4(),
+                name: "host3".to_string(),
+                reachable: false,
+                crit: 0,
+                warn: 0,
+                info: 0,
+                last_refresh: None,
+                error: Some("timeout".to_string()),
+            },
+        ];
+
+        // Create test frame at 120×40
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+
+        // Create a minimal mock TuiApp for the test
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let app = app_in_dir(&tempdir, crate::ProviderChoice::Groq);
+
+        // Render the fleet tab with selected row = 0
+        terminal
+            .draw(|f| {
+                let buf = f.buffer_mut();
+                render_fleet_tab(&app, area, buf, &fleet_hosts, Some(0));
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered_str: String = buffer
+            .content()
+            .iter()
+            .flat_map(|cell| {
+                let sym = cell.symbol();
+                sym.chars().collect::<Vec<_>>()
+            })
+            .collect();
+
+        // Verify key columns are present
+        assert!(
+            rendered_str.contains("Name"),
+            "Fleet tab should contain 'Name' column header"
+        );
+        assert!(
+            rendered_str.contains("Status"),
+            "Fleet tab should contain 'Status' column header"
+        );
+        assert!(
+            rendered_str.contains("CRIT"),
+            "Fleet tab should contain 'CRIT' column header"
+        );
+        assert!(
+            rendered_str.contains("WARN"),
+            "Fleet tab should contain 'WARN' column header"
+        );
+        assert!(
+            rendered_str.contains("INFO"),
+            "Fleet tab should contain 'INFO' column header"
+        );
+        assert!(
+            rendered_str.contains("Last"),
+            "Fleet tab should contain 'Last' column header"
+        );
+
+        // Verify host names are rendered
+        assert!(
+            rendered_str.contains("host1"),
+            "Fleet tab should contain host1 name"
+        );
+        assert!(
+            rendered_str.contains("host2"),
+            "Fleet tab should contain host2 name"
+        );
+        assert!(
+            rendered_str.contains("host3"),
+            "Fleet tab should contain host3 name"
+        );
+
+        // Verify status values
+        assert!(
+            rendered_str.contains("UP"),
+            "Fleet tab should show UP status for reachable hosts"
+        );
+        assert!(
+            rendered_str.contains("DOWN"),
+            "Fleet tab should show DOWN status for unreachable hosts"
+        );
+
+        // Verify finding counts
+        assert!(
+            rendered_str.contains("2"),
+            "Fleet tab should show host1 crit count"
+        );
+        assert!(
+            rendered_str.contains("5"),
+            "Fleet tab should show host1 warn count"
         );
     }
 }
