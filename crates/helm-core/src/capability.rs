@@ -26,6 +26,8 @@ pub enum Capability {
     BrowserControl,
     /// Make outbound network requests.
     NetworkOut,
+    /// Read Kubernetes cluster state via kubectl.
+    KubectlRead,
     /// Run privileged operations through sudo.
     Sudo,
 }
@@ -43,6 +45,7 @@ impl Capability {
             Self::PkgInstall => "pkg.install",
             Self::BrowserControl => "browser.control",
             Self::NetworkOut => "network.out",
+            Self::KubectlRead => "kubectl.read",
             Self::Sudo => "sudo",
         }
     }
@@ -73,6 +76,7 @@ impl Capability {
             Self::PkgInstall,
             Self::BrowserControl,
             Self::NetworkOut,
+            Self::KubectlRead,
             Self::Sudo,
         ]
     }
@@ -125,6 +129,7 @@ impl FromStr for Capability {
             "pkg.install" => Ok(Self::PkgInstall),
             "browser.control" => Ok(Self::BrowserControl),
             "network.out" => Ok(Self::NetworkOut),
+            "kubectl.read" => Ok(Self::KubectlRead),
             "sudo" => Ok(Self::Sudo),
             _ => Err(format!("unknown capability: {value}")),
         }
