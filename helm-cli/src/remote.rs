@@ -40,6 +40,18 @@ pub struct RemoteEntry {
     pub credential: Credential,
 }
 
+/// Finding from a remote host, tagged with host_id for aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct FleetFinding {
+    pub host_id: Uuid,
+    pub host_name: String,
+    pub severity: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub last_seen: Option<i64>,
+}
+
 fn default_port() -> u16 {
     22
 }
@@ -99,6 +111,47 @@ impl RemoteRegistry {
         self.remotes.retain(|r| r.name != name);
         self.remotes.len() != before
     }
+
+    /// Collect findings from all remotes in parallel, bounded to 20 concurrent tasks.
+    /// Returns a vec of (host_id, result) tuples.
+    #[allow(dead_code)]
+    pub async fn parallel_collect(&self) -> Vec<(Uuid, Result<Vec<FleetFinding>>)> {
+        use tokio::task::JoinSet;
+
+        let mut joinset = JoinSet::new();
+        let mut results = Vec::new();
+        let mut task_iter = self.remotes.iter().peekable();
+        const MAX_CONCURRENT: usize = 20;
+
+        // Spawn initial batch of tasks (up to MAX_CONCURRENT)
+        while joinset.len() < MAX_CONCURRENT && task_iter.peek().is_some() {
+            if let Some(remote) = task_iter.next() {
+                let remote_clone = remote.clone();
+                joinset.spawn(async move {
+                    (remote_clone.host_id, remote_clone.collect_findings().await)
+                });
+            }
+        }
+
+        // Spawn remaining tasks as earlier ones complete
+        while !joinset.is_empty() {
+            if let Ok((host_id, findings_result)) = joinset.join_next().await.unwrap() {
+                results.push((host_id, findings_result));
+            }
+
+            // Spawn one more task if available and we're below the max
+            if joinset.len() < MAX_CONCURRENT {
+                if let Some(remote) = task_iter.next() {
+                    let remote_clone = remote.clone();
+                    joinset.spawn(async move {
+                        (remote_clone.host_id, remote_clone.collect_findings().await)
+                    });
+                }
+            }
+        }
+
+        results
+    }
 }
 
 impl RemoteEntry {
@@ -140,6 +193,78 @@ impl RemoteEntry {
             .stderr(Stdio::piped());
         let output = cmd.output().await.context("spawning ssh")?;
         Ok(output.status.success())
+    }
+
+    /// Collect findings from remote host via SSH + helm monitor --format json.
+    /// Returns a vector of FleetFinding tagged with this host's ID.
+    /// Timeout: 30s per host.
+    #[allow(dead_code)]
+    pub async fn collect_findings(&self) -> Result<Vec<FleetFinding>> {
+        let mut argv = self.ssh_argv();
+        argv.extend_from_slice(&[
+            "helm".to_owned(),
+            "monitor".to_owned(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ]);
+
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output_future = cmd.output();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), output_future)
+            .await
+            .context("timeout collecting findings from remote host")?
+            .context("spawning ssh for findings collection")?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "helm monitor on {} returned non-zero status",
+                self.name
+            ))
+            .with_context(|| format!("collecting findings from {}", self.name));
+        }
+
+        // Parse stdout as JSON array
+        let json_text = String::from_utf8_lossy(&output.stdout);
+        let values: Vec<serde_json::Value> = serde_json::from_str(&json_text)
+            .with_context(|| format!("parsing JSON from {}", self.name))?;
+
+        // Map to FleetFinding, tagging with host_id
+        let mut findings = Vec::new();
+        for val in values {
+            if let Ok(obj) = val.as_object().ok_or_else(|| anyhow!("expected object")) {
+                let severity = obj
+                    .get("severity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let title = obj
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let description = obj
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned());
+                let last_seen = obj.get("last_seen").and_then(|v| v.as_i64());
+
+                findings.push(FleetFinding {
+                    host_id: self.host_id,
+                    host_name: self.name.clone(),
+                    severity,
+                    title,
+                    description,
+                    last_seen,
+                });
+            }
+        }
+
+        Ok(findings)
     }
 }
 
@@ -274,5 +399,51 @@ mod tests {
             }
             _ => panic!("Credential serialization roundtrip failed"),
         }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fleet_parallel_refresh_20_hosts() {
+        // Create a mock RemoteRegistry with 20 RemoteEntry fixtures
+        let mut registry = RemoteRegistry::default();
+        let start = std::time::Instant::now();
+
+        for i in 0..20 {
+            registry.upsert(RemoteEntry {
+                host_id: Uuid::new_v4(),
+                name: format!("host-{}", i),
+                host: format!("host-{}.invalid", i), // invalid hosts will timeout
+                port: 22,
+                user: Some("ubuntu".to_owned()),
+                ssh_opts: None,
+                credential: Credential::SshAgent,
+            });
+        }
+
+        // Call parallel_collect and measure elapsed time
+        let results = registry.parallel_collect().await;
+        let elapsed = start.elapsed();
+
+        // Assert all 20 hosts return results (success or error)
+        assert_eq!(results.len(), 20, "expected 20 results");
+
+        // Each result should be a (host_id, Result<...>)
+        for (host_id, result) in &results {
+            // host_id should not be nil
+            assert_ne!(host_id.as_bytes(), &[0u8; 16]);
+            // result will be an error due to invalid hosts, which is fine
+            let _ = result; // silence unused warning
+        }
+
+        // Assert elapsed time is reasonable (parallel should be much faster than serial)
+        // With 30s timeout per host and max 20 concurrent, worst case is ~30s
+        // If parallel is working, 20 invalid hosts should timeout in ~30s total
+        // not 20 * 30s = 600s
+        eprintln!("20-host parallel collection took: {:?}", elapsed);
+        assert!(
+            elapsed.as_secs() <= 35,
+            "parallel collection took too long: {:?}",
+            elapsed
+        );
     }
 }
