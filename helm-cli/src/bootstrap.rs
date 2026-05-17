@@ -43,11 +43,13 @@ impl BootstrapPlan {
 
     pub fn to_remote_entry(&self, name: &str) -> RemoteEntry {
         RemoteEntry {
+            host_id: uuid::Uuid::new_v4(),
             name: name.to_owned(),
             host: self.host.clone(),
             port: self.port,
             user: self.user.clone(),
             ssh_opts: None,
+            credential: Default::default(),
         }
     }
 }

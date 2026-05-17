@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use uuid::Uuid;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RemoteRegistry {
@@ -16,8 +17,17 @@ pub struct RemoteRegistry {
     pub remotes: Vec<RemoteEntry>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum Credential {
+    #[default]
+    SshAgent,
+    KeyFile(PathBuf),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteEntry {
+    #[serde(default = "Uuid::new_v4")]
+    pub host_id: Uuid,
     pub name: String,
     pub host: String,
     #[serde(default = "default_port")]
@@ -26,6 +36,8 @@ pub struct RemoteEntry {
     pub user: Option<String>,
     #[serde(default)]
     pub ssh_opts: Option<String>,
+    #[serde(default)]
+    pub credential: Credential,
 }
 
 fn default_port() -> u16 {
@@ -106,6 +118,10 @@ impl RemoteEntry {
         argv.push("BatchMode=yes".to_owned());
         argv.push("-o".to_owned());
         argv.push("ConnectTimeout=10".to_owned());
+        if let Credential::KeyFile(path) = &self.credential {
+            argv.push("-i".to_owned());
+            argv.push(path.to_string_lossy().to_string());
+        }
         argv.push(match self.user.as_deref() {
             Some(user) => format!("{user}@{}", self.host),
             None => self.host.clone(),
@@ -143,19 +159,24 @@ mod tests {
     #[test]
     fn registry_upsert_replaces_existing_entry() {
         let mut registry = RemoteRegistry::default();
+        let host_id = Uuid::new_v4();
         registry.upsert(RemoteEntry {
+            host_id,
             name: "prod".to_owned(),
             host: "prod-1.example.com".to_owned(),
             port: 22,
             user: Some("root".to_owned()),
             ssh_opts: None,
+            credential: Credential::SshAgent,
         });
         registry.upsert(RemoteEntry {
+            host_id: Uuid::new_v4(),
             name: "prod".to_owned(),
             host: "prod-2.example.com".to_owned(),
             port: 2222,
             user: Some("ubuntu".to_owned()),
             ssh_opts: Some("-i ~/.ssh/prod".to_owned()),
+            credential: Credential::SshAgent,
         });
 
         assert_eq!(registry.remotes.len(), 1);
@@ -166,11 +187,13 @@ mod tests {
     #[test]
     fn remote_entry_ssh_argv_includes_port_user_and_opts() {
         let entry = RemoteEntry {
+            host_id: Uuid::new_v4(),
             name: "prod".to_owned(),
             host: "prod.example.com".to_owned(),
             port: 2222,
             user: Some("ubuntu".to_owned()),
             ssh_opts: Some("-i ~/.ssh/prod -o StrictHostKeyChecking=no".to_owned()),
+            credential: Credential::SshAgent,
         };
 
         assert_eq!(
@@ -190,5 +213,66 @@ mod tests {
                 "ubuntu@prod.example.com"
             ]
         );
+    }
+
+    #[test]
+    fn test_ssh_argv_with_keyfile_injects_identity_flag() {
+        let entry = RemoteEntry {
+            host_id: Uuid::new_v4(),
+            name: "prod".to_owned(),
+            host: "prod.example.com".to_owned(),
+            port: 22,
+            user: Some("ubuntu".to_owned()),
+            ssh_opts: None,
+            credential: Credential::KeyFile(PathBuf::from("/home/user/.ssh/id_rsa")),
+        };
+
+        let argv = entry.ssh_argv();
+        assert!(argv.contains(&"-i".to_owned()));
+        assert!(argv.contains(&"/home/user/.ssh/id_rsa".to_owned()));
+
+        // Verify -i comes before the host argument
+        let i_idx = argv.iter().position(|x| x == "-i").unwrap();
+        let path_idx = argv
+            .iter()
+            .position(|x| x == "/home/user/.ssh/id_rsa")
+            .unwrap();
+        let host_idx = argv
+            .iter()
+            .position(|x| x.contains("prod.example.com"))
+            .unwrap();
+        assert!(i_idx < path_idx);
+        assert!(path_idx < host_idx);
+    }
+
+    #[test]
+    fn test_credential_default_is_ssh_agent() {
+        let cred = Credential::default();
+        assert!(matches!(cred, Credential::SshAgent));
+    }
+
+    #[test]
+    fn test_credential_serialization_roundtrip() {
+        let entry = RemoteEntry {
+            host_id: Uuid::new_v4(),
+            name: "prod".to_owned(),
+            host: "prod.example.com".to_owned(),
+            port: 22,
+            user: Some("ubuntu".to_owned()),
+            ssh_opts: None,
+            credential: Credential::KeyFile(PathBuf::from("/home/user/.ssh/id_rsa")),
+        };
+
+        // Serialize to TOML and back
+        let toml_str = toml::to_string(&entry).unwrap();
+        let deserialized: RemoteEntry = toml::from_str(&toml_str).unwrap();
+
+        // Verify credential matches
+        match (&entry.credential, &deserialized.credential) {
+            (Credential::KeyFile(path1), Credential::KeyFile(path2)) => {
+                assert_eq!(path1, path2);
+            }
+            _ => panic!("Credential serialization roundtrip failed"),
+        }
     }
 }
