@@ -1,286 +1,813 @@
-HELMOPS Rebirth — Roadmap
+HELMOPS Rebirth Roadmap
+Status: rewritten on 2026-05-17
 
- Context
+Purpose
 
- HELM today is a half-built ReAct chat agent wearing a monitoring TUI as a hat. Senior DevOps will not adopt it as a daily driver because:
+This document is the execution blueprint for rebuilding HELMOPS into a
+local-first Linux and DevOps troubleshooting console with a stable,
+incident-first dashboard in M3 and daemon plus fleet evolution in M4.
 
- 1. The dashboard fails the 5-second test. 10 tabs, 3-line status bar, truncated metadata, no severity grouping, no trend lines. The eye has no anchor.
- 2. Selection jumps on live refresh. selected_finding: usize (tui.rs:1143) is a positional index; refresh_dashboard (tui.rs:4808) rebuilds the findings Vec wholesale. The clamp at L4351
- only fires on filter/sort, not refresh. The operator literally cannot read a finding before it switches under them.
- 3. WHY pane is duplicate spam. tui.rs:6066 iterates correlated_finding_ids with zero dedup, emitting "● WARN has failed..." ~20× in a row.
- 4. Scope is single-host. No fleet view. RemoteRegistry exists but the dashboard never iterates it. No Kubernetes, no libvirt/QEMU, no Docker Compose collectors.
- 5. No alerting. Findings sit in a TUI; pager never fires.
- 6. Auto-plan generation absent. Operators must Alt+G manually per finding, then wait. No background cache, no fingerprint-keyed memoization.
- 7. Massive dead surface. 31 top-level CLI commands, 4 TUI modes (Chat/Plan/Diagnose/Auto), agent JSON-RPC server, MCP, skills, episodes, sessions, replay — all noise for a sysadmin who
- just wants helm watch.
+This roadmap replaces older drafts that treated HELMOPS as a chat-first or
+collector-first tool. The target product is an operator console:
 
- Outcome. Rebirth as HELMOPS: a TUI-first incident-and-monitoring daily driver. Operator opens it, sees the top problem in ≤5 seconds, reads a fix plan auto-generated in the background,
- applies it with one keystroke, and the audit log proves what happened. Strip the agent. Keep the security spine (capability gate, taint, HMAC audit). Add fleet, K8s, libvirt, Compose, real
-  alerting.
+- open the TUI and know the top risk in 5 to 10 seconds
+- keep the active incident pinned across refreshes
+- preserve plans, evidence, audit, and execution state durably
+- prepare guided troubleshooting before the operator asks
+- stay useful without AI, then improve with AI when available
+- evolve from single-host local ops to multi-host fleet monitoring without
+  throwing away the current monitor, plan, apply, and audit foundations
 
- ---
- Strip / Keep / Add (Ruthless)
+Product Definition
 
- STRIP (delete entire files / modules)
+HELMOPS is a Linux operations console for:
 
- - helm-cli/src/serve.rs — agent JSON-RPC server.
- - helm-cli/src/agent_remote.rs, hooks.rs, ndjson_sink.rs, snapshot_sink.rs — agent event sinks.
- - crates/helm-agent/ — the ReAct loop crate (entire crate).
- - TuiMode::Chat | Plan | Diagnose | Auto (main.rs:275) and their routing (main.rs:1721). Keep only Dashboard.
- - CLI commands: episodes, skills, sessions, mcp, replay, memory, profile, undo, redo, export, stats, serve, chat, plan, diagnose, auto.
- - Agent-only tools from crates/helm-tools/: anything not used by helm-monitor/src/execute.rs apply-plan path.
- - TUI tabs: collapse 10 → 5 (kill Assist, fold Processes+Network+Storage into Resources, keep Alerts, Services, Resources, Logs, Changes).
- - WHY-pane raw-correlation iteration (tui.rs:6060-6091).
+- professional sysadmins
+- DevOps and SRE operators
+- deployment and release engineers
+- advanced Linux users who want readable troubleshooting instead of raw tables
 
- KEEP (security + signal spine)
+The final product is not:
 
- - 16 detectors + 14 collectors (crates/helm-monitor/).
- - HMAC-chained audit log (append-only, verifies after every episode).
- - Tainted<T> propagation and TaintLevel::External on browser/SSH/MCP inputs.
- - Capability gate before every tool call. *.write blocked on tainted input.
- - Finding lifecycle (open/new/recurring/suppressed/resolved/self-resolved) + stable fingerprint (findings.rs:224).
- - Changesets (config-diff snapshots).
- - Multi-provider LLM (anthropic, gemini, ollama, openai_compat, mock) — for narrative/plan generation only.
- - RemoteRegistry (extend, don't replace).
- - Apply-plan path (crates/helm-monitor/src/execute.rs) — independent of agent, safe.
- - host_hostname-keyed snapshot store (crates/helm-memory/src/snapshots.rs).
- - Secrets policy: $XDG_CONFIG_HOME/helm/secrets.toml mode 0600; no env auto-import.
+- a generic AI chat shell
+- a tab maze where the operator has to discover what matters
+- an ephemeral dashboard whose selection, plans, or apply state disappear on
+  refresh
 
- ADD
+Core Product Promise
 
- - Sparkline history per metric (cpu/mem/disk/net/loadavg) — ring buffer in DashboardData.
- - Severity-grouped finding list (CRIT / WARN / INFO) with fingerprint-stable selection.
- - Fleet panel: parallel SSH JoinSet, host_id UUID, credential abstraction.
- - K8s collector via kubectl wrapper (events, pod status, restarts, OOMKills).
- - libvirt/QEMU collector via virsh wrapper (domain state, snapshots, host load).
- - Docker Compose collector (project-level, layered over existing Docker collector).
- - Alerting sinks: webhook, Slack, PagerDuty — gated by severity + dedup window.
- - Auto-plan generation: on finding selection, spawn background LLM call, cache by fingerprint, render when ready, no blocking.
- - Configurable thresholds via $XDG_CONFIG_HOME/helm/thresholds.toml.
- - helm watch as default subcommand (zero-arg launch goes straight to dashboard).
+For every active incident, HELMOPS must answer:
 
- ---
- TUI Layout (Post-Redesign)
+1. what broke
+2. where it broke
+3. how bad it is
+4. since when it has been happening
+5. what changed before it broke
+6. what evidence proves it
+7. what safe checks to run
+8. what fix is recommended
+9. how to roll it back
+10. how to verify the fix worked
 
- ┌─ HELMOPS  host: prod-web-01  fleet: 12/12 up  uptime: 23d ───────── 14:32:07 ─┐
- │ [1]Alerts  [2]Services  [3]Resources  [4]Logs  [5]Changes        ?:help q:quit│
- ├──────────────────────────────────┬────────────────────────────────────────────┤
- │ CRIT (2)                         │ ▌nginx: 5xx rate 14%  (×17 last 5m)        │
- │ ● nginx 5xx spike       ×17  5m  │                                            │
- │ ● disk /var 96% full    new  2m  │ WHEN   first 14:27:11  last 14:32:03       │
- │                                  │ WHERE  prod-web-01 :: systemd/nginx        │
- │ WARN (4)                         │ WHAT   error rate breached 5% threshold    │
- │ ● postgres replica lag  ×3   8m  │ WHY    upstream auth-svc returning 502     │
- │ ● kube pod CrashLoop    ×2   1m  │        (correlated: 3 findings)            │
- │ ● memory pressure       new  1m  │ IMPACT user-facing 5xx; SLO burn 3.2x      │
- │ ● cert expiry < 7d      ×1   1h  │                                            │
- │                                  │ FIX PLAN (auto, cached)                    │
- │ INFO (3)                         │   1. systemctl restart auth-svc            │
- │ ● package updates       ×1  12h  │   2. verify /healthz returns 200           │
- │ ● ntp drift             ×1   6h  │   3. tail -f /var/log/auth-svc.log         │
- │ ● snapshot rotated      new  1m  │   [a]apply  [e]edit  [d]dismiss            │
- │                                  │                                            │
- │ ▁▂▃▅▇▇▆▅▄▃▂▁▁▂▃▅▇ cpu  ▂▂▂▃▄▅▇█ │ Evidence:                                  │
- │ ▁▁▂▂▃▃▄▄▅▅▆▆▇▇██ mem  ▁▁▂▂▃▄▅▆ │   nginx access.log lines 4427-4444         │
- │                                  │   auth-svc journal 14:26-14:32             │
- └──────────────────────────────────┴────────────────────────────────────────────┘
-   ↑↓ select  ←→ tab  Enter detail  a apply  / search  s suppress  r refresh
+Non-Negotiable Invariants
 
- Single-line status bar. Five tabs. Severity-grouped left pane with sparklines below. Right pane: WHEN/WHERE/WHAT/WHY/IMPACT/FIX PLAN in that exact order. Apply key bound at all times.
+These are release-blocking requirements:
 
- ---
- Critical Files
+1. No live refresh may silently switch the active incident.
+2. No generated plan may disappear after refresh or restart.
+3. No apply action may depend only on volatile in-memory UI state.
+4. Every persisted narrative, audit field, and stored transcript content must be
+   redacted where required.
+5. No write action may happen without an explicit review or approval boundary.
+6. HELMOPS must remain useful in local-only mode with AI disabled.
+7. Evidence must never be hidden behind AI wording alone.
+8. Audit and change tracking must remain append-only and verifiable.
 
- ┌─────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
- │                              Path                               │                                                         Why                                                         │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ helm-cli/src/tui.rs                                             │ Dashboard rewrite (L1008-1046 DashboardData, L1143 selected_finding, L4351-4360 clamp, L4441/L4808 refresh, L5414   │
- │                                                                 │ spawn, L6017-6144 detail pane, L10090-11600 tabs)                                                                   │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ helm-cli/src/main.rs                                            │ Strip TuiMode + commands (L133-187, L275-282, L1721-1725); orphan helm_agent imports (L35, L5902, L6458, L7030)     │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ helm-cli/src/remote.rs                                          │ Add host_id UUID, parallel JoinSet (L11, L28, L120)                                                                 │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ helm-cli/src/serve.rs agent_remote.rs hooks.rs ndjson_sink.rs   │ Delete                                                                                                              │
- │ snapshot_sink.rs                                                │                                                                                                                     │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ crates/helm-agent/                                              │ Delete crate                                                                                                        │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ crates/helm-monitor/src/findings.rs                             │ Add correlate() + dedup_by_title() near compute_fingerprint (L224)                                                  │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ crates/helm-monitor/src/execute.rs                              │ Validate apply-plan after agent strip (L235-293 uses std::process directly, safe)                                   │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ crates/helm-monitor/src/collectors/                             │ New: kubernetes.rs, libvirt.rs, compose.rs                                                                          │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ crates/helm-monitor/src/alerting/                               │ New module: webhook.rs, slack.rs, pagerduty.rs                                                                      │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ crates/helm-memory/src/snapshots.rs                             │ Already host_hostname-keyed (L11, L43-44, L60) — extend host_id                                                     │
- ├─────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
- │ Cargo.toml (workspace)                                          │ Remove helm-agent member                                                                                            │
- └─────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+Current Foundation To Keep
 
- ---
- Roadmap
+The current repo already contains valuable foundations. Do not rewrite these
+away unless there is a direct correctness problem:
 
- Every task = atomic commit gated by cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets. Each slice ends with a verification
- gate. Each milestone ends with the deterministic RC gate (cargo test deterministic_100_run -- --ignored).
+- `helm-monitor` collectors, detectors, snapshots, findings, troubleshooting
+  plan model, and execution model
+- `helm-memory` persistence for snapshots, findings, plans, change sets, audit
+  chain, and related local state
+- read-only versus apply boundary
+- remote and bootstrap concepts
+- typed plan steps, verification, rollback, and audit linkage
 
- M1 — UX Foundation + Agent Strip (the rebirth)
+What Must Change
 
- Goal: Operator opens HELMOPS, sees grouped findings, selects one, reads it without it jumping, and the binary is half the size.
+The operator mental model must change from:
 
- - Slice 1.1 — Fix selection-jump bug.
-   - T1.1.1: Replace selected_finding: usize with selected_fingerprint: Option<u64>. Capture fingerprint pre-refresh in refresh_dashboard (tui.rs:4808), restore index post-refresh by
- fingerprint lookup, fall back to clamp.
-   - T1.1.2: Add unit test: build findings Vec [A,B,C], select B, replace Vec with [A,C,B,D], assert selection still on B.
-   - Verify: test passes; manual helm watch for 30s confirms selection sticky across refreshes.
-   - Deliverable: commit fix(tui): pin finding selection by fingerprint across live refresh.
- - Slice 1.2 — Fix WHY-pane dedup.
-   - T1.2.1: At tui.rs:6060-6091, group correlated findings by title via HashMap<String, (Severity, usize)>, render ● {sev} {title} (×{count}).
-   - T1.2.2: Snapshot test on a synthetic finding with 17 correlations → expect 1 line (×17).
-   - Verify: snapshot test; manual inspection on the nginx-5xx scenario.
-   - Deliverable: commit fix(tui): collapse duplicate correlations in WHY pane.
- - Slice 1.3 — Tab + status-bar collapse.
-   - T1.3.1: Reduce OpsTab enum (tui.rs:852-865) to 5 variants: Alerts, Services, Resources, Logs, Changes. Move Processes/Network/Storage render fns under Resources tab via sub-section
- toggle.
-   - T1.3.2: Compress status bar to single line (host, fleet count, uptime, clock, tab list, hotkeys).
-   - T1.3.3: Severity-group left pane: CRIT block, WARN block, INFO block, with sparklines beneath.
-   - Verify: snapshot test of dashboard render at 120×40; cargo run -- watch visual diff against mockup.
-   - Deliverable: commit feat(tui): collapse to 5 tabs + severity-grouped left pane.
- - Slice 1.4 — Strip the agent.
-   - T1.4.1: Delete helm-cli/src/{serve,agent_remote,hooks,ndjson_sink,snapshot_sink}.rs + their mod lines in main.rs. Delete crates/helm-agent. Remove from workspace Cargo.toml.
-   - T1.4.2: Remove TuiMode::{Chat,Plan,Diagnose,Auto} variants + routing (main.rs:275-282, 1721-1725). Default subcommand → watch.
-   - T1.4.3: Delete CLI commands listed in STRIP section from Commands enum (main.rs:133-187). Update help text.
-   - T1.4.4: Run cargo build, fix orphaned helm_agent:: imports at L35, L5902, L6458, L6462, L7030.
-   - T1.4.5: Validate apply-plan still works (execute.rs:235-293 uses std::process::Command directly, no agent dep). Add integration test invoking apply_plan on a 2-step plan.
-   - Verify: full workspace builds clean; binary size compared pre/post (expect ≥30% drop); apply-plan integration test green.
-   - Deliverable: commit refactor: strip ReAct agent + chat/plan/diagnose modes; helm watch is the product.
+- collector-first
+- raw tab-first
+- developer-centric
+- ephemeral state
+- provider-prompt-heavy
 
- M1 gate: cargo fmt --check, cargo clippy -- -D warnings, full workspace test suite, deterministic_100_run.
+to:
 
- ---
- M2 — Real-Time Trends
+- incident-first
+- operator-centric
+- stable workspace
+- durable plan and execution state
+- AI as additive, not required
 
- Goal: Operator sees the curve, not just the current value.
+Target Product Architecture
 
- - Slice 2.1 — Ring-buffer history in DashboardData. Add VecDeque<f64> per metric (cpu/mem/disk/net/load), cap 60 points, push on each refresh.
- - Slice 2.2 — Ratatui Sparkline rendering beneath severity groups (left pane bottom strip).
- - Slice 2.3 — Per-tab sparklines: Resources tab gets large sparklines for top-N processes/disks/interfaces.
- - Slice 2.4 — Configurable refresh cadence + history depth via thresholds.toml.
+M3 target architecture:
 
- M2 gate: render perf budget — full dashboard refresh ≤16ms at 60 findings + 5 sparklines. Benchmark in cargo bench.
+- TUI is the incident console
+- dashboard opens by default
+- latest persisted dashboard state is read on startup
+- live refresh reads new findings without changing the pinned workspace
+- generated plan records are written immediately into
+  `troubleshooting_plans`
+- apply flow rehydrates from persisted plan data and writes execution results
+  into change-set and audit storage
 
- ---
- M3 — Fleet (Multi-Host)
+M4 target architecture:
 
- Goal: One dashboard, N hosts, parallel.
+- `helmopsd` becomes the long-running local owner of collection, detector runs,
+  finding lifecycle, plan precomputation, and persistence
+- TUI becomes a client of daemon-managed state instead of the primary collector
+  owner
+- installed remote agents become the default transport for fleet monitoring
+- central HELMOPS becomes the fleet rollup and operator console
 
- - Slice 3.1 — Extend RemoteEntry (remote.rs:28) with host_id: Uuid; migrate registry file.
- - Slice 3.2 — Parallel SSH JoinSet in RemoteRegistry; collect findings from N hosts concurrently. Benchmark at N=20.
- - Slice 3.3 — Credential abstraction: enum Credential { SshAgent, KeyFile(PathBuf), Password(Secret) }. No password in registry file.
- - Slice 3.4 — Fleet panel in TUI: header shows fleet: 12/12 up; new tab [6]Fleet (re-add as 6th tab — fleet view warrants it). Per-host CRIT counts.
+Operator Personas and Explicit Needs
 
- M3 gate: 20-host fixture (mock SSH responder) completes full refresh in ≤2s; HMAC chain verifies across multi-host episode.
+Professional sysadmin:
 
- ---
- M4 — Kubernetes / VM / Compose
+- failed services, disk pressure, mount failures, auth failures, timers, backup
+  failures, package and security updates
+- exact start time and recurrence history
+- safe fix steps with rollback and verification
+- audit trail of what was seen and changed
 
- Goal: Cover the real infrastructure surface.
+Expert DevOps engineer:
 
- - Slice 4.1 — Kubernetes collector via kubectl wrapper (crates/helm-monitor/src/collectors/kubernetes.rs): events (Warning), pod restarts, OOMKills, PVC pressure. Capability-gated
- KubectlRead.
- - Slice 4.2 — libvirt/QEMU collector via virsh wrapper: domain state, snapshot age, host load.
- - Slice 4.3 — Docker Compose collector: layered over existing Docker collector, groups containers by project label.
- - Slice 4.4 — Detector tuning for new finding types; thresholds in thresholds.toml.
+- correlation across services, processes, containers, listeners, logs, system
+  load, and recent changes
+- severity and state filtering
+- noise handling with suppress, resolve, reopen, and assignment-like tagging
+- before and after verification that a fix actually changed system state
 
- M4 gate: integration tests against a kind cluster + a libvirt test VM + a compose fixture, all in CI matrix.
+Master deployment engineer:
 
- ---
- M5 — Alerting
+- release breakage, port conflicts, config drift, disk and inode exhaustion,
+  timers, mounts, dependency failure, backup validity
+- before and after snapshots around apply
+- canary-style verification and blast-radius awareness
 
- Goal: It pages people.
+Veteran Linux user:
 
- - Slice 5.1 — Alert routing module (crates/helm-monitor/src/alerting/mod.rs): severity threshold, dedup window per fingerprint, rate limit.
- - Slice 5.2 — Webhook sink (HTTP POST, JSON body, retry with backoff).
- - Slice 5.3 — Slack sink (incoming webhook URL, channel override, severity color).
- - Slice 5.4 — PagerDuty sink (Events API v2, dedup_key = finding fingerprint).
+- readable health summary
+- “what is wrong, why, since when, what changed, and what should I run”
+- raw views available on demand, not forced first
+- predictable keyboard behavior with no hidden mode confusion
 
- M5 gate: end-to-end: trigger CRIT finding in mock → PD event fires within 5s → resolution event fires on lifecycle close.
+Target Information Architecture
 
- ---
- M6 — AI Excellence
+Top bar:
 
- Goal: Operator selects a finding; a fix plan is already waiting.
+- `HELMOPS`
+- scope: local host, host group, environment, or fleet
+- live state: `LIVE`, latest collection time, collector health
+- AI assist state: `ai local`, `ai api`, or `ai off`
+- quick counters: critical, warning, info, muted
+- key health chips: CPU, memory, root disk, service failures, container health
 
- - Slice 6.1 — Auto-plan generation on selection: on selected_fingerprint change, spawn background tokio::task that calls LLM; cache result by fingerprint in Arc<DashMap<Fingerprint,
- PlanState>>.
- - Slice 6.2 — Render cached plan in FIX PLAN section instantly if cache hit; "generating…" spinner otherwise.
- - Slice 6.3 — Plan-quality test: golden fixtures of 20 findings × 5 providers, snapshot test for structure (numbered steps, capability-gated commands, no destructive ops without confirm).
- - Slice 6.4 — [a]apply hotkey wires to execute.rs apply-plan path with capability gate + taint check + audit append.
+Left column: incident queue
 
- M6 gate: cache hit ratio ≥80% on second open of same finding; deterministic_100_run still green; HMAC chain verifies across apply episode.
+- severity-first ordering
+- tie-break by impact, recency, recurrence, and operator state
+- each row shows:
+  - severity
+  - short title
+  - host or scope
+  - state: new, active, recurring, muted, resolved
+  - `open for`
+  - `last seen`
+- beginner-safe density by default
+- expert density and filter modes available
 
- ---
- Verification
+Center column: incident workspace
 
- Per task (atomic commit):
-     │ - Slice 5.3 — Slack sink (incoming webhook URL, channel override, severity color).                                                                                                    │
-     │ - Slice 5.4 — PagerDuty sink (Events API v2, dedup_key = finding fingerprint).                                                                                                        │
-     │                                                                                                                                                                                       │
-     │ M5 gate: end-to-end: trigger CRIT finding in mock → PD event fires within 5s → resolution event fires on lifecycle close.                                                             │
-     │                                                                                                                                                                                       │
-     │ ---                                                                                                                                                                                   │
-     │ M6 — AI Excellence                                                                                                                                                                    │
-     │                                                                                                                                                                                       │
-     │ Goal: Operator selects a finding; a fix plan is already waiting.                                                                                                                      │
-     │                                                                                                                                                                                       │
-     │ - Slice 6.1 — Auto-plan generation on selection: on selected_fingerprint change, spawn background tokio::task that calls LLM; cache result by fingerprint in Arc<DashMap<Fingerprint, │
-     │  PlanState>>.                                                                                                                                                                         │
-     │ - Slice 6.2 — Render cached plan in FIX PLAN section instantly if cache hit; "generating…" spinner otherwise.                                                                         │
-     │ - Slice 6.3 — Plan-quality test: golden fixtures of 20 findings × 5 providers, snapshot test for structure (numbered steps, capability-gated commands, no destructive ops without     │
-     │ confirm).                                                                                                                                                                             │
-     │ - Slice 6.4 — [a]apply hotkey wires to execute.rs apply-plan path with capability gate + taint check + audit append.                                                                  │
-     │                                                                                                                                                                                       │
-     │ M6 gate: cache hit ratio ≥80% on second open of same finding; deterministic_100_run still green; HMAC chain verifies across apply episode.                                            │
-     │                                                                                                                                                                                       │
-     │ ---                                                                                                                                                                                   │
-     │ Verification                                                                                                                                                                          │
-     │                                                                                                                                                                                       │
-     │ Per task (atomic commit):                                                                                                                                                             │
-     │ cargo fmt --check                                                                                                                                                                     │
-     │ cargo clippy --workspace --all-targets -- -D warnings                                                                                                                                 │
-     │ cargo test --workspace --all-targets                                                                                                                                                  │
-     │                                                                                                                                                                                       │
-     │ Per slice (slice gate): manual TUI run for visible slices; integration test for non-visible; snapshot test where applicable.                                                          │
-     │                                                                                                                                                                                       │
-     │ Per milestone (RC gate):                                                                                                                                                              │
-     │ cargo test deterministic_100_run -- --ignored                                                                                                                                         │
-     │                                                                                                                                                                                       │
-     │ Cross-cutting invariants (run every milestone):                                                                                                                                       │
-     │ 1. HMAC audit chain verifies after the milestone's representative episode.                                                                                                            │
-     │ 2. Capability gate denies *.write on TaintLevel::External (regression test).                                                                                                          │
-     │ 3. Read-only diagnose-equivalent mode blocks all write tools.                                                                                                                         │
-     │ 4. Secrets file mode is 0600; env vars not auto-imported.                                                                                                                             │
-     │                                                                                                                                                                                       │
-     │ End-to-end smoke (post-M6):                                                                                                                                                           │
-     │ 1. helm watch opens directly to dashboard in <500ms.                                                                                                                                  │
-     │ 2. Top CRIT finding visible within 5s (eye-to-finding latency).                                                                                                                       │
-     │ 3. Select finding → fix plan renders within 2s (cache hit instant).                                                                                                                   │
-     │ 4. a → plan executes → audit log appends → HMAC verifies.                                                                                                                             │
-     │ 5. Fleet of 12 hosts refreshes in ≤2s; selection sticky across refresh.                                                                                                               │
-     │                                                                                                                                                                                       │
-     │ ---                                                                                                                                                                                   │
-     │ Spikes (do before committing to design)                                                                                                                                               │
-     │                                                                                                                                                                                       │
-     │ 1. Parallel SSH at N=20: benchmark JoinSet vs serial; measure tail latency. Decide pool size.                                                                                         │
-     │ 2. Sparkline render cost: measure ratatui Sparkline at 60-point buffer × 8 metrics in left pane; budget ≤4ms.                                                                         │
-     │ 3. Auto-plan cache economics: measure LLM round-trip per provider, expected cache hit ratio on a 24h trace, decide TTL.                                                               │
-     │                                                                                                                                                                                       │
-     │ ---                                                                                                                                                                                   │
-     │ Out of Scope (do not build)                                                                                                                                                           │
-     │                                                                                                                                                                                       │
-     │ - Fine-tuning, weight updates, self-modifying code (never, per CLAUDE.md §10).                                                                                                        │
-     │ - Windows / macOS support (deferred to v2.0).                                                                                                                                         │
-     │ - Web UI. TUI is the product.                                                                                                                                                         │
-     │ - General chat / Q&A interface.                                                                                                                                                       │
-     │ - MCP / skills / sessions / episodes / replay UX surface.                                             
+Required section order:
+
+1. WHAT BROKE
+2. IMPACT
+3. WHEN
+4. WHY IT HAPPENED
+5. WHAT CHANGED BEFORE IT BROKE
+6. EVIDENCE
+7. HOW TO REPRODUCE / VERIFY
+8. RECOMMENDED FIX PLAN
+9. ROLLBACK
+10. EXECUTION STATUS
+
+Right column: evidence and actions
+
+- timeline
+- logs
+- services
+- processes
+- network
+- storage
+- containers
+- changes
+
+Action surface:
+
+- open evidence
+- run safe check
+- review fix plan
+- apply step-by-step
+- suppress
+- resolve
+- reopen
+- regenerate plan
+
+Footer
+
+Keep the keyboard model minimal and memorable:
+
+- `Tab` cycle panes
+- `Enter` open or drill into selected incident
+- `F5` refresh
+- `Alt+G` generate plan
+- `Alt+A` apply reviewed plan
+- `Alt+E` evidence
+- `Alt+F` follow-up check
+- `S` suppress
+- `R` resolve
+- `U` reopen
+- `?` or `F1` help
+
+Data Model Blueprint
+
+Finding record requirements:
+
+- `id`
+- `fingerprint`
+- `severity`
+- `state`
+- `title`
+- `impact`
+- `host`
+- `first_seen`
+- `last_seen`
+- `open_duration_secs`
+- `recurrence_count`
+- `evidence`
+- `changed_context`
+- `verification_ready`
+
+Troubleshooting plan record requirements:
+
+- `id`
+- `finding_id`
+- `source`
+- `snapshot_id`
+- `created_at`
+- `updated_at`
+- `dashboard_plan_status`
+- `generation_error`
+- `narrative_summary`
+- `hypotheses_json`
+- `read_only_steps_json`
+- `proposed_fix_steps_json`
+- `verification_steps_json`
+- `reproduction_steps_json`
+- `approval_required`
+
+Pinned workspace state requirements:
+
+- active `fingerprint`
+- active `finding_id`
+- active `plan_id`
+- selected evidence tab
+- detail scroll position
+- plan view identity that survives refresh and reorder
+
+Change-set requirements:
+
+- before snapshot id
+- after snapshot id
+- plan id
+- step-level command previews
+- execution status
+- output summary
+- verification summary
+- rollback linkage where relevant
+
+Audit requirements:
+
+- detection audit
+- plan generation audit
+- plan rejection audit
+- approval audit
+- execution audit
+- verification audit
+- final state transition audit
+
+Milestone Blueprint
+
+M0 — Product Reset and Roadmap Baseline
+
+Goal:
+Lock the product posture and remove ambiguity from the roadmap itself.
+
+Deliverables:
+
+- rewritten roadmap aligned to incident-first HELMOPS
+- explicit success criteria for M3 and M4
+- shared terminology:
+  - incident
+  - workspace
+  - evidence
+  - dashboard plan
+  - apply session
+  - daemon
+  - agent
+
+Verification:
+
+- roadmap reviewed against current code and corrected for false assumptions
+- no references remain to deprecated chat-first or collector-first framing
+
+M1 — Dashboard-First Foundation
+
+Goal:
+Make the dashboard the default product surface and remove unstable navigation
+patterns.
+
+Features:
+
+- dashboard opens by default
+- dashboard-only TUI mode
+- stable queue selection by finding fingerprint
+- severity-prioritized queue
+- empty-state handling when no snapshots exist
+- first-pass HELMOPS branding and operator-focused copy
+
+Deliverables:
+
+- `helm` and `helm tui` land in dashboard mode
+- first-run local host view works with zero prior state
+- operator can open findings without selection drift
+
+Verification:
+
+- dashboard opens on clean DB
+- refresh does not crash with no snapshot
+- selected incident remains the same across reorder and refresh
+
+M2 — Visual Structure and Triage Speed
+
+Goal:
+Make the dashboard readable in under 10 seconds.
+
+Features:
+
+- stronger top bar and severity strip
+- clearer queue hierarchy
+- compact and readable detail layout
+- sparkline and trend summary foundation
+- section ordering that matches operator triage flow
+
+Deliverables:
+
+- top bar with live state and health chips
+- readable incident queue
+- detail workspace with operator-first sections
+
+Verification:
+
+- screenshot review shows top issue without tab hunting
+- render tests cover the main dashboard states
+- keyboard hints remain visible in dashboard mode
+
+M3 — Incident Workspace Hardening
+
+Goal:
+Make the active incident workspace durable, trustworthy, and safe for daily
+operations.
+
+Features:
+
+1. Stable workspace ownership
+- replace stale index ownership with fingerprint ownership everywhere
+- add dedicated pinned incident state
+- preserve workspace through 5+ refresh cycles
+
+2. Durable plan lifecycle
+- persist every generated dashboard plan immediately
+- store `finding_id`, `updated_at`, `dashboard_plan_status`,
+  `generation_error`, `narrative_summary`, `verification_steps_json`,
+  `reproduction_steps_json`
+- rehydrate plans from store, not transient UI state
+
+3. Correct incident timing semantics
+- queue shows both `open for` from `first_seen` and `last seen`
+- detail pane shows first seen, last seen, and recurrence
+- recurring incidents stop reading like `0m` unless they are truly new
+
+4. Guided troubleshooting workspace
+- auto-prepared troubleshooting summary for top findings
+- clear `WHY`, `IMPACT`, `VERIFY`, and `ROLLBACK` sections
+- change-context section from change sets and recent audit
+
+5. Trusted apply flow
+- load validated steps from persisted plan
+- use the same runtime DB path for preview and execution
+- show modal completion and results instead of leaving execution stuck
+- persist change-set and audit outcomes for each apply
+
+6. Provider handling cleanup
+- runtime uses last-saved provider and model by default
+- local-only fallback behaves cleanly
+- dashboard shows `ai local`, `ai api`, or `ai off`
+- operator is not forced through provider prompts for monitoring
+
+Deliverables:
+
+- pinned incident workspace
+- durable dashboard plans
+- corrected age labels
+- stable apply modal with completion state
+- provider status cleanup
+
+Verification:
+
+- plan survives refresh and restart
+- selected incident stays pinned through reorder
+- apply opens from dashboard and executes from persisted steps
+- no-step plans return a clear message and do not hang
+- successful apply returns a completed modal state and change set
+- dashboard uses runtime DB path for plan preview and execution
+
+M4 — Continuous Monitoring and Fleet Evolution
+
+Goal:
+Move collection ownership into a daemon and expand from local host to fleet.
+
+Features:
+
+1. `helmopsd` local daemon
+- periodic collection
+- detector runs
+- finding lifecycle updates
+- plan precomputation for top incidents
+- persistence and audit writes
+- health reporting for TUI clients
+
+2. Daemon command surface
+- `helm daemon start`
+- `helm daemon stop`
+- `helm daemon status`
+- `helm dashboard`
+- `helm incident show <id>`
+- `helm incident plan <id>`
+- `helm incident apply <id|plan-id>`
+
+3. Installed remote agents
+- install and register on Linux hosts
+- local collectors and detectors on the remote machine
+- snapshot export or query API
+- reviewed approval path for remote execution
+
+4. Fleet view
+- host rollups
+- environment scoping
+- per-host drill-down
+- dedupe and correlation
+- host plus container incident relationships
+
+Deliverables:
+
+- daemon binary behavior integrated into CLI
+- local daemon-backed dashboard
+- first-class remote agent registration and host visibility
+- fleet summary with host incident counts
+
+Verification:
+
+- daemon starts and maintains snapshots without TUI ownership
+- TUI renders from daemon state without doing a full collection on every render
+- remote host appears in fleet view
+- mixed local and remote audit chain still verifies
+
+M5 — Evidence Breadth and Domain Expansion
+
+Goal:
+Cover the systems operators actually manage most often.
+
+Features:
+
+- stronger container evidence views
+- release and change correlation
+- runtime breadth for Docker, Podman, compose, virtualization, and later
+  Kubernetes adapters
+- additional detectors and threshold tuning
+
+Deliverables:
+
+- new collectors and detectors
+- better domain-specific incident narratives
+- test fixtures per supported runtime
+
+Verification:
+
+- fixture-backed integration coverage for each new runtime
+- new incidents surface correctly in queue and workspace
+
+M6 — Alerting and Notification Pipelines
+
+Goal:
+Push critical incidents outside the terminal when required without turning the
+product into alert spam.
+
+Features:
+
+- webhook sink
+- Slack sink
+- PagerDuty sink
+- dedup window per fingerprint
+- severity thresholding
+- resolution and suppression propagation
+
+Deliverables:
+
+- outbound alert pipeline
+- notification configuration model
+- audit coverage for notification decisions
+
+Verification:
+
+- critical incident triggers one notification inside dedup window
+- resolve or suppress updates notification state correctly
+
+M7 — AI-Assisted Plan Excellence
+
+Goal:
+Improve guidance quality without making AI mandatory.
+
+Features:
+
+- background plan precomputation for top findings
+- deterministic prompt and parse structure
+- bounded step count
+- clearer risk, rollback, and verification sections
+- strong dangerous-command rejection and audit trail
+- cache and reuse plan narratives where appropriate
+
+Deliverables:
+
+- improved guided troubleshooting drafts
+- stricter plan normalization
+- safer command acceptance policy
+
+Verification:
+
+- plan generation stays non-blocking to the UI
+- repeated opening of same finding reuses stored plan state
+- dangerous commands are blocked, tagged, and audited
+
+Detailed Work Breakdown For M3
+
+Track A — State and persistence
+
+Tasks:
+
+- finalize migration for dashboard plan fields
+- ensure plan insert path writes `finding_id`
+- update plan list and get queries to include new metadata
+- implement latest plan lookup by finding id
+- restore active plan on refresh from persisted state
+
+Done criteria:
+
+- generated plan is durable immediately after creation
+- refresh and restart rehydrate the same plan
+
+Track B — Workspace stability
+
+Tasks:
+
+- eliminate detail ownership by list index
+- pin active workspace by fingerprint and finding id
+- preserve active plan id for the pinned incident
+- keep evidence and detail drill-down on the same finding after refresh
+
+Done criteria:
+
+- active workspace never jumps to another incident during refresh
+
+Track C — Incident semantics and copy
+
+Tasks:
+
+- use `first_seen` for open duration
+- render `last_seen` separately
+- refine state labels: new, active, recurring, muted, resolved
+- update detail section copy to match operator needs
+
+Done criteria:
+
+- queue and detail timing semantics are correct and readable
+
+Track D — Apply flow correctness
+
+Tasks:
+
+- preview plan from runtime DB path
+- execute plan from same DB path
+- return execution result to TUI modal
+- close stuck `Running` state by transitioning to `Done`
+- write step approvals and execution outcome to audit
+- show clear result summary in modal and transcript
+
+Done criteria:
+
+- no apply modal can remain stuck indefinitely after the background task
+  finishes
+- zero-step and success cases are both clear
+
+Track E — AI assist status and provider UX
+
+Tasks:
+
+- load last provider and model as runtime default
+- keep API key persistence rules unchanged
+- show provider state without blocking monitoring
+- keep local-only fallback path visible and safe
+
+Done criteria:
+
+- monitoring works normally even when no remote provider is configured
+
+Detailed Work Breakdown For M4
+
+Track A — Daemon runtime
+
+Tasks:
+
+- define daemon loop cadence and overlap prevention
+- persist heartbeat and collector health
+- implement manual refresh request path
+- expose daemon status query
+
+Track B — TUI as daemon client
+
+Tasks:
+
+- move full collection ownership out of the TUI
+- query daemon-managed latest state
+- keep manual refresh and evidence drill-down behavior
+
+Track C — Remote agents
+
+Tasks:
+
+- agent install command
+- agent register command
+- host identity and trust model
+- signed or trustworthy snapshot exchange
+- remote command approval boundary
+
+Track D — Fleet dashboard
+
+Tasks:
+
+- fleet summary cards
+- per-host incident counts
+- host detail drill-down
+- fleet filters and search
+
+Release Acceptance Matrix
+
+Functional acceptance:
+
+- launch shows highest-risk issue without changing tabs
+- beginner can answer “what broke and what do I do” within 10 seconds
+- expert reaches logs, services, process, network, or storage drill-down in at
+  most two actions
+- critical incident remains stable across 5 or more refresh cycles
+- reviewed plan persists and can be reopened later
+- apply session produces change-set and audit outputs
+
+Regression acceptance:
+
+- dashboard opens with no prior snapshot
+- queue selection is stable across refresh
+- plan survives refresh
+- apply modal does not stick in `Running`
+- provider default persists across restart
+- age labels use `open for` and `last seen` correctly
+
+Security and safety acceptance:
+
+- config file still does not persist plaintext API keys
+- secrets remain only in the secrets store
+- audit chain verifies after detection, plan generation, approval, execution,
+  and verification
+- dangerous commands remain blocked and logged
+
+Performance acceptance:
+
+- dashboard render remains responsive while plan generation is pending
+- live refresh does not overlap uncontrolled monitor runs
+- daemon prevents collector overlap for scheduled work
+
+Developer Deliverables
+
+Code deliverables:
+
+- migrations for dashboard plan persistence
+- TUI workspace and apply-flow hardening
+- daemon command surface
+- remote agent registration path
+- tests for pinned selection, persisted plans, and apply completion
+
+Documentation deliverables:
+
+- this roadmap
+- updated README describing HELMOPS as a dashboard-first ops console
+- docs for provider behavior and AI-optional operation
+- docs for daemon and agent setup
+- operator troubleshooting guide for plan/apply workflow
+
+Build, Run, and Verify Instructions
+
+Prerequisites:
+
+- Rust toolchain installed
+- Linux environment with system access relevant to the collectors
+- optional Ollama for local AI assistance
+- optional API provider key stored only in secrets store
+
+Build:
+
+1. `cargo fmt --check`
+2. `cargo clippy --workspace --all-targets -- -D warnings`
+3. `cargo test --workspace --all-targets`
+4. `cargo build --release -p helm-cli`
+
+Run local dashboard:
+
+1. `cargo run -p helm-cli`
+2. or `cargo run -p helm-cli -- tui`
+
+Run with explicit DB path during development:
+
+1. `cargo run -p helm-cli -- --db-path /tmp/helmops-dev.db`
+2. `cargo run -p helm-cli -- --db-path /tmp/helmops-dev.db tui`
+
+Optional local AI setup:
+
+1. install and start Ollama
+2. `ollama pull qwen3:4b`
+3. run HELMOPS with provider set to Ollama or configure through `helm init`
+
+Operational smoke test for new dashboard changes:
+
+1. launch the TUI
+2. verify the queue renders `open` and `seen`
+3. select a finding and confirm the workspace sections render in the required
+   order
+4. press `Alt+G` and confirm a plan is generated and persists after `F5`
+5. press `Alt+A` and verify the reviewed apply flow opens
+6. approve or skip steps and confirm the modal reaches a finished state
+7. reopen the same incident and confirm the persisted plan is still attached
+
+Database and persistence verification:
+
+1. generate a plan for a finding
+2. restart HELMOPS
+3. reopen the same finding
+4. confirm the same plan id and narrative are restored
+5. apply a plan
+6. confirm a change set and audit records exist
+
+Daemon rollout steps for M4:
+
+1. implement daemon commands
+2. start daemon locally
+3. verify daemon heartbeat and snapshot updates
+4. point TUI reads at daemon-managed state
+5. validate no duplicate collection loops run
+
+Remote agent rollout steps for M4:
+
+1. install agent on test host
+2. register host in HELMOPS
+3. confirm host appears in fleet view
+4. verify remote finding drill-down
+5. verify reviewed remote apply path and audit trail
+
+Immediate Next Implementation Priorities
+
+1. finish M3 apply-flow hardening and regression tests
+2. complete roadmap-aligned TUI copy and workspace polish
+3. begin daemon command surface and lifecycle design
+4. design remote agent registration and fleet data model
+
+Definition of Final Product
+
+HELMOPS is complete for this roadmap when:
+
+- the default local experience is a reliable incident-first console
+- the top risk is visible in seconds
+- the active workspace is stable and durable
+- every finding has evidence, timing, impact, and a guided path forward
+- reviewed fix plans and apply sessions are persisted and auditable
+- AI improves the workflow without being required
+- continuous local monitoring is daemon-managed
+- remote installed agents feed a coherent fleet view
+
+That is the product to build. Everything in this roadmap should be evaluated
+against that end state, not against legacy dashboard, chat, or collector-first
+behavior.

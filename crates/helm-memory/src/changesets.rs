@@ -313,12 +313,19 @@ pub struct TroubleshootingPlanRecord {
     pub id: String,
     pub source: String,
     pub snapshot_id: String,
+    pub finding_id: String,
     pub hypotheses_json: String,
     pub read_only_steps_json: String,
     pub proposed_fix_steps_json: String,
     pub approval_required: bool,
     pub created_at: i64,
+    pub updated_at: i64,
     pub verdict_summary: String,
+    pub narrative_summary: String,
+    pub dashboard_plan_status: String,
+    pub generation_error: String,
+    pub verification_steps_json: String,
+    pub reproduction_steps_json: String,
 }
 
 /// Store and retrieve troubleshooting plans.
@@ -337,14 +344,82 @@ impl TroubleshootingPlanStore {
         approval_required: bool,
         verdict_summary: &str,
     ) -> Result<(), MemoryError> {
+        let now = chrono::Utc::now().timestamp();
+        let finding_id = source
+            .strip_prefix("finding:")
+            .map(str::trim)
+            .unwrap_or_default();
+        let dashboard_plan_status = if proposed_fix_steps_json.trim() == "[]" {
+            "pending"
+        } else {
+            "ready"
+        };
         conn.execute(
-            "INSERT INTO troubleshooting_plans (id, source, snapshot_id, hypotheses_json, read_only_steps_json, proposed_fix_steps_json, approval_required, created_at, verdict_summary)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO troubleshooting_plans (
+                id, source, snapshot_id, finding_id, hypotheses_json, read_only_steps_json,
+                proposed_fix_steps_json, approval_required, created_at, updated_at,
+                verdict_summary, narrative_summary, dashboard_plan_status, generation_error,
+                verification_steps_json, reproduction_steps_json
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, '', '[]', '[]')",
             params![
-                id, source, snapshot_id,
-                hypotheses_json, read_only_steps_json, proposed_fix_steps_json,
-                approval_required, chrono::Utc::now().timestamp(),
+                id,
+                source,
+                snapshot_id,
+                finding_id,
+                hypotheses_json,
+                read_only_steps_json,
+                proposed_fix_steps_json,
+                approval_required,
+                now,
+                now,
                 verdict_summary,
+                verdict_summary,
+                dashboard_plan_status,
+            ],
+        )
+        .map_err(|e| MemoryError::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_dashboard_plan(
+        conn: &Connection,
+        id: &str,
+        finding_id: &str,
+        read_only_steps_json: &str,
+        proposed_fix_steps_json: &str,
+        narrative_summary: &str,
+        dashboard_plan_status: &str,
+        generation_error: &str,
+        verification_steps_json: &str,
+        reproduction_steps_json: &str,
+    ) -> Result<(), MemoryError> {
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE troubleshooting_plans
+             SET finding_id = ?2,
+                 read_only_steps_json = ?3,
+                 proposed_fix_steps_json = ?4,
+                 verdict_summary = ?5,
+                 narrative_summary = ?5,
+                 dashboard_plan_status = ?6,
+                 generation_error = ?7,
+                 verification_steps_json = ?8,
+                 reproduction_steps_json = ?9,
+                 updated_at = ?10
+             WHERE id = ?1",
+            params![
+                id,
+                finding_id,
+                read_only_steps_json,
+                proposed_fix_steps_json,
+                narrative_summary,
+                dashboard_plan_status,
+                generation_error,
+                verification_steps_json,
+                reproduction_steps_json,
+                now,
             ],
         )
         .map_err(|e| MemoryError::Other(e.to_string()))?;
@@ -357,19 +432,72 @@ impl TroubleshootingPlanStore {
     ) -> Result<Option<TroubleshootingPlanRecord>, MemoryError> {
         let result = conn
             .query_row(
-                "SELECT id, source, snapshot_id, hypotheses_json, read_only_steps_json, proposed_fix_steps_json, approval_required, created_at, verdict_summary FROM troubleshooting_plans WHERE id = ?1",
+                "SELECT id, source, snapshot_id, finding_id, hypotheses_json, read_only_steps_json,
+                        proposed_fix_steps_json, approval_required, created_at, updated_at,
+                        verdict_summary, narrative_summary, dashboard_plan_status,
+                        generation_error, verification_steps_json, reproduction_steps_json
+                 FROM troubleshooting_plans
+                 WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(TroubleshootingPlanRecord {
                         id: row.get(0)?,
                         source: row.get(1)?,
                         snapshot_id: row.get(2)?,
-                        hypotheses_json: row.get(3)?,
-                        read_only_steps_json: row.get(4)?,
-                        proposed_fix_steps_json: row.get(5)?,
-                        approval_required: row.get::<_, i64>(6)? != 0,
-                        created_at: row.get(7)?,
-                        verdict_summary: row.get(8)?,
+                        finding_id: row.get(3)?,
+                        hypotheses_json: row.get(4)?,
+                        read_only_steps_json: row.get(5)?,
+                        proposed_fix_steps_json: row.get(6)?,
+                        approval_required: row.get::<_, i64>(7)? != 0,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
+                        verdict_summary: row.get(10)?,
+                        narrative_summary: row.get(11)?,
+                        dashboard_plan_status: row.get(12)?,
+                        generation_error: row.get(13)?,
+                        verification_steps_json: row.get(14)?,
+                        reproduction_steps_json: row.get(15)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MemoryError::Other(e.to_string()))?;
+        Ok(result)
+    }
+
+    pub fn latest_for_finding(
+        conn: &Connection,
+        finding_id: &str,
+    ) -> Result<Option<TroubleshootingPlanRecord>, MemoryError> {
+        let result = conn
+            .query_row(
+                "SELECT id, source, snapshot_id, finding_id, hypotheses_json, read_only_steps_json,
+                        proposed_fix_steps_json, approval_required, created_at, updated_at,
+                        verdict_summary, narrative_summary, dashboard_plan_status,
+                        generation_error, verification_steps_json, reproduction_steps_json
+                 FROM troubleshooting_plans
+                 WHERE finding_id = ?1
+                 ORDER BY updated_at DESC, created_at DESC
+                 LIMIT 1",
+                params![finding_id],
+                |row| {
+                    Ok(TroubleshootingPlanRecord {
+                        id: row.get(0)?,
+                        source: row.get(1)?,
+                        snapshot_id: row.get(2)?,
+                        finding_id: row.get(3)?,
+                        hypotheses_json: row.get(4)?,
+                        read_only_steps_json: row.get(5)?,
+                        proposed_fix_steps_json: row.get(6)?,
+                        approval_required: row.get::<_, i64>(7)? != 0,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
+                        verdict_summary: row.get(10)?,
+                        narrative_summary: row.get(11)?,
+                        dashboard_plan_status: row.get(12)?,
+                        generation_error: row.get(13)?,
+                        verification_steps_json: row.get(14)?,
+                        reproduction_steps_json: row.get(15)?,
                     })
                 },
             )
@@ -384,7 +512,13 @@ impl TroubleshootingPlanStore {
     ) -> Result<Vec<TroubleshootingPlanRecord>, MemoryError> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, source, snapshot_id, hypotheses_json, read_only_steps_json, proposed_fix_steps_json, approval_required, created_at, verdict_summary FROM troubleshooting_plans ORDER BY created_at DESC LIMIT ?1",
+                "SELECT id, source, snapshot_id, finding_id, hypotheses_json, read_only_steps_json,
+                        proposed_fix_steps_json, approval_required, created_at, updated_at,
+                        verdict_summary, narrative_summary, dashboard_plan_status,
+                        generation_error, verification_steps_json, reproduction_steps_json
+                 FROM troubleshooting_plans
+                 ORDER BY updated_at DESC, created_at DESC
+                 LIMIT ?1",
             )
             .map_err(|e| MemoryError::Other(e.to_string()))?;
         let records = stmt
@@ -393,12 +527,19 @@ impl TroubleshootingPlanStore {
                     id: row.get(0)?,
                     source: row.get(1)?,
                     snapshot_id: row.get(2)?,
-                    hypotheses_json: row.get(3)?,
-                    read_only_steps_json: row.get(4)?,
-                    proposed_fix_steps_json: row.get(5)?,
-                    approval_required: row.get::<_, i64>(6)? != 0,
-                    created_at: row.get(7)?,
-                    verdict_summary: row.get(8)?,
+                    finding_id: row.get(3)?,
+                    hypotheses_json: row.get(4)?,
+                    read_only_steps_json: row.get(5)?,
+                    proposed_fix_steps_json: row.get(6)?,
+                    approval_required: row.get::<_, i64>(7)? != 0,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    verdict_summary: row.get(10)?,
+                    narrative_summary: row.get(11)?,
+                    dashboard_plan_status: row.get(12)?,
+                    generation_error: row.get(13)?,
+                    verification_steps_json: row.get(14)?,
+                    reproduction_steps_json: row.get(15)?,
                 })
             })
             .map_err(|e| MemoryError::Other(e.to_string()))?;
@@ -417,6 +558,8 @@ mod tests {
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../migrations/0008_changesets.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/0010_dashboard_plans.sql"))
             .unwrap();
         conn
     }
@@ -549,5 +692,50 @@ mod tests {
         assert_eq!(list[0].id, "cs-c");
         assert_eq!(list[1].id, "cs-b");
         assert_eq!(list[2].id, "cs-a");
+    }
+
+    #[test]
+    fn dashboard_plan_metadata_roundtrips() {
+        let conn = setup_db();
+        TroubleshootingPlanStore::insert(
+            &conn,
+            "plan-meta",
+            "finding: finding-1",
+            "snap-1",
+            "[]",
+            "[]",
+            "[]",
+            true,
+            "initial",
+        )
+        .unwrap();
+
+        TroubleshootingPlanStore::update_dashboard_plan(
+            &conn,
+            "plan-meta",
+            "finding-1",
+            r#"["journalctl -u nginx -n 50"]"#,
+            r#"[{"title":"restart service","command":{"tool":"shell","command_text":"systemctl restart nginx","expected_effect":"restart nginx","risk":"medium"}}]"#,
+            "Nginx failed after a bad config reload.",
+            "ready",
+            "",
+            r#"["systemctl is-active nginx"]"#,
+            r#"["journalctl -u nginx -n 50"]"#,
+        )
+        .unwrap();
+
+        let record = TroubleshootingPlanStore::latest_for_finding(&conn, "finding-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.id, "plan-meta");
+        assert_eq!(record.dashboard_plan_status, "ready");
+        assert_eq!(
+            record.narrative_summary,
+            "Nginx failed after a bad config reload."
+        );
+        assert_eq!(
+            record.verification_steps_json,
+            r#"["systemctl is-active nginx"]"#
+        );
     }
 }

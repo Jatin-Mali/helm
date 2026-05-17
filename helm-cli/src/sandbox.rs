@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use helm_tools::tool::SandboxPolicy;
 use which::which;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,13 +48,6 @@ pub fn resolve(enabled: bool, sandbox_dir: Option<&PathBuf>) -> Result<Option<Re
 }
 
 impl ResolvedSandbox {
-    pub fn policy(&self) -> SandboxPolicy {
-        SandboxPolicy {
-            root_dir: self.root_dir.clone(),
-            bwrap_program: self.bwrap_program.clone(),
-        }
-    }
-
     pub fn display_root(&self) -> &Path {
         &self.root_dir
     }

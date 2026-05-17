@@ -62,14 +62,6 @@ pub fn default_db_path() -> PathBuf {
     data_file("helm.db")
 }
 
-pub fn default_graph_path() -> PathBuf {
-    data_file("graph.db")
-}
-
-pub fn default_snapshots_path() -> PathBuf {
-    data_dir().join("snapshots")
-}
-
 pub fn default_log_path() -> PathBuf {
     data_dir().join("logs").join("helm.log")
 }
@@ -107,8 +99,4 @@ pub fn default_allowlist_path() -> PathBuf {
 #[allow(dead_code)]
 pub fn default_mcp_servers_path() -> PathBuf {
     config_file("mcp-servers.toml")
-}
-
-pub fn user_profile_file() -> PathBuf {
-    config_file("user_profile.toml")
 }

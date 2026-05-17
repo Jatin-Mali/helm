@@ -54,6 +54,10 @@ fn plan_store_roundtrip() {
         "../crates/helm-memory/migrations/0008_changesets.sql"
     ))
     .unwrap();
+    conn.execute_batch(include_str!(
+        "../crates/helm-memory/migrations/0010_dashboard_plans.sql"
+    ))
+    .unwrap();
 
     let steps_json = r#"[{"title":"check disk","command":{"tool":"shell","input":{"command":"df -h"},"command_text":"df -h","expected_effect":"check disk","risk":"none","blast_radius":"Unknown","rollback":"NotNeeded","verification":[]},"hypothesis_id":null,"expected_output":null,"interpretation_guide":null}]"#;
     TroubleshootingPlanStore::insert(
@@ -72,6 +76,7 @@ fn plan_store_roundtrip() {
         .unwrap()
         .unwrap();
     assert_eq!(record.id, "plan-1");
+    assert_eq!(record.dashboard_plan_status, "ready");
     let loaded_steps: Vec<serde_json::Value> =
         serde_json::from_str(&record.proposed_fix_steps_json).unwrap();
     assert_eq!(loaded_steps.len(), 1);
@@ -139,6 +144,10 @@ fn change_set_persistence_roundtrip() {
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute_batch(include_str!(
         "../crates/helm-memory/migrations/0008_changesets.sql"
+    ))
+    .unwrap();
+    conn.execute_batch(include_str!(
+        "../crates/helm-memory/migrations/0010_dashboard_plans.sql"
     ))
     .unwrap();
 
