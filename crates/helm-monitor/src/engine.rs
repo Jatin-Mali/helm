@@ -4,10 +4,12 @@ use uuid::Uuid;
 
 use crate::{
     collectors::{
-        backups::BackupsCollector, containers::ContainersCollector, disks::DisksCollector,
-        firewall::FirewallCollector, host::HostCollector, load::LoadCollector, logs::LogsCollector,
-        network::NetworkCollector, packages::PackagesCollector, ports::PortsCollector,
-        processes::ProcessCollector, services::ServicesCollector, timers::TimersCollector,
+        backups::BackupsCollector, compose::ComposeCollector, containers::ContainersCollector,
+        disks::DisksCollector, firewall::FirewallCollector, host::HostCollector,
+        kubernetes::KubernetesCollector, libvirt::LibvirtCollector, load::LoadCollector,
+        logs::LogsCollector, network::NetworkCollector, packages::PackagesCollector,
+        ports::PortsCollector, processes::ProcessCollector, services::ServicesCollector,
+        timers::TimersCollector,
     },
     snapshot::{CollectorError, MonitorProfile, SnapshotDomains, SystemSnapshot},
 };
@@ -33,6 +35,9 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         network_result,
         processes_result,
         firewall_result,
+        kubernetes_result,
+        libvirt_result,
+        compose_result,
     ) = tokio::join!(
         HostCollector.collect(profile),
         LoadCollector.collect(profile),
@@ -47,6 +52,9 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         NetworkCollector.collect(profile),
         ProcessCollector.collect(profile),
         FirewallCollector.collect(profile),
+        KubernetesCollector.collect(profile),
+        LibvirtCollector.collect(profile),
+        ComposeCollector.collect(profile),
     );
 
     let host_identity = unwrap_or_default(host_result, "host", &mut errors);
@@ -62,6 +70,9 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
     let network_out = unwrap_or_default(network_result, "network", &mut errors);
     let processes_out = unwrap_or_default(processes_result, "processes", &mut errors);
     let firewall_out = unwrap_or_default(firewall_result, "firewall", &mut errors);
+    let kubernetes_out = unwrap_or_default(kubernetes_result, "kubernetes", &mut errors);
+    let libvirt_out = unwrap_or_default(libvirt_result, "libvirt", &mut errors);
+    let compose_out = unwrap_or_default(compose_result, "compose", &mut errors);
 
     let domains = SnapshotDomains {
         host: host_identity.clone(),
@@ -77,6 +88,9 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         network: network_out,
         processes: processes_out,
         firewall: firewall_out,
+        kubernetes: kubernetes_out,
+        libvirt: libvirt_out,
+        compose: compose_out,
     };
 
     SystemSnapshot {
@@ -105,5 +119,27 @@ fn unwrap_or_default<T: Default>(
             });
             T::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::MonitorProfile;
+
+    #[tokio::test]
+    async fn test_collect_snapshot_includes_new_domains() {
+        let result = collect_snapshot(MonitorProfile::Standard).await;
+
+        // Verify that all three new domains are present and accessible
+        let _kubernetes = &result.domains.kubernetes;
+        let _libvirt = &result.domains.libvirt;
+        let _compose = &result.domains.compose;
+
+        // Verify the domain_names list includes the three new domains
+        let domain_names = crate::snapshot::SnapshotDomains::domain_names();
+        assert!(domain_names.contains(&"kubernetes"));
+        assert!(domain_names.contains(&"libvirt"));
+        assert!(domain_names.contains(&"compose"));
     }
 }

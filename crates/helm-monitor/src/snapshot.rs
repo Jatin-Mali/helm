@@ -437,6 +437,9 @@ pub struct SnapshotDomains {
     pub network: NetworkSnapshot,
     pub processes: ProcessSnapshot,
     pub firewall: FirewallSnapshot,
+    pub kubernetes: crate::collectors::kubernetes::KubernetesSnapshot,
+    pub libvirt: crate::collectors::libvirt::LibvirtSnapshot,
+    pub compose: crate::collectors::compose::ComposeSnapshot,
 }
 
 /// Non-fatal error from one collector.
@@ -448,7 +451,7 @@ pub struct CollectorError {
 }
 
 impl SnapshotDomains {
-    /// Return the 13 domain names in a stable order matching the struct fields.
+    /// Return the 16 domain names in a stable order matching the struct fields.
     pub fn domain_names() -> Vec<&'static str> {
         vec![
             "host",
@@ -464,6 +467,9 @@ impl SnapshotDomains {
             "network",
             "processes",
             "firewall",
+            "kubernetes",
+            "libvirt",
+            "compose",
         ]
     }
 }
@@ -655,6 +661,9 @@ impl Default for SnapshotDomains {
             network: NetworkSnapshot::default(),
             processes: ProcessSnapshot::default(),
             firewall: FirewallSnapshot::default(),
+            kubernetes: crate::collectors::kubernetes::KubernetesSnapshot::default(),
+            libvirt: crate::collectors::libvirt::LibvirtSnapshot::default(),
+            compose: crate::collectors::compose::ComposeSnapshot::default(),
         }
     }
 }
