@@ -20,6 +20,8 @@ const MIGRATION_0010: &str = include_str!("../migrations/0006_snapshots.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0007_findings.sql");
 const MIGRATION_0012: &str = include_str!("../migrations/0008_changesets.sql");
 const MIGRATION_0013: &str = include_str!("../migrations/0009_finding_state.sql");
+const MIGRATION_0014: &str = include_str!("../migrations/0010_dashboard_plans.sql");
+const MIGRATION_0015: &str = include_str!("../migrations/0011_host_id_snapshots.sql");
 
 /// Minimal schema for per-host audit shard DBs (audit_events only).
 const SHARD_SCHEMA: &str = "\
@@ -1126,7 +1128,9 @@ fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
             apply_0012(conn)
         }
         12 => apply_0013(conn),
-        13 => conn
+        13 => apply_0014(conn),
+        14 => apply_0015(conn),
+        15 => conn
             .execute_batch("PRAGMA foreign_keys = ON")
             .map_err(sqlite_error),
         other => Err(MemoryError::Migration(format!(
@@ -1188,6 +1192,29 @@ fn apply_0013(conn: &Connection) -> Result<(), MemoryError> {
         conn.execute_batch(MIGRATION_0013).map_err(sqlite_error)?;
     }
     conn.execute_batch("PRAGMA user_version = 13")
+        .map_err(sqlite_error)?;
+    apply_0014(conn)?;
+    Ok(())
+}
+
+fn apply_0014(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .map_err(sqlite_error)?;
+    if !column_exists(conn, "troubleshooting_plans", "finding_id")? {
+        conn.execute_batch(MIGRATION_0014).map_err(sqlite_error)?;
+    }
+    conn.execute_batch("PRAGMA user_version = 14")
+        .map_err(sqlite_error)?;
+    apply_0015(conn)
+}
+
+fn apply_0015(conn: &Connection) -> Result<(), MemoryError> {
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .map_err(sqlite_error)?;
+    if !column_exists(conn, "snapshots", "host_id")? {
+        conn.execute_batch(MIGRATION_0015).map_err(sqlite_error)?;
+    }
+    conn.execute_batch("PRAGMA user_version = 15")
         .map_err(sqlite_error)?;
     Ok(())
 }
@@ -1674,7 +1701,7 @@ mod tests {
     async fn schema_version_reports_current_version_edge_case() {
         let (_dir, store) = store().await;
 
-        assert_eq!(store.schema_version().await.unwrap(), 13);
+        assert_eq!(store.schema_version().await.unwrap(), 15);
     }
 
     #[tokio::test]
@@ -1747,7 +1774,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(version, 13);
+        assert_eq!(version, 15);
         assert_eq!(has_column, 1);
     }
 

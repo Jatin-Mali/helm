@@ -71,9 +71,10 @@ fn e2e_plan_from_problem_service_failure() {
 
 #[test]
 fn no_fix_without_evidence_on_empty_snapshot() {
+    let snapshot = empty_snapshot();
     let plan = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(plan_from_problem("disk is full"));
+        .block_on(plan_from_problem_with_snapshot("disk is full", snapshot));
     // Empty snapshot means no actionable evidence -> no fix steps
     assert!(
         plan.proposed_fix_steps.is_empty(),
@@ -441,6 +442,7 @@ fn findings_persisted_in_snapshot_can_be_retrieved_by_id() {
         "CREATE TABLE IF NOT EXISTS snapshots (
             id TEXT PRIMARY KEY,
             host_hostname TEXT NOT NULL DEFAULT 'unknown',
+            host_id TEXT NOT NULL DEFAULT '',
             collected_at INTEGER NOT NULL,
             profile TEXT NOT NULL DEFAULT 'standard',
             domains_json TEXT NOT NULL DEFAULT '{}',
@@ -537,6 +539,7 @@ fn explain_finding_works_across_multiple_snapshots() {
         "CREATE TABLE IF NOT EXISTS snapshots (
             id TEXT PRIMARY KEY,
             host_hostname TEXT NOT NULL DEFAULT 'unknown',
+            host_id TEXT NOT NULL DEFAULT '',
             collected_at INTEGER NOT NULL,
             profile TEXT NOT NULL DEFAULT 'standard',
             domains_json TEXT NOT NULL DEFAULT '{}',

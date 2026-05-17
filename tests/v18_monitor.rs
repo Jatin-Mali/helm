@@ -540,6 +540,7 @@ fn monitor_snapshot_is_persisted_and_reloaded_as_baseline() {
         "CREATE TABLE IF NOT EXISTS snapshots (
             id TEXT PRIMARY KEY,
             host_hostname TEXT NOT NULL DEFAULT 'unknown',
+            host_id TEXT NOT NULL DEFAULT '',
             collected_at INTEGER NOT NULL,
             profile TEXT NOT NULL DEFAULT 'standard',
             domains_json TEXT NOT NULL DEFAULT '{}',
@@ -599,6 +600,7 @@ fn monitor_persistence_advances_baseline_across_runs() {
         "CREATE TABLE IF NOT EXISTS snapshots (
             id TEXT PRIMARY KEY,
             host_hostname TEXT NOT NULL DEFAULT 'unknown',
+            host_id TEXT NOT NULL DEFAULT '',
             collected_at INTEGER NOT NULL,
             profile TEXT NOT NULL DEFAULT 'standard',
             domains_json TEXT NOT NULL DEFAULT '{}',

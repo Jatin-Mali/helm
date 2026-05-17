@@ -295,6 +295,7 @@ fn snapshot_persistence_round_trip() {
         "CREATE TABLE IF NOT EXISTS snapshots (
             id TEXT PRIMARY KEY,
             host_hostname TEXT NOT NULL DEFAULT 'unknown',
+            host_id TEXT NOT NULL DEFAULT '',
             collected_at INTEGER NOT NULL,
             profile TEXT NOT NULL DEFAULT 'standard',
             domains_json TEXT NOT NULL DEFAULT '{}',
