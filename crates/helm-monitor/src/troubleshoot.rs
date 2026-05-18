@@ -1646,4 +1646,55 @@ ROLLBACK: none
             "evidence summary should contain the observed value"
         );
     }
+
+    #[test]
+    fn plan_quality_structure() {
+        assert!(CommandValidator::validate_command("systemctl restart nginx").is_ok());
+        assert!(
+            CommandValidator::validate_command("journalctl -u nginx --since '5 min ago'").is_ok()
+        );
+        assert!(
+            CommandValidator::validate_command("kubectl rollout restart deployment/api").is_ok()
+        );
+
+        assert!(CommandValidator::validate_command("rm -rf /").is_err());
+        assert!(CommandValidator::validate_command("dd if=/dev/zero of=/dev/sda").is_err());
+        assert!(CommandValidator::validate_command("> /dev/sda").is_err());
+    }
+
+    #[test]
+    fn parse_llm_response_numbered_steps() {
+        let fixture = "\
+---NARRATIVE---
+nginx is returning 5xx errors because the upstream auth-svc is down.
+---FIX PLAN---
+COMMAND: systemctl status auth-svc
+PURPOSE: Check auth-svc current state
+RISK: none
+ROLLBACK: none
+---
+COMMAND: systemctl restart auth-svc
+PURPOSE: Restart the failing service
+RISK: low
+ROLLBACK: systemctl stop auth-svc
+---
+COMMAND: curl -sf http://localhost:8080/healthz
+PURPOSE: Verify auth-svc is healthy after restart
+RISK: none
+ROLLBACK: none
+";
+        let plan = parse_llm_response(fixture).expect("fixture should parse cleanly");
+        assert_eq!(plan.steps.len(), 3, "expected 3 steps");
+        for step in &plan.steps {
+            assert!(!step.command.is_empty(), "each step must have a command");
+            assert!(!step.purpose.is_empty(), "each step must have a purpose");
+        }
+        for step in &plan.steps {
+            assert!(
+                CommandValidator::validate_command(&step.command).is_ok(),
+                "fixture command '{}' should be safe",
+                step.command
+            );
+        }
+    }
 }
