@@ -24,6 +24,7 @@ pub mod restart_loop;
 pub mod restore_test;
 pub mod smart;
 pub mod snapshot_age;
+pub mod ssh_exposure;
 pub mod swap_exhaustion;
 pub mod unhealthy_container;
 
@@ -113,6 +114,8 @@ impl DetectorRegistry {
         reg.register(Box::new(compose_health::ComposeHealthDetector));
         // Cert detectors
         reg.register(Box::new(cert_expiry::CertExpiryDetector));
+        // SSH exposure
+        reg.register(Box::new(ssh_exposure::SshExposureDetector));
         reg
     }
 }

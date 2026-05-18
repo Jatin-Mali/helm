@@ -148,6 +148,7 @@ enum Command {
     ChangeSet(ChangeSetArgs),
     Backup(BackupArgs),
     Runbook(RunbookArgs),
+    Alerting(AlertingArgs),
 }
 
 #[derive(Debug, Args)]
@@ -893,6 +894,21 @@ struct RunbookArgs {
     profile: String,
 }
 
+#[derive(Debug, Args)]
+struct AlertingArgs {
+    #[command(subcommand)]
+    command: AlertingCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AlertingCommand {
+    /// Show current alerting configuration
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum ProviderChoice {
@@ -1273,6 +1289,9 @@ async fn run() -> Result<()> {
         }
         Command::Runbook(args) => {
             run_runbook_command(args).await?;
+        }
+        Command::Alerting(args) => {
+            run_alerting_command(args).await?;
         }
     }
     Ok(())
@@ -1766,6 +1785,7 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "change-set"
                 | "backup"
                 | "runbook"
+                | "alerting"
         )
     )
 }
@@ -5844,6 +5864,32 @@ async fn run_backup_command(args: BackupArgs) -> Result<()> {
                     println!();
                     println!("✅ All backup systems look healthy.");
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_alerting_command(args: AlertingArgs) -> Result<()> {
+    match args.command {
+        AlertingCommand::Show { json } => {
+            let config = helm_monitor::alerting::load_config()
+                .unwrap_or_else(|_| helm_monitor::alerting::AlertConfig::default());
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "min_severity": config.min_severity.as_str(),
+                    "dedup_window_secs": config.dedup_window_secs,
+                    "rate_limit_per_min": config.rate_limit_per_min,
+                }))?);
+            } else {
+                println!("Alerting Configuration");
+                println!("{}", "─".repeat(50));
+                println!("Min severity:  {}", config.min_severity.as_str());
+                println!("Dedup window:  {}s", config.dedup_window_secs);
+                println!("Rate limit:    {}/min", config.rate_limit_per_min);
+                println!();
+                println!("Alerting sinks are configured separately in config.toml.");
+                println!("Run `helm config` to view and edit configuration.");
             }
         }
     }
