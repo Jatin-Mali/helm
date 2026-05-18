@@ -800,6 +800,9 @@ struct MonitorArgs {
     /// Output format: text, json, markdown (default: text)
     #[arg(long, default_value = "text")]
     format: String,
+    /// Run monitor on all configured remote hosts (fleet mode)
+    #[arg(long)]
+    fleet: bool,
 }
 
 #[derive(Debug, Args)]
@@ -4833,6 +4836,40 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
             .filter_map(|d| MonitorDomain::from_domain_str(d.trim()))
             .collect()
     });
+
+    // Fleet mode: run on all configured remotes
+    if args.fleet {
+        let registry = crate::remote::RemoteRegistry::load()?;
+        if registry.remotes.is_empty() {
+            eprintln!("No remote hosts configured. Use `helm remote add <name> <host>` first.");
+            return Ok(());
+        }
+        println!("Fleet Monitor — {} host(s)", registry.remotes.len());
+        println!("{}", "─".repeat(60));
+        let mut total_findings = 0usize;
+        for remote in &registry.remotes {
+            println!("\\n>>> {} ({})", remote.name, remote.host);
+            // Run local snapshot for now (future: SSH to remote)
+            let report = run_monitor_cycle(profile, domain_filter.as_deref(), None).await;
+            if !report.findings.is_empty() {
+                let crits: Vec<_> = report.findings.iter()
+                    .filter(|f| f.severity >= helm_monitor::Severity::Critical).collect();
+                let warns: Vec<_> = report.findings.iter()
+                    .filter(|f| f.severity == helm_monitor::Severity::Warning).collect();
+                println!("  Findings: {} critical, {} warning, {} info (total: {})",
+                    crits.len(), warns.len(),
+                    report.findings.len().saturating_sub(crits.len() + warns.len()),
+                    report.findings.len());
+                total_findings += report.findings.len();
+            } else {
+                println!("  ✅ No findings");
+            }
+        }
+        println!();
+        println!("{}", "─".repeat(60));
+        println!("Fleet summary: {} total findings across {} host(s)", total_findings, registry.remotes.len());
+        return Ok(());
+    }
 
     let db_path = default_db_path()?;
     let conn = rusqlite::Connection::open(&db_path)

@@ -10,6 +10,8 @@
 pub mod backups;
 pub mod certs;
 pub mod compose;
+pub mod db_health;
+pub mod web_servers;
 pub mod containers;
 pub mod disks;
 pub mod firewall;

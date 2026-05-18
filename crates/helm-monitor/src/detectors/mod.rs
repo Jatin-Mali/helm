@@ -4,7 +4,11 @@ pub mod backup_schedule;
 pub mod backup_stale;
 pub mod cert_expiry;
 pub mod compose_health;
+pub mod config_drift;
 pub mod container_restart;
+pub mod db_health;
+pub mod desktop_notify;
+pub mod dns_health;
 pub mod disk_usage;
 pub mod domain_state;
 pub mod exposed_port;
@@ -15,6 +19,7 @@ pub mod inactive_service;
 pub mod inode_usage;
 pub mod journal_errors;
 pub mod memory_pressure;
+pub mod monitoring_health;
 pub mod oom_event;
 pub mod oom_kill;
 pub mod package_updates;
@@ -27,6 +32,7 @@ pub mod snapshot_age;
 pub mod ssh_exposure;
 pub mod swap_exhaustion;
 pub mod unhealthy_container;
+pub mod web_server;
 
 use crate::{
     findings::{Finding, MonitorDomain},
@@ -116,6 +122,12 @@ impl DetectorRegistry {
         reg.register(Box::new(cert_expiry::CertExpiryDetector));
         // SSH exposure
         reg.register(Box::new(ssh_exposure::SshExposureDetector));
+        reg.register(Box::new(db_health::DbHealthDetector));
+        reg.register(Box::new(web_server::WebServerDetector));
+        reg.register(Box::new(config_drift::ConfigDriftDetector));
+        reg.register(Box::new(desktop_notify::DesktopNotifyDetector));
+        reg.register(Box::new(monitoring_health::MonitoringHealthDetector));
+        reg.register(Box::new(dns_health::DnsHealthDetector));
         reg
     }
 }
