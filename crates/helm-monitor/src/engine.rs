@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::{
     alerting::{AlertConfig, AlertRouter},
     collectors::{
-        backups::BackupsCollector, compose::ComposeCollector, containers::ContainersCollector,
+        backups::BackupsCollector,        compose::ComposeCollector, certs::CertsCollector,containers::ContainersCollector,
         disks::DisksCollector, firewall::FirewallCollector, host::HostCollector,
         kubernetes::KubernetesCollector, libvirt::LibvirtCollector, load::LoadCollector,
         logs::LogsCollector, network::NetworkCollector, packages::PackagesCollector,
@@ -86,6 +86,7 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         kubernetes_result,
         libvirt_result,
         compose_result,
+        certs_result,
     ) = tokio::join!(
         HostCollector.collect(profile),
         LoadCollector.collect(profile),
@@ -103,6 +104,7 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         KubernetesCollector.collect(profile),
         LibvirtCollector.collect(profile),
         ComposeCollector.collect(profile),
+        CertsCollector.collect(profile),
     );
 
     let host_identity = unwrap_or_default(host_result, "host", &mut errors);
@@ -121,6 +123,7 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
     let kubernetes_out = unwrap_or_default(kubernetes_result, "kubernetes", &mut errors);
     let libvirt_out = unwrap_or_default(libvirt_result, "libvirt", &mut errors);
     let compose_out = unwrap_or_default(compose_result, "compose", &mut errors);
+    let certs_out = unwrap_or_default(certs_result, "certs", &mut errors);
 
     let domains = SnapshotDomains {
         host: host_identity.clone(),
@@ -139,6 +142,7 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         kubernetes: kubernetes_out,
         libvirt: libvirt_out,
         compose: compose_out,
+        certs: certs_out,
     };
 
     SystemSnapshot {

@@ -1,6 +1,12 @@
 HELMOPS Rebirth Roadmap
 Status: rewritten on 2026-05-17
 
+Related execution document:
+
+- `docs/helmops-gap-closure-checklist.md` tracks only the remaining work for the
+  unfinished milestones and is the direct follow-through checklist after the
+  current audit.
+
 Purpose
 
 This document is the execution blueprint for rebuilding HELMOPS into a

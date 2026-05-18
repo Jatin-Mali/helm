@@ -96,6 +96,7 @@ mod tests {
                 available: true,
             },
             compose: Default::default(),
+            certs: Default::default(),
         };
         SystemSnapshot::new(
             "test-snapshot".to_string(),

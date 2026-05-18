@@ -134,14 +134,72 @@ enum Command {
     Completion(CompletionArgs),
     Tui(TuiArgs),
     Remote(RemoteArgs),
+    Agent(AgentArgs),
     Bootstrap(BootstrapArgs),
     TrustReport(TrustReportArgs),
+    Dashboard(TuiArgs),
+    Daemon(DaemonArgs),
+    Incident(IncidentArgs),
     Snapshot(SnapshotArgs),
     Monitor(MonitorArgs),
     Troubleshoot(TroubleshootArgs),
     Explain(ExplainArgs),
     ApplyPlan(ApplyPlanArgs),
     ChangeSet(ChangeSetArgs),
+}
+
+#[derive(Debug, Args)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: DaemonCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    Start(DaemonStartArgs),
+    Stop,
+    Status,
+    Run(DaemonRunArgs),
+}
+
+#[derive(Debug, Args)]
+struct DaemonStartArgs {
+    #[arg(long, default_value_t = 60)]
+    interval: u64,
+}
+
+#[derive(Debug, Args)]
+struct DaemonRunArgs {
+    #[arg(long, default_value_t = 60)]
+    interval: u64,
+}
+
+#[derive(Debug, Args)]
+struct IncidentArgs {
+    #[command(subcommand)]
+    command: IncidentCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum IncidentCommand {
+    Show {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    Plan {
+        #[arg(value_name = "ID")]
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Apply {
+        #[arg(value_name = "ID_OR_PLAN_ID")]
+        id_or_plan_id: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -195,6 +253,12 @@ struct RemoteArgs {
     command: RemoteCommand,
 }
 
+#[derive(Debug, Args)]
+struct AgentArgs {
+    #[command(subcommand)]
+    command: AgentCommand,
+}
+
 #[derive(Debug, Subcommand)]
 enum RemoteCommand {
     /// Register a new SSH-reachable remote target.
@@ -207,6 +271,26 @@ enum RemoteCommand {
         name: String,
     },
     /// Remove a registered remote.
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// Install HELMOPS on a remote Linux host and register it as an installed agent.
+    Install(AgentInstallArgs),
+    /// Register an already-installed remote agent with the local fleet registry.
+    Register(AgentRegisterArgs),
+    /// List installed agents from the remote registry.
+    List,
+    /// Test agent reachability over SSH and report its transport metadata.
+    Test {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Remove a registered agent.
     Remove {
         #[arg(value_name = "NAME")]
         name: String,
@@ -226,6 +310,63 @@ struct RemoteAddArgs {
     /// Optional inline SSH options (e.g. "-i ~/.ssh/id_ed25519").
     #[arg(long)]
     ssh_opts: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AgentInstallArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(long, value_name = "HOST")]
+    host: String,
+    #[arg(long, value_name = "USER")]
+    user: Option<String>,
+    #[arg(long, default_value_t = 22)]
+    port: u16,
+    /// Optional inline SSH options (e.g. "-i ~/.ssh/id_ed25519").
+    #[arg(long)]
+    ssh_opts: Option<String>,
+    /// Run the installed agent on this interval in seconds.
+    #[arg(long, default_value_t = 60)]
+    interval: u64,
+    /// Download the helm binary on the remote from this URL instead of uploading the local one.
+    #[arg(long, value_name = "URL")]
+    release_url: Option<String>,
+    /// Path to a local helm binary to upload. Defaults to the currently running binary.
+    #[arg(long, value_name = "PATH")]
+    local_binary: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct AgentRegisterArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(long, value_name = "HOST")]
+    host: String,
+    #[arg(long, value_name = "USER")]
+    user: Option<String>,
+    #[arg(long, default_value_t = 22)]
+    port: u16,
+    /// Optional inline SSH options (e.g. "-i ~/.ssh/id_ed25519").
+    #[arg(long)]
+    ssh_opts: Option<String>,
+    /// Installed binary path on the remote host.
+    #[arg(long, default_value = "$HOME/.helm/bin/helm")]
+    install_path: String,
+    /// Agent service unit name if supervised by systemd user services.
+    #[arg(long, default_value = "helmopsd.service")]
+    service_name: String,
+    /// Preferred supervision mode recorded for this host.
+    #[arg(long, default_value = "detached-process")]
+    supervisor: AgentSupervisorArg,
+    /// Expected collection interval in seconds.
+    #[arg(long, default_value_t = 60)]
+    interval: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AgentSupervisorArg {
+    DetachedProcess,
+    SystemdUser,
 }
 
 #[derive(Debug, Args)]
@@ -1031,6 +1172,9 @@ async fn run() -> Result<()> {
         Command::Remote(args) => {
             run_remote_command(args).await?;
         }
+        Command::Agent(args) => {
+            run_agent_command(args).await?;
+        }
         // stripped: Command::Serve
         Command::Bootstrap(args) => {
             run_bootstrap_command(args).await?;
@@ -1043,6 +1187,36 @@ async fn run() -> Result<()> {
             } else {
                 print!("{}", render_trust_report(&report));
             }
+        }
+        Command::Dashboard(args) => {
+            let dashboard_mode = !cli.read_only && !cli.yes;
+            tui::run_tui(tui::TuiRuntime {
+                provider_settings,
+                db_path,
+                memory,
+                max_iterations: cli.max_iterations,
+                config_path,
+                secrets: secrets_store,
+                tui_paste_key_modal: config
+                    .as_ref()
+                    .and_then(|config| config.security.as_ref())
+                    .and_then(|security| security.tui_paste_key_modal)
+                    .unwrap_or(true),
+                auto_approve: cli.yes,
+                read_only: cli.read_only,
+                diagnose_mode: false,
+                dashboard_mode,
+                sandbox: sandbox.clone(),
+                remote_target: cli.remote.clone(),
+            })
+            .await?;
+            let _ = args;
+        }
+        Command::Daemon(args) => {
+            run_daemon_command(args, &db_path).await?;
+        }
+        Command::Incident(args) => {
+            run_incident_command(args).await?;
         }
         Command::Snapshot(args) => {
             run_collect_snapshot_command(args).await?;
@@ -1538,10 +1712,20 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "memory"
                 | "profile"
                 | "remote"
+                | "agent"
                 | "serve"
                 | "bootstrap"
                 | "diagnose"
                 | "trust-report"
+                | "dashboard"
+                | "daemon"
+                | "incident"
+                | "snapshot"
+                | "monitor"
+                | "troubleshoot"
+                | "explain"
+                | "apply-plan"
+                | "change-set"
         )
     )
 }
@@ -3527,7 +3711,7 @@ fn classify_exit_code(error: &(dyn std::error::Error + 'static)) -> u8 {
 }
 
 async fn run_remote_command(args: RemoteArgs) -> Result<()> {
-    use remote::{RemoteEntry, RemoteRegistry};
+    use remote::{RemoteEntry, RemoteRegistry, RemoteTransport};
     let mut registry = RemoteRegistry::load()?;
     match args.command {
         RemoteCommand::Add(a) => {
@@ -3539,6 +3723,8 @@ async fn run_remote_command(args: RemoteArgs) -> Result<()> {
                 user: a.user,
                 ssh_opts: a.ssh_opts,
                 credential: Default::default(),
+                transport: RemoteTransport::Ssh,
+                agent: None,
             };
             registry.upsert(entry);
             registry.save()?;
@@ -3550,7 +3736,14 @@ async fn run_remote_command(args: RemoteArgs) -> Result<()> {
             }
             for r in &registry.remotes {
                 let user = r.user.as_deref().unwrap_or("(default user)");
-                println!("{:<20} {}@{}:{}", r.name, user, r.host, r.port);
+                println!(
+                    "{:<20} {:<16} {}@{}:{}",
+                    r.name,
+                    r.summary_label(),
+                    user,
+                    r.host,
+                    r.port
+                );
             }
         }
         RemoteCommand::Test { name } => {
@@ -3574,6 +3767,620 @@ async fn run_remote_command(args: RemoteArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn supervisor_arg_to_remote(value: AgentSupervisorArg) -> remote::AgentSupervisor {
+    match value {
+        AgentSupervisorArg::DetachedProcess => remote::AgentSupervisor::DetachedProcess,
+        AgentSupervisorArg::SystemdUser => remote::AgentSupervisor::SystemdUser,
+    }
+}
+
+fn current_executable_or(path: Option<PathBuf>) -> Result<PathBuf> {
+    match path {
+        Some(path) => Ok(path),
+        None => std::env::current_exe().context("resolving current helm binary"),
+    }
+}
+
+fn agent_metadata(
+    install_path: String,
+    service_name: String,
+    interval_secs: u64,
+    supervisor: remote::AgentSupervisor,
+    trust: remote::AgentTrustMode,
+) -> remote::AgentMetadata {
+    remote::AgentMetadata {
+        install_path,
+        service_name,
+        interval_secs,
+        supervisor,
+        trust,
+        registered_at: Utc::now().to_rfc3339(),
+    }
+}
+
+async fn run_agent_command(args: AgentArgs) -> Result<()> {
+    use remote::{AgentTrustMode, RemoteEntry, RemoteRegistry, RemoteTransport};
+
+    let mut registry = RemoteRegistry::load()?;
+    match args.command {
+        AgentCommand::Install(args) => {
+            let local_binary = current_executable_or(args.local_binary)?;
+            let plan = bootstrap::BootstrapPlan {
+                host: args.host.clone(),
+                user: args.user.clone(),
+                port: args.port,
+                release_url: args.release_url.clone(),
+                register_as: None,
+            };
+            let report = bootstrap::run(plan, local_binary).await?;
+            let mut entry = RemoteEntry {
+                host_id: uuid::Uuid::new_v4(),
+                name: args.name.clone(),
+                host: args.host,
+                port: args.port,
+                user: args.user,
+                ssh_opts: args.ssh_opts,
+                credential: Default::default(),
+                transport: RemoteTransport::InstalledAgent,
+                agent: None,
+            };
+            let supervisor = install_remote_agent_supervisor(&entry, args.interval).await?;
+            entry.agent = Some(agent_metadata(
+                report.installed_path.clone(),
+                "helmopsd.service".to_owned(),
+                args.interval,
+                supervisor,
+                AgentTrustMode::SshBootstrap,
+            ));
+            registry.upsert(entry);
+            registry.save()?;
+            println!("installed agent: {}", args.name);
+            println!("  host: {}", report.host);
+            println!("  remote uname: {}", report.remote_uname);
+            println!("  helm version: {}", report.remote_helm_version);
+            println!("  install path: {}", report.installed_path);
+            println!(
+                "  supervisor: {}",
+                match supervisor {
+                    remote::AgentSupervisor::SystemdUser => "systemd-user",
+                    remote::AgentSupervisor::DetachedProcess => "detached",
+                }
+            );
+        }
+        AgentCommand::Register(args) => {
+            let entry = RemoteEntry {
+                host_id: uuid::Uuid::new_v4(),
+                name: args.name.clone(),
+                host: args.host,
+                port: args.port,
+                user: args.user,
+                ssh_opts: args.ssh_opts,
+                credential: Default::default(),
+                transport: RemoteTransport::InstalledAgent,
+                agent: Some(agent_metadata(
+                    args.install_path,
+                    args.service_name,
+                    args.interval,
+                    supervisor_arg_to_remote(args.supervisor),
+                    AgentTrustMode::ManualRegistration,
+                )),
+            };
+            registry.upsert(entry);
+            registry.save()?;
+            println!("registered agent: {}", args.name);
+        }
+        AgentCommand::List => {
+            let mut any = false;
+            for r in &registry.remotes {
+                if r.transport != RemoteTransport::InstalledAgent {
+                    continue;
+                }
+                any = true;
+                let user = r.user.as_deref().unwrap_or("(default user)");
+                if let Some(agent) = &r.agent {
+                    println!(
+                        "{:<20} {:<16} {}@{}:{}  every {}s  trust={}  path={}",
+                        r.name,
+                        r.summary_label(),
+                        user,
+                        r.host,
+                        r.port,
+                        agent.interval_secs,
+                        match agent.trust {
+                            AgentTrustMode::ManualRegistration => "manual",
+                            AgentTrustMode::SshBootstrap => "ssh-bootstrap",
+                        },
+                        agent.install_path
+                    );
+                } else {
+                    println!(
+                        "{:<20} {:<16} {}@{}:{}",
+                        r.name,
+                        r.summary_label(),
+                        user,
+                        r.host,
+                        r.port
+                    );
+                }
+            }
+            if !any {
+                println!(
+                    "no installed agents registered. Use `helm agent install NAME --host ...`."
+                );
+            }
+        }
+        AgentCommand::Test { name } => {
+            let entry = registry
+                .get(&name)
+                .ok_or_else(|| anyhow!("unknown agent: {name}"))?;
+            if entry.transport != RemoteTransport::InstalledAgent {
+                return Err(anyhow!(
+                    "remote `{name}` is registered as SSH-only, not an installed agent"
+                ));
+            }
+            match entry.ping().await {
+                Ok(true) => {
+                    println!("agent {name} reachable over ssh.");
+                    if let Some(agent) = &entry.agent {
+                        println!("  transport: {}", entry.summary_label());
+                        println!("  service: {}", agent.service_name);
+                        println!("  interval: {}s", agent.interval_secs);
+                        println!("  trust: {:?}", agent.trust);
+                    }
+                }
+                Ok(false) => println!("agent {name} unreachable (ssh exited non-zero)."),
+                Err(error) => println!("agent {name} probe failed: {error}"),
+            }
+        }
+        AgentCommand::Remove { name } => {
+            let removed = registry.remove(&name);
+            registry.save()?;
+            if removed {
+                println!("removed agent: {name}");
+            } else {
+                println!("no agent named {name}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn install_remote_agent_supervisor(
+    entry: &remote::RemoteEntry,
+    interval_secs: u64,
+) -> Result<remote::AgentSupervisor> {
+    let systemd_script = format!(
+        "set -eu\n\
+mkdir -p \"$HOME/.config/systemd/user\"\n\
+cat > \"$HOME/.config/systemd/user/helmopsd.service\" <<'EOF'\n\
+[Unit]\n\
+Description=HELMOPS daemon\n\
+After=default.target\n\
+\n\
+[Service]\n\
+ExecStart=%h/.helm/bin/helm daemon run --interval {interval_secs}\n\
+Restart=always\n\
+RestartSec=5\n\
+Environment=XDG_CONFIG_HOME=%h/.config\n\
+Environment=XDG_DATA_HOME=%h/.local/share\n\
+Environment=XDG_CACHE_HOME=%h/.cache\n\
+\n\
+[Install]\n\
+WantedBy=default.target\n\
+EOF\n\
+systemctl --user daemon-reload\n\
+systemctl --user enable --now helmopsd.service\n\
+systemctl --user is-active --quiet helmopsd.service"
+    );
+
+    if entry.run_shell(&systemd_script).await.is_ok() {
+        return Ok(remote::AgentSupervisor::SystemdUser);
+    }
+
+    let detached_script = format!(
+        "set -eu\n\
+mkdir -p \"$HOME/.local/state/helm/logs\"\n\
+pkill -f \"$HOME/.helm/bin/helm daemon run --interval {interval_secs}\" >/dev/null 2>&1 || true\n\
+nohup \"$HOME/.helm/bin/helm\" daemon run --interval {interval_secs} > \"$HOME/.local/state/helm/logs/helmopsd.log\" 2>&1 < /dev/null &\n\
+sleep 1\n\
+pgrep -f \"$HOME/.helm/bin/helm daemon run --interval {interval_secs}\" >/dev/null"
+    );
+    entry.run_shell(&detached_script).await?;
+    Ok(remote::AgentSupervisor::DetachedProcess)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct DaemonState {
+    pub pid: Option<u32>,
+    pub status: String,
+    pub started_at: Option<String>,
+    pub last_heartbeat: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error: Option<String>,
+    pub last_snapshot_id: Option<String>,
+    pub last_finding_count: usize,
+    pub refresh_interval_secs: u64,
+    pub db_path: String,
+}
+
+fn daemon_state_path() -> PathBuf {
+    paths::default_daemon_state_path()
+}
+
+fn daemon_pid_path() -> PathBuf {
+    paths::default_daemon_pid_path()
+}
+
+fn daemon_refresh_request_path() -> PathBuf {
+    paths::default_daemon_refresh_request_path()
+}
+
+fn daemon_log_path() -> PathBuf {
+    paths::default_daemon_log_path()
+}
+
+fn process_alive(pid: u32) -> bool {
+    PathBuf::from(format!("/proc/{pid}")).exists()
+}
+
+fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn write_daemon_state(state: &DaemonState) -> Result<()> {
+    let path = daemon_state_path();
+    ensure_parent_dir(&path)?;
+    let text = serde_json::to_string_pretty(state)?;
+    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+pub(crate) fn read_daemon_state() -> Option<DaemonState> {
+    let path = daemon_state_path();
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub(crate) fn daemon_is_running() -> bool {
+    read_daemon_state()
+        .and_then(|state| state.pid)
+        .is_some_and(process_alive)
+}
+
+pub(crate) fn request_daemon_refresh() -> Result<bool> {
+    if !daemon_is_running() {
+        return Ok(false);
+    }
+    let path = daemon_refresh_request_path();
+    ensure_parent_dir(&path)?;
+    fs::write(&path, now_rfc3339()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+async fn run_daemon_command(args: DaemonArgs, db_path: &Path) -> Result<()> {
+    match args.command {
+        DaemonCommand::Start(args) => run_daemon_start(args, db_path).await,
+        DaemonCommand::Stop => run_daemon_stop().await,
+        DaemonCommand::Status => run_daemon_status(),
+        DaemonCommand::Run(args) => run_daemon_loop(args.interval, db_path.to_path_buf()).await,
+    }
+}
+
+async fn run_daemon_start(args: DaemonStartArgs, db_path: &Path) -> Result<()> {
+    if let Some(pid) = read_daemon_state().and_then(|state| state.pid) {
+        if process_alive(pid) {
+            println!("helm daemon already running (pid {pid})");
+            return Ok(());
+        }
+    }
+
+    let exe = env::current_exe().context("locating current helm binary")?;
+    let log_path = daemon_log_path();
+    ensure_parent_dir(&log_path)?;
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("cloning {}", log_path.display()))?;
+
+    let mut child = std::process::Command::new(exe);
+    child
+        .arg("--db-path")
+        .arg(db_path)
+        .arg("daemon")
+        .arg("run")
+        .arg("--interval")
+        .arg(args.interval.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr));
+
+    let spawned = child.spawn().context("spawning helm daemon")?;
+    let pid = spawned.id();
+    fs::write(daemon_pid_path(), pid.to_string()).ok();
+    let state = DaemonState {
+        pid: Some(pid),
+        status: "starting".to_owned(),
+        started_at: Some(now_rfc3339()),
+        last_heartbeat: Some(now_rfc3339()),
+        last_success_at: None,
+        last_error: None,
+        last_snapshot_id: None,
+        last_finding_count: 0,
+        refresh_interval_secs: args.interval,
+        db_path: db_path.display().to_string(),
+    };
+    write_daemon_state(&state)?;
+    println!(
+        "helm daemon started (pid {pid})\nstate: {}\nlog: {}",
+        daemon_state_path().display(),
+        log_path.display()
+    );
+    Ok(())
+}
+
+async fn run_daemon_stop() -> Result<()> {
+    let Some(mut state) = read_daemon_state() else {
+        println!("helm daemon is not running");
+        return Ok(());
+    };
+    let Some(pid) = state.pid else {
+        println!("helm daemon is not running");
+        return Ok(());
+    };
+    if !process_alive(pid) {
+        state.status = "stopped".to_owned();
+        state.pid = None;
+        state.last_heartbeat = Some(now_rfc3339());
+        write_daemon_state(&state)?;
+        let _ = fs::remove_file(daemon_pid_path());
+        println!("helm daemon already stopped");
+        return Ok(());
+    }
+
+    let status = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .context("sending SIGTERM to daemon")?;
+    if !status.success() {
+        return Err(anyhow!("failed to stop daemon pid {pid}"));
+    }
+
+    for _ in 0..20 {
+        if !process_alive(pid) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    state.status = if process_alive(pid) {
+        "stopping".to_owned()
+    } else {
+        "stopped".to_owned()
+    };
+    state.pid = if process_alive(pid) { Some(pid) } else { None };
+    state.last_heartbeat = Some(now_rfc3339());
+    write_daemon_state(&state)?;
+    if !process_alive(pid) {
+        let _ = fs::remove_file(daemon_pid_path());
+        let _ = fs::remove_file(daemon_refresh_request_path());
+    }
+    println!("helm daemon {}", state.status);
+    Ok(())
+}
+
+fn run_daemon_status() -> Result<()> {
+    let Some(state) = read_daemon_state() else {
+        println!("helm daemon offline");
+        return Ok(());
+    };
+    let pid_note = state
+        .pid
+        .map(|pid| {
+            if process_alive(pid) {
+                format!("pid {pid}")
+            } else {
+                format!("pid {pid} stale")
+            }
+        })
+        .unwrap_or_else(|| "no pid".to_owned());
+    println!("helm daemon {}", state.status);
+    println!("  {}", pid_note);
+    println!("  interval: {}s", state.refresh_interval_secs);
+    println!("  db: {}", state.db_path);
+    if let Some(ts) = state.started_at.as_deref() {
+        println!("  started: {ts}");
+    }
+    if let Some(ts) = state.last_heartbeat.as_deref() {
+        println!("  heartbeat: {ts}");
+    }
+    if let Some(ts) = state.last_success_at.as_deref() {
+        println!("  last success: {ts}");
+    }
+    if let Some(snapshot_id) = state.last_snapshot_id.as_deref() {
+        println!(
+            "  last snapshot: {} ({} finding(s))",
+            snapshot_id, state.last_finding_count
+        );
+    }
+    if let Some(error) = state.last_error.as_deref() {
+        println!("  last error: {error}");
+    }
+    Ok(())
+}
+
+async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
+    ensure_parent_dir(&db_path)?;
+    ensure_parent_dir(&daemon_pid_path())?;
+    let pid = std::process::id();
+    fs::write(daemon_pid_path(), pid.to_string()).ok();
+    let mut state = DaemonState {
+        pid: Some(pid),
+        status: "running".to_owned(),
+        started_at: Some(now_rfc3339()),
+        last_heartbeat: Some(now_rfc3339()),
+        last_success_at: None,
+        last_error: None,
+        last_snapshot_id: None,
+        last_finding_count: 0,
+        refresh_interval_secs: interval,
+        db_path: db_path.display().to_string(),
+    };
+    write_daemon_state(&state)?;
+
+    let request_path = daemon_refresh_request_path();
+    let mut next_run = std::time::Instant::now();
+    let mut collecting = false; // overlap guard
+    loop {
+        let requested = request_path.exists();
+        let due = std::time::Instant::now() >= next_run;
+        if (requested || due) && !collecting {
+            collecting = true;
+            state.status = if requested {
+                "refresh-requested".to_owned()
+            } else {
+                "collecting".to_owned()
+            };
+            state.last_heartbeat = Some(now_rfc3339());
+            let _ = write_daemon_state(&state);
+
+            // Run collection cycle; catch errors so daemon survives failures
+            match run_single_collection_cycle(&db_path, interval).await {
+                Ok(report) => {
+                    state.status = "running".to_owned();
+                    state.last_success_at = Some(now_rfc3339());
+                    state.last_error = None;
+                    state.last_snapshot_id = Some(report.snapshot.id);
+                    state.last_finding_count = report.findings.len();
+                }
+                Err(e) => {
+                    state.status = "running".to_owned();
+                    state.last_error =
+                        Some(format!("collection failed: {e:#}"));
+                    // Keep previous snapshot_id so the TUI has something to show
+                }
+            }
+            state.last_heartbeat = Some(now_rfc3339());
+            let _ = write_daemon_state(&state);
+            if requested {
+                let _ = fs::remove_file(&request_path);
+            }
+            next_run =
+                std::time::Instant::now() + std::time::Duration::from_secs(interval.max(5));
+            collecting = false;
+        } else {
+            state.last_heartbeat = Some(now_rfc3339());
+            let _ = write_daemon_state(&state);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// Run one collection + snapshot cycle. Returns report on success, error on failure.
+struct DaemonCycleReport {
+    snapshot: helm_monitor::SystemSnapshot,
+    findings: Vec<helm_monitor::Finding>,
+}
+
+async fn run_single_collection_cycle(
+    db_path: &Path,
+    _interval: u64,
+) -> Result<DaemonCycleReport, anyhow::Error> {
+    let conn = rusqlite::Connection::open(db_path)
+        .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+    let prev = load_previous_snapshot(&conn);
+    let report = run_monitor_cycle(
+        MonitorProfile::Standard,
+        None,
+        prev,
+    )
+    .await;
+    persist_monitor_snapshot(
+        &conn,
+        &report.snapshot,
+        &serde_json::to_string(&report.findings).unwrap_or_default(),
+    );
+    Ok(DaemonCycleReport {
+        snapshot: report.snapshot,
+        findings: report.findings,
+    })
+}
+
+async fn run_incident_command(args: IncidentArgs) -> Result<()> {
+    match args.command {
+        IncidentCommand::Show { id } => {
+            run_explain_command(ExplainArgs {
+                finding_id: id,
+                json: false,
+            })
+            .await
+        }
+        IncidentCommand::Plan { id, json } => {
+            let db_path = default_db_path()?;
+            let conn = rusqlite::Connection::open(&db_path)
+                .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+            let finding = find_finding_by_id(&conn, &id)
+                .ok_or_else(|| anyhow!("finding '{id}' not found in stored snapshots"))?;
+            let plan = plan_from_finding(&finding).await;
+            if json {
+                println!(
+                    "{}",
+                    helm_core::redact_secrets(&serde_json::to_string_pretty(&plan)?)
+                );
+            } else {
+                println!("{}", helm_core::redact_secrets(&plan.render_text()));
+            }
+            let source = format!("finding:{}", finding.id);
+            let _ = TroubleshootingPlanStore::insert(
+                &conn,
+                &plan.id,
+                &source,
+                &plan.snapshot_id,
+                &helm_core::redact_secrets(
+                    &serde_json::to_string(&plan.hypotheses).unwrap_or_default(),
+                ),
+                &helm_core::redact_secrets(
+                    &serde_json::to_string(&plan.read_only_steps).unwrap_or_default(),
+                ),
+                &helm_core::redact_secrets(
+                    &serde_json::to_string(&plan.proposed_fix_steps).unwrap_or_default(),
+                ),
+                plan.approval_required,
+                &helm_core::redact_secrets(&plan.render_text()),
+            );
+            Ok(())
+        }
+        IncidentCommand::Apply {
+            id_or_plan_id,
+            yes,
+            json,
+        } => {
+            let db_path = default_db_path()?;
+            let conn = rusqlite::Connection::open(&db_path)
+                .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+            let plan_id = if id_or_plan_id.starts_with("plan-") {
+                id_or_plan_id
+            } else {
+                TroubleshootingPlanStore::latest_for_finding(&conn, &id_or_plan_id)
+                    .with_context(|| {
+                        format!("looking up latest plan for finding '{id_or_plan_id}'")
+                    })?
+                    .map(|record| record.id)
+                    .ok_or_else(|| {
+                        anyhow!("no persisted plan found for finding '{id_or_plan_id}'")
+                    })?
+            };
+            let _ = run_apply_plan_command_at_path(db_path, ApplyPlanArgs { plan_id, yes, json })
+                .await?;
+            Ok(())
+        }
+    }
 }
 
 async fn run_collect_snapshot_command(args: SnapshotArgs) -> Result<()> {
@@ -4933,6 +5740,66 @@ mod tests {
             Some(super::Command::Tui(args)) => assert_eq!(args.mode, super::TuiMode::Dashboard),
             other => panic!("expected tui command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dashboard_and_daemon_commands_parse() {
+        let dashboard = parse_cli_from(["helm", "dashboard"]).unwrap();
+        let daemon = parse_cli_from(["helm", "daemon", "start", "--interval", "30"]).unwrap();
+        let agent = parse_cli_from([
+            "helm",
+            "agent",
+            "register",
+            "prod-1",
+            "--host",
+            "prod1.example.com",
+        ])
+        .unwrap();
+
+        match dashboard.command {
+            Some(super::Command::Dashboard(args)) => {
+                assert_eq!(args.mode, super::TuiMode::Dashboard)
+            }
+            other => panic!("expected dashboard command, got {other:?}"),
+        }
+        assert!(matches!(
+            daemon.command,
+            Some(super::Command::Daemon(super::DaemonArgs {
+                command: super::DaemonCommand::Start(_)
+            }))
+        ));
+        assert!(matches!(
+            agent.command,
+            Some(super::Command::Agent(super::AgentArgs {
+                command: super::AgentCommand::Register(_)
+            }))
+        ));
+    }
+
+    #[test]
+    fn incident_commands_parse() {
+        let show = parse_cli_from(["helm", "incident", "show", "finding-123"]).unwrap();
+        let plan = parse_cli_from(["helm", "incident", "plan", "finding-123", "--json"]).unwrap();
+        let apply = parse_cli_from(["helm", "incident", "apply", "plan-123", "--yes"]).unwrap();
+
+        assert!(matches!(
+            show.command,
+            Some(super::Command::Incident(super::IncidentArgs {
+                command: super::IncidentCommand::Show { .. }
+            }))
+        ));
+        assert!(matches!(
+            plan.command,
+            Some(super::Command::Incident(super::IncidentArgs {
+                command: super::IncidentCommand::Plan { .. }
+            }))
+        ));
+        assert!(matches!(
+            apply.command,
+            Some(super::Command::Incident(super::IncidentArgs {
+                command: super::IncidentCommand::Apply { .. }
+            }))
+        ));
     }
 
     #[test]

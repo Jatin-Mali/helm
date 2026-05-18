@@ -407,6 +407,37 @@ pub struct FirewallSnapshot {
     pub default_accept_input: Option<bool>,
 }
 
+// ── Certificates ───────────────────────────────────────────────────────────
+
+/// TLS certificate entry from a listening service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertEntry {
+    /// Host:port we checked (e.g. "example.com:443").
+    pub address: String,
+    /// Certificate subject CN.
+    pub subject_cn: String,
+    /// Certificate issuer CN.
+    pub issuer_cn: String,
+    /// Not-after date in ISO 8601.
+    pub not_after: String,
+    /// Days remaining until expiry.
+    pub days_remaining: i64,
+    /// SAN entries (DNS names).
+    pub sans: Vec<String>,
+    /// Whether this cert is self-signed.
+    pub self_signed: bool,
+    /// Error message if check failed (empty on success).
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CertSnapshot {
+    /// Certificates discovered from listening services.
+    pub certificates: Vec<CertEntry>,
+    /// Whether openssl s_client was available.
+    pub openssl_available: bool,
+}
+
 // ── Root snapshot ──────────────────────────────────────────────────────────
 
 /// Root `SystemSnapshot` per TRD §4.1.
@@ -440,6 +471,7 @@ pub struct SnapshotDomains {
     pub kubernetes: crate::collectors::kubernetes::KubernetesSnapshot,
     pub libvirt: crate::collectors::libvirt::LibvirtSnapshot,
     pub compose: crate::collectors::compose::ComposeSnapshot,
+    pub certs: CertSnapshot,
 }
 
 /// Non-fatal error from one collector.
@@ -470,6 +502,7 @@ impl SnapshotDomains {
             "kubernetes",
             "libvirt",
             "compose",
+            "certs",
         ]
     }
 }
@@ -664,6 +697,7 @@ impl Default for SnapshotDomains {
             kubernetes: crate::collectors::kubernetes::KubernetesSnapshot::default(),
             libvirt: crate::collectors::libvirt::LibvirtSnapshot::default(),
             compose: crate::collectors::compose::ComposeSnapshot::default(),
+            certs: CertSnapshot::default(),
         }
     }
 }

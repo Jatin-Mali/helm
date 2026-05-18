@@ -2,6 +2,7 @@
 
 pub mod backup_schedule;
 pub mod backup_stale;
+pub mod cert_expiry;
 pub mod compose_health;
 pub mod container_restart;
 pub mod disk_usage;
@@ -110,6 +111,8 @@ impl DetectorRegistry {
         reg.register(Box::new(snapshot_age::SnapshotAgeDetector));
         // Compose detectors
         reg.register(Box::new(compose_health::ComposeHealthDetector));
+        // Cert detectors
+        reg.register(Box::new(cert_expiry::CertExpiryDetector));
         reg
     }
 }

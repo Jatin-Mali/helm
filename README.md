@@ -223,6 +223,7 @@ execution. The local client starts the remote `helm` binary and replays
 - `docs/trust-ladder.md`
 - `docs/data-boundary.md`
 - `docs/detector-review-checklist.md`
+- `docs/helmops-gap-closure-checklist.md`
 - `docs/troubleshooting.md`
 - `docs/release-notes-v1.0.md`
 - `CONTRIBUTING.md`

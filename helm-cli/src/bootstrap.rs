@@ -50,6 +50,8 @@ impl BootstrapPlan {
             user: self.user.clone(),
             ssh_opts: None,
             credential: Default::default(),
+            transport: crate::remote::RemoteTransport::Ssh,
+            agent: None,
         }
     }
 }

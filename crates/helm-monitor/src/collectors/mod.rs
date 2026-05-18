@@ -8,6 +8,7 @@
 //! - Returns domain-specific errors in CollectorError format.
 
 pub mod backups;
+pub mod certs;
 pub mod compose;
 pub mod containers;
 pub mod disks;

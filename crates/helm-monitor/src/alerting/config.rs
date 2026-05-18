@@ -46,11 +46,16 @@ struct AlertConfigRaw {
 }
 
 pub fn load_config() -> Result<AlertConfig, Box<dyn std::error::Error>> {
-    let path = dirs_config_path();
+    load_config_from_path(&dirs_config_path())
+}
+
+pub fn load_config_from_path(
+    path: &std::path::Path,
+) -> Result<AlertConfig, Box<dyn std::error::Error>> {
     if !path.exists() {
         return Ok(AlertConfig::default());
     }
-    let content = std::fs::read_to_string(&path)?;
+    let content = std::fs::read_to_string(path)?;
     let root: TomlRoot = toml::from_str(&content)?;
     let Some(raw) = root.alerting else {
         return Ok(AlertConfig::default());
@@ -93,24 +98,18 @@ mod tests {
 
     #[test]
     fn load_config_missing_file_returns_default() {
-        let tmp = std::env::temp_dir().join("helm_alerting_test_no_file");
-        let _ = std::fs::create_dir_all(&tmp);
-        // SAFETY: single-threaded test binary; no concurrent env reads
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
-        let c = load_config().unwrap();
+        let tmp = std::env::temp_dir().join("helm_alerting_test_no_file_thresholds.toml");
+        // File doesn't exist → should return default
+        let c = load_config_from_path(&tmp).unwrap();
         assert_eq!(c.min_severity, Severity::Warning);
     }
 
     #[test]
     fn load_config_parses_alerting_section() {
-        let tmp = std::env::temp_dir().join("helm_alerting_test_parse");
-        let helm_dir = tmp.join("helm");
-        let _ = std::fs::create_dir_all(&helm_dir);
+        let tmp = std::env::temp_dir().join("helm_alerting_test_parse_thresholds.toml");
         let toml = "[alerting]\nmin_severity = \"critical\"\ndedup_window_secs = 120\nrate_limit_per_min = 10\n";
-        std::fs::write(helm_dir.join("thresholds.toml"), toml).unwrap();
-        // SAFETY: single-threaded test binary; no concurrent env reads
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
-        let c = load_config().unwrap();
+        std::fs::write(&tmp, toml).unwrap();
+        let c = load_config_from_path(&tmp).unwrap();
         assert_eq!(c.min_severity, Severity::Critical);
         assert_eq!(c.dedup_window_secs, 120);
         assert_eq!(c.rate_limit_per_min, 10);

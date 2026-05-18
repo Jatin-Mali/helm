@@ -113,6 +113,7 @@ mod tests {
                 total_container_count: 0,
                 available: true,
             },
+            certs: Default::default(),
         };
         SystemSnapshot::new(
             "test-snapshot".to_string(),

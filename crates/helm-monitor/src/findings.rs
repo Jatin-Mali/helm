@@ -71,6 +71,7 @@ pub enum MonitorDomain {
     Kubernetes,
     Libvirt,
     Compose,
+    Certs,
 }
 
 impl MonitorDomain {
@@ -91,6 +92,7 @@ impl MonitorDomain {
             Self::Kubernetes => "kubernetes",
             Self::Libvirt => "libvirt",
             Self::Compose => "compose",
+            Self::Certs => "certs",
         }
     }
 
@@ -111,6 +113,7 @@ impl MonitorDomain {
             "kubernetes" => Some(Self::Kubernetes),
             "libvirt" => Some(Self::Libvirt),
             "compose" => Some(Self::Compose),
+            "certs" => Some(Self::Certs),
             _ => None,
         }
     }

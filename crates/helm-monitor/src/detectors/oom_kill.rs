@@ -89,6 +89,7 @@ mod tests {
             },
             libvirt: Default::default(),
             compose: Default::default(),
+            certs: Default::default(),
         };
         SystemSnapshot::new(
             "test-snapshot".to_string(),

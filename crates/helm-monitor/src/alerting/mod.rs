@@ -29,6 +29,32 @@ pub struct AlertRouter {
     dedup_state: HashMap<String, Instant>,
     last_window_start: Instant,
     sent_this_window: u32,
+    /// Optional audit callback: (action, fingerprint, reason)
+    audit_callback: Option<Box<dyn Fn(&str, &str, &str) + Send + Sync>>,
+}
+
+/// Notification decision for audit trail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationDecision {
+    Sent,
+    SkippedSeverity,
+    SkippedDedup,
+    SkippedRateLimit,
+    Resolved,
+    Suppressed,
+}
+
+impl NotificationDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::SkippedSeverity => "skipped-severity",
+            Self::SkippedDedup => "skipped-dedup",
+            Self::SkippedRateLimit => "skipped-ratelimit",
+            Self::Resolved => "resolved",
+            Self::Suppressed => "suppressed",
+        }
+    }
 }
 
 impl AlertRouter {
@@ -39,11 +65,20 @@ impl AlertRouter {
             dedup_state: HashMap::new(),
             last_window_start: Instant::now(),
             sent_this_window: 0,
+            audit_callback: None,
         }
     }
 
     pub fn with_sink(mut self, sink: Box<dyn AlertSink>) -> Self {
         self.sinks.push(sink);
+        self
+    }
+
+    pub fn with_audit<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str, &str, &str) + Send + Sync + 'static,
+    {
+        self.audit_callback = Some(Box::new(callback));
         self
     }
 
@@ -56,6 +91,7 @@ impl AlertRouter {
 
         // severity gate
         if payload.severity < self.config.min_severity {
+            self.audit(NotificationDecision::SkippedSeverity, &payload.fingerprint, "severity below threshold");
             return Ok(());
         }
 
@@ -64,6 +100,7 @@ impl AlertRouter {
         // dedup window
         if let Some(&last) = self.dedup_state.get(&payload.fingerprint) {
             if now.duration_since(last).as_secs() < self.config.dedup_window_secs {
+                self.audit(NotificationDecision::SkippedDedup, &payload.fingerprint, "within dedup window");
                 return Ok(());
             }
         }
@@ -74,6 +111,7 @@ impl AlertRouter {
             self.sent_this_window = 0;
         }
         if self.sent_this_window >= self.config.rate_limit_per_min {
+            self.audit(NotificationDecision::SkippedRateLimit, &payload.fingerprint, "rate limit exceeded");
             return Ok(());
         }
 
@@ -86,7 +124,20 @@ impl AlertRouter {
 
         self.dedup_state.insert(payload.fingerprint.clone(), now);
         self.sent_this_window += 1;
+        self.audit(NotificationDecision::Sent, &payload.fingerprint, "notification delivered");
         Ok(())
+    }
+
+    /// Record a lifecycle-driven notification update (resolve/suppress).
+    pub fn notify_lifecycle(&mut self, fingerprint: &str, decision: NotificationDecision) {
+        self.dedup_state.remove(fingerprint);
+        self.audit(decision, fingerprint, "lifecycle update");
+    }
+
+    fn audit(&self, decision: NotificationDecision, fingerprint: &str, reason: &str) {
+        if let Some(ref cb) = self.audit_callback {
+            cb(decision.as_str(), fingerprint, reason);
+        }
     }
 }
 

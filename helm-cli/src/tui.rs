@@ -44,7 +44,6 @@ use ratatui::{
 };
 use serde::Deserialize;
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
-use uuid::Uuid;
 
 use crate::{
     ProviderChoice, ProviderSettings, TroubleshootingPlanStore, build_provider, custom_commands,
@@ -233,8 +232,6 @@ enum UiEvent {
     Input(Event),
     Tick,
     DashboardRefresh,
-    DashboardLiveRefresh,
-    TickSkipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -982,17 +979,36 @@ struct DashboardMetrics {
 
 /// Per-host fleet status for multi-host view.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
 struct FleetHostStatus {
-    pub host_id: Uuid,
     pub name: String,
+    pub endpoint: String,
+    pub transport: String,
     pub reachable: bool,
     pub crit: usize,
     pub warn: usize,
     pub info: usize,
     pub last_refresh: Option<Instant>,
     pub error: Option<String>,
+    pub detail: Option<FleetHostDetail>,
+}
+
+#[derive(Debug, Clone)]
+struct FleetHostDetail {
+    snapshot_id: String,
+    collected_at: String,
+    hostname: String,
+    findings: Vec<FindingSummary>,
+    failed_services: usize,
+    total_services: usize,
+    running_containers: usize,
+    total_containers: usize,
+    compose_projects: usize,
+    degraded_compose_projects: usize,
+    kubernetes_pods: usize,
+    kubernetes_problem_pods: usize,
+    vm_domains: usize,
+    vm_problem_domains: usize,
+    collector_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1163,6 +1179,7 @@ struct DashboardState {
     needs_plan_generation: bool,
     /// Flag to prevent double-spawning of fleet collection tasks.
     fleet_collection_in_flight: bool,
+    pending_fleet_rx: Option<tokio::sync::oneshot::Receiver<Vec<FleetHostStatus>>>,
 }
 
 impl DashboardState {
@@ -1187,6 +1204,7 @@ impl DashboardState {
             plan_cache: HashMap::new(),
             needs_plan_generation: false,
             fleet_collection_in_flight: false,
+            pending_fleet_rx: None,
         }
     }
 }
@@ -1311,7 +1329,584 @@ fn infer_finding_kind(finding: &Finding) -> String {
         helm_monitor::MonitorDomain::Kubernetes => "Kubernetes".to_owned(),
         helm_monitor::MonitorDomain::Libvirt => "Libvirt".to_owned(),
         helm_monitor::MonitorDomain::Compose => "Compose".to_owned(),
+        helm_monitor::MonitorDomain::Certs => "Cert".to_owned(),
     }
+}
+
+fn finding_summary_from_finding(
+    finding: &Finding,
+    host: String,
+    first_seen: i64,
+    last_seen: i64,
+    state: DashboardFindingState,
+) -> FindingSummary {
+    let kind = infer_finding_kind(finding);
+    let sample = finding
+        .evidence
+        .first()
+        .map(|e| {
+            if e.value.trim().is_empty() {
+                e.note.clone()
+            } else {
+                e.value.clone()
+            }
+        })
+        .unwrap_or_else(|| finding.title.clone());
+    FindingSummary {
+        id: finding.id.clone(),
+        fingerprint: if finding.fingerprint.is_empty() {
+            finding.fingerprint()
+        } else {
+            finding.fingerprint.clone()
+        },
+        severity: finding.severity.as_str().to_string(),
+        confidence: finding.confidence.as_str().to_string(),
+        title: finding.title.clone(),
+        affected_resource: finding.affected_resource.clone(),
+        snapshot_id: finding.snapshot_id.clone(),
+        domain: finding.category.as_str().to_string(),
+        kind,
+        host,
+        status: state,
+        occurrence_count: 1,
+        first_seen,
+        last_seen,
+        age_label: format_relative_age(first_seen),
+        sample,
+        state_note: String::new(),
+        evidence_text: finding
+            .evidence
+            .iter()
+            .map(|e| format!("{} = {} -- {}", e.source, e.value, e.note))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        evidence_sources: finding.evidence.iter().map(|e| e.source.clone()).collect(),
+        impact: finding.impact.clone(),
+        assumptions: finding.assumptions.clone(),
+        missing_data: finding.missing_data.clone(),
+        read_only_checks: finding.read_only_checks.clone(),
+        fix_plan: finding.fix_plan.clone(),
+        risk: match finding.severity.as_str() {
+            "critical" => "high".to_owned(),
+            "warning" => "medium".to_owned(),
+            _ => "low".to_owned(),
+        },
+        rollback: finding
+            .fix_plan
+            .as_ref()
+            .map(|_| "review generated plan before apply".to_owned())
+            .unwrap_or_else(|| "read-only / not applicable".to_owned()),
+        command_preview: finding.read_only_checks.join("\n"),
+        detector_id: finding.detector_id.clone(),
+        correlated_finding_ids: Vec::new(),
+    }
+}
+
+fn fleet_detail_from_report(report: &crate::remote::FleetHostReport) -> FleetHostDetail {
+    let snapshot = report.snapshot.as_ref();
+    let collected_at_ts = snapshot
+        .map(|snap| snap.collected_at.timestamp())
+        .unwrap_or_else(|| Utc::now().timestamp());
+    let hostname = snapshot
+        .map(|snap| snap.host.hostname.clone())
+        .unwrap_or_else(|| report.host_name.clone());
+    let findings = report
+        .findings
+        .iter()
+        .map(|finding| {
+            finding_summary_from_finding(
+                finding,
+                hostname.clone(),
+                collected_at_ts,
+                collected_at_ts,
+                DashboardFindingState::Open,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let (
+        snapshot_id,
+        collected_at,
+        failed_services,
+        total_services,
+        running_containers,
+        total_containers,
+        compose_projects,
+        degraded_compose_projects,
+        kubernetes_pods,
+        kubernetes_problem_pods,
+        vm_domains,
+        vm_problem_domains,
+        collector_errors,
+    ) = if let Some(snapshot) = snapshot {
+        let running_containers = snapshot
+            .domains
+            .containers
+            .containers
+            .iter()
+            .filter(|c| c.status.eq_ignore_ascii_case("running"))
+            .count();
+        let degraded_compose_projects = snapshot
+            .domains
+            .compose
+            .projects
+            .iter()
+            .filter(|project| project.status != "healthy")
+            .count();
+        let kubernetes_problem_pods = snapshot
+            .domains
+            .kubernetes
+            .pods
+            .iter()
+            .filter(|pod| pod.restarts > 0 || pod.oom_kill_count > 0 || pod.status != "Running")
+            .count();
+        let vm_problem_domains = snapshot
+            .domains
+            .libvirt
+            .domains
+            .iter()
+            .filter(|domain| domain.state != "running")
+            .count();
+        (
+            snapshot.id.clone(),
+            format_dashboard_when(snapshot.collected_at.timestamp()),
+            snapshot.domains.services.failed_units.len(),
+            snapshot.domains.services.units.len(),
+            running_containers,
+            snapshot.domains.containers.containers.len(),
+            snapshot.domains.compose.projects.len(),
+            degraded_compose_projects,
+            snapshot.domains.kubernetes.pods.len(),
+            kubernetes_problem_pods,
+            snapshot.domains.libvirt.domains.len(),
+            vm_problem_domains,
+            snapshot
+                .collector_errors
+                .iter()
+                .map(|err| format!("{}: {}", err.domain, err.message))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (
+            String::new(),
+            "unknown".to_owned(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+        )
+    };
+
+    FleetHostDetail {
+        snapshot_id,
+        collected_at,
+        hostname,
+        findings,
+        failed_services,
+        total_services,
+        running_containers,
+        total_containers,
+        compose_projects,
+        degraded_compose_projects,
+        kubernetes_pods,
+        kubernetes_problem_pods,
+        vm_domains,
+        vm_problem_domains,
+        collector_errors,
+    }
+}
+
+fn finding_resource_matches(finding: &FindingSummary, candidate: &str) -> bool {
+    let candidate = candidate.to_ascii_lowercase();
+    let resource = finding.affected_resource.to_ascii_lowercase();
+    let title = finding.title.to_ascii_lowercase();
+    let evidence = finding.evidence_sources.join(" ").to_ascii_lowercase();
+    !candidate.is_empty()
+        && (resource.contains(&candidate)
+            || candidate.contains(&resource)
+            || title.contains(&candidate)
+            || evidence.contains(&candidate))
+}
+
+fn domain_specific_why_lines(finding: &FindingSummary, domains: &SnapshotDomains) -> Vec<String> {
+    match finding.domain.as_str() {
+        "containers" => domains
+            .containers
+            .containers
+            .iter()
+            .find(|container| finding_resource_matches(finding, &container.name))
+            .map(|container| {
+                vec![format!(
+                    "Container {} is {}{}{}.",
+                    container.name,
+                    container.status,
+                    container
+                        .health
+                        .as_ref()
+                        .map(|health| format!(", health={health}"))
+                        .unwrap_or_default(),
+                    container
+                        .restart_count
+                        .map(|count| format!(", restarts={count}"))
+                        .unwrap_or_default()
+                )]
+            })
+            .unwrap_or_default(),
+        "compose" => domains
+            .compose
+            .projects
+            .iter()
+            .find(|project| finding_resource_matches(finding, &project.name))
+            .map(|project| {
+                vec![format!(
+                    "Compose project {} is {} with {} of {} containers running and {} unhealthy.",
+                    project.name,
+                    project.status,
+                    project.running_count,
+                    project.container_count,
+                    project.unhealthy_count
+                )]
+            })
+            .unwrap_or_default(),
+        "kubernetes" => domains
+            .kubernetes
+            .pods
+            .iter()
+            .find(|pod| finding_resource_matches(finding, &pod.name))
+            .map(|pod| {
+                vec![format!(
+                    "Pod {} in namespace {} is {} with ready={} and restarts={}.",
+                    pod.name, pod.namespace, pod.status, pod.ready, pod.restarts
+                )]
+            })
+            .unwrap_or_default(),
+        "libvirt" => domains
+            .libvirt
+            .domains
+            .iter()
+            .find(|domain| finding_resource_matches(finding, &domain.name))
+            .map(|domain| {
+                vec![format!(
+                    "VM {} is {} with {} snapshots retained.",
+                    domain.name, domain.state, domain.snapshot_count
+                )]
+            })
+            .unwrap_or_default(),
+        "services" => domains
+            .services
+            .failed_units
+            .iter()
+            .find(|unit| finding_resource_matches(finding, &unit.name))
+            .map(|unit| {
+                vec![format!(
+                    "Systemd reports {} as load={} active={} sub={}.",
+                    unit.name, unit.loaded, unit.active, unit.sub
+                )]
+            })
+            .unwrap_or_default(),
+        "disks" => domains
+            .disks
+            .filesystems
+            .iter()
+            .find(|fs| {
+                finding_resource_matches(finding, &fs.mount_point)
+                    || finding_resource_matches(finding, &fs.device)
+            })
+            .map(|fs| {
+                let pct = if fs.total_bytes > 0 {
+                    (fs.used_bytes as f64 / fs.total_bytes as f64 * 100.0).round() as u64
+                } else {
+                    0
+                };
+                vec![format!(
+                    "Filesystem {} mounted at {} is at {}% used.",
+                    fs.device, fs.mount_point, pct
+                )]
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn domain_specific_evidence_lines(
+    finding: &FindingSummary,
+    domains: &SnapshotDomains,
+) -> Vec<String> {
+    match finding.domain.as_str() {
+        "containers" => domains
+            .containers
+            .containers
+            .iter()
+            .find(|container| finding_resource_matches(finding, &container.name))
+            .map(|container| {
+                let mut lines = vec![format!(
+                    "Image {} · ports {} · mounts {}",
+                    container.image,
+                    if container.ports.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        container.ports.join(", ")
+                    },
+                    if container.mounts.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        container.mounts.join(", ")
+                    }
+                )];
+                if let Some(project) = domains
+                    .compose
+                    .projects
+                    .iter()
+                    .find(|project| container.name.contains(&project.name))
+                {
+                    lines.push(format!(
+                        "Compose correlation: project {} is {} ({} unhealthy containers).",
+                        project.name, project.status, project.unhealthy_count
+                    ));
+                }
+                lines
+            })
+            .unwrap_or_default(),
+        "compose" => domains
+            .compose
+            .projects
+            .iter()
+            .find(|project| finding_resource_matches(finding, &project.name))
+            .map(|project| {
+                vec![format!(
+                    "Project {} has {} containers, {} running, {} unhealthy.",
+                    project.name,
+                    project.container_count,
+                    project.running_count,
+                    project.unhealthy_count
+                )]
+            })
+            .unwrap_or_default(),
+        "kubernetes" => domains
+            .kubernetes
+            .pods
+            .iter()
+            .find(|pod| finding_resource_matches(finding, &pod.name))
+            .map(|pod| {
+                vec![
+                    format!(
+                        "Namespace {} · age {} · events {} · oom_kills {}",
+                        pod.namespace, pod.age, pod.events_count, pod.oom_kill_count
+                    ),
+                    format!(
+                        "Cluster context: {} pods across {} namespaces.",
+                        domains.kubernetes.pods.len(),
+                        domains.kubernetes.namespace_count
+                    ),
+                ]
+            })
+            .unwrap_or_default(),
+        "libvirt" => domains
+            .libvirt
+            .domains
+            .iter()
+            .find(|domain| finding_resource_matches(finding, &domain.name))
+            .map(|domain| {
+                vec![format!(
+                    "vcpus={} memory={}MB snapshots={} oldest_snapshot_days={}",
+                    domain.vcpus,
+                    domain.memory_mb,
+                    domain.snapshot_count,
+                    domain
+                        .age_days
+                        .map(|days| days.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned())
+                )]
+            })
+            .unwrap_or_default(),
+        "services" => domains
+            .services
+            .timers
+            .iter()
+            .find(|timer| finding_resource_matches(finding, &timer.unit))
+            .map(|timer| {
+                vec![format!(
+                    "Timer {} last triggered {} and next triggers {}.",
+                    timer.name, timer.last_trigger, timer.next_trigger
+                )]
+            })
+            .unwrap_or_default(),
+        "disks" => {
+            let mut lines = Vec::new();
+            if let Some(fs) = domains.disks.filesystems.iter().find(|fs| {
+                finding_resource_matches(finding, &fs.mount_point)
+                    || finding_resource_matches(finding, &fs.device)
+            }) {
+                if let Some(inode) = domains
+                    .disks
+                    .inodes
+                    .iter()
+                    .find(|inode| inode.mount_point == fs.mount_point)
+                {
+                    let inode_pct = if inode.total > 0 {
+                        (inode.used as f64 / inode.total as f64 * 100.0).round() as u64
+                    } else {
+                        0
+                    };
+                    lines.push(format!(
+                        "Inode pressure at {}% on {}.",
+                        inode_pct, inode.mount_point
+                    ));
+                }
+                if let Some(device) = domains.disks.block_devices.iter().find(|device| {
+                    device
+                        .mount_points
+                        .iter()
+                        .any(|mount| mount == &fs.mount_point)
+                }) {
+                    lines.push(format!(
+                        "Block device {} readonly={} mount_points={}",
+                        device.name,
+                        device.ro,
+                        if device.mount_points.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            device.mount_points.join(", ")
+                        }
+                    ));
+                }
+            }
+            lines
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn domain_specific_verification_lines(
+    finding: &FindingSummary,
+    domains: &SnapshotDomains,
+) -> Vec<String> {
+    match finding.domain.as_str() {
+        "containers" => domains
+            .containers
+            .containers
+            .iter()
+            .find(|container| finding_resource_matches(finding, &container.name))
+            .map(|container| {
+                vec![
+                    format!("docker ps --filter name={} --no-trunc", container.name),
+                    format!("docker logs --tail 50 {}", container.name),
+                ]
+            })
+            .unwrap_or_default(),
+        "compose" => domains
+            .compose
+            .projects
+            .iter()
+            .find(|project| finding_resource_matches(finding, &project.name))
+            .map(|project| {
+                vec![
+                    format!("docker compose -p {} ps", project.name),
+                    format!("docker compose -p {} logs --tail 50", project.name),
+                ]
+            })
+            .unwrap_or_default(),
+        "kubernetes" => domains
+            .kubernetes
+            .pods
+            .iter()
+            .find(|pod| finding_resource_matches(finding, &pod.name))
+            .map(|pod| {
+                vec![
+                    format!("kubectl get pod -n {} {}", pod.namespace, pod.name),
+                    format!("kubectl describe pod -n {} {}", pod.namespace, pod.name),
+                ]
+            })
+            .unwrap_or_default(),
+        "libvirt" => domains
+            .libvirt
+            .domains
+            .iter()
+            .find(|domain| finding_resource_matches(finding, &domain.name))
+            .map(|domain| {
+                vec![
+                    format!("virsh dominfo {}", domain.name),
+                    format!("virsh snapshot-list {}", domain.name),
+                ]
+            })
+            .unwrap_or_default(),
+        "services" => domains
+            .services
+            .failed_units
+            .iter()
+            .find(|unit| finding_resource_matches(finding, &unit.name))
+            .map(|unit| {
+                vec![
+                    format!("systemctl status {}", unit.name),
+                    format!("journalctl -u {} -n 50", unit.name),
+                ]
+            })
+            .unwrap_or_default(),
+        "disks" => domains
+            .disks
+            .filesystems
+            .iter()
+            .find(|fs| {
+                finding_resource_matches(finding, &fs.mount_point)
+                    || finding_resource_matches(finding, &fs.device)
+            })
+            .map(|fs| {
+                vec![
+                    format!("df -h {}", fs.mount_point),
+                    format!("df -i {}", fs.mount_point),
+                ]
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn related_change_context_lines(
+    finding: &FindingSummary,
+    change_sets: &[ChangeSetRecord],
+    audit_events: &[DashboardAuditRow],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let resource = finding.affected_resource.to_ascii_lowercase();
+    let domain = finding.domain.to_ascii_lowercase();
+
+    for change in change_sets.iter().take(5) {
+        let text = format!(
+            "{} {} {} {}",
+            change.plan_title, change.summary, change.status, change.id
+        )
+        .to_ascii_lowercase();
+        if (!resource.is_empty() && text.contains(&resource)) || text.contains(&domain) {
+            lines.push(format!(
+                "Change-set {} is {} and mentions this incident scope.",
+                change.id, change.status
+            ));
+            if !change.summary.trim().is_empty() {
+                lines.push(change.summary.clone());
+            }
+        }
+    }
+
+    for event in audit_events.iter().take(8) {
+        let text = format!("{} {} {}", event.capability, event.command, event.decision)
+            .to_ascii_lowercase();
+        if (!resource.is_empty() && text.contains(&resource)) || text.contains(&domain) {
+            lines.push(format!(
+                "Operator activity {} {} ({})",
+                event.time, event.command, event.decision
+            ));
+        }
+    }
+
+    lines.truncate(4);
+    lines
 }
 
 pub struct TuiApp {
@@ -1630,11 +2225,105 @@ impl TuiApp {
                         self.pending_apply_rx = None;
                     }
                 }
-                // Spawn parallel fleet collection (non-blocking) if not already in flight
-                if self.mode == AgentMode::Dashboard && !self.dashboard.fleet_collection_in_flight {
+                if let Some(rx) = &mut self.dashboard.pending_fleet_rx {
+                    if let Ok(hosts) = rx.try_recv() {
+                        self.dashboard.data.fleet_hosts = hosts;
+                        self.dashboard.fleet_collection_in_flight = false;
+                        self.dashboard.pending_fleet_rx = None;
+                    }
+                }
+                // Spawn real fleet collection from registered remotes when fleet view is active.
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.active_tab == OpsTab::Fleet
+                    && !self.dashboard.fleet_collection_in_flight
+                    && self.dashboard.pending_fleet_rx.is_none()
+                {
                     self.dashboard.fleet_collection_in_flight = true;
-                    // Fleet collection would be spawned here in a full implementation
-                    // For now, mark the flag to prevent double-spawn until results arrive
+                    let registry = crate::remote::RemoteRegistry::load().unwrap_or_default();
+                    let (tx_hosts, rx_hosts) =
+                        tokio::sync::oneshot::channel::<Vec<FleetHostStatus>>();
+                    tokio::spawn(async move {
+                        let results = registry.parallel_collect_reports().await;
+                        let mut hosts = Vec::new();
+                        for remote in &registry.remotes {
+                            let matching = results
+                                .iter()
+                                .find(|(host_id, _)| *host_id == remote.host_id);
+                            let host_status = match matching {
+                                Some((_host_id, Ok(report))) => {
+                                    let crit = report
+                                        .findings
+                                        .iter()
+                                        .filter(|f| {
+                                            f.severity.as_str().eq_ignore_ascii_case("critical")
+                                        })
+                                        .count();
+                                    let warn = report
+                                        .findings
+                                        .iter()
+                                        .filter(|f| {
+                                            f.severity.as_str().eq_ignore_ascii_case("warning")
+                                        })
+                                        .count();
+                                    let info = report.findings.len().saturating_sub(crit + warn);
+                                    FleetHostStatus {
+                                        name: remote.name.clone(),
+                                        endpoint: format!(
+                                            "{}@{}:{}",
+                                            remote.user.as_deref().unwrap_or("default"),
+                                            remote.host,
+                                            remote.port
+                                        ),
+                                        transport: remote.summary_label(),
+                                        reachable: true,
+                                        crit,
+                                        warn,
+                                        info,
+                                        last_refresh: Some(Instant::now()),
+                                        error: None,
+                                        detail: Some(fleet_detail_from_report(report)),
+                                    }
+                                }
+                                Some((_host_id, Err(error))) => FleetHostStatus {
+                                    name: remote.name.clone(),
+                                    endpoint: format!(
+                                        "{}@{}:{}",
+                                        remote.user.as_deref().unwrap_or("default"),
+                                        remote.host,
+                                        remote.port
+                                    ),
+                                    transport: remote.summary_label(),
+                                    reachable: false,
+                                    crit: 0,
+                                    warn: 0,
+                                    info: 0,
+                                    last_refresh: Some(Instant::now()),
+                                    error: Some(error.to_string()),
+                                    detail: None,
+                                },
+                                None => FleetHostStatus {
+                                    name: remote.name.clone(),
+                                    endpoint: format!(
+                                        "{}@{}:{}",
+                                        remote.user.as_deref().unwrap_or("default"),
+                                        remote.host,
+                                        remote.port
+                                    ),
+                                    transport: remote.summary_label(),
+                                    reachable: false,
+                                    crit: 0,
+                                    warn: 0,
+                                    info: 0,
+                                    last_refresh: None,
+                                    error: Some("no collection result".to_owned()),
+                                    detail: None,
+                                },
+                            };
+                            hosts.push(host_status);
+                        }
+                        let _ = tx_hosts.send(hosts);
+                    });
+                    self.dashboard.pending_fleet_rx = Some(rx_hosts);
                 }
                 Ok(false)
             }
@@ -1650,19 +2339,6 @@ impl TuiApp {
                     self.dashboard.data.tick_count = tick_count;
                     self.dashboard.data.ticks_skipped = ticks_skipped;
                     self.dashboard.data.consecutive_skips = consecutive_skips;
-                }
-                Ok(false)
-            }
-            UiEvent::DashboardLiveRefresh => {
-                if self.mode == AgentMode::Dashboard {
-                    let _ = self.refresh_dashboard_live().await;
-                }
-                Ok(false)
-            }
-            UiEvent::TickSkipped => {
-                if self.mode == AgentMode::Dashboard {
-                    self.dashboard.data.ticks_skipped += 1;
-                    self.dashboard.data.consecutive_skips += 1;
                 }
                 Ok(false)
             }
@@ -4563,9 +5239,8 @@ Report the exit status and the concise output."
                     if self.dashboard.active_tab == OpsTab::Fleet {
                         if let Some(row) = self.dashboard.fleet_selected_row {
                             if let Some(host) = self.dashboard.data.fleet_hosts.get(row) {
-                                self.toast(format!("Switched to host: {}", host.name));
-                                // Trigger dashboard refresh after remote switch
-                                self.refresh_dashboard_live().await?;
+                                self.active_remote = Some(host.name.clone());
+                                self.toast(format!("Active remote set to {}", host.name));
                             }
                         }
                     } else if let Some(idx) = self.dashboard_selected_finding_index() {
@@ -4600,21 +5275,31 @@ Report the exit status and the concise output."
     }
 
     async fn refresh_dashboard_live(&mut self) -> Result<()> {
-        // Set overlap guard to prevent the 60s tick from firing again while we're running
+        if crate::request_daemon_refresh()? {
+            self.toast("Requested daemon refresh");
+            self.refresh_dashboard();
+            self.dashboard.data.last_tick_instant = Some(Instant::now());
+            self.dashboard.data.tick_count += 1;
+            self.dashboard.data.ticks_skipped = 0;
+            self.dashboard.data.consecutive_skips = 0;
+            return Ok(());
+        }
+
+        // Fallback path when daemon is not running yet.
         if let Some(ref guard) = self.dashboard.overlap_guard {
             guard.store(true, Ordering::SeqCst);
         }
         let db_path = self.runtime.db_path.clone();
         let conn = rusqlite::Connection::open(&db_path)
             .with_context(|| format!("failed to open db at {}", db_path.display()))?;
-        self.toast("Refreshing dashboard...");
+        self.toast("Daemon offline, running local refresh");
         let prev = crate::load_previous_snapshot(&conn);
         let report = crate::run_monitor_cycle(MonitorProfile::Standard, None, prev).await;
         let findings_json = serde_json::to_string(&report.findings).unwrap_or_default();
         crate::persist_monitor_snapshot(&conn, &report.snapshot, &findings_json);
         self.refresh_dashboard();
         self.toast(format!(
-            "Dashboard refreshed: {} finding(s) on {}",
+            "Dashboard refreshed locally: {} finding(s) on {}",
             report.findings.len(),
             report.snapshot.host.hostname
         ));
@@ -4622,7 +5307,6 @@ Report the exit status and the concise output."
         self.dashboard.data.tick_count += 1;
         self.dashboard.data.ticks_skipped = 0;
         self.dashboard.data.consecutive_skips = 0;
-        // Write audit event for the collector run before clearing the overlap guard.
         let domain_count = SnapshotDomains::domain_names().len();
         self.write_dashboard_event(
             "collector-run",
@@ -4635,7 +5319,6 @@ Report the exit status and the concise output."
             &helm_memory::stable_hash_hex(&report.snapshot.id),
             &helm_memory::stable_hash_hex(&report.findings.len().to_string()),
         )?;
-        // Clear overlap guard after the live refresh completes
         if let Some(ref guard) = self.dashboard.overlap_guard {
             guard.store(false, Ordering::SeqCst);
         }
@@ -5620,8 +6303,6 @@ fn spawn_dashboard_refresh_task(
     tx: mpsc::UnboundedSender<UiEvent>,
     overlap_guard: Arc<AtomicBool>,
 ) {
-    let tx2 = tx.clone();
-    let tx3 = tx.clone();
     // Lightweight dashboard re-read every 5s (reads latest snapshot from DB)
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -5632,27 +6313,7 @@ fn spawn_dashboard_refresh_task(
             }
         }
     });
-    // Full monitor cycle every 60s (collect + detect + persist)
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        let mut _local_consecutive_skips: u64 = 0;
-        loop {
-            interval.tick().await;
-            if overlap_guard.load(Ordering::SeqCst) {
-                _local_consecutive_skips += 1;
-                if tx2.send(UiEvent::TickSkipped).is_err() {
-                    break;
-                }
-            } else {
-                _local_consecutive_skips = 0;
-                if tx2.send(UiEvent::DashboardLiveRefresh).is_err() {
-                    break;
-                }
-            }
-        }
-    });
-    // Drop tx3 — held only to keep channel alive while tasks run
-    let _ = tx3;
+    let _ = overlap_guard;
 }
 
 fn render_app(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -5825,10 +6486,11 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(8),
+            Constraint::Length(2),
         ])
         .split(inner);
 
@@ -5836,6 +6498,7 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     render_ops_status_strip(app, vert[1], buf);
     render_ops_tabbar(app, vert[2], buf);
     render_ops_body(app, vert[3], buf);
+    render_ops_footer(app, vert[4], buf);
 }
 
 fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -5845,12 +6508,48 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     } else {
         &d.hostname
     };
+    let display_name = hostname.to_ascii_uppercase();
     let time_str = if d.collected_at.is_empty() {
         "--:-- UTC"
     } else {
         &d.collected_at
     };
-    let provider_model = format!("{}/{}", app.provider_name.to_ascii_lowercase(), app.model);
+
+    // Scope: show host or fleet context
+    let scope_label = if let Some(remote) = app.active_remote.as_deref() {
+        format!("host {remote}")
+    } else if app.dashboard.active_tab == OpsTab::Fleet {
+        "fleet".to_owned()
+    } else {
+        display_name.clone()
+    };
+
+    let ai_label = provider_boundary_label(app);
+    let provider_model_label = provider_model_label(app);
+    let daemon_label = crate::read_daemon_state()
+        .map(|state| {
+            if !crate::daemon_is_running() {
+                "daemon off".to_owned()
+            } else {
+                format!("daemon {}", state.status)
+            }
+        })
+        .unwrap_or_else(|| "daemon off".to_owned());
+    let unhealthy_collectors = d.collector_health.iter().filter(|(_, ok, _)| !*ok).count();
+    let collector_label = if unhealthy_collectors == 0 {
+        format!("col ok/{0}", d.collector_health.len())
+    } else {
+        format!(
+            "col {}/{1} bad",
+            unhealthy_collectors,
+            d.collector_health.len()
+        )
+    };
+    let collector_color = if unhealthy_collectors == 0 {
+        OPS_GREEN
+    } else {
+        OPS_YELLOW
+    };
     let cpu_color = if d.cpu_percent >= 85.0 {
         OPS_RED
     } else if d.cpu_percent >= 50.0 {
@@ -5871,42 +6570,45 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         OPS_MUTED
     };
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+    // Right-aligned metrics
+    let right_metrics = format!(
+        "load {:.1} {:.1} {:.1}  mem {:.0}%  cpu {:.0}% ",
+        d.load_1m, d.load_5m, d.load_15m, d.memory_used_pct, d.cpu_percent
+    );
+    let right_w = right_metrics.chars().count() as u16;
+
+    let horiz = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
         .split(area);
 
-    let top_right = format!(
-        "load {:.1} {:.1} {:.1}  mem {:.0}% ",
-        d.load_1m, d.load_5m, d.load_15m, d.memory_used_pct
-    );
-    let top_right_w = top_right.chars().count() as u16;
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(top_right_w)])
-        .split(rows[0]);
-
+    // Left side: HELMOPS | hostname | ai state | daemon | LIVE | time | collectors
     Paragraph::new(Line::from(vec![
         Span::styled(
             " HELMOPS",
             Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" | ", Style::default().fg(OPS_DIM)),
-        Span::styled(hostname.to_ascii_uppercase(), Style::default().fg(OPS_FG)),
+        Span::styled(scope_label, Style::default().fg(OPS_FG)),
         Span::styled(" | ", Style::default().fg(OPS_DIM)),
-        Span::styled(provider_model, Style::default().fg(OPS_MUTED)),
+        Span::styled(provider_model_label, Style::default().fg(OPS_MUTED)),
         Span::styled(" | ", Style::default().fg(OPS_DIM)),
-        Span::styled("●", Style::default().fg(OPS_GREEN)),
+        Span::styled(daemon_label, Style::default().fg(OPS_MUTED)),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled("\u{25CF}", Style::default().fg(OPS_GREEN)),
         Span::styled(
             " LIVE",
             Style::default().fg(OPS_GREEN).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" | ", Style::default().fg(OPS_DIM)),
         Span::styled(time_str, Style::default().fg(OPS_MUTED)),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled(collector_label, Style::default().fg(collector_color)),
     ]))
     .style(Style::default().bg(OPS_SURFACE))
-    .render(top[0], buf);
+    .render(horiz[0], buf);
 
+    // Right side: load + mem + cpu metrics
     Paragraph::new(Line::from(vec![
         Span::styled("load ", Style::default().fg(OPS_DIM)),
         Span::styled(format!("{:.1}", d.load_1m), Style::default().fg(load_color)),
@@ -5919,20 +6621,15 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             format!("{:.0}%", d.memory_used_pct),
             Style::default().fg(mem_color),
         ),
-        Span::raw(" "),
-    ]))
-    .style(Style::default().bg(OPS_SURFACE))
-    .render(top[1], buf);
-
-    Paragraph::new(Line::from(vec![
-        Span::styled(" cpu ", Style::default().fg(OPS_DIM)),
+        Span::styled("  cpu ", Style::default().fg(OPS_DIM)),
         Span::styled(
             format!("{:.0}%", d.cpu_percent),
             Style::default().fg(cpu_color),
         ),
+        Span::raw(" "),
     ]))
     .style(Style::default().bg(OPS_SURFACE))
-    .render(rows[1], buf);
+    .render(horiz[1], buf);
 }
 
 fn render_ops_status_strip(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -5985,12 +6682,36 @@ fn render_ops_status_strip(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             OPS_BLUE,
             Color::Rgb(0x0d, 0x21, 0x37),
         ),
+        Span::raw(" "),
+        badge("MUTED", m.suppressed, OPS_DIM, Color::Rgb(0x1d, 0x22, 0x2a)),
     ]);
     let mut right_spans = Vec::new();
-    for (idx, (mount, pct)) in d.disk_bars.iter().take(2).enumerate() {
-        if idx > 0 {
-            right_spans.push(Span::styled("  ", Style::default()));
-        }
+    let service_color = if d.failed_services > 0 {
+        OPS_RED
+    } else {
+        OPS_GREEN
+    };
+    let container_color = if d.total_containers > 0 && d.running_containers < d.total_containers {
+        OPS_YELLOW
+    } else {
+        OPS_GREEN
+    };
+    right_spans.push(Span::styled("svc ", Style::default().fg(OPS_DIM)));
+    right_spans.push(Span::styled(
+        format!("{} fail", d.failed_services),
+        Style::default()
+            .fg(service_color)
+            .add_modifier(Modifier::BOLD),
+    ));
+    right_spans.push(Span::styled("  ctr ", Style::default().fg(OPS_DIM)));
+    right_spans.push(Span::styled(
+        format!("{}/{}", d.running_containers, d.total_containers),
+        Style::default()
+            .fg(container_color)
+            .add_modifier(Modifier::BOLD),
+    ));
+    for (mount, pct) in d.disk_bars.iter().take(2) {
+        right_spans.push(Span::styled("  ", Style::default()));
         right_spans.extend(meter(mount, *pct));
     }
     let right = Line::from(right_spans);
@@ -6010,7 +6731,15 @@ fn render_ops_status_strip(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
 fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let mut spans = Vec::new();
-    for tab in OpsTab::all() {
+    let tabs = OpsTab::all();
+    for (i, tab) in tabs.iter().enumerate() {
+        // Add separator before first evidence tab (SERVICES)
+        if *tab == OpsTab::Services {
+            spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(OPS_DIM).bg(OPS_SURFACE),
+            ));
+        }
         let active = *tab == app.dashboard.active_tab;
         let fg = if active { OPS_FG } else { OPS_DIM };
         let bg = if active { OPS_BG } else { OPS_SURFACE };
@@ -6022,7 +6751,9 @@ fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 Modifier::empty()
             }),
         ));
-        spans.push(Span::styled(" ", Style::default().bg(OPS_SURFACE)));
+        if i < tabs.len() - 1 && tabs[i + 1] != OpsTab::Services {
+            spans.push(Span::styled(" ", Style::default().bg(OPS_SURFACE)));
+        }
     }
     Paragraph::new(Line::from(spans))
         .style(Style::default().bg(OPS_SURFACE))
@@ -6039,11 +6770,18 @@ fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 for dx in 0..width {
                     buf[(x + dx, area.y + area.height.saturating_sub(1))]
                         .set_style(Style::default().bg(OPS_BG).fg(OPS_BLUE));
-                    buf[(x + dx, area.y + area.height.saturating_sub(1))].set_char('▁');
+                    buf[(x + dx, area.y + area.height.saturating_sub(1))].set_char('\u{2581}');
                 }
                 break;
             }
-            x = x.saturating_add(width + 1);
+            // Account for separator spacing before SERVICES
+            x = if tab == &OpsTab::Alerts
+                && *tabs.get(pos + 1).unwrap_or(&OpsTab::Fleet) == OpsTab::Services
+            {
+                x.saturating_add(width + 1 + 3) // " │ " is 3 chars
+            } else {
+                x.saturating_add(width + 1)
+            };
         }
     }
 }
@@ -6091,7 +6829,23 @@ fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     let visible = app.dashboard_visible_finding_indices();
     {
-        let count_str = format!("{} open ", visible.len());
+        let open_count = visible
+            .iter()
+            .filter(|&&idx| {
+                app.dashboard
+                    .data
+                    .findings
+                    .get(idx)
+                    .map(|f| {
+                        !matches!(
+                            f.status,
+                            DashboardFindingState::Suppressed | DashboardFindingState::Resolved
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        let count_str = format!("{open_count} open ");
         let count_len = count_str.chars().count() as u16;
         let hdr = Layout::default()
             .direction(Direction::Horizontal)
@@ -6115,7 +6869,11 @@ fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
-                " View active in ALERTS tab",
+                " Evidence view active",
+                Style::default().fg(OPS_DIM),
+            )),
+            Line::from(Span::styled(
+                " Press 1 or Left to return to INCIDENTS",
                 Style::default().fg(OPS_DIM),
             )),
         ])
@@ -6123,7 +6881,7 @@ fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .render(vert[1], buf);
     } else if visible.is_empty() {
         Paragraph::new(Line::from(Span::styled(
-            " No active findings",
+            " No active incidents",
             Style::default().fg(OPS_MUTED),
         )))
         .style(Style::default().bg(OPS_BG))
@@ -6220,16 +6978,23 @@ fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" INCIDENT WORKSPACE ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
     let actual_idx = app
         .dashboard_selected_finding_index()
         .or_else(|| app.dashboard_visible_finding_indices().first().copied());
     let Some(actual_idx) = actual_idx else {
         Paragraph::new(Line::from(Span::styled(
-            " Select an alert from the queue",
+            " Select an incident from the queue",
             Style::default().fg(OPS_MUTED),
         )))
         .style(Style::default().bg(OPS_BG))
-        .render(area, buf);
+        .render(inner, buf);
         return;
     };
     let finding = &app.dashboard.data.findings[actual_idx];
@@ -6248,12 +7013,25 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let last_seen_str = format_dashboard_when(finding.last_seen);
     let first_seen_str = format_dashboard_when(finding.first_seen);
 
-    let w = area.width as usize;
+    let w = inner.width as usize;
     let sep = Line::from(Span::styled("─".repeat(w), Style::default().fg(OPS_BORDER)));
     let blank = Line::from("");
     let cmd_style = Style::default()
         .fg(Color::Rgb(0x79, 0xc0, 0xff))
         .bg(OPS_SURFACE);
+    let active_plan = app
+        .dashboard
+        .active_plan
+        .as_ref()
+        .filter(|p| p.finding_id == finding.id);
+    let domain_why = domain_specific_why_lines(finding, &app.dashboard.data.domains);
+    let domain_evidence = domain_specific_evidence_lines(finding, &app.dashboard.data.domains);
+    let domain_verify = domain_specific_verification_lines(finding, &app.dashboard.data.domains);
+    let related_changes = related_change_context_lines(
+        finding,
+        &app.dashboard.data.change_sets,
+        &app.dashboard.data.audit_events,
+    );
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -6281,6 +7059,24 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         finding.title.as_str(),
         Style::default().fg(OPS_FG),
     )));
+    lines.push(blank.clone());
+
+    lines.push(sep.clone());
+    lines.push(Line::from(Span::styled(
+        "IMPACT",
+        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+    )));
+    if finding.impact.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Impact not yet summarized.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            finding.impact.as_str(),
+            Style::default().fg(OPS_FG),
+        )));
+    }
     lines.push(blank.clone());
 
     lines.push(sep.clone());
@@ -6328,6 +7124,19 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 Style::default().fg(OPS_FG),
             )));
         }
+        for line in &domain_why {
+            lines.push(Line::from(Span::styled(
+                line.as_str(),
+                Style::default().fg(OPS_DIM),
+            )));
+        }
+    } else if !domain_why.is_empty() {
+        for line in &domain_why {
+            lines.push(Line::from(Span::styled(
+                line.as_str(),
+                Style::default().fg(OPS_FG),
+            )));
+        }
     } else if !finding.evidence_text.trim().is_empty() {
         if let Some(first) = finding.evidence_text.lines().next() {
             let first = first.trim();
@@ -6345,44 +7154,84 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     lines.push(sep.clone());
     lines.push(Line::from(Span::styled(
-        "IMPACT",
+        "WHAT CHANGED BEFORE IT BROKE",
         Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
     )));
-    if finding.impact.trim().is_empty() {
+    if !related_changes.is_empty() {
+        for line in &related_changes {
+            lines.push(Line::from(Span::styled(
+                line.as_str(),
+                Style::default().fg(OPS_FG),
+            )));
+        }
+    } else if let Some(change) = app.dashboard.data.change_sets.iter().find(|change| {
+        change.plan_id == active_plan.map(|p| p.plan_id.as_str()).unwrap_or_default()
+    }) {
         lines.push(Line::from(Span::styled(
-            "Impact not yet summarized.",
-            Style::default().fg(OPS_MUTED),
+            format!("Reviewed change-set {} is {}.", change.id, change.status),
+            Style::default().fg(OPS_FG),
+        )));
+        if !change.summary.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                change.summary.as_str(),
+                Style::default().fg(OPS_DIM),
+            )));
+        }
+    } else if let Some(event) = app.dashboard.data.audit_events.first() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Recent operator activity: {} {} ({})",
+                event.time, event.command, event.decision
+            ),
+            Style::default().fg(OPS_FG),
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            finding.impact.as_str(),
-            Style::default().fg(OPS_FG),
+            "No reviewed change-set or operator event is linked to this incident yet.",
+            Style::default().fg(OPS_MUTED),
         )));
     }
     lines.push(blank.clone());
 
     lines.push(sep.clone());
-    lines.push(Line::from(Span::styled(
-        "WHAT CHANGED BEFORE IT BROKE",
-        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
-    )));
-    if let Some(plan) = app.dashboard.data.change_sets.iter().find(|change| {
-        change.plan_id
-            == app
-                .dashboard
-                .active_plan
-                .as_ref()
-                .map(|p| p.plan_id.as_str())
-                .unwrap_or_default()
-    }) {
+    lines.push(Line::from(vec![
+        Span::styled(
+            "EVIDENCE READ ",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("(captured before any fix)", Style::default().fg(OPS_DIM)),
+    ]));
+    if finding.evidence_text.trim().is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("Recent reviewed change-set: {} ({})", plan.id, plan.status),
-            Style::default().fg(OPS_FG),
+            "No captured evidence text yet.",
+            Style::default().fg(OPS_MUTED),
         )));
     } else {
+        for line in finding.evidence_text.lines().take(4) {
+            if !line.trim().is_empty() {
+                lines.push(Line::from(Span::styled(
+                    line.trim().to_owned(),
+                    Style::default().fg(OPS_FG),
+                )));
+            }
+        }
+    }
+    for line in &domain_evidence {
         lines.push(Line::from(Span::styled(
-            "No reviewed change-set is linked to this incident yet.",
-            Style::default().fg(OPS_MUTED),
+            line.as_str(),
+            Style::default().fg(OPS_DIM),
+        )));
+    }
+    if !finding.evidence_sources.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("Sources: {}", finding.evidence_sources.join(" · ")),
+            Style::default().fg(OPS_DIM),
+        )));
+    }
+    if !finding.missing_data.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("Missing: {}", finding.missing_data.join(" · ")),
+            Style::default().fg(OPS_YELLOW),
         )));
     }
     lines.push(blank.clone());
@@ -6392,12 +7241,13 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         "HOW TO REPRODUCE / VERIFY",
         Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
     )));
-    if finding.read_only_checks.is_empty() {
+    if finding.read_only_checks.is_empty() && domain_verify.is_empty() {
         lines.push(Line::from(Span::styled(
             "No verification checks stored yet.",
             Style::default().fg(OPS_MUTED),
         )));
-    } else {
+    }
+    if !finding.read_only_checks.is_empty() {
         for check in &finding.read_only_checks {
             lines.push(Line::from(vec![
                 Span::styled("  - ", Style::default().fg(OPS_DIM)),
@@ -6405,21 +7255,22 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             ]));
         }
     }
+    for check in &domain_verify {
+        lines.push(Line::from(vec![
+            Span::styled("  - ", Style::default().fg(OPS_DIM)),
+            Span::styled(check.as_str(), Style::default().fg(OPS_DIM)),
+        ]));
+    }
     lines.push(blank.clone());
 
     lines.push(sep.clone());
     lines.push(Line::from(vec![
         Span::styled(
-            "RECOMMENDED FIX PLAN ",
+            "FIX PLAN ",
             Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
         ),
         Span::styled("(approval required per step)", Style::default().fg(OPS_DIM)),
     ]));
-    let active_plan = app
-        .dashboard
-        .active_plan
-        .as_ref()
-        .filter(|p| p.finding_id == finding.id);
     if let Some(plan) = active_plan {
         match &plan.status {
             PlanStatus::Ready { fix_steps, .. } => {
@@ -6432,6 +7283,12 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                             cmd_style.add_modifier(Modifier::BOLD),
                         ),
                     ]));
+                    if !step.purpose.trim().is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled("    why  ", Style::default().fg(OPS_DIM)),
+                            Span::styled(step.purpose.as_str(), Style::default().fg(OPS_FG)),
+                        ]));
+                    }
                 }
             }
             _ => lines.push(Line::from(Span::styled(
@@ -6453,32 +7310,6 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             "  Press Alt+G to generate the guided troubleshooting plan.",
             Style::default().fg(OPS_MUTED),
         )));
-    }
-    lines.push(blank.clone());
-
-    lines.push(sep.clone());
-    lines.push(Line::from(vec![
-        Span::styled(
-            "EVIDENCE READ ",
-            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "(read-only, already collected)",
-            Style::default().fg(OPS_DIM),
-        ),
-    ]));
-    if finding.read_only_checks.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  No read-only checks stored yet.",
-            Style::default().fg(OPS_MUTED),
-        )));
-    } else {
-        for check in &finding.read_only_checks {
-            lines.push(Line::from(vec![
-                Span::styled("  ✓ ", Style::default().fg(OPS_GREEN)),
-                Span::styled(check.as_str(), Style::default().fg(OPS_DIM)),
-            ]));
-        }
     }
     lines.push(blank.clone());
 
@@ -6539,7 +7370,14 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         ),
         Span::styled(" ", Style::default().bg(OPS_BG)),
         Span::styled(
-            " S — Suppress ",
+            " Alt+A — Apply ",
+            Style::default()
+                .fg(OPS_GREEN)
+                .bg(Color::Rgb(0x0d, 0x20, 0x08)),
+        ),
+        Span::styled(" ", Style::default().bg(OPS_BG)),
+        Span::styled(
+            " S — Mute ",
             Style::default()
                 .fg(OPS_YELLOW)
                 .bg(Color::Rgb(0x1a, 0x20, 0x08)),
@@ -6557,12 +7395,12 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
         .wrap(Wrap { trim: false })
-        .render(area, buf);
+        .render(inner, buf);
 }
 
 fn render_ops_evidence(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
-        .title(" EVIDENCE ")
+        .title(" EVIDENCE / SNAPSHOT ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(OPS_BORDER));
     let inner = block.inner(area);
@@ -6572,7 +7410,7 @@ fn render_ops_evidence(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .dashboard_selected_finding_index()
         .or_else(|| app.dashboard_visible_finding_indices().first().copied());
     let Some(actual_idx) = actual_idx else {
-        Paragraph::new("Select an alert from the queue")
+        Paragraph::new("Select an incident from the queue")
             .style(Style::default().fg(OPS_MUTED))
             .render(inner, buf);
         return;
@@ -6608,7 +7446,7 @@ fn render_ops_evidence(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         text.push_str(&finding.missing_data.join("\n"));
         text.push('\n');
     }
-    text.push_str("\nEnter return to detail   Alt+F follow-up   Alt+G generate plan");
+    text.push_str("\nEnter return to workspace   Alt+F follow-up   Alt+G generate plan");
 
     Paragraph::new(text)
         .style(Style::default().fg(OPS_FG).bg(OPS_BG))
@@ -6619,7 +7457,7 @@ fn render_ops_evidence(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
 fn render_ops_troubleshoot_plan(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
-        .title(" GUIDED TROUBLESHOOTING ")
+        .title(" ACTIONS / GUIDED PLAN ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(OPS_BORDER));
     let inner = block.inner(area);
@@ -6629,7 +7467,7 @@ fn render_ops_troubleshoot_plan(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .dashboard_selected_finding_index()
         .or_else(|| app.dashboard_visible_finding_indices().first().copied());
     let Some(actual_idx) = actual_idx else {
-        Paragraph::new("Select an alert from the queue")
+        Paragraph::new("Select an incident from the queue")
             .style(Style::default().fg(OPS_MUTED))
             .render(inner, buf);
         return;
@@ -7232,6 +8070,10 @@ fn render_fleet_tab(
         .title(" FLEET ");
     let inner = block.inner(area);
     block.render(area, buf);
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(10), Constraint::Min(8)])
+        .split(inner);
 
     if fleet_hosts.is_empty() {
         Paragraph::new(Span::styled(
@@ -7239,7 +8081,7 @@ fn render_fleet_tab(
             Style::default().fg(OPS_MUTED),
         ))
         .style(Style::default().bg(OPS_BG))
-        .render(inner, buf);
+        .render(layout[0], buf);
         return;
     }
 
@@ -7250,6 +8092,10 @@ fn render_fleet_tab(
         )),
         Cell::from(Span::styled(
             "Status",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            "Transport",
             Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
         )),
         Cell::from(Span::styled(
@@ -7292,6 +8138,13 @@ fn render_fleet_tab(
                 }
             })
             .unwrap_or_else(|| "N/A".to_owned());
+        let last_cell = if host.reachable {
+            last_str
+        } else if let Some(error) = &host.error {
+            truncate_cell(error, 24)
+        } else {
+            last_str
+        };
 
         let row = Row::new(vec![
             Cell::from(Span::styled(
@@ -7306,6 +8159,10 @@ fn render_fleet_tab(
                     .add_modifier(Modifier::BOLD),
             )),
             Cell::from(Span::styled(
+                truncate_cell(&host.transport, 15),
+                Style::default().fg(OPS_BLUE).bg(bg),
+            )),
+            Cell::from(Span::styled(
                 format!("{}", host.crit),
                 Style::default().fg(OPS_RED).bg(bg),
             )),
@@ -7317,7 +8174,7 @@ fn render_fleet_tab(
                 format!("{}", host.info),
                 Style::default().fg(OPS_BLUE).bg(bg),
             )),
-            Cell::from(Span::styled(last_str, Style::default().fg(OPS_DIM).bg(bg))),
+            Cell::from(Span::styled(last_cell, Style::default().fg(OPS_DIM).bg(bg))),
         ])
         .height(1);
 
@@ -7327,17 +8184,157 @@ fn render_fleet_tab(
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(30),
-            Constraint::Percentage(10),
-            Constraint::Percentage(12),
-            Constraint::Percentage(12),
-            Constraint::Percentage(12),
             Constraint::Percentage(24),
+            Constraint::Percentage(10),
+            Constraint::Percentage(18),
+            Constraint::Percentage(12),
+            Constraint::Percentage(12),
+            Constraint::Percentage(12),
+            Constraint::Percentage(12),
         ],
     )
     .style(Style::default().bg(OPS_BG));
 
-    table.render(inner, buf);
+    table.render(layout[0], buf);
+
+    let detail_block = Block::default()
+        .title(" HOST DRILL-DOWN ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let detail_inner = detail_block.inner(layout[1]);
+    detail_block.render(layout[1], buf);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(host) = selected_row.and_then(|row| fleet_hosts.get(row)) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                host.name.as_str(),
+                Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(host.endpoint.as_str(), Style::default().fg(OPS_DIM)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Transport  ", Style::default().fg(OPS_MUTED)),
+            Span::styled(host.transport.as_str(), Style::default().fg(OPS_BLUE)),
+            Span::styled("   State  ", Style::default().fg(OPS_MUTED)),
+            Span::styled(
+                if host.reachable { "up" } else { "down" },
+                Style::default().fg(if host.reachable { OPS_GREEN } else { OPS_RED }),
+            ),
+        ]));
+
+        if let Some(detail) = &host.detail {
+            lines.push(Line::from(vec![
+                Span::styled("Host       ", Style::default().fg(OPS_MUTED)),
+                Span::styled(detail.hostname.as_str(), Style::default().fg(OPS_FG)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Collected  ", Style::default().fg(OPS_MUTED)),
+                Span::styled(detail.collected_at.as_str(), Style::default().fg(OPS_FG)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Snapshot   ", Style::default().fg(OPS_MUTED)),
+                Span::styled(
+                    if detail.snapshot_id.is_empty() {
+                        "none"
+                    } else {
+                        detail.snapshot_id.as_str()
+                    },
+                    Style::default().fg(OPS_FG),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Runtime    ", Style::default().fg(OPS_MUTED)),
+                Span::styled(
+                    format!(
+                        "svc {} failed / {} total · ctr {} / {} running",
+                        detail.failed_services,
+                        detail.total_services,
+                        detail.running_containers,
+                        detail.total_containers
+                    ),
+                    Style::default().fg(OPS_FG),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Platforms  ", Style::default().fg(OPS_MUTED)),
+                Span::styled(
+                    format!(
+                        "compose {} bad / {} total · k8s {} bad / {} pods · vms {} bad / {} domains",
+                        detail.degraded_compose_projects,
+                        detail.compose_projects,
+                        detail.kubernetes_problem_pods,
+                        detail.kubernetes_pods,
+                        detail.vm_problem_domains,
+                        detail.vm_domains
+                    ),
+                    Style::default().fg(OPS_FG),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "TOP INCIDENTS",
+                Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+            )));
+            if detail.findings.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "No incidents returned from the remote host.",
+                    Style::default().fg(OPS_MUTED),
+                )));
+            } else {
+                for finding in detail.findings.iter().take(6) {
+                    let sev = match finding.severity.as_str() {
+                        "critical" => "CRIT",
+                        "warning" => "WARN",
+                        _ => "INFO",
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{sev} "),
+                            Style::default().fg(finding_severity_color(&finding.severity)),
+                        ),
+                        Span::styled(
+                            truncate_cell(
+                                &finding.title,
+                                detail_inner.width.saturating_sub(8) as usize,
+                            ),
+                            Style::default().fg(OPS_FG),
+                        ),
+                    ]));
+                }
+            }
+            if !detail.collector_errors.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("Collector issues: {}", detail.collector_errors.join(" · ")),
+                    Style::default().fg(OPS_YELLOW),
+                )));
+            }
+        } else if let Some(error) = &host.error {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("Host detail unavailable: {error}"),
+                Style::default().fg(OPS_YELLOW),
+            )));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Enter sets this host as the active remote target for guided work.",
+            Style::default().fg(OPS_DIM),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Select a host to inspect remote incidents and runtime health.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    }
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .wrap(Wrap { trim: false })
+        .render(detail_inner, buf);
 }
 
 #[allow(dead_code)]
@@ -7771,7 +8768,7 @@ fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     let line1 = Line::from(vec![
         key(" Tab"),
-        desc(" focus panes"),
+        desc(" focus"),
         sep(),
         key("F5"),
         desc(" refresh"),
@@ -7780,7 +8777,7 @@ fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
         desc(" select"),
         sep(),
         key("Alt+G"),
-        desc(" gen plan"),
+        desc(" plan"),
         sep(),
         key("Alt+E"),
         desc(" evidence"),
@@ -7796,13 +8793,19 @@ fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .render(rows[0], buf);
 
     let right = "F1 help";
-    let left = " R resolve";
+    let left = " R resolve  1 incidents  2-8 evidence";
     let pad = area
         .width
         .saturating_sub(left.len() as u16 + right.len() as u16) as usize;
     let line2 = Line::from(vec![
         key(" R"),
         desc(" resolve"),
+        sep(),
+        key("1"),
+        desc(" incidents"),
+        sep(),
+        key("2-8"),
+        desc(" evidence"),
         Span::styled(" ".repeat(pad), Style::default().fg(OPS_DIM)),
         key("F1"),
         desc(" help"),
@@ -7906,6 +8909,15 @@ fn provider_boundary_label(app: &TuiApp) -> &'static str {
     } else {
         "ai api"
     }
+}
+
+fn provider_model_label(app: &TuiApp) -> String {
+    if !app.is_llm_provider_configured() {
+        return "no provider".to_owned();
+    }
+    let provider = &app.provider_name;
+    let model = truncate(&app.model, 24);
+    format!("{provider}/{model}")
 }
 
 fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -8221,7 +9233,7 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
 fn render_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let mode_label = "DASHBOARD";
-    let mode_hint = "Tab panes | F5 refresh | Alt+E evidence | Alt+F check | Alt+G plan | a/Alt+A apply | 1-5 tabs";
+    let mode_hint = "Tab panes | F5 refresh | Enter incident | Alt+E evidence | Alt+F check | Alt+G plan | a/Alt+A apply | 1 incidents | 2-8 evidence";
     let line = Line::from(vec![
         Span::styled(
             format!(" [{mode_label}] "),
@@ -8453,7 +9465,7 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
         }
         ModalState::Help => {
             Paragraph::new(if app.mode == AgentMode::Dashboard {
-                "Dashboard: Tab focus panes | Left/Right or 1-8 switch tabs | Up/Down move queue | Enter drill in | Alt+E evidence | Alt+F follow-up | Alt+G guided plan | Alt+A apply | S suppress | R resolve | U reopen | F5 refresh | Ctrl+P palette | Ctrl+H/? help"
+                "Dashboard: Tab focus panes | Left/Right or 1-8 switch tabs | 1 returns to incidents | 2-8 open evidence views | Up/Down move queue | Enter open incident | Alt+E evidence | Alt+F follow-up | Alt+G guided plan | Alt+A apply | S mute | R resolve | U reopen | F5 refresh | Ctrl+P palette | Ctrl+H/? help"
             } else {
                 "Enter submit | Alt+Enter newline | Ctrl+P commands | Ctrl+N new session | Ctrl+C cancel running task, then Ctrl+C again to quit | PageUp/PageDown scroll | Ctrl+T toggle sidebar | Ctrl+H/? help"
             })
@@ -10230,10 +11242,21 @@ mod tests {
         let rendered = buf_to_string(&buf);
         assert!(!rendered.is_empty(), "buffer should not be empty");
         assert!(rendered.contains("HELMOPS"), "should render HELMOPS header");
-        assert!(rendered.contains("QUEUE"), "should render queue title");
-        assert!(rendered.contains("testbox"), "should show hostname");
+        assert!(
+            rendered.contains("FINDING QUEUE"),
+            "should render finding queue title"
+        );
+        assert!(
+            rendered.contains("TESTBOX"),
+            "should show hostname in header"
+        );
+        assert!(
+            rendered.contains("ollama"),
+            "should show provider/model in header"
+        );
         assert!(rendered.contains("CRIT 1"), "should show CRIT count");
         assert!(rendered.contains("WARN 1"), "should show WARN count");
+        assert!(rendered.contains("MUTED 0"), "should show muted count");
         assert!(
             rendered.contains("Disk /var 78% full"),
             "should show selected finding detail"
@@ -10279,6 +11302,14 @@ mod tests {
             rendered.contains("mem 62%"),
             "should show mem percent in header: got '{rendered}'"
         );
+        assert!(
+            rendered.contains("col ok/"),
+            "should show collector health summary: got '{rendered}'"
+        );
+        assert!(
+            rendered.contains("svc 2 fail"),
+            "should show service failure chip: got '{rendered}'"
+        );
     }
 
     #[test]
@@ -10322,6 +11353,26 @@ mod tests {
             rendered.contains("IMPACT"),
             "detail should show IMPACT section"
         );
+        let impact_idx = rendered.find("IMPACT").unwrap_or(usize::MAX);
+        let when_idx = rendered.find("WHEN").unwrap_or(usize::MAX);
+        let why_idx = rendered.find("WHY IT HAPPENED").unwrap_or(usize::MAX);
+        let change_idx = rendered
+            .find("WHAT CHANGED BEFORE IT BROKE")
+            .unwrap_or(usize::MAX);
+        let evidence_idx = rendered.find("EVIDENCE").unwrap_or(usize::MAX);
+        let verify_idx = rendered
+            .find("HOW TO REPRODUCE / VERIFY")
+            .unwrap_or(usize::MAX);
+        let fix_idx = rendered.find("RECOMMENDED FIX PLAN").unwrap_or(usize::MAX);
+        assert!(
+            impact_idx < when_idx
+                && when_idx < why_idx
+                && why_idx < change_idx
+                && change_idx < evidence_idx
+                && evidence_idx < verify_idx
+                && verify_idx < fix_idx,
+            "detail sections should follow the incident workspace order: got '{rendered}'"
+        );
         // Verify correlation engine added correlated_finding_ids
         let finding0 = &app.dashboard.data.findings[0];
         assert!(
@@ -10354,6 +11405,10 @@ mod tests {
         assert!(
             rendered.contains("EVIDENCE"),
             "evidence should render evidence section"
+        );
+        assert!(
+            rendered.contains("EVIDENCE / SNAPSHOT"),
+            "evidence view should use the snapshot evidence title"
         );
     }
 
@@ -10542,6 +11597,10 @@ mod tests {
         assert!(
             rendered.contains("QUEUE"),
             "queue should be visible on all tabs: {rendered}"
+        );
+        assert!(
+            rendered.contains("Evidence view active"),
+            "non-incident tabs should be explicitly framed as evidence: {rendered}"
         );
     }
 
@@ -11005,7 +12064,7 @@ mod tests {
 
         assert!(
             rendered.contains("2 open"),
-            "Active filter should show 2 findings (New+Recurring, resolved is hidden): got '{rendered}'"
+            "Active filter should show 2 open findings: got '{rendered}'"
         );
         // Resolved should be hidden
         assert!(
@@ -11127,7 +12186,7 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            rendered.contains("No active findings"),
+            rendered.contains("No active incidents"),
             "ResolvedOnly filter should show empty state when nothing is resolved: got '{rendered}'"
         );
 
@@ -11371,7 +12430,7 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            rendered.contains("SERVICES") || rendered.contains("services"),
+            rendered.contains("EV:SVC") || rendered.contains("SYSTEMD SERVICES"),
             "Tab switching should work while LLM pending: got '{rendered}'"
         );
     }
@@ -11913,34 +12972,40 @@ mod tests {
         // Create mock FleetHostStatus entries (3 hosts)
         let fleet_hosts = vec![
             FleetHostStatus {
-                host_id: Uuid::new_v4(),
                 name: "host1".to_string(),
+                endpoint: "ubuntu@host1:22".to_string(),
+                transport: "ssh".to_string(),
                 reachable: true,
                 crit: 2,
                 warn: 5,
                 info: 10,
                 last_refresh: Some(Instant::now()),
                 error: None,
+                detail: None,
             },
             FleetHostStatus {
-                host_id: Uuid::new_v4(),
                 name: "host2".to_string(),
+                endpoint: "ubuntu@host2:22".to_string(),
+                transport: "agent/systemd-user".to_string(),
                 reachable: true,
                 crit: 0,
                 warn: 1,
                 info: 3,
                 last_refresh: Some(Instant::now()),
                 error: None,
+                detail: None,
             },
             FleetHostStatus {
-                host_id: Uuid::new_v4(),
                 name: "host3".to_string(),
+                endpoint: "ubuntu@host3:22".to_string(),
+                transport: "agent/detached".to_string(),
                 reachable: false,
                 crit: 0,
                 warn: 0,
                 info: 0,
                 last_refresh: None,
                 error: Some("timeout".to_string()),
+                detail: None,
             },
         ];
 
@@ -12039,62 +13104,53 @@ mod tests {
 
     #[test]
     fn test_fleet_hosts_aggregation_from_results() {
-        use uuid::Uuid;
         use std::time::Instant;
 
-        // Simulate three hosts with different findings
-        let uuid1 = Uuid::new_v4();
-        let uuid2 = Uuid::new_v4();
-        let uuid3 = Uuid::new_v4();
-
         // Mock successful results with different severities
-        let fleet_hosts = vec![
+        let fleet_hosts = [
             FleetHostStatus {
-                host_id: uuid1,
                 name: "host1".to_string(),
+                endpoint: "ubuntu@host1:22".to_string(),
+                transport: "ssh".to_string(),
                 reachable: true,
                 crit: 1,
                 warn: 0,
                 info: 0,
                 last_refresh: Some(Instant::now()),
                 error: None,
+                detail: None,
             },
             FleetHostStatus {
-                host_id: uuid2,
                 name: "host2".to_string(),
+                endpoint: "ubuntu@host2:22".to_string(),
+                transport: "agent/systemd-user".to_string(),
                 reachable: true,
                 crit: 0,
                 warn: 1,
                 info: 0,
                 last_refresh: Some(Instant::now()),
                 error: None,
+                detail: None,
             },
             FleetHostStatus {
-                host_id: uuid3,
                 name: "host3".to_string(),
+                endpoint: "ubuntu@host3:22".to_string(),
+                transport: "agent/detached".to_string(),
                 reachable: false,
                 crit: 0,
                 warn: 0,
                 info: 0,
                 last_refresh: Some(Instant::now()),
                 error: Some("connection timeout".to_string()),
+                detail: None,
             },
         ];
 
         // Verify aggregation logic
         assert_eq!(fleet_hosts.len(), 3, "Should have 3 hosts");
-        assert_eq!(
-            fleet_hosts[0].crit, 1,
-            "Host 1 should have 1 CRIT finding"
-        );
-        assert_eq!(
-            fleet_hosts[1].warn, 1,
-            "Host 2 should have 1 WARN finding"
-        );
-        assert_eq!(
-            fleet_hosts[2].reachable, false,
-            "Host 3 should be unreachable"
-        );
+        assert_eq!(fleet_hosts[0].crit, 1, "Host 1 should have 1 CRIT finding");
+        assert_eq!(fleet_hosts[1].warn, 1, "Host 2 should have 1 WARN finding");
+        assert!(!fleet_hosts[2].reachable, "Host 3 should be unreachable");
         assert!(
             fleet_hosts[2].error.is_some(),
             "Host 3 should have error message"
@@ -12102,14 +13158,11 @@ mod tests {
 
         // Verify counting logic
         let reachable_count = fleet_hosts.iter().filter(|h| h.reachable).count();
-        assert_eq!(
-            reachable_count, 2,
-            "Should count 2 reachable hosts"
-        );
+        assert_eq!(reachable_count, 2, "Should count 2 reachable hosts");
     }
 
-    #[tokio::test]
-    async fn test_background_tick_spawn_flag() {
+    #[test]
+    fn test_background_tick_spawn_flag() {
         let tempdir = tempfile::TempDir::new().unwrap();
         let mut app = app_in_dir(&tempdir, crate::ProviderChoice::Ollama);
 
@@ -12117,8 +13170,8 @@ mod tests {
         app.mode = AgentMode::Dashboard;
 
         // Initially, fleet_collection_in_flight should be false
-        assert_eq!(
-            app.dashboard.fleet_collection_in_flight, false,
+        assert!(
+            !app.dashboard.fleet_collection_in_flight,
             "Fleet collection should not be in flight initially"
         );
 
@@ -12128,8 +13181,8 @@ mod tests {
         }
 
         // After "spawning" the collection, the flag should be true
-        assert_eq!(
-            app.dashboard.fleet_collection_in_flight, true,
+        assert!(
+            app.dashboard.fleet_collection_in_flight,
             "Fleet collection flag should be set to prevent double-spawn"
         );
 
@@ -12142,29 +13195,30 @@ mod tests {
 
     #[test]
     fn test_fleet_status_render_display() {
-        let uuid1 = Uuid::new_v4();
-        let uuid2 = Uuid::new_v4();
-
-        let fleet_hosts = vec![
+        let fleet_hosts = [
             FleetHostStatus {
-                host_id: uuid1,
                 name: "web1".to_string(),
+                endpoint: "ubuntu@web1:22".to_string(),
+                transport: "ssh".to_string(),
                 reachable: true,
                 crit: 0,
                 warn: 0,
                 info: 0,
                 last_refresh: Some(Instant::now()),
                 error: None,
+                detail: None,
             },
             FleetHostStatus {
-                host_id: uuid2,
                 name: "db1".to_string(),
+                endpoint: "ubuntu@db1:22".to_string(),
+                transport: "agent/systemd-user".to_string(),
                 reachable: true,
                 crit: 0,
                 warn: 0,
                 info: 0,
                 last_refresh: Some(Instant::now()),
                 error: None,
+                detail: None,
             },
         ];
 
@@ -12173,6 +13227,9 @@ mod tests {
         let total_count = fleet_hosts.len();
         let status_str = format!("fleet: {}/{} up", reachable_count, total_count);
 
-        assert_eq!(status_str, "fleet: 2/2 up", "Status format should match expected");
+        assert_eq!(
+            status_str, "fleet: 2/2 up",
+            "Status format should match expected"
+        );
     }
 }

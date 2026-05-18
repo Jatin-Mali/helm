@@ -66,6 +66,22 @@ pub fn default_log_path() -> PathBuf {
     data_dir().join("logs").join("helm.log")
 }
 
+pub fn default_daemon_log_path() -> PathBuf {
+    data_dir().join("logs").join("helmopsd.log")
+}
+
+pub fn default_daemon_state_path() -> PathBuf {
+    data_file("daemon-state.json")
+}
+
+pub fn default_daemon_pid_path() -> PathBuf {
+    data_file("daemon.pid")
+}
+
+pub fn default_daemon_refresh_request_path() -> PathBuf {
+    data_file("daemon-refresh.request")
+}
+
 #[allow(dead_code)]
 pub fn default_secrets_path() -> PathBuf {
     config_file("secrets.toml")

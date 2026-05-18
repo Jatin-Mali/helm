@@ -7,6 +7,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use chrono::Utc;
+use helm_monitor::{Finding, SystemSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -24,6 +26,59 @@ pub enum Credential {
     KeyFile(PathBuf),
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteTransport {
+    #[default]
+    Ssh,
+    InstalledAgent,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentTrustMode {
+    #[default]
+    ManualRegistration,
+    SshBootstrap,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentSupervisor {
+    #[default]
+    DetachedProcess,
+    SystemdUser,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMetadata {
+    #[serde(default = "default_agent_service_name")]
+    pub service_name: String,
+    #[serde(default = "default_agent_install_path")]
+    pub install_path: String,
+    #[serde(default = "default_agent_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default)]
+    pub supervisor: AgentSupervisor,
+    #[serde(default)]
+    pub trust: AgentTrustMode,
+    #[serde(default = "now_rfc3339")]
+    pub registered_at: String,
+}
+
+impl Default for AgentMetadata {
+    fn default() -> Self {
+        Self {
+            service_name: default_agent_service_name(),
+            install_path: default_agent_install_path(),
+            interval_secs: default_agent_interval_secs(),
+            supervisor: AgentSupervisor::DetachedProcess,
+            trust: AgentTrustMode::ManualRegistration,
+            registered_at: now_rfc3339(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteEntry {
     #[serde(default = "Uuid::new_v4")]
@@ -38,6 +93,10 @@ pub struct RemoteEntry {
     pub ssh_opts: Option<String>,
     #[serde(default)]
     pub credential: Credential,
+    #[serde(default)]
+    pub transport: RemoteTransport,
+    #[serde(default)]
+    pub agent: Option<AgentMetadata>,
 }
 
 /// Finding from a remote host, tagged with host_id for aggregation.
@@ -52,8 +111,32 @@ pub struct FleetFinding {
     pub last_seen: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetHostReport {
+    pub host_id: Uuid,
+    pub host_name: String,
+    pub findings: Vec<Finding>,
+    pub snapshot: Option<SystemSnapshot>,
+}
+
 fn default_port() -> u16 {
     22
+}
+
+fn default_agent_service_name() -> String {
+    "helmopsd.service".to_owned()
+}
+
+fn default_agent_install_path() -> String {
+    "$HOME/.helm/bin/helm".to_owned()
+}
+
+fn default_agent_interval_secs() -> u64 {
+    60
+}
+
+fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339()
 }
 
 fn xdg_config_dir() -> std::path::PathBuf {
@@ -152,9 +235,67 @@ impl RemoteRegistry {
 
         results
     }
+
+    /// Collect a richer remote report from all remotes in parallel, bounded to 20 tasks.
+    #[allow(dead_code)]
+    pub async fn parallel_collect_reports(&self) -> Vec<(Uuid, Result<FleetHostReport>)> {
+        use tokio::task::JoinSet;
+
+        let mut joinset = JoinSet::new();
+        let mut results = Vec::new();
+        let mut task_iter = self.remotes.iter().peekable();
+        const MAX_CONCURRENT: usize = 20;
+
+        while joinset.len() < MAX_CONCURRENT && task_iter.peek().is_some() {
+            if let Some(remote) = task_iter.next() {
+                let remote_clone = remote.clone();
+                joinset.spawn(async move {
+                    (remote_clone.host_id, remote_clone.collect_report().await)
+                });
+            }
+        }
+
+        while !joinset.is_empty() {
+            if let Ok((host_id, report_result)) = joinset.join_next().await.unwrap() {
+                results.push((host_id, report_result));
+            }
+
+            if joinset.len() < MAX_CONCURRENT
+                && let Some(remote) = task_iter.next()
+            {
+                let remote_clone = remote.clone();
+                joinset.spawn(async move {
+                    (remote_clone.host_id, remote_clone.collect_report().await)
+                });
+            }
+        }
+
+        results
+    }
 }
 
 impl RemoteEntry {
+    fn remote_helm_command(&self) -> String {
+        self.agent
+            .as_ref()
+            .map(|agent| agent.install_path.clone())
+            .unwrap_or_else(|| "helm".to_owned())
+    }
+
+    pub fn summary_label(&self) -> String {
+        match (&self.transport, &self.agent) {
+            (RemoteTransport::InstalledAgent, Some(agent)) => {
+                let supervisor = match agent.supervisor {
+                    AgentSupervisor::SystemdUser => "systemd-user",
+                    AgentSupervisor::DetachedProcess => "detached",
+                };
+                format!("agent/{supervisor}")
+            }
+            (RemoteTransport::InstalledAgent, None) => "agent".to_owned(),
+            (RemoteTransport::Ssh, _) => "ssh".to_owned(),
+        }
+    }
+
     /// Build the `ssh user@host -p port [opts]` command prefix as a vector of args.
     pub fn ssh_argv(&self) -> Vec<String> {
         let mut argv = vec!["ssh".to_owned()];
@@ -182,6 +323,29 @@ impl RemoteEntry {
         argv
     }
 
+    pub async fn run_shell(&self, script: &str) -> Result<String> {
+        let mut argv = self.ssh_argv();
+        argv.push("sh".to_owned());
+        argv.push("-lc".to_owned());
+        argv.push(script.to_owned());
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = cmd.output().await.context("spawning ssh shell")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "remote shell failed on {} ({}): {}",
+                self.name,
+                output.status,
+                stderr.trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     /// Run `ssh remote true` and return whether the connection succeeded.
     pub async fn ping(&self) -> Result<bool> {
         let mut argv = self.ssh_argv();
@@ -200,13 +364,55 @@ impl RemoteEntry {
     /// Timeout: 30s per host.
     #[allow(dead_code)]
     pub async fn collect_findings(&self) -> Result<Vec<FleetFinding>> {
+        let raw_findings = self.collect_raw_findings().await?;
+
+        // Map to FleetFinding, tagging with host_id
+        let mut findings = Vec::new();
+        for finding in raw_findings {
+            findings.push(FleetFinding {
+                host_id: self.host_id,
+                host_name: self.name.clone(),
+                severity: finding.severity.as_str().to_owned(),
+                title: finding.title.clone(),
+                description: (!finding.impact.trim().is_empty()).then(|| finding.impact.clone()),
+                last_seen: None,
+            });
+        }
+
+        Ok(findings)
+    }
+
+    pub async fn collect_report(&self) -> Result<FleetHostReport> {
+        let findings = self.collect_raw_findings().await?;
+        let snapshot = self.collect_snapshot().await.ok();
+        Ok(FleetHostReport {
+            host_id: self.host_id,
+            host_name: self.name.clone(),
+            findings,
+            snapshot,
+        })
+    }
+
+    async fn collect_raw_findings(&self) -> Result<Vec<Finding>> {
+        let stdout = self
+            .run_helm_json(&["monitor", "--format", "json"], "findings collection")
+            .await?;
+        serde_json::from_str::<Vec<Finding>>(&stdout)
+            .with_context(|| format!("parsing findings JSON from {}", self.name))
+    }
+
+    async fn collect_snapshot(&self) -> Result<SystemSnapshot> {
+        let stdout = self
+            .run_helm_json(&["snapshot", "--json"], "snapshot collection")
+            .await?;
+        serde_json::from_str::<SystemSnapshot>(&stdout)
+            .with_context(|| format!("parsing snapshot JSON from {}", self.name))
+    }
+
+    async fn run_helm_json(&self, remote_argv: &[&str], action: &str) -> Result<String> {
         let mut argv = self.ssh_argv();
-        argv.extend_from_slice(&[
-            "helm".to_owned(),
-            "monitor".to_owned(),
-            "--format".to_owned(),
-            "json".to_owned(),
-        ]);
+        argv.push(self.remote_helm_command());
+        argv.extend(remote_argv.iter().map(|arg| (*arg).to_owned()));
 
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..])
@@ -217,54 +423,20 @@ impl RemoteEntry {
         let output_future = cmd.output();
         let output = tokio::time::timeout(std::time::Duration::from_secs(30), output_future)
             .await
-            .context("timeout collecting findings from remote host")?
-            .context("spawning ssh for findings collection")?;
+            .with_context(|| format!("timeout during {action} from remote host"))?
+            .with_context(|| format!("spawning ssh for {action}"))?;
 
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!(
-                "helm monitor on {} returned non-zero status",
-                self.name
-            ))
-            .with_context(|| format!("collecting findings from {}", self.name));
+                "{} on {} returned non-zero status: {}",
+                action,
+                self.name,
+                stderr.trim()
+            ));
         }
 
-        // Parse stdout as JSON array
-        let json_text = String::from_utf8_lossy(&output.stdout);
-        let values: Vec<serde_json::Value> = serde_json::from_str(&json_text)
-            .with_context(|| format!("parsing JSON from {}", self.name))?;
-
-        // Map to FleetFinding, tagging with host_id
-        let mut findings = Vec::new();
-        for val in values {
-            if let Ok(obj) = val.as_object().ok_or_else(|| anyhow!("expected object")) {
-                let severity = obj
-                    .get("severity")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_owned();
-                let title = obj
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_owned();
-                let description = obj
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_owned());
-                let last_seen = obj.get("last_seen").and_then(|v| v.as_i64());
-
-                findings.push(FleetFinding {
-                    host_id: self.host_id,
-                    host_name: self.name.clone(),
-                    severity,
-                    title,
-                    description,
-                    last_seen,
-                });
-            }
-        }
-
-        Ok(findings)
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 }
 
@@ -293,6 +465,8 @@ mod tests {
             user: Some("root".to_owned()),
             ssh_opts: None,
             credential: Credential::SshAgent,
+            transport: RemoteTransport::Ssh,
+            agent: None,
         });
         registry.upsert(RemoteEntry {
             host_id: Uuid::new_v4(),
@@ -302,6 +476,8 @@ mod tests {
             user: Some("ubuntu".to_owned()),
             ssh_opts: Some("-i ~/.ssh/prod".to_owned()),
             credential: Credential::SshAgent,
+            transport: RemoteTransport::Ssh,
+            agent: None,
         });
 
         assert_eq!(registry.remotes.len(), 1);
@@ -319,6 +495,8 @@ mod tests {
             user: Some("ubuntu".to_owned()),
             ssh_opts: Some("-i ~/.ssh/prod -o StrictHostKeyChecking=no".to_owned()),
             credential: Credential::SshAgent,
+            transport: RemoteTransport::Ssh,
+            agent: None,
         };
 
         assert_eq!(
@@ -350,6 +528,8 @@ mod tests {
             user: Some("ubuntu".to_owned()),
             ssh_opts: None,
             credential: Credential::KeyFile(PathBuf::from("/home/user/.ssh/id_rsa")),
+            transport: RemoteTransport::Ssh,
+            agent: None,
         };
 
         let argv = entry.ssh_argv();
@@ -377,6 +557,27 @@ mod tests {
     }
 
     #[test]
+    fn test_installed_agent_summary_label() {
+        let entry = RemoteEntry {
+            host_id: Uuid::new_v4(),
+            name: "prod".to_owned(),
+            host: "prod.example.com".to_owned(),
+            port: 22,
+            user: Some("ubuntu".to_owned()),
+            ssh_opts: None,
+            credential: Credential::SshAgent,
+            transport: RemoteTransport::InstalledAgent,
+            agent: Some(AgentMetadata {
+                supervisor: AgentSupervisor::SystemdUser,
+                ..AgentMetadata::default()
+            }),
+        };
+
+        assert_eq!(entry.summary_label(), "agent/systemd-user");
+        assert_eq!(entry.remote_helm_command(), "$HOME/.helm/bin/helm");
+    }
+
+    #[test]
     fn test_credential_serialization_roundtrip() {
         let entry = RemoteEntry {
             host_id: Uuid::new_v4(),
@@ -386,6 +587,8 @@ mod tests {
             user: Some("ubuntu".to_owned()),
             ssh_opts: None,
             credential: Credential::KeyFile(PathBuf::from("/home/user/.ssh/id_rsa")),
+            transport: RemoteTransport::Ssh,
+            agent: None,
         };
 
         // Serialize to TOML and back
@@ -414,6 +617,8 @@ mod tests {
             user: None,
             ssh_opts: None,
             credential: Credential::SshAgent,
+            transport: RemoteTransport::Ssh,
+            agent: None,
         };
         let entry2 = RemoteEntry {
             host_id: Uuid::new_v4(),
@@ -423,6 +628,8 @@ mod tests {
             user: None,
             ssh_opts: None,
             credential: Credential::SshAgent,
+            transport: RemoteTransport::Ssh,
+            agent: None,
         };
         assert_ne!(entry1.host_id, entry2.host_id, "UUIDs should be unique");
 
@@ -445,6 +652,8 @@ mod tests {
             user: Some("ubuntu".to_owned()),
             ssh_opts: None,
             credential: Credential::SshAgent,
+            transport: RemoteTransport::Ssh,
+            agent: None,
         };
         let original_host_id = entry_with_uuid.host_id;
         registry.upsert(entry_with_uuid.clone());
@@ -497,6 +706,8 @@ port = 22
                 user: Some("ubuntu".to_owned()),
                 ssh_opts: None,
                 credential: Credential::SshAgent,
+                transport: RemoteTransport::Ssh,
+                agent: None,
             });
         }
 
