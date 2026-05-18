@@ -1,5 +1,6 @@
 //! Monitoring engine for HELM — typed system snapshots, collectors, and detectors.
 
+pub mod alerting;
 pub mod collectors;
 pub mod detectors;
 pub mod engine;
@@ -14,7 +15,9 @@ pub use execute::{
     ChangeSet, ChangeSetStatus, ChangeSetStep, ExecutionEngine, PreChangeBackup, StepOutcome,
     StepStatus, format_change_set,
 };
-pub use findings::{Confidence, EvidenceRef, Finding, FindingId, MonitorDomain, PlanId, Severity};
+pub use findings::{
+    Confidence, EvidenceRef, Finding, FindingId, FindingLifecycle, MonitorDomain, PlanId, Severity,
+};
 pub use reporter::{MonitorReport, MonitorReporter};
 pub use snapshot::{
     BackupSnapshot, BackupTool, BlockDevice, CollectorError, ContainerInfo, ContainerRuntime,

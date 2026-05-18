@@ -116,6 +116,24 @@ impl MonitorDomain {
     }
 }
 
+// ── FindingLifecycle ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingLifecycle {
+    #[default]
+    Open,
+    Resolved,
+    SelfResolved,
+    Suppressed,
+}
+
+impl FindingLifecycle {
+    pub fn is_resolved(self) -> bool {
+        matches!(self, Self::Resolved | Self::SelfResolved)
+    }
+}
+
 // ── Finding ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,6 +155,8 @@ pub struct Finding {
     pub impact: String,
     pub read_only_checks: Vec<String>,
     pub fix_plan: Option<String>,
+    #[serde(default)]
+    pub lifecycle: FindingLifecycle,
 }
 
 /// Concrete reference to a snapshot field or measurement.
@@ -184,6 +204,7 @@ impl Finding {
             impact: String::new(),
             read_only_checks: Vec::new(),
             fix_plan: None,
+            lifecycle: FindingLifecycle::Open,
         }
     }
 
