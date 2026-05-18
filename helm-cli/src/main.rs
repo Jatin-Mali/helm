@@ -147,6 +147,7 @@ enum Command {
     ApplyPlan(ApplyPlanArgs),
     ChangeSet(ChangeSetArgs),
     Backup(BackupArgs),
+    Runbook(RunbookArgs),
 }
 
 #[derive(Debug, Args)]
@@ -882,6 +883,16 @@ enum BackupCommand {
     },
 }
 
+#[derive(Debug, Args)]
+struct RunbookArgs {
+    /// Output file path (default: helm-runbook.md in cwd)
+    #[arg(long, default_value = "helm-runbook.md")]
+    output: PathBuf,
+    /// Profile depth
+    #[arg(long, default_value = "standard")]
+    profile: String,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum ProviderChoice {
@@ -1259,6 +1270,9 @@ async fn run() -> Result<()> {
         }
         Command::Backup(args) => {
             run_backup_command(args).await?;
+        }
+        Command::Runbook(args) => {
+            run_runbook_command(args).await?;
         }
     }
     Ok(())
@@ -1751,6 +1765,7 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "apply-plan"
                 | "change-set"
                 | "backup"
+                | "runbook"
         )
     )
 }
@@ -5048,6 +5063,178 @@ async fn run_explain_command(args: ExplainArgs) -> Result<()> {
         let redacted = helm_core::redact_secrets(&output);
         print!("{redacted}");
     }
+    Ok(())
+}
+
+async fn run_runbook_command(args: RunbookArgs) -> Result<()> {
+    let profile: helm_monitor::MonitorProfile = args.profile.parse().unwrap_or(helm_monitor::MonitorProfile::Standard);
+    let snapshot = helm_monitor::engine::collect_snapshot(profile).await;
+    let detectors = helm_monitor::detectors::DetectorRegistry::default_registry();
+    let all_findings = detectors.detect(&snapshot, None, None);
+
+    let mut lines = Vec::new();
+
+    // Title
+    lines.push(format!("# HELM Runbook — {}", snapshot.host.hostname));
+    lines.push(String::new());
+    lines.push(format!("- **Generated:** {}", snapshot.collected_at.format("%Y-%m-%d %H:%M:%S UTC")));
+    lines.push(format!("- **Profile:** {:?}", snapshot.profile));
+    lines.push(format!("- **OS:** {}", snapshot.host.os_pretty_name.as_deref().unwrap_or("unknown")));
+    lines.push(format!("- **Kernel:** {} {}", snapshot.host.kernel_name, snapshot.host.kernel_release));
+    lines.push(format!("- **Arch:** {}", snapshot.host.machine));
+    lines.push(format!("- **Uptime:** {:.1}h", snapshot.host.uptime_seconds as f64 / 3600.0));
+    lines.push(String::new());
+
+    // System Status
+    lines.push("## System Status".to_string());
+    lines.push(String::new());
+    lines.push(format!("- **CPU cores:** {} logical", snapshot.domains.load.cpu_logical_count));
+    lines.push(format!("- **Load:** {:.2} / {:.2} / {:.2}", 
+        snapshot.domains.load.load_average.one,
+        snapshot.domains.load.load_average.five,
+        snapshot.domains.load.load_average.fifteen));
+    lines.push(format!("- **Memory:** {} / {} ({:.1}%)",
+        human_bytes(snapshot.domains.load.memory.used),
+        human_bytes(snapshot.domains.load.memory.total),
+        (snapshot.domains.load.memory.used as f64 / snapshot.domains.load.memory.total.max(1) as f64) * 100.0));
+    lines.push(format!("- **Swap:** used {} / total {}",
+        human_bytes(snapshot.domains.load.swap_used),
+        human_bytes(snapshot.domains.load.swap_total)));
+    lines.push(String::new());
+
+    // Disks
+    lines.push("## Disks".to_string());
+    lines.push(String::new());
+    for fs in &snapshot.domains.disks.filesystems {
+        let pct = if fs.total_bytes > 0 { 
+            (fs.used_bytes as f64 / fs.total_bytes as f64) * 100.0 
+        } else { 0.0 };
+        lines.push(format!("- **{}** ({}) — {} / {} ({:.0}%)",
+            fs.mount_point, fs.device,
+            human_bytes(fs.used_bytes), human_bytes(fs.total_bytes), pct));
+    }
+    lines.push(String::new());
+
+    // Services
+    lines.push("## Services".to_string());
+    lines.push(String::new());
+    if !snapshot.domains.services.failed_units.is_empty() {
+        lines.push("### Failed Units".to_string());
+        for u in &snapshot.domains.services.failed_units {
+            lines.push(format!("- **{}** — {}", u.name, u.description));
+        }
+        lines.push(String::new());
+    }
+    let running: Vec<_> = snapshot.domains.services.units.iter()
+        .filter(|u| u.active == "active")
+        .collect();
+    lines.push(format!("**{} active services**", running.len()));
+    lines.push(String::new());
+
+    // Containers
+    if let Some(ref rt) = snapshot.domains.containers.runtime {
+        lines.push("## Containers".to_string());
+        lines.push(String::new());
+        lines.push(format!("- **Runtime:** {:?}", rt));
+        lines.push(format!("- **Count:** {}", snapshot.domains.containers.containers.len()));
+        lines.push(String::new());
+    }
+
+    // Network
+    lines.push("## Network".to_string());
+    lines.push(String::new());
+    lines.push(format!("- **Listening ports:** {}", snapshot.domains.ports.listeners.len()));
+    for l in &snapshot.domains.ports.listeners {
+        if let Some(ref proc) = l.process_name {
+            lines.push(format!("  - {}:{} ({})", l.local_address, l.local_port, proc));
+        }
+    }
+    lines.push(String::new());
+
+    // Certs
+    if !snapshot.domains.certs.certificates.is_empty() {
+        lines.push("## Certificates".to_string());
+        lines.push(String::new());
+        for c in &snapshot.domains.certs.certificates {
+            if c.error.is_empty() {
+                lines.push(format!("- **{}** — {} ({}) expires in {} days",
+                    c.address, c.subject_cn, c.issuer_cn, c.days_remaining));
+                if c.self_signed {
+                    lines.push("  - ⚠ Self-signed".to_string());
+                }
+            }
+        }
+        lines.push(String::new());
+    }
+
+    // Backups
+    lines.push("## Backups".to_string());
+    lines.push(String::new());
+    let tool_names: Vec<&str> = snapshot.domains.backups.tools_detected.iter().map(|t| t.name.as_str()).collect();
+    if tool_names.is_empty() {
+        lines.push("- ⚠ No backup tools detected".to_string());
+    } else {
+        lines.push(format!("- **Tools:** {}", tool_names.join(", ")));
+    }
+    lines.push(String::new());
+
+    // Findings
+    lines.push("## Findings".to_string());
+    lines.push(String::new());
+
+    let critical: Vec<_> = all_findings.iter().filter(|f| f.severity == helm_monitor::Severity::Critical).collect();
+    let warnings: Vec<_> = all_findings.iter().filter(|f| f.severity == helm_monitor::Severity::Warning).collect();
+    let infos: Vec<_> = all_findings.iter().filter(|f| f.severity == helm_monitor::Severity::Info).collect();
+
+    lines.push(format!("- **{} critical**, **{} warnings**, **{} info**", 
+        critical.len(), warnings.len(), infos.len()));
+    lines.push(String::new());
+
+    for f in &critical {
+        lines.push(format!("### 🔴 {}", f.title));
+        lines.push(format!("- **Resource:** {}", f.affected_resource));
+        lines.push(format!("- **Domain:** {}", f.category.as_str()));
+        if !f.impact.is_empty() { lines.push(format!("- **Impact:** {}", f.impact)); }
+        lines.push(String::new());
+    }
+    for f in &warnings {
+        lines.push(format!("### 🟡 {}", f.title));
+        lines.push(format!("- **Resource:** {}", f.affected_resource));
+        if !f.impact.is_empty() { lines.push(format!("- **Impact:** {}", f.impact)); }
+        lines.push(String::new());
+    }
+    for f in &infos {
+        lines.push(format!("### 🔵 {}", f.title));
+        if !f.impact.is_empty() { lines.push(format!("- **Impact:** {}", f.impact)); }
+        lines.push(String::new());
+    }
+
+    // Action items
+    lines.push("## Recommended Actions".to_string());
+    lines.push(String::new());
+    let mut n = 1;
+    for f in critical.iter().chain(warnings.iter()).take(10) {
+        lines.push(format!("{}. Investigate: {}", n, f.title));
+        n += 1;
+    }
+    if n == 1 {
+        lines.push("✅ No critical actions required.".to_string());
+    }
+    lines.push(String::new());
+
+    // Footer
+    lines.push("---".to_string());
+    lines.push(format!("*Runbook generated by HELM {}", env!("CARGO_PKG_VERSION")));
+    lines.push(format!("*Next step: run `helm troubleshoot \"<problem>\"` for guided investigation"));
+
+    let content = lines.join("\n");
+    std::fs::write(&args.output, &content)
+        .with_context(|| format!("failed to write runbook to {}", args.output.display()))?;
+
+    println!("Runbook written to {}", args.output.display());
+    println!("  {} critical, {} warnings, {} info findings",
+        critical.len(), warnings.len(), infos.len());
+
     Ok(())
 }
 
