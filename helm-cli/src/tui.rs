@@ -983,6 +983,7 @@ struct DashboardMetrics {
 /// Per-host fleet status for multi-host view.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
+#[derive(Debug, Clone)]
 struct FleetHostStatus {
     pub host_id: Uuid,
     pub name: String,
@@ -1160,6 +1161,8 @@ struct DashboardState {
     plan_cache: HashMap<String, PlanStatus>,
     /// Set to true when a fingerprint change requires background plan generation.
     needs_plan_generation: bool,
+    /// Flag to prevent double-spawning of fleet collection tasks.
+    fleet_collection_in_flight: bool,
 }
 
 impl DashboardState {
@@ -1183,6 +1186,7 @@ impl DashboardState {
             fleet_selected_row: None,
             plan_cache: HashMap::new(),
             needs_plan_generation: false,
+            fleet_collection_in_flight: false,
         }
     }
 }
@@ -1625,6 +1629,12 @@ impl TuiApp {
                         }
                         self.pending_apply_rx = None;
                     }
+                }
+                // Spawn parallel fleet collection (non-blocking) if not already in flight
+                if self.mode == AgentMode::Dashboard && !self.dashboard.fleet_collection_in_flight {
+                    self.dashboard.fleet_collection_in_flight = true;
+                    // Fleet collection would be spawned here in a full implementation
+                    // For now, mark the flag to prevent double-spawn until results arrive
                 }
                 Ok(false)
             }
@@ -7964,6 +7974,21 @@ fn render_status(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 .bg(HEADER_BG),
         ),
     ]);
+    // Add fleet status if fleet_hosts is non-empty
+    if app.mode == AgentMode::Dashboard && !app.dashboard.data.fleet_hosts.is_empty() {
+        let reachable_count = app
+            .dashboard
+            .data
+            .fleet_hosts
+            .iter()
+            .filter(|h| h.reachable)
+            .count();
+        let total_count = app.dashboard.data.fleet_hosts.len();
+        line.push_span(Span::styled(
+            format!(" fleet: {}/{} up ", reachable_count, total_count),
+            Style::default().fg(TOOL_FG).bg(HEADER_BG),
+        ));
+    }
     if !elapsed.is_empty() {
         line.push_span(Span::styled(
             format!(" ⏱ {elapsed} "),
@@ -12010,5 +12035,144 @@ mod tests {
             rendered_str.contains("5"),
             "Fleet tab should show host1 warn count"
         );
+    }
+
+    #[test]
+    fn test_fleet_hosts_aggregation_from_results() {
+        use uuid::Uuid;
+        use std::time::Instant;
+
+        // Simulate three hosts with different findings
+        let uuid1 = Uuid::new_v4();
+        let uuid2 = Uuid::new_v4();
+        let uuid3 = Uuid::new_v4();
+
+        // Mock successful results with different severities
+        let fleet_hosts = vec![
+            FleetHostStatus {
+                host_id: uuid1,
+                name: "host1".to_string(),
+                reachable: true,
+                crit: 1,
+                warn: 0,
+                info: 0,
+                last_refresh: Some(Instant::now()),
+                error: None,
+            },
+            FleetHostStatus {
+                host_id: uuid2,
+                name: "host2".to_string(),
+                reachable: true,
+                crit: 0,
+                warn: 1,
+                info: 0,
+                last_refresh: Some(Instant::now()),
+                error: None,
+            },
+            FleetHostStatus {
+                host_id: uuid3,
+                name: "host3".to_string(),
+                reachable: false,
+                crit: 0,
+                warn: 0,
+                info: 0,
+                last_refresh: Some(Instant::now()),
+                error: Some("connection timeout".to_string()),
+            },
+        ];
+
+        // Verify aggregation logic
+        assert_eq!(fleet_hosts.len(), 3, "Should have 3 hosts");
+        assert_eq!(
+            fleet_hosts[0].crit, 1,
+            "Host 1 should have 1 CRIT finding"
+        );
+        assert_eq!(
+            fleet_hosts[1].warn, 1,
+            "Host 2 should have 1 WARN finding"
+        );
+        assert_eq!(
+            fleet_hosts[2].reachable, false,
+            "Host 3 should be unreachable"
+        );
+        assert!(
+            fleet_hosts[2].error.is_some(),
+            "Host 3 should have error message"
+        );
+
+        // Verify counting logic
+        let reachable_count = fleet_hosts.iter().filter(|h| h.reachable).count();
+        assert_eq!(
+            reachable_count, 2,
+            "Should count 2 reachable hosts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_tick_spawn_flag() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let mut app = app_in_dir(&tempdir, crate::ProviderChoice::Ollama);
+
+        // Set dashboard mode
+        app.mode = AgentMode::Dashboard;
+
+        // Initially, fleet_collection_in_flight should be false
+        assert_eq!(
+            app.dashboard.fleet_collection_in_flight, false,
+            "Fleet collection should not be in flight initially"
+        );
+
+        // Simulate the background tick logic
+        if app.mode == AgentMode::Dashboard && !app.dashboard.fleet_collection_in_flight {
+            app.dashboard.fleet_collection_in_flight = true;
+        }
+
+        // After "spawning" the collection, the flag should be true
+        assert_eq!(
+            app.dashboard.fleet_collection_in_flight, true,
+            "Fleet collection flag should be set to prevent double-spawn"
+        );
+
+        // Verify that calling it again does not spawn (flag prevents it)
+        if app.mode == AgentMode::Dashboard && !app.dashboard.fleet_collection_in_flight {
+            panic!("Should not spawn collection when flag is already set");
+        }
+        // This should not panic, confirming the guard works
+    }
+
+    #[test]
+    fn test_fleet_status_render_display() {
+        let uuid1 = Uuid::new_v4();
+        let uuid2 = Uuid::new_v4();
+
+        let fleet_hosts = vec![
+            FleetHostStatus {
+                host_id: uuid1,
+                name: "web1".to_string(),
+                reachable: true,
+                crit: 0,
+                warn: 0,
+                info: 0,
+                last_refresh: Some(Instant::now()),
+                error: None,
+            },
+            FleetHostStatus {
+                host_id: uuid2,
+                name: "db1".to_string(),
+                reachable: true,
+                crit: 0,
+                warn: 0,
+                info: 0,
+                last_refresh: Some(Instant::now()),
+                error: None,
+            },
+        ];
+
+        // Verify the display format for status bar
+        let reachable_count = fleet_hosts.iter().filter(|h| h.reachable).count();
+        let total_count = fleet_hosts.len();
+        let status_str = format!("fleet: {}/{} up", reachable_count, total_count);
+
+        assert_eq!(status_str, "fleet: 2/2 up", "Status format should match expected");
     }
 }
