@@ -76,9 +76,18 @@
 4. Credential abstraction implemented (SshAgent, KeyFile, Password); no passwords in registry file
 5. Selection sticky across fleet refresh; HMAC chain verifies across multi-host episode
 
-**Plans:** TBD
+**Plans:** 8 plans in 3 waves
 
-**Status:** Pending
+- [ ] 03-01-PLAN.md — Credential abstraction (SshAgent + KeyFile) in RemoteEntry
+- [ ] 03-02-PLAN.md — Parallel SSH collection via JoinSet + findings aggregation
+- [ ] 03-03-PLAN.md — Fleet integration into DashboardData + background refresh spawning
+- [ ] 03-04-PLAN.md — Fleet tab UI rendering + keyboard navigation
+- [ ] 03-05-PLAN.md — Snapshot store migration: add host_id column
+- [ ] 03-06-PLAN.md — RemoteEntry.host_id field: UUID generation + persistence (Wave 1 prerequisite)
+- [ ] 03-07-PLAN.md — HMAC audit chain for multi-host fleet episodes (Wave 2)
+- [ ] 03-08-PLAN.md — Fleet selection sticky by host_id across refresh (Wave 3)
+
+**Status:** Planning complete — all 8 plans created
 
 ---
 
