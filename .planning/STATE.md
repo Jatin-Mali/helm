@@ -1,3 +1,17 @@
+---
+gsd_state_version: 1.0
+milestone: v1.0
+milestone_name: milestone
+status: unknown
+last_updated: "2026-05-18T06:58:26.407Z"
+progress:
+  total_phases: 6
+  completed_phases: 1
+  total_plans: 18
+  completed_plans: 11
+  percent: 17
+---
+
 # HELMOPS Project State
 
 **Last Updated:** 2026-05-18  
@@ -10,6 +24,7 @@
 **HELMOPS** = TUI-first incident-and-monitoring daily driver for Linux DevOps.
 
 **Primary Operator Flow:**
+
 1. Open dashboard (`helm` or `helm watch`) → sees top problem in ≤5s
 2. Select finding → reads WHY/IMPACT/FIX PLAN
 3. Press `[a]apply` → plan executes, audit log records it
@@ -22,6 +37,7 @@
 **Milestone:** M1–M6 Complete — HELMOPS Rebirth Roadmap Finished
 
 **Completion:**
+
 - M1 (UX Foundation + Agent Strip) ............................ ████████████████████ 100% ✓
 - M2 (Real-Time Trends) ...................................... ████████████████████ 100% ✓
 - M3 (Fleet) ................................................. ████████████████████ 100% ✓
@@ -40,6 +56,7 @@
 **Core Achievement:** HELMOPS reborn from monolithic HELM chat agent to focused TUI-first monitoring platform.
 
 **Shipped:**
+
 1. ✓ Selection pinning via fingerprint (no more jump on refresh)
 2. ✓ WHY-pane deduplication (collapsed correlations, e.g., "×17" vs 17 lines)
 3. ✓ Tab collapse: 10 → 5 (Alerts, Services, Resources, Logs, Changes)
@@ -50,6 +67,7 @@
 8. ✓ Security spine intact: HMAC audit, capability gate, taint propagation
 
 **Gates Passed:**
+
 - Workspace clean builds
 - Clippy + fmt verified
 - Full test suite green
@@ -61,6 +79,7 @@
 **Core Achievement:** Operator sees metric trends, not just snapshot values.
 
 **Shipped:**
+
 1. ✓ Ring-buffer history: VecDeque<f64> per metric (cpu/mem/disk/net/loadavg), 60-point cap
 2. ✓ Sparklines in left pane beneath severity blocks
 3. ✓ Per-tab sparklines in Resources tab (processes, disks, interfaces)
@@ -68,6 +87,7 @@
 5. ✓ Performance: sparkline render ≤4ms, full refresh ≤16ms
 
 **Gates Passed:**
+
 - Performance benchmarks (cargo bench)
 - deterministic_100_run passes
 - HMAC chain verifies across M2 episodes
@@ -80,6 +100,7 @@
 **Goal:** One dashboard sees N hosts, refreshes in parallel.
 
 **Slices:**
+
 - **3.1:** Extend RemoteEntry with host_id: Uuid
 - **3.2:** Parallel SSH JoinSet in RemoteRegistry
 - **3.3:** Credential abstraction (SshAgent, KeyFile, Password)
@@ -118,6 +139,7 @@
 **Locked (SPEC P0, D1–D11):** All rebirth decisions finalized in linked-purring-hearth.md.
 
 **Key Locked Decisions:**
+
 - D1: Rebirth as TUI-first incident-and-monitoring platform
 - D2: Fingerprint-based selection pinning
 - D3: Severity-grouped left pane + collapsed correlations
@@ -157,6 +179,7 @@
 ### Constraints Inventory
 
 **Performance (Non-Negotiable):**
+
 - Dashboard refresh: ≤16ms at 60 findings + 5 sparklines
 - Fleet parallel: 20-host refresh ≤2s
 - Sparkline render: ≤4ms
@@ -164,6 +187,7 @@
 - Finding visibility: <5s
 
 **Security (Cross-Cutting Invariants):**
+
 - HMAC audit chain verifies after every episode
 - Capability gate blocks `*.write` on external-tainted
 - Secrets file 0600 (user only), parent 0700
@@ -171,6 +195,7 @@
 - Tool JSON schema validation before dispatch
 
 **Process:**
+
 - Every task: fmt + clippy + test
 - Every milestone: deterministic_100_run
 - Every milestone: security invariant verification
@@ -194,6 +219,7 @@
 ## Session Continuity
 
 **For next session:**
+
 1. Run `gsd-sdk query roadmap.analyze` to view full M3 slice/task breakdown
 2. Start with slice 3.1 (RemoteEntry UUID extension)
 3. Reference linked-purring-hearth.md for exact line numbers and code paths
@@ -201,6 +227,7 @@
 5. Gates: fmt + clippy + test every task; deterministic_100_run every milestone
 
 **Resources:**
+
 - PROJECT.md — locked decisions (D1–D11)
 - REQUIREMENTS.md — full M1–M6 scope with acceptance criteria
 - ROADMAP.md — slice-by-slice breakdown + success criteria
