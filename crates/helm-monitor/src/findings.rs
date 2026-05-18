@@ -68,6 +68,9 @@ pub enum MonitorDomain {
     Timers,
     Processes,
     Firewall,
+    Kubernetes,
+    Libvirt,
+    Compose,
 }
 
 impl MonitorDomain {
@@ -85,6 +88,9 @@ impl MonitorDomain {
             Self::Timers => "timers",
             Self::Processes => "processes",
             Self::Firewall => "firewall",
+            Self::Kubernetes => "kubernetes",
+            Self::Libvirt => "libvirt",
+            Self::Compose => "compose",
         }
     }
 
@@ -102,6 +108,9 @@ impl MonitorDomain {
             "timers" => Some(Self::Timers),
             "processes" => Some(Self::Processes),
             "firewall" => Some(Self::Firewall),
+            "kubernetes" => Some(Self::Kubernetes),
+            "libvirt" => Some(Self::Libvirt),
+            "compose" => Some(Self::Compose),
             _ => None,
         }
     }

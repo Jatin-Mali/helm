@@ -2,8 +2,10 @@
 
 pub mod backup_schedule;
 pub mod backup_stale;
+pub mod compose_health;
 pub mod container_restart;
 pub mod disk_usage;
+pub mod domain_state;
 pub mod exposed_port;
 pub mod failed_services;
 pub mod fs_readonly;
@@ -13,10 +15,14 @@ pub mod inode_usage;
 pub mod journal_errors;
 pub mod memory_pressure;
 pub mod oom_event;
+pub mod oom_kill;
 pub mod package_updates;
+pub mod pod_restart;
+pub mod pvc_pressure;
 pub mod restart_loop;
 pub mod restore_test;
 pub mod smart;
+pub mod snapshot_age;
 pub mod swap_exhaustion;
 pub mod unhealthy_container;
 
@@ -95,6 +101,15 @@ impl DetectorRegistry {
         reg.register(Box::new(backup_schedule::MissingBackupScheduleDetector));
         reg.register(Box::new(restore_test::RestoreTestMissingDetector));
         reg.register(Box::new(package_updates::SecurityUpdatesDetector));
+        // Kubernetes detectors
+        reg.register(Box::new(pod_restart::PodRestartDetector));
+        reg.register(Box::new(oom_kill::OOMKillDetector));
+        reg.register(Box::new(pvc_pressure::PVCPressureDetector));
+        // Libvirt detectors
+        reg.register(Box::new(domain_state::DomainStateDetector));
+        reg.register(Box::new(snapshot_age::SnapshotAgeDetector));
+        // Compose detectors
+        reg.register(Box::new(compose_health::ComposeHealthDetector));
         reg
     }
 }

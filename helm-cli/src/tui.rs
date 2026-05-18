@@ -1298,6 +1298,9 @@ fn infer_finding_kind(finding: &Finding) -> String {
         helm_monitor::MonitorDomain::Timers => "Timer".to_owned(),
         helm_monitor::MonitorDomain::Processes => "Process".to_owned(),
         helm_monitor::MonitorDomain::Firewall => "Firewall".to_owned(),
+        helm_monitor::MonitorDomain::Kubernetes => "Kubernetes".to_owned(),
+        helm_monitor::MonitorDomain::Libvirt => "Libvirt".to_owned(),
+        helm_monitor::MonitorDomain::Compose => "Compose".to_owned(),
     }
 }
 
