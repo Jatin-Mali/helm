@@ -146,6 +146,7 @@ enum Command {
     Explain(ExplainArgs),
     ApplyPlan(ApplyPlanArgs),
     ChangeSet(ChangeSetArgs),
+    Backup(BackupArgs),
 }
 
 #[derive(Debug, Args)]
@@ -861,6 +862,26 @@ enum ChangeSetCommand {
     },
 }
 
+#[derive(Debug, Args)]
+struct BackupArgs {
+    #[command(subcommand)]
+    command: BackupCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BackupCommand {
+    /// Check backup health (stale, missing schedule, no restore test)
+    Check {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate a detailed backup report
+    Report {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum ProviderChoice {
@@ -1235,6 +1256,9 @@ async fn run() -> Result<()> {
         }
         Command::ChangeSet(args) => {
             run_change_set_command(args).await?;
+        }
+        Command::Backup(args) => {
+            run_backup_command(args).await?;
         }
     }
     Ok(())
@@ -1726,6 +1750,7 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "explain"
                 | "apply-plan"
                 | "change-set"
+                | "backup"
         )
     )
 }
@@ -5498,6 +5523,143 @@ fn write_audit_event(
             event_hash,
         ],
     )?;
+    Ok(())
+}
+
+async fn run_backup_command(args: BackupArgs) -> Result<()> {
+    let db_path = default_db_path()?;
+    let _conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+
+    match args.command {
+        BackupCommand::Check { json } => {
+            let snapshot = helm_monitor::engine::collect_snapshot(
+                helm_monitor::MonitorProfile::Quick,
+            )
+            .await;
+            let detectors = helm_monitor::detectors::DetectorRegistry::default_registry();
+            let backup_findings = detectors.detect(
+                &snapshot,
+                Some(&[helm_monitor::MonitorDomain::Backups]),
+                None,
+            );
+
+            if json {
+                let report = serde_json::json!({
+                    "hostname": snapshot.host.hostname,
+                    "tools_detected": snapshot.domains.backups.tools_detected.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                    "timer_count": snapshot.domains.timers.systemd_timers.len(),
+                    "findings": backup_findings.iter().map(|f| serde_json::json!({
+                        "title": f.title,
+                        "severity": f.severity.as_str(),
+                        "resource": f.affected_resource,
+                        "confidence": f.confidence.as_str(),
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let tool_names: Vec<&str> = snapshot.domains.backups.tools_detected.iter().map(|t| t.name.as_str()).collect();
+                println!("Backup Health Check — {}", snapshot.host.hostname);
+                println!("{}", "─".repeat(60));
+                println!("Tools detected:  {}", tool_names.join(", "));
+                println!();
+
+                if backup_findings.is_empty() {
+                    println!("✅ All backup checks passed — no issues found.");
+                } else {
+                    println!("Findings ({}):", backup_findings.len());
+                    for f in &backup_findings {
+                        let icon = match f.severity {
+                            helm_monitor::Severity::Critical => "🔴",
+                            helm_monitor::Severity::Warning => "🟡",
+                            helm_monitor::Severity::Info => "🔵",
+                        };
+                        println!("  {} {} [{}]", icon, f.title, f.severity.as_str());
+                    }
+                    println!();
+                    println!("Run `helm troubleshoot <problem>` or `helm monitor --domain backups` for details.");
+                }
+            }
+        }
+        BackupCommand::Report { json } => {
+            let snapshot = helm_monitor::engine::collect_snapshot(
+                helm_monitor::MonitorProfile::Standard,
+            )
+            .await;
+            let detectors = helm_monitor::detectors::DetectorRegistry::default_registry();
+            let backup_findings = detectors.detect(
+                &snapshot,
+                Some(&[helm_monitor::MonitorDomain::Backups]),
+                None,
+            );
+
+            if json {
+                let report = serde_json::json!({
+                    "hostname": snapshot.host.hostname,
+                    "os": snapshot.host.os_pretty_name,
+                    "collected_at": snapshot.collected_at.to_rfc3339(),
+                    "backup_tools": snapshot.domains.backups.tools_detected.iter().map(|t| serde_json::json!({
+                        "name": t.name,
+                        "config_path": t.config_path,
+                    })).collect::<Vec<_>>(),
+                    "systemd_timers": snapshot.domains.timers.systemd_timers.iter().map(|t| serde_json::json!({
+                        "name": t.name,
+                        "next": t.next_trigger,
+                        "last": t.last_trigger,
+                    })).collect::<Vec<_>>(),
+                    "findings": backup_findings.iter().map(|f| serde_json::json!({
+                        "title": f.title,
+                        "severity": f.severity.as_str(),
+                        "resource": f.affected_resource,
+                        "confidence": f.confidence.as_str(),
+                        "impact": f.impact,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let tool_names: Vec<&str> = snapshot.domains.backups.tools_detected.iter().map(|t| t.name.as_str()).collect();
+                println!("Backup Report — {}", snapshot.host.hostname);
+                println!("OS: {}", snapshot.host.os_pretty_name.as_deref().unwrap_or("unknown"));
+                println!("Collected: {}", snapshot.collected_at.format("%Y-%m-%d %H:%M:%S UTC"));
+                println!("{}", "─".repeat(60));
+                println!();
+                println!("Backup Tools:");
+                println!("  Detected: {}", tool_names.join(", "));
+                for t in &snapshot.domains.backups.tools_detected {
+                    if let Some(cfg) = &t.config_path {
+                        println!("    {} config: {}", t.name, cfg);
+                    }
+                }
+                println!();
+
+                if !snapshot.domains.timers.systemd_timers.is_empty() {
+                    println!("Systemd Timers:");
+                    for t in &snapshot.domains.timers.systemd_timers {
+                        println!("  {:<40} next: {:<20} last: {}", t.name, t.next_trigger, t.last_trigger);
+                    }
+                    println!();
+                }
+
+                println!("Health Findings: {}", backup_findings.len());
+                for f in &backup_findings {
+                    let icon = match f.severity {
+                        helm_monitor::Severity::Critical => "🔴",
+                        helm_monitor::Severity::Warning => "🟡",
+                        helm_monitor::Severity::Info => "🔵",
+                    };
+                    println!("  {} {}", icon, f.title);
+                    if !f.impact.is_empty() {
+                        println!("     Impact: {}", f.impact);
+                    }
+                }
+
+                if backup_findings.is_empty() {
+                    println!();
+                    println!("✅ All backup systems look healthy.");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
