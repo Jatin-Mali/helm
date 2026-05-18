@@ -3,6 +3,7 @@
 use uuid::Uuid;
 
 use crate::{
+    alerting::{AlertConfig, AlertRouter},
     collectors::{
         backups::BackupsCollector, compose::ComposeCollector, containers::ContainersCollector,
         disks::DisksCollector, firewall::FirewallCollector, host::HostCollector,
@@ -11,10 +12,57 @@ use crate::{
         ports::PortsCollector, processes::ProcessCollector, services::ServicesCollector,
         timers::TimersCollector,
     },
+    detectors::DetectorRegistry,
+    findings::Finding,
     snapshot::{CollectorError, MonitorProfile, SnapshotDomains, SystemSnapshot},
 };
 
 use crate::collectors::Collector as _;
+
+/// Orchestrates collect → detect → alert in a single tick.
+pub struct AlertingEngine {
+    detectors: DetectorRegistry,
+    router: AlertRouter,
+    previous: Option<SystemSnapshot>,
+}
+
+impl AlertingEngine {
+    pub fn new(router: AlertRouter) -> Self {
+        Self {
+            detectors: DetectorRegistry::default(),
+            router,
+            previous: None,
+        }
+    }
+
+    /// Replace the detector registry (used in tests).
+    pub fn with_detectors(mut self, detectors: DetectorRegistry) -> Self {
+        self.detectors = detectors;
+        self
+    }
+
+    /// Collect a snapshot, run detectors, route findings through alerting sinks.
+    pub async fn run_once(
+        &mut self,
+        profile: MonitorProfile,
+    ) -> Result<Vec<Finding>, Box<dyn std::error::Error>> {
+        let snapshot = collect_snapshot(profile).await;
+        let findings = self
+            .detectors
+            .detect(&snapshot, None, self.previous.as_ref());
+        for finding in &findings {
+            self.router.route(finding).await?;
+        }
+        self.previous = Some(snapshot);
+        Ok(findings)
+    }
+}
+
+impl Default for AlertingEngine {
+    fn default() -> Self {
+        Self::new(AlertRouter::new(AlertConfig::default()))
+    }
+}
 
 pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
     let id = Uuid::new_v4().to_string();
@@ -125,21 +173,86 @@ fn unwrap_or_default<T: Default>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::MonitorProfile;
+    use crate::{
+        alerting::{AlertConfig, AlertPayload, AlertRouter, AlertSink, SendFuture},
+        detectors::Detector,
+        findings::{Confidence, Finding, MonitorDomain, Severity},
+        snapshot::MonitorProfile,
+    };
+    use std::sync::{Arc, Mutex};
 
     #[tokio::test]
     async fn test_collect_snapshot_includes_new_domains() {
         let result = collect_snapshot(MonitorProfile::Standard).await;
-
-        // Verify that all three new domains are present and accessible
         let _kubernetes = &result.domains.kubernetes;
         let _libvirt = &result.domains.libvirt;
         let _compose = &result.domains.compose;
-
-        // Verify the domain_names list includes the three new domains
         let domain_names = crate::snapshot::SnapshotDomains::domain_names();
         assert!(domain_names.contains(&"kubernetes"));
         assert!(domain_names.contains(&"libvirt"));
         assert!(domain_names.contains(&"compose"));
+    }
+
+    struct CaptureSink(Arc<Mutex<Vec<String>>>);
+
+    impl AlertSink for CaptureSink {
+        fn send<'a>(&'a self, alert: &'a AlertPayload) -> SendFuture<'a> {
+            let captured = self.0.clone();
+            let fp = alert.fingerprint.clone();
+            Box::pin(async move {
+                captured.lock().unwrap().push(fp);
+                Ok(())
+            })
+        }
+    }
+
+    struct AlwaysCritDetector;
+
+    impl Detector for AlwaysCritDetector {
+        fn id(&self) -> &'static str {
+            "test-crit"
+        }
+        fn domain(&self) -> MonitorDomain {
+            MonitorDomain::Services
+        }
+        fn detect(
+            &self,
+            snapshot: &SystemSnapshot,
+            _previous: Option<&SystemSnapshot>,
+        ) -> Vec<Finding> {
+            vec![Finding::new(
+                &snapshot.id,
+                "test-crit",
+                "test-resource",
+                "Test CRIT alert",
+                Severity::Critical,
+                Confidence::High,
+                MonitorDomain::Services,
+            )]
+        }
+    }
+
+    #[tokio::test]
+    async fn alerting_engine_routes_crit_finding_to_sink() {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Box::new(CaptureSink(captured.clone()));
+        let config = AlertConfig {
+            min_severity: Severity::Critical,
+            dedup_window_secs: 0,
+            rate_limit_per_min: 60,
+        };
+        let router = AlertRouter::new(config).with_sink(sink);
+
+        let mut reg = DetectorRegistry::new();
+        reg.register(Box::new(AlwaysCritDetector));
+
+        let mut engine = AlertingEngine::new(router).with_detectors(reg);
+        let findings = engine.run_once(MonitorProfile::Standard).await.unwrap();
+
+        assert!(!findings.is_empty(), "detector should produce at least one finding");
+        assert!(
+            !captured.lock().unwrap().is_empty(),
+            "sink should receive the routed alert"
+        );
     }
 }

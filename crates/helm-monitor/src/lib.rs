@@ -10,7 +10,7 @@ pub mod reporter;
 pub mod snapshot;
 pub mod troubleshoot;
 
-pub use engine::collect_snapshot;
+pub use engine::{AlertingEngine, collect_snapshot};
 pub use execute::{
     ChangeSet, ChangeSetStatus, ChangeSetStep, ExecutionEngine, PreChangeBackup, StepOutcome,
     StepStatus, format_change_set,
