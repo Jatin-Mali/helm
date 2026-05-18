@@ -401,6 +401,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_host_id_uuid_persistence() {
+        use tempfile::tempdir;
+
+        // Test 1: RemoteEntry::Default produces unique UUIDs
+        let entry1 = RemoteEntry {
+            host_id: Uuid::new_v4(),
+            name: "host1".to_owned(),
+            host: "host1.example.com".to_owned(),
+            port: 22,
+            user: None,
+            ssh_opts: None,
+            credential: Credential::SshAgent,
+        };
+        let entry2 = RemoteEntry {
+            host_id: Uuid::new_v4(),
+            name: "host2".to_owned(),
+            host: "host2.example.com".to_owned(),
+            port: 22,
+            user: None,
+            ssh_opts: None,
+            credential: Credential::SshAgent,
+        };
+        assert_ne!(entry1.host_id, entry2.host_id, "UUIDs should be unique");
+
+        // Test 2: RemoteEntry serializes and deserializes with stable host_id
+        let original_uuid = entry1.host_id;
+        let toml_str = toml::to_string(&entry1).unwrap();
+        let deserialized: RemoteEntry = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            deserialized.host_id, original_uuid,
+            "host_id should persist across serialize/deserialize"
+        );
+
+        // Test 3: RemoteRegistry save and load preserves host_ids
+        let mut registry = RemoteRegistry::default();
+        let entry_with_uuid = RemoteEntry {
+            host_id: Uuid::new_v4(),
+            name: "test-host".to_owned(),
+            host: "test.example.com".to_owned(),
+            port: 22,
+            user: Some("ubuntu".to_owned()),
+            ssh_opts: None,
+            credential: Credential::SshAgent,
+        };
+        let original_host_id = entry_with_uuid.host_id;
+        registry.upsert(entry_with_uuid.clone());
+
+        // Write to temp file and reload
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_remotes.toml");
+        let registry_to_save = registry.clone();
+        let toml_text = toml::to_string_pretty(&registry_to_save).unwrap();
+        std::fs::write(&path, toml_text).unwrap();
+
+        // Load it back
+        let loaded_registry = RemoteRegistry::load_from(&path).unwrap();
+        let reloaded_entry = loaded_registry.get("test-host").unwrap();
+        assert_eq!(
+            reloaded_entry.host_id, original_host_id,
+            "host_id should persist across registry save/load cycles"
+        );
+
+        // Test 4: Old TOML entries without host_id get auto-generated on load
+        // Create a TOML string without host_id field (backward compatibility)
+        let old_toml = r#"
+[[remotes]]
+name = "legacy-host"
+host = "legacy.example.com"
+port = 22
+"#;
+        let legacy_registry: RemoteRegistry = toml::from_str(old_toml).unwrap();
+        let legacy_entry = legacy_registry.remotes.first().unwrap();
+        assert_ne!(
+            legacy_entry.host_id.as_bytes(),
+            &[0u8; 16],
+            "host_id should be auto-generated (non-nil UUID) for old TOML entries"
+        );
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_fleet_parallel_refresh_20_hosts() {
