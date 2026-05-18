@@ -1,21 +1,25 @@
 pub mod config;
+pub mod pagerduty;
 pub mod payload;
+pub mod slack;
+pub mod webhook;
 
 pub use config::{AlertConfig, load_config};
+pub use pagerduty::PagerDutySink;
 pub use payload::AlertPayload;
+pub use slack::SlackSink;
+pub use webhook::WebhookSink;
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::findings::Finding;
 
+pub type SendFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>>;
+
 pub trait AlertSink: Send + Sync {
-    fn send<'a>(
-        &'a self,
-        alert: &'a AlertPayload,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>,
-    >;
+    fn send<'a>(&'a self, alert: &'a AlertPayload) -> SendFuture<'a>;
 }
 
 pub struct AlertRouter {
@@ -108,16 +112,7 @@ mod tests {
     struct CaptureSink(Arc<Mutex<Vec<String>>>);
 
     impl AlertSink for CaptureSink {
-        fn send<'a>(
-            &'a self,
-            alert: &'a AlertPayload,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>
-                    + Send
-                    + 'a,
-            >,
-        > {
+        fn send<'a>(&'a self, alert: &'a AlertPayload) -> crate::alerting::SendFuture<'a> {
             let captured = self.0.clone();
             let fp = alert.fingerprint.clone();
             Box::pin(async move {

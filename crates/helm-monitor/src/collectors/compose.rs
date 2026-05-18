@@ -87,9 +87,9 @@ fn parse_compose_projects(output: &str) -> Vec<ComposeProject> {
     #[derive(Debug, Deserialize)]
     struct DockerContainer {
         #[serde(rename = "ID")]
-        id: String,
+        _id: String,
         #[serde(rename = "Names")]
-        names: String,
+        _names: String,
         #[serde(rename = "State")]
         state: String,
         #[serde(rename = "Status")]
@@ -123,7 +123,7 @@ fn parse_compose_projects(output: &str) -> Vec<ComposeProject> {
                     if let Some(proj_name) = project_name {
                         projects
                             .entry(proj_name)
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(container);
                     }
                 }
