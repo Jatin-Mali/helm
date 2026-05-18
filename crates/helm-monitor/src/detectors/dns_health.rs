@@ -43,9 +43,9 @@ impl Detector for DnsHealthDetector {
                 .with_impact("Applications relying on DNS name resolution will fail"),
             );
         } else {
-            let has_local = resolvers
-                .iter()
-                .any(|r| r.starts_with("127.") || r.starts_with("10.") || r.starts_with("192.168."));
+            let has_local = resolvers.iter().any(|r| {
+                r.starts_with("127.") || r.starts_with("10.") || r.starts_with("192.168.")
+            });
             let has_public = resolvers
                 .iter()
                 .any(|r| r == "8.8.8.8" || r == "1.1.1.1" || r == "9.9.9.9");

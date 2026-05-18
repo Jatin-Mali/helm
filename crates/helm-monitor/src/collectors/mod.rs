@@ -10,9 +10,8 @@
 pub mod backups;
 pub mod certs;
 pub mod compose;
-pub mod db_health;
-pub mod web_servers;
 pub mod containers;
+pub mod db_health;
 pub mod disks;
 pub mod firewall;
 pub mod host;
@@ -26,6 +25,7 @@ pub mod ports;
 pub mod processes;
 pub mod services;
 pub mod timers;
+pub mod web_servers;
 
 use std::process::Output;
 

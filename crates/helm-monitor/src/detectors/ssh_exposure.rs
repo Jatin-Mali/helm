@@ -32,10 +32,7 @@ impl Detector for SshExposureDetector {
             .listeners
             .iter()
             .filter(|l| {
-                l.local_port == 22
-                    || l.process_name
-                        .as_ref()
-                        .is_some_and(|n| n.contains("sshd"))
+                l.local_port == 22 || l.process_name.as_ref().is_some_and(|n| n.contains("sshd"))
             })
             .collect();
 
@@ -76,9 +73,7 @@ impl Detector for SshExposureDetector {
                     "SSH accessible from the network increases attack surface. \
                      Restrict with firewall rules if not needed.",
                 )
-                .with_read_only_check(
-                    "ss -tlnp | grep :22",
-                ),
+                .with_read_only_check("ss -tlnp | grep :22"),
             );
         }
 
@@ -120,12 +115,14 @@ impl Detector for SshExposureDetector {
 
             // Check PasswordAuthentication
             let password_auth = find_config_value(&effective_text, "PasswordAuthentication");
-            let challenge_response = find_config_value(&effective_text, "ChallengeResponseAuthentication");
-            let kbd_interactive = find_config_value(&effective_text, "KbdInteractiveAuthentication");
+            let challenge_response =
+                find_config_value(&effective_text, "ChallengeResponseAuthentication");
+            let kbd_interactive =
+                find_config_value(&effective_text, "KbdInteractiveAuthentication");
 
-            let password_enabled = password_auth.map_or(true, |v| v == "yes")
-                || challenge_response.map_or(false, |v| v == "yes")
-                || kbd_interactive.map_or(false, |v| v == "yes");
+            let password_enabled = password_auth.is_none_or(|v| v == "yes")
+                || (challenge_response == Some("yes"))
+                || (kbd_interactive == Some("yes"));
 
             if password_enabled && password_auth != Some("no") {
                 findings.push(
@@ -240,8 +237,11 @@ fn find_config_value<'a>(lines: &'a str, key: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::{HostIdentity, ListenerEntry, MonitorProfile, SnapshotDomains, SystemSnapshot};
+    use crate::snapshot::{
+        HostIdentity, ListenerEntry, MonitorProfile, SnapshotDomains, SystemSnapshot,
+    };
 
+    #[allow(clippy::field_reassign_with_default)]
     fn make_snapshot(listeners: Vec<ListenerEntry>) -> SystemSnapshot {
         let mut domains = SnapshotDomains::default();
         let mut port_snap = crate::snapshot::PortSnapshot::default();
@@ -300,7 +300,10 @@ mod tests {
     #[test]
     fn test_find_config_value() {
         let config = "PasswordAuthentication no\nPermitRootLogin no\n#PubkeyAuthentication yes\n";
-        assert_eq!(find_config_value(config, "PasswordAuthentication"), Some("no"));
+        assert_eq!(
+            find_config_value(config, "PasswordAuthentication"),
+            Some("no")
+        );
         assert_eq!(find_config_value(config, "PermitRootLogin"), Some("no"));
         assert_eq!(find_config_value(config, "PubkeyAuthentication"), None); // commented out
         assert_eq!(find_config_value(config, "nonexistent"), None);

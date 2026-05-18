@@ -2,7 +2,7 @@
 //! Uses respective CLI tools for non-invasive health checks.
 
 use crate::{
-    collectors::{err, run_timed, Collector},
+    collectors::{Collector, run_timed},
     snapshot::MonitorProfile,
 };
 
@@ -44,6 +44,7 @@ impl Collector for DbHealthCollector {
         "db-health"
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     async fn collect(
         self,
         profile: MonitorProfile,
@@ -81,7 +82,14 @@ impl Collector for DbHealthCollector {
 async fn probe_postgresql(profile: MonitorProfile) -> Option<DbInstance> {
     let result = run_timed(
         "psql",
-        &["-U", "postgres", "-c", "SELECT version(), count(*) FROM pg_stat_activity;", "-t", "-A"],
+        &[
+            "-U",
+            "postgres",
+            "-c",
+            "SELECT version(), count(*) FROM pg_stat_activity;",
+            "-t",
+            "-A",
+        ],
         profile,
     )
     .await;
@@ -126,7 +134,11 @@ async fn probe_postgresql(profile: MonitorProfile) -> Option<DbInstance> {
 async fn probe_mysql(profile: MonitorProfile) -> Option<DbInstance> {
     let result = run_timed(
         "mysql",
-        &["-e", "SELECT VERSION(), COUNT(*) FROM information_schema.PROCESSLIST;", "-N"],
+        &[
+            "-e",
+            "SELECT VERSION(), COUNT(*) FROM information_schema.PROCESSLIST;",
+            "-N",
+        ],
         profile,
     )
     .await;

@@ -4278,6 +4278,7 @@ fn run_daemon_status() -> Result<()> {
     Ok(())
 }
 
+#[allow(unused_assignments)]
 async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
     ensure_parent_dir(&db_path)?;
     ensure_parent_dir(&daemon_pid_path())?;
@@ -4324,8 +4325,7 @@ async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
                 }
                 Err(e) => {
                     state.status = "running".to_owned();
-                    state.last_error =
-                        Some(format!("collection failed: {e:#}"));
+                    state.last_error = Some(format!("collection failed: {e:#}"));
                     // Keep previous snapshot_id so the TUI has something to show
                 }
             }
@@ -4334,8 +4334,7 @@ async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
             if requested {
                 let _ = fs::remove_file(&request_path);
             }
-            next_run =
-                std::time::Instant::now() + std::time::Duration::from_secs(interval.max(5));
+            next_run = std::time::Instant::now() + std::time::Duration::from_secs(interval.max(5));
             collecting = false;
         } else {
             state.last_heartbeat = Some(now_rfc3339());
@@ -4358,12 +4357,7 @@ async fn run_single_collection_cycle(
     let conn = rusqlite::Connection::open(db_path)
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
     let prev = load_previous_snapshot(&conn);
-    let report = run_monitor_cycle(
-        MonitorProfile::Standard,
-        None,
-        prev,
-    )
-    .await;
+    let report = run_monitor_cycle(MonitorProfile::Standard, None, prev).await;
     persist_monitor_snapshot(
         &conn,
         &report.snapshot,
@@ -4852,14 +4846,26 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
             // Run local snapshot for now (future: SSH to remote)
             let report = run_monitor_cycle(profile, domain_filter.as_deref(), None).await;
             if !report.findings.is_empty() {
-                let crits: Vec<_> = report.findings.iter()
-                    .filter(|f| f.severity >= helm_monitor::Severity::Critical).collect();
-                let warns: Vec<_> = report.findings.iter()
-                    .filter(|f| f.severity == helm_monitor::Severity::Warning).collect();
-                println!("  Findings: {} critical, {} warning, {} info (total: {})",
-                    crits.len(), warns.len(),
-                    report.findings.len().saturating_sub(crits.len() + warns.len()),
-                    report.findings.len());
+                let crits: Vec<_> = report
+                    .findings
+                    .iter()
+                    .filter(|f| f.severity >= helm_monitor::Severity::Critical)
+                    .collect();
+                let warns: Vec<_> = report
+                    .findings
+                    .iter()
+                    .filter(|f| f.severity == helm_monitor::Severity::Warning)
+                    .collect();
+                println!(
+                    "  Findings: {} critical, {} warning, {} info (total: {})",
+                    crits.len(),
+                    warns.len(),
+                    report
+                        .findings
+                        .len()
+                        .saturating_sub(crits.len() + warns.len()),
+                    report.findings.len()
+                );
                 total_findings += report.findings.len();
             } else {
                 println!("  ✅ No findings");
@@ -4867,7 +4873,11 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
         }
         println!();
         println!("{}", "─".repeat(60));
-        println!("Fleet summary: {} total findings across {} host(s)", total_findings, registry.remotes.len());
+        println!(
+            "Fleet summary: {} total findings across {} host(s)",
+            total_findings,
+            registry.remotes.len()
+        );
         return Ok(());
     }
 
@@ -5124,7 +5134,10 @@ async fn run_explain_command(args: ExplainArgs) -> Result<()> {
 }
 
 async fn run_runbook_command(args: RunbookArgs) -> Result<()> {
-    let profile: helm_monitor::MonitorProfile = args.profile.parse().unwrap_or(helm_monitor::MonitorProfile::Standard);
+    let profile: helm_monitor::MonitorProfile = args
+        .profile
+        .parse()
+        .unwrap_or(helm_monitor::MonitorProfile::Standard);
     let snapshot = helm_monitor::engine::collect_snapshot(profile).await;
     let detectors = helm_monitor::detectors::DetectorRegistry::default_registry();
     let all_findings = detectors.detect(&snapshot, None, None);
@@ -5134,41 +5147,71 @@ async fn run_runbook_command(args: RunbookArgs) -> Result<()> {
     // Title
     lines.push(format!("# HELM Runbook — {}", snapshot.host.hostname));
     lines.push(String::new());
-    lines.push(format!("- **Generated:** {}", snapshot.collected_at.format("%Y-%m-%d %H:%M:%S UTC")));
+    lines.push(format!(
+        "- **Generated:** {}",
+        snapshot.collected_at.format("%Y-%m-%d %H:%M:%S UTC")
+    ));
     lines.push(format!("- **Profile:** {:?}", snapshot.profile));
-    lines.push(format!("- **OS:** {}", snapshot.host.os_pretty_name.as_deref().unwrap_or("unknown")));
-    lines.push(format!("- **Kernel:** {} {}", snapshot.host.kernel_name, snapshot.host.kernel_release));
+    lines.push(format!(
+        "- **OS:** {}",
+        snapshot.host.os_pretty_name.as_deref().unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "- **Kernel:** {} {}",
+        snapshot.host.kernel_name, snapshot.host.kernel_release
+    ));
     lines.push(format!("- **Arch:** {}", snapshot.host.machine));
-    lines.push(format!("- **Uptime:** {:.1}h", snapshot.host.uptime_seconds as f64 / 3600.0));
+    lines.push(format!(
+        "- **Uptime:** {:.1}h",
+        snapshot.host.uptime_seconds as f64 / 3600.0
+    ));
     lines.push(String::new());
 
     // System Status
     lines.push("## System Status".to_string());
     lines.push(String::new());
-    lines.push(format!("- **CPU cores:** {} logical", snapshot.domains.load.cpu_logical_count));
-    lines.push(format!("- **Load:** {:.2} / {:.2} / {:.2}", 
+    lines.push(format!(
+        "- **CPU cores:** {} logical",
+        snapshot.domains.load.cpu_logical_count
+    ));
+    lines.push(format!(
+        "- **Load:** {:.2} / {:.2} / {:.2}",
         snapshot.domains.load.load_average.one,
         snapshot.domains.load.load_average.five,
-        snapshot.domains.load.load_average.fifteen));
-    lines.push(format!("- **Memory:** {} / {} ({:.1}%)",
+        snapshot.domains.load.load_average.fifteen
+    ));
+    lines.push(format!(
+        "- **Memory:** {} / {} ({:.1}%)",
         human_bytes(snapshot.domains.load.memory.used),
         human_bytes(snapshot.domains.load.memory.total),
-        (snapshot.domains.load.memory.used as f64 / snapshot.domains.load.memory.total.max(1) as f64) * 100.0));
-    lines.push(format!("- **Swap:** used {} / total {}",
+        (snapshot.domains.load.memory.used as f64
+            / snapshot.domains.load.memory.total.max(1) as f64)
+            * 100.0
+    ));
+    lines.push(format!(
+        "- **Swap:** used {} / total {}",
         human_bytes(snapshot.domains.load.swap_used),
-        human_bytes(snapshot.domains.load.swap_total)));
+        human_bytes(snapshot.domains.load.swap_total)
+    ));
     lines.push(String::new());
 
     // Disks
     lines.push("## Disks".to_string());
     lines.push(String::new());
     for fs in &snapshot.domains.disks.filesystems {
-        let pct = if fs.total_bytes > 0 { 
-            (fs.used_bytes as f64 / fs.total_bytes as f64) * 100.0 
-        } else { 0.0 };
-        lines.push(format!("- **{}** ({}) — {} / {} ({:.0}%)",
-            fs.mount_point, fs.device,
-            human_bytes(fs.used_bytes), human_bytes(fs.total_bytes), pct));
+        let pct = if fs.total_bytes > 0 {
+            (fs.used_bytes as f64 / fs.total_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        lines.push(format!(
+            "- **{}** ({}) — {} / {} ({:.0}%)",
+            fs.mount_point,
+            fs.device,
+            human_bytes(fs.used_bytes),
+            human_bytes(fs.total_bytes),
+            pct
+        ));
     }
     lines.push(String::new());
 
@@ -5182,7 +5225,11 @@ async fn run_runbook_command(args: RunbookArgs) -> Result<()> {
         }
         lines.push(String::new());
     }
-    let running: Vec<_> = snapshot.domains.services.units.iter()
+    let running: Vec<_> = snapshot
+        .domains
+        .services
+        .units
+        .iter()
         .filter(|u| u.active == "active")
         .collect();
     lines.push(format!("**{} active services**", running.len()));
@@ -5193,17 +5240,26 @@ async fn run_runbook_command(args: RunbookArgs) -> Result<()> {
         lines.push("## Containers".to_string());
         lines.push(String::new());
         lines.push(format!("- **Runtime:** {:?}", rt));
-        lines.push(format!("- **Count:** {}", snapshot.domains.containers.containers.len()));
+        lines.push(format!(
+            "- **Count:** {}",
+            snapshot.domains.containers.containers.len()
+        ));
         lines.push(String::new());
     }
 
     // Network
     lines.push("## Network".to_string());
     lines.push(String::new());
-    lines.push(format!("- **Listening ports:** {}", snapshot.domains.ports.listeners.len()));
+    lines.push(format!(
+        "- **Listening ports:** {}",
+        snapshot.domains.ports.listeners.len()
+    ));
     for l in &snapshot.domains.ports.listeners {
         if let Some(ref proc) = l.process_name {
-            lines.push(format!("  - {}:{} ({})", l.local_address, l.local_port, proc));
+            lines.push(format!(
+                "  - {}:{} ({})",
+                l.local_address, l.local_port, proc
+            ));
         }
     }
     lines.push(String::new());
@@ -5214,8 +5270,10 @@ async fn run_runbook_command(args: RunbookArgs) -> Result<()> {
         lines.push(String::new());
         for c in &snapshot.domains.certs.certificates {
             if c.error.is_empty() {
-                lines.push(format!("- **{}** — {} ({}) expires in {} days",
-                    c.address, c.subject_cn, c.issuer_cn, c.days_remaining));
+                lines.push(format!(
+                    "- **{}** — {} ({}) expires in {} days",
+                    c.address, c.subject_cn, c.issuer_cn, c.days_remaining
+                ));
                 if c.self_signed {
                     lines.push("  - ⚠ Self-signed".to_string());
                 }
@@ -5227,7 +5285,13 @@ async fn run_runbook_command(args: RunbookArgs) -> Result<()> {
     // Backups
     lines.push("## Backups".to_string());
     lines.push(String::new());
-    let tool_names: Vec<&str> = snapshot.domains.backups.tools_detected.iter().map(|t| t.name.as_str()).collect();
+    let tool_names: Vec<&str> = snapshot
+        .domains
+        .backups
+        .tools_detected
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
     if tool_names.is_empty() {
         lines.push("- ⚠ No backup tools detected".to_string());
     } else {
@@ -5239,30 +5303,49 @@ async fn run_runbook_command(args: RunbookArgs) -> Result<()> {
     lines.push("## Findings".to_string());
     lines.push(String::new());
 
-    let critical: Vec<_> = all_findings.iter().filter(|f| f.severity == helm_monitor::Severity::Critical).collect();
-    let warnings: Vec<_> = all_findings.iter().filter(|f| f.severity == helm_monitor::Severity::Warning).collect();
-    let infos: Vec<_> = all_findings.iter().filter(|f| f.severity == helm_monitor::Severity::Info).collect();
+    let critical: Vec<_> = all_findings
+        .iter()
+        .filter(|f| f.severity == helm_monitor::Severity::Critical)
+        .collect();
+    let warnings: Vec<_> = all_findings
+        .iter()
+        .filter(|f| f.severity == helm_monitor::Severity::Warning)
+        .collect();
+    let infos: Vec<_> = all_findings
+        .iter()
+        .filter(|f| f.severity == helm_monitor::Severity::Info)
+        .collect();
 
-    lines.push(format!("- **{} critical**, **{} warnings**, **{} info**", 
-        critical.len(), warnings.len(), infos.len()));
+    lines.push(format!(
+        "- **{} critical**, **{} warnings**, **{} info**",
+        critical.len(),
+        warnings.len(),
+        infos.len()
+    ));
     lines.push(String::new());
 
     for f in &critical {
         lines.push(format!("### 🔴 {}", f.title));
         lines.push(format!("- **Resource:** {}", f.affected_resource));
         lines.push(format!("- **Domain:** {}", f.category.as_str()));
-        if !f.impact.is_empty() { lines.push(format!("- **Impact:** {}", f.impact)); }
+        if !f.impact.is_empty() {
+            lines.push(format!("- **Impact:** {}", f.impact));
+        }
         lines.push(String::new());
     }
     for f in &warnings {
         lines.push(format!("### 🟡 {}", f.title));
         lines.push(format!("- **Resource:** {}", f.affected_resource));
-        if !f.impact.is_empty() { lines.push(format!("- **Impact:** {}", f.impact)); }
+        if !f.impact.is_empty() {
+            lines.push(format!("- **Impact:** {}", f.impact));
+        }
         lines.push(String::new());
     }
     for f in &infos {
         lines.push(format!("### 🔵 {}", f.title));
-        if !f.impact.is_empty() { lines.push(format!("- **Impact:** {}", f.impact)); }
+        if !f.impact.is_empty() {
+            lines.push(format!("- **Impact:** {}", f.impact));
+        }
         lines.push(String::new());
     }
 
@@ -5281,16 +5364,25 @@ async fn run_runbook_command(args: RunbookArgs) -> Result<()> {
 
     // Footer
     lines.push("---".to_string());
-    lines.push(format!("*Runbook generated by HELM {}", env!("CARGO_PKG_VERSION")));
-    lines.push(format!("*Next step: run `helm troubleshoot \"<problem>\"` for guided investigation"));
+    lines.push(format!(
+        "*Runbook generated by HELM {}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    lines.push(
+        "*Next step: run `helm troubleshoot \"<problem>\"` for guided investigation".to_string(),
+    );
 
     let content = lines.join("\n");
     std::fs::write(&args.output, &content)
         .with_context(|| format!("failed to write runbook to {}", args.output.display()))?;
 
     println!("Runbook written to {}", args.output.display());
-    println!("  {} critical, {} warnings, {} info findings",
-        critical.len(), warnings.len(), infos.len());
+    println!(
+        "  {} critical, {} warnings, {} info findings",
+        critical.len(),
+        warnings.len(),
+        infos.len()
+    );
 
     Ok(())
 }
@@ -5777,10 +5869,8 @@ async fn run_backup_command(args: BackupArgs) -> Result<()> {
 
     match args.command {
         BackupCommand::Check { json } => {
-            let snapshot = helm_monitor::engine::collect_snapshot(
-                helm_monitor::MonitorProfile::Quick,
-            )
-            .await;
+            let snapshot =
+                helm_monitor::engine::collect_snapshot(helm_monitor::MonitorProfile::Quick).await;
             let detectors = helm_monitor::detectors::DetectorRegistry::default_registry();
             let backup_findings = detectors.detect(
                 &snapshot,
@@ -5802,7 +5892,13 @@ async fn run_backup_command(args: BackupArgs) -> Result<()> {
                 });
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                let tool_names: Vec<&str> = snapshot.domains.backups.tools_detected.iter().map(|t| t.name.as_str()).collect();
+                let tool_names: Vec<&str> = snapshot
+                    .domains
+                    .backups
+                    .tools_detected
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect();
                 println!("Backup Health Check — {}", snapshot.host.hostname);
                 println!("{}", "─".repeat(60));
                 println!("Tools detected:  {}", tool_names.join(", "));
@@ -5821,15 +5917,16 @@ async fn run_backup_command(args: BackupArgs) -> Result<()> {
                         println!("  {} {} [{}]", icon, f.title, f.severity.as_str());
                     }
                     println!();
-                    println!("Run `helm troubleshoot <problem>` or `helm monitor --domain backups` for details.");
+                    println!(
+                        "Run `helm troubleshoot <problem>` or `helm monitor --domain backups` for details."
+                    );
                 }
             }
         }
         BackupCommand::Report { json } => {
-            let snapshot = helm_monitor::engine::collect_snapshot(
-                helm_monitor::MonitorProfile::Standard,
-            )
-            .await;
+            let snapshot =
+                helm_monitor::engine::collect_snapshot(helm_monitor::MonitorProfile::Standard)
+                    .await;
             let detectors = helm_monitor::detectors::DetectorRegistry::default_registry();
             let backup_findings = detectors.detect(
                 &snapshot,
@@ -5861,10 +5958,22 @@ async fn run_backup_command(args: BackupArgs) -> Result<()> {
                 });
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                let tool_names: Vec<&str> = snapshot.domains.backups.tools_detected.iter().map(|t| t.name.as_str()).collect();
+                let tool_names: Vec<&str> = snapshot
+                    .domains
+                    .backups
+                    .tools_detected
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect();
                 println!("Backup Report — {}", snapshot.host.hostname);
-                println!("OS: {}", snapshot.host.os_pretty_name.as_deref().unwrap_or("unknown"));
-                println!("Collected: {}", snapshot.collected_at.format("%Y-%m-%d %H:%M:%S UTC"));
+                println!(
+                    "OS: {}",
+                    snapshot.host.os_pretty_name.as_deref().unwrap_or("unknown")
+                );
+                println!(
+                    "Collected: {}",
+                    snapshot.collected_at.format("%Y-%m-%d %H:%M:%S UTC")
+                );
                 println!("{}", "─".repeat(60));
                 println!();
                 println!("Backup Tools:");
@@ -5879,7 +5988,10 @@ async fn run_backup_command(args: BackupArgs) -> Result<()> {
                 if !snapshot.domains.timers.systemd_timers.is_empty() {
                     println!("Systemd Timers:");
                     for t in &snapshot.domains.timers.systemd_timers {
-                        println!("  {:<40} next: {:<20} last: {}", t.name, t.next_trigger, t.last_trigger);
+                        println!(
+                            "  {:<40} next: {:<20} last: {}",
+                            t.name, t.next_trigger, t.last_trigger
+                        );
                     }
                     println!();
                 }
@@ -5913,11 +6025,14 @@ async fn run_alerting_command(args: AlertingArgs) -> Result<()> {
             let config = helm_monitor::alerting::load_config()
                 .unwrap_or_else(|_| helm_monitor::alerting::AlertConfig::default());
             if json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "min_severity": config.min_severity.as_str(),
-                    "dedup_window_secs": config.dedup_window_secs,
-                    "rate_limit_per_min": config.rate_limit_per_min,
-                }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "min_severity": config.min_severity.as_str(),
+                        "dedup_window_secs": config.dedup_window_secs,
+                        "rate_limit_per_min": config.rate_limit_per_min,
+                    }))?
+                );
             } else {
                 println!("Alerting Configuration");
                 println!("{}", "─".repeat(50));

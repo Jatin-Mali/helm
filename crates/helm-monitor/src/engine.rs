@@ -5,12 +5,12 @@ use uuid::Uuid;
 use crate::{
     alerting::{AlertConfig, AlertRouter},
     collectors::{
-        backups::BackupsCollector,        compose::ComposeCollector, certs::CertsCollector,containers::ContainersCollector,
-        disks::DisksCollector, firewall::FirewallCollector, host::HostCollector,
-        kubernetes::KubernetesCollector, libvirt::LibvirtCollector, load::LoadCollector,
-        logs::LogsCollector, network::NetworkCollector, packages::PackagesCollector,
-        ports::PortsCollector, processes::ProcessCollector, services::ServicesCollector,
-        timers::TimersCollector,
+        backups::BackupsCollector, certs::CertsCollector, compose::ComposeCollector,
+        containers::ContainersCollector, disks::DisksCollector, firewall::FirewallCollector,
+        host::HostCollector, kubernetes::KubernetesCollector, libvirt::LibvirtCollector,
+        load::LoadCollector, logs::LogsCollector, network::NetworkCollector,
+        packages::PackagesCollector, ports::PortsCollector, processes::ProcessCollector,
+        services::ServicesCollector, timers::TimersCollector,
     },
     detectors::DetectorRegistry,
     findings::Finding,

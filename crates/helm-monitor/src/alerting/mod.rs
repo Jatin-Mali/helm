@@ -23,6 +23,7 @@ pub trait AlertSink: Send + Sync {
     fn send<'a>(&'a self, alert: &'a AlertPayload) -> SendFuture<'a>;
 }
 
+#[allow(clippy::type_complexity)]
 pub struct AlertRouter {
     sinks: Vec<Box<dyn AlertSink>>,
     config: AlertConfig,
@@ -91,7 +92,11 @@ impl AlertRouter {
 
         // severity gate
         if payload.severity < self.config.min_severity {
-            self.audit(NotificationDecision::SkippedSeverity, &payload.fingerprint, "severity below threshold");
+            self.audit(
+                NotificationDecision::SkippedSeverity,
+                &payload.fingerprint,
+                "severity below threshold",
+            );
             return Ok(());
         }
 
@@ -100,7 +105,11 @@ impl AlertRouter {
         // dedup window
         if let Some(&last) = self.dedup_state.get(&payload.fingerprint) {
             if now.duration_since(last).as_secs() < self.config.dedup_window_secs {
-                self.audit(NotificationDecision::SkippedDedup, &payload.fingerprint, "within dedup window");
+                self.audit(
+                    NotificationDecision::SkippedDedup,
+                    &payload.fingerprint,
+                    "within dedup window",
+                );
                 return Ok(());
             }
         }
@@ -111,7 +120,11 @@ impl AlertRouter {
             self.sent_this_window = 0;
         }
         if self.sent_this_window >= self.config.rate_limit_per_min {
-            self.audit(NotificationDecision::SkippedRateLimit, &payload.fingerprint, "rate limit exceeded");
+            self.audit(
+                NotificationDecision::SkippedRateLimit,
+                &payload.fingerprint,
+                "rate limit exceeded",
+            );
             return Ok(());
         }
 
@@ -124,7 +137,11 @@ impl AlertRouter {
 
         self.dedup_state.insert(payload.fingerprint.clone(), now);
         self.sent_this_window += 1;
-        self.audit(NotificationDecision::Sent, &payload.fingerprint, "notification delivered");
+        self.audit(
+            NotificationDecision::Sent,
+            &payload.fingerprint,
+            "notification delivered",
+        );
         Ok(())
     }
 

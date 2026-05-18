@@ -2,9 +2,9 @@
 //! Uses `openssl s_client` to fetch and parse certificates.
 
 use crate::{
-    collectors::{run_timed, Collector},
-    snapshot::{CertEntry, CertSnapshot, MonitorProfile},
     CollectorError,
+    collectors::{Collector, run_timed},
+    snapshot::{CertEntry, CertSnapshot, MonitorProfile},
 };
 
 #[derive(Default)]
@@ -99,6 +99,7 @@ async fn discover_tls_listeners(profile: MonitorProfile) -> Vec<String> {
 }
 
 /// Check a TLS certificate using openssl s_client piped to openssl x509.
+#[allow(clippy::result_large_err, clippy::manual_strip)]
 async fn check_cert(addr: &str, profile: MonitorProfile) -> Result<CertEntry, CertEntry> {
     let servername = addr.split(':').next().unwrap_or("localhost");
     let shell_cmd = format!(
@@ -106,7 +107,7 @@ async fn check_cert(addr: &str, profile: MonitorProfile) -> Result<CertEntry, Ce
         addr, servername
     );
 
-    let timeout = profile.per_collector_timeout() as u64;
+    let timeout = profile.per_collector_timeout();
     let output = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&shell_cmd)
@@ -147,6 +148,7 @@ async fn check_cert(addr: &str, profile: MonitorProfile) -> Result<CertEntry, Ce
     parse_x509_output(addr, &stdout)
 }
 
+#[allow(clippy::result_large_err, clippy::manual_strip)]
 fn parse_x509_output(addr: &str, output: &str) -> Result<CertEntry, CertEntry> {
     let mut subject_cn = String::new();
     let mut issuer_cn = String::new();
@@ -155,16 +157,14 @@ fn parse_x509_output(addr: &str, output: &str) -> Result<CertEntry, CertEntry> {
 
     for line in output.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("subject=") {
-            let subj = &trimmed["subject=".len()..];
+        if let Some(subj) = trimmed.strip_prefix("subject=") {
             for part in subj.split(',') {
                 let part = part.trim();
                 if part.starts_with("CN = ") || part.starts_with("CN=") {
                     subject_cn = part.split('=').nth(1).unwrap_or("").trim().to_string();
                 }
             }
-        } else if trimmed.starts_with("issuer=") {
-            let iss = &trimmed["issuer=".len()..];
+        } else if let Some(iss) = trimmed.strip_prefix("issuer=") {
             for part in iss.split(',') {
                 let part = part.trim();
                 if part.starts_with("CN = ") || part.starts_with("CN=") {

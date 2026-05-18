@@ -103,6 +103,7 @@ mod tests {
     use super::*;
     use crate::snapshot::{CertEntry, CertSnapshot, SnapshotDomains, SystemSnapshot};
 
+    #[allow(clippy::field_reassign_with_default)]
     fn test_snapshot(certs: Vec<CertEntry>) -> SystemSnapshot {
         let mut domains = SnapshotDomains::default();
         domains.certs = CertSnapshot {
@@ -205,9 +206,11 @@ mod tests {
         let detector = CertExpiryDetector;
         let findings = detector.detect(&snapshot, None);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0]
-            .evidence
-            .iter()
-            .any(|e| e.value.to_lowercase().contains("self-signed")));
+        assert!(
+            findings[0]
+                .evidence
+                .iter()
+                .any(|e| e.value.to_lowercase().contains("self-signed"))
+        );
     }
 }

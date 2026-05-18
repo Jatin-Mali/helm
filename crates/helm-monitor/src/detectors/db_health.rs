@@ -1,7 +1,6 @@
 //! Database health detector: checks PostgreSQL/MySQL instance health.
 
 use crate::{
-    collectors::db_health::DbHealthSnapshot,
     detectors::Detector,
     findings::{Confidence, Finding, MonitorDomain, Severity},
     snapshot::SystemSnapshot,
@@ -44,7 +43,10 @@ impl Detector for DbHealthDetector {
                         &snapshot.id,
                         self.id(),
                         &svc.name,
-                        &format!("Database service {} is {} ({})", svc.name, svc.active, svc.sub),
+                        &format!(
+                            "Database service {} is {} ({})",
+                            svc.name, svc.active, svc.sub
+                        ),
                         if svc.active == "failed" {
                             Severity::Critical
                         } else {
@@ -58,7 +60,7 @@ impl Detector for DbHealthDetector {
                         &format!("active={} sub={}", svc.active, svc.sub),
                         "Database service is not running",
                     )
-                    .with_impact(format!("Database-dependent applications may be unavailable"))
+                    .with_impact("Database-dependent applications may be unavailable".to_string())
                     .with_read_only_check(format!("systemctl status {}", svc.name)),
                 );
             }
@@ -70,9 +72,7 @@ impl Detector for DbHealthDetector {
             .ports
             .listeners
             .iter()
-            .filter(|l| {
-                l.local_port == 5432 || l.local_port == 3306
-            })
+            .filter(|l| l.local_port == 5432 || l.local_port == 3306)
             .collect();
 
         // Check listening ports — if service is not running but port is listening
@@ -103,8 +103,12 @@ impl Detector for DbHealthDetector {
                     )
                     .with_evidence(
                         &format!("ports.listeners[{}]", l.local_port),
-                        &format!("{}:{} {}", l.local_address, l.local_port,
-                            l.process_name.as_deref().unwrap_or("unknown")),
+                        &format!(
+                            "{}:{} {}",
+                            l.local_address,
+                            l.local_port,
+                            l.process_name.as_deref().unwrap_or("unknown")
+                        ),
                         "Database port is listening without a managed service",
                     )
                     .with_assumption("Database may be running under a different service name"),
@@ -120,10 +124,11 @@ impl Detector for DbHealthDetector {
 mod tests {
     use super::*;
     use crate::snapshot::{
-        HostIdentity, ListenerEntry, MonitorProfile, PortSnapshot, ServiceSnapshot, SnapshotDomains,
-        SystemSnapshot, SystemdUnit,
+        HostIdentity, ListenerEntry, MonitorProfile, PortSnapshot, ServiceSnapshot,
+        SnapshotDomains, SystemSnapshot, SystemdUnit,
     };
 
+    #[allow(clippy::field_reassign_with_default)]
     fn make_snapshot(units: Vec<SystemdUnit>, listeners: Vec<ListenerEntry>) -> SystemSnapshot {
         let mut domains = SnapshotDomains::default();
         domains.services = ServiceSnapshot {

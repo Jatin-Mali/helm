@@ -6524,7 +6524,7 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         display_name.clone()
     };
 
-    let ai_label = provider_boundary_label(app);
+    let _ai_label = provider_boundary_label(app);
     let provider_model_label = provider_model_label(app);
     let daemon_label = crate::read_daemon_state()
         .map(|state| {

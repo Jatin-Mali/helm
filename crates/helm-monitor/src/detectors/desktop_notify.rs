@@ -26,7 +26,7 @@ impl Detector for DesktopNotifyDetector {
     ) -> Vec<Finding> {
         // Try to send notifications for critical findings
         // This is best-effort — failures are silent
-        let hostname = &snapshot.host.hostname;
+        let _hostname = &snapshot.host.hostname;
         let _ = std::process::Command::new("which")
             .arg("notify-send")
             .output()

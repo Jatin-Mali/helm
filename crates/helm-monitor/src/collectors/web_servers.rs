@@ -2,7 +2,7 @@
 //! Parses config files to enumerate served sites and TLS status.
 
 use crate::{
-    collectors::{run_timed, Collector},
+    collectors::{Collector, run_timed},
     snapshot::MonitorProfile,
 };
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,7 @@ impl Collector for WebServerCollector {
         "web-servers"
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     async fn collect(
         self,
         profile: MonitorProfile,
@@ -75,10 +76,7 @@ async fn parse_nginx_sites() -> Result<Vec<WebSite>, std::io::Error> {
     let mut sites = Vec::new();
 
     // Common nginx config locations
-    let config_dirs = [
-        "/etc/nginx/sites-enabled",
-        "/etc/nginx/conf.d",
-    ];
+    let config_dirs = ["/etc/nginx/sites-enabled", "/etc/nginx/conf.d"];
 
     for dir in &config_dirs {
         let path = Path::new(dir);
@@ -88,8 +86,9 @@ async fn parse_nginx_sites() -> Result<Vec<WebSite>, std::io::Error> {
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
                 let file_path = entry.path();
-                if file_path.extension().map_or(false, |e| e == "conf") || 
-                   file_path.file_name().map_or(false, |n| n == "default") {
+                if file_path.extension().is_some_and(|e| e == "conf")
+                    || file_path.file_name().is_some_and(|n| n == "default")
+                {
                     if let Ok(content) = std::fs::read_to_string(&file_path) {
                         let mut server_name = String::new();
                         let mut listen = "80".to_string();
@@ -117,7 +116,9 @@ async fn parse_nginx_sites() -> Result<Vec<WebSite>, std::io::Error> {
                                 listen = lp.to_string();
                                 tls = lp.contains("443") || lp.contains("ssl");
                             }
-                            if trimmed.starts_with("ssl_certificate ") && !trimmed.contains("ssl_certificate_key") {
+                            if trimmed.starts_with("ssl_certificate ")
+                                && !trimmed.contains("ssl_certificate_key")
+                            {
                                 tls_cert = Some(
                                     trimmed
                                         .strip_prefix("ssl_certificate")
@@ -181,7 +182,11 @@ async fn parse_caddy_sites() -> Result<Vec<WebSite>, std::io::Error> {
 
             for line in content.lines() {
                 let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('{') || trimmed.starts_with('}') {
+                if trimmed.is_empty()
+                    || trimmed.starts_with('#')
+                    || trimmed.starts_with('{')
+                    || trimmed.starts_with('}')
+                {
                     continue;
                 }
                 // Site block starts with domain
@@ -189,7 +194,11 @@ async fn parse_caddy_sites() -> Result<Vec<WebSite>, std::io::Error> {
                     if !current_server.is_empty() {
                         sites.push(WebSite {
                             server_name: current_server.clone(),
-                            listen: if current_tls { "443".into() } else { "80".into() },
+                            listen: if current_tls {
+                                "443".into()
+                            } else {
+                                "80".into()
+                            },
                             tls: current_tls,
                             tls_cert: None,
                             root: None,
@@ -216,7 +225,11 @@ async fn parse_caddy_sites() -> Result<Vec<WebSite>, std::io::Error> {
             if !current_server.is_empty() {
                 sites.push(WebSite {
                     server_name: current_server,
-                    listen: if current_tls { "443".into() } else { "80".into() },
+                    listen: if current_tls {
+                        "443".into()
+                    } else {
+                        "80".into()
+                    },
                     tls: current_tls,
                     tls_cert: None,
                     root: None,
