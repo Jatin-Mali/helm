@@ -249,7 +249,10 @@ mod tests {
         let mut engine = AlertingEngine::new(router).with_detectors(reg);
         let findings = engine.run_once(MonitorProfile::Standard).await.unwrap();
 
-        assert!(!findings.is_empty(), "detector should produce at least one finding");
+        assert!(
+            !findings.is_empty(),
+            "detector should produce at least one finding"
+        );
         assert!(
             !captured.lock().unwrap().is_empty(),
             "sink should receive the routed alert"

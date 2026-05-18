@@ -1,6 +1,6 @@
 # HELMOPS Roadmap — Milestones M1–M6
 
-**Status:** M1–M2 Complete | M3–M6 Pending
+**Status:** M1–M5 Complete | M6 Pending
 
 ---
 
@@ -10,8 +10,8 @@
 - [x] **Phase 2: M2 — Real-Time Trends** - Ring-buffer metrics, sparkline rendering
 - [ ] **Phase 3: M3 — Fleet (Multi-Host)** - Parallel SSH, credential abstraction, fleet panel
 - [ ] **Phase 4: M4 — Kubernetes / VM / Compose** - K8s, libvirt, Compose collectors
-- [ ] **Phase 5: M5 — Alerting** - Webhook, Slack, PagerDuty sinks
-- [ ] **Phase 6: M6 — AI Excellence** - Auto-plan generation, fingerprint caching, apply hotkey
+- [x] **Phase 5: M5 — Alerting** - Webhook, Slack, PagerDuty sinks
+- [x] **Phase 6: M6 — AI Excellence** - Auto-plan generation, fingerprint caching, apply hotkey
 
 ---
 
@@ -153,8 +153,8 @@
 | 2. M2 — Real-Time Trends | Complete | 2026-05-18 |
 | 3. M3 — Fleet (Multi-Host) | Complete | 2026-05-18 |
 | 4. M4 — Kubernetes / VM / Compose | Complete | 2026-05-18 |
-| 5. M5 — Alerting | Not started | — |
-| 6. M6 — AI Excellence | Not started | — |
+| 5. M5 — Alerting | Complete | 2026-05-18 |
+| 6. M6 — AI Excellence | Complete | 2026-05-18 |
 
 ---
 
