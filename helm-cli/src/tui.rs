@@ -1156,6 +1156,10 @@ struct DashboardState {
     sparkline_history_depth: usize,
     /// Selected row in Fleet tab for multi-host view.
     fleet_selected_row: Option<usize>,
+    /// Fingerprint-keyed plan cache: survives re-selection of the same finding.
+    plan_cache: HashMap<String, PlanStatus>,
+    /// Set to true when a fingerprint change requires background plan generation.
+    needs_plan_generation: bool,
 }
 
 impl DashboardState {
@@ -1177,6 +1181,8 @@ impl DashboardState {
             overlap_guard: None,
             sparkline_history_depth: thresholds.sparkline_history_depth.clamp(10, 300),
             fleet_selected_row: None,
+            plan_cache: HashMap::new(),
+            needs_plan_generation: false,
         }
     }
 }
@@ -1533,6 +1539,15 @@ impl TuiApp {
                                 }
                             }
                         }
+                        // Cache the resolved plan by fingerprint so re-selection is instant.
+                        if let Some(fp) = self
+                            .dashboard
+                            .pinned_incident
+                            .as_ref()
+                            .map(|p| p.fingerprint.clone())
+                        {
+                            self.dashboard.plan_cache.insert(fp, status.clone());
+                        }
                         let active_plan_ctx = self
                             .dashboard
                             .active_plan
@@ -1562,6 +1577,12 @@ impl TuiApp {
                         }
                         self.dashboard.pending_plan_rx = None;
                     }
+                }
+                // Auto-generate plan when selection changed to an uncached finding.
+                if self.dashboard.needs_plan_generation && self.dashboard.pending_plan_rx.is_none()
+                {
+                    self.dashboard.needs_plan_generation = false;
+                    let _ = self.generate_dashboard_plan().await;
                 }
                 // Handle rate-limited auto-retry countdown.
                 if let Some(ref mut plan) = self.dashboard.active_plan {
@@ -1785,6 +1806,18 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.apply_dashboard_plan().await?;
+                    return Ok(false);
+                }
+                KeyCode::Char('a')
+                    if self.mode == AgentMode::Dashboard
+                        && key.modifiers.is_empty()
+                        && self
+                            .dashboard
+                            .active_plan
+                            .as_ref()
+                            .is_some_and(|p| matches!(p.status, PlanStatus::Ready { .. })) =>
+                {
                     self.apply_dashboard_plan().await?;
                     return Ok(false);
                 }
@@ -4385,9 +4418,23 @@ Report the exit status and the concise output."
             .get(vpos)
             .and_then(|&idx| self.dashboard.data.findings.get(idx))
             .map(|f| f.fingerprint.clone());
-        self.dashboard.selected_fingerprint = fp;
+        let changed = fp.as_deref() != self.dashboard.selected_fingerprint.as_deref();
+        self.dashboard.selected_fingerprint = fp.clone();
         if !matches!(self.dashboard.view, DashboardView::Overview) {
             self.persist_pinned_incident_from_current();
+        }
+        if changed {
+            if let Some(ref fingerprint) = fp {
+                if let Some(cached_status) = self.dashboard.plan_cache.get(fingerprint).cloned() {
+                    // Cache hit: restore plan state instantly without spawning a new task.
+                    if let Some(ref mut plan) = self.dashboard.active_plan {
+                        plan.status = cached_status;
+                    }
+                } else {
+                    // Cache miss: queue auto-generation on next tick.
+                    self.dashboard.needs_plan_generation = true;
+                }
+            }
         }
     }
 
@@ -8149,7 +8196,7 @@ fn render_input(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
 fn render_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let mode_label = "DASHBOARD";
-    let mode_hint = "Tab panes | F5 refresh | Alt+E evidence | Alt+F check | Alt+G plan | Alt+A apply | 1-5 tabs";
+    let mode_hint = "Tab panes | F5 refresh | Alt+E evidence | Alt+F check | Alt+G plan | a/Alt+A apply | 1-5 tabs";
     let line = Line::from(vec![
         Span::styled(
             format!(" [{mode_label}] "),

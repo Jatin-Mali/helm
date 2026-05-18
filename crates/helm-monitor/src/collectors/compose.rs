@@ -121,10 +121,7 @@ fn parse_compose_projects(output: &str) -> Vec<ComposeProject> {
                     });
 
                     if let Some(proj_name) = project_name {
-                        projects
-                            .entry(proj_name)
-                            .or_default()
-                            .push(container);
+                        projects.entry(proj_name).or_default().push(container);
                     }
                 }
             }

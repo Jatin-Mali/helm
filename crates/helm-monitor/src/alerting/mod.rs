@@ -15,8 +15,9 @@ use std::time::Instant;
 
 use crate::findings::Finding;
 
-pub type SendFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>>;
+pub type SendFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>,
+>;
 
 pub trait AlertSink: Send + Sync {
     fn send<'a>(&'a self, alert: &'a AlertPayload) -> SendFuture<'a>;
