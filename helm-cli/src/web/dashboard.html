@@ -357,12 +357,24 @@ function connect() {
   ws.onmessage = (ev) => {
     try {
       const data = JSON.parse(ev.data);
-      if (data.error) return;
+      if (data.error) {
+        document.getElementById('detail-panel').innerHTML =
+          '<div style="padding:20px;color:var(--accent-red)">Error: ' + esc(data.error) + '</div>';
+        return;
+      }
       state.snapshot = data;
       state.findings = data.findings || [];
-      renderAll();
+      try {
+        renderAll();
+      } catch (renderErr) {
+        console.error('Render error:', renderErr);
+        document.getElementById('detail-panel').innerHTML =
+          '<div style="padding:20px;color:var(--accent-red)">Render error: ' + esc(renderErr.message) + '</div>';
+      }
     } catch (e) {
       console.error('Parse error:', e);
+      document.getElementById('detail-panel').innerHTML =
+        '<div style="padding:20px;color:var(--accent-red)">Data error: ' + esc(e.message) + '</div>';
     }
   };
 

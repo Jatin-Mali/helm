@@ -395,14 +395,23 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
     let backup_count = snapshot.domains.backups.tools_detected.len();
     let stale_backups = 0; // Future: detect stale backups
 
-    // Collector health
-    let collector_health: Vec<CollectorHealth> = snapshot
+    // Collector health — all domains, marking unhealthy ones from errors
+    let unhealthy: std::collections::HashSet<String> = snapshot
         .collector_errors
         .iter()
-        .map(|e| CollectorHealth {
-            domain: format!("{:?}", e.domain).to_lowercase(),
-            healthy: false,
-            error: Some(e.message.clone()),
+        .map(|e| format!("{:?}", e.domain).to_lowercase())
+        .collect();
+    let collector_health: Vec<CollectorHealth> = helm_monitor::SnapshotDomains::domain_names()
+        .iter()
+        .map(|&d| {
+            let name = d.to_string();
+            let is_healthy = !unhealthy.contains(&name);
+            let error = if is_healthy { None } else {
+                snapshot.collector_errors.iter()
+                    .find(|e| format!("{:?}", e.domain).to_lowercase() == name)
+                    .map(|e| e.message.clone())
+            };
+            CollectorHealth { domain: name, healthy: is_healthy, error }
         })
         .collect();
 
