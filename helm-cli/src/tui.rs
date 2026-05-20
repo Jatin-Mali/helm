@@ -6560,8 +6560,7 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Min(8),
-            Constraint::Length(2),
+            Constraint::Min(10),
         ])
         .split(inner);
 
@@ -6569,7 +6568,6 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     render_ops_status_strip(app, vert[1], buf);
     render_ops_tabbar(app, vert[2], buf);
     render_ops_body(app, vert[3], buf);
-    render_ops_footer(app, vert[4], buf);
 }
 
 fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
