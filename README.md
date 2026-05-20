@@ -57,6 +57,28 @@ Dashboard shortcuts:
 - `Alt+U` reopen a suppressed or resolved finding
 - `Shift+Tab` cycle Dashboard → Chat → Plan → Diagnose
 
+### Web Dashboard
+
+```sh
+# Start the live web dashboard
+helm web
+
+# Custom port
+helm web --port 8080
+```
+
+Open http://localhost:9120 in your browser. The web dashboard provides:
+
+- **Live system overview**: CPU, memory, load, disk usage — updates every 5 seconds
+- **Finding queue**: severity-grouped alerts with click-to-inspect
+- **Detail panel**: WHAT BROKE → IMPACT → EVIDENCE → FIX PLAN
+- **8 tabs**: ALERTS, SERVICES, CONTAINERS, PROCESSES, NETWORK, DISK, LOGS, FLEET
+- **Keyboard shortcuts**: `1-8` tabs, `↑/↓` queue, `Enter` select, `Escape` deselect, `Alt+G` plan, `F5` refresh
+- **Dark theme**: GitHub-dark inspired, zero-dependency single HTML file
+
+The web dashboard connects via WebSocket to the helm daemon for real-time data.
+Start the daemon first for continuous data: `helm daemon start`
+
 ## Safe CLI Flows
 
 ```sh

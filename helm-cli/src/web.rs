@@ -60,6 +60,7 @@ pub struct LiveSnapshot {
     pub findings: Vec<FindingEntry>,
     pub services: Vec<ServiceEntry>,
     pub containers: Vec<ContainerEntry>,
+    pub processes: Vec<ProcessEntry>,
     pub collector_health: Vec<CollectorHealth>,
     pub fleet_hosts: Vec<FleetHost>,
 }
@@ -127,6 +128,14 @@ pub struct PortListener {
     pub port: u16,
     pub protocol: String,
     pub process: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessEntry {
+    pub name: String,
+    pub pid: Option<u32>,
+    pub ports: Vec<u16>,
 }
 
 #[derive(Serialize, Clone)]
@@ -360,6 +369,20 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         process: l.process_name.clone().unwrap_or_default(),
     }).collect();
 
+    // Processes — derived from port listeners (unique process names)
+    let mut process_map: std::collections::HashMap<String, (Option<u32>, Vec<u16>)> = std::collections::HashMap::new();
+    for l in &snapshot.domains.ports.listeners {
+        if let Some(ref name) = l.process_name {
+            let entry = process_map.entry(name.clone()).or_insert((l.pid, Vec::new()));
+            entry.1.push(l.local_port);
+        }
+    }
+    let processes: Vec<ProcessEntry> = process_map.into_iter().map(|(name, (pid, ports))| ProcessEntry {
+        name,
+        pid,
+        ports,
+    }).collect();
+
     // Log entries
     let mut log_entries: Vec<String> = Vec::new();
     log_entries.extend(snapshot.domains.logs.kernel_errors.iter().cloned());
@@ -414,6 +437,7 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         findings,
         services,
         containers,
+        processes,
         collector_health,
         fleet_hosts: {
             crate::remote::RemoteRegistry::load()

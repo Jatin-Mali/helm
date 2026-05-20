@@ -537,7 +537,19 @@ function renderTabs() {
     ? logLines.map(l => `<div style="margin-bottom:2px">${esc(l)}</div>`).join('')
     : '<div style="color:var(--text-muted)">No recent errors</div>';
 
-  // Fleet tab
+  // Processes tab
+  let procRows = '';
+  for (const p of (d.processes || [])) {
+    const ports = (p.ports || []).join(', ');
+    procRows += `<tr><td>${p.pid || '—'}</td><td>${esc(p.name)}</td><td style="color:var(--text-muted)">${ports || '—'}</td></tr>`;
+  }
+  if (!procRows && d.portListeners && d.portListeners.length) {
+    for (const p of d.portListeners) {
+      if (p.process) procRows += `<tr><td>—</td><td>${esc(p.process)}</td><td style="color:var(--text-muted)">:${p.port}</td></tr>`;
+    }
+  }
+  if (!procRows) procRows = '<tr><td colspan="3" style="color:var(--text-muted);text-align:center;padding:12px">No process data — run with sudo for full details</td></tr>';
+  document.getElementById('tbl-processes').querySelector('tbody').innerHTML = procRows;
   let fleetRows = '';
   for (const h of (d.fleetHosts || [])) {
     const cls = h.status === 'online' ? 'state-ok' : h.status === 'warning' ? 'state-warn' : 'state-fail';
