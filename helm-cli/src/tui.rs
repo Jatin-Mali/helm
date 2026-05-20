@@ -2399,11 +2399,6 @@ impl TuiApp {
             if self.key_matches(&key, "quit", KeyCode::Char('d'), KeyModifiers::CONTROL)
                 && self.input.text.is_empty()
             {
-                // In Dashboard mode, Ctrl+D toggles daemon instead of quitting
-                if self.mode == AgentMode::Dashboard {
-                    self.toggle_daemon().await?;
-                    return Ok(false);
-                }
                 return Ok(true);
             }
             if self.key_matches(&key, "newline", KeyCode::Char('j'), KeyModifiers::CONTROL) {
@@ -5281,24 +5276,6 @@ Report the exit status and the concise output."
             self.session.transcript_scroll = 0;
         }
         let _ = tx;
-        Ok(())
-    }
-
-    /// Toggle the HELMOPS daemon on/off from the TUI.
-    async fn toggle_daemon(&mut self) -> Result<()> {
-        let state = crate::read_daemon_state();
-        if state.as_ref().map_or(false, |s| s.status == "running") {
-            let msg = crate::daemon_stop_core().await?;
-            self.toast(&format!("Daemon: {msg}"));
-        } else {
-            let db_path = self.runtime.db_path.clone();
-            let msg = crate::daemon_start_core(
-                crate::DaemonStartArgs { interval: 60 },
-                &db_path,
-            ).await?;
-            self.toast(&format!("Daemon: {msg}"));
-        }
-        self.refresh_dashboard();
         Ok(())
     }
 
@@ -8791,7 +8768,7 @@ fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
         key("Tab"),
         desc(" focus "),
         sep(),
-        key("F5/r"),
+        key("F5"),
         desc(" refresh "),
         sep(),
         key("Enter"),
@@ -8816,7 +8793,7 @@ fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
         desc(" tabs "),
         sep(),
         key("Ctrl+D"),
-        desc(" daemon"),
+        desc(" quit"),
     ]);
     Paragraph::new(line1)
         .style(Style::default().bg(OPS_SURFACE))
