@@ -65,6 +65,9 @@ tracing-opentelemetry = "0.28"
 sha2 = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tower = "0.5"
 
 helm-core = { path = "crates/helm-core" }
 helm-providers = { path = "crates/helm-providers" }

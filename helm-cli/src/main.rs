@@ -10,6 +10,7 @@ mod sandbox;
 mod secrets;
 mod telemetry;
 mod tui;
+mod web;
 
 use std::{
     env,
@@ -149,6 +150,7 @@ enum Command {
     Backup(BackupArgs),
     Runbook(RunbookArgs),
     Alerting(AlertingArgs),
+    Web(WebArgs),
 }
 
 #[derive(Debug, Args)]
@@ -912,6 +914,14 @@ enum AlertingCommand {
     },
 }
 
+/// Start the HELMOPS web dashboard server
+#[derive(Debug, Args)]
+struct WebArgs {
+    /// Port to listen on
+    #[arg(long, default_value = "9120")]
+    port: u16,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 enum ProviderChoice {
@@ -1295,6 +1305,10 @@ async fn run() -> Result<()> {
         }
         Command::Alerting(args) => {
             run_alerting_command(args).await?;
+        }
+        Command::Web(args) => {
+            let db_path = default_db_path()?;
+            web::serve(db_path, args.port).await?;
         }
     }
     Ok(())
@@ -1789,6 +1803,7 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "backup"
                 | "runbook"
                 | "alerting"
+                | "web"
         )
     )
 }
