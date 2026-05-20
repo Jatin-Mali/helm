@@ -2431,6 +2431,11 @@ impl TuiApp {
             if self.key_matches(&key, "quit", KeyCode::Char('d'), KeyModifiers::CONTROL)
                 && self.input.text.is_empty()
             {
+                // In Dashboard mode, Ctrl+D toggles daemon instead of quitting
+                if self.mode == AgentMode::Dashboard {
+                    self.toggle_daemon().await?;
+                    return Ok(false);
+                }
                 return Ok(true);
             }
             if self.key_matches(&key, "newline", KeyCode::Char('j'), KeyModifiers::CONTROL) {
