@@ -2177,15 +2177,7 @@ impl TuiApp {
                         self.dashboard.pending_plan_rx = None;
                     }
                 }
-                // Defer plan generation to background when selection changes.
-                // The user must press Alt+G to trigger explicit generation.
-                // Background hint is shown in FIX PLAN section.
-                if self.dashboard.needs_plan_generation && self.dashboard.pending_plan_rx.is_none()
-                {
-                    self.dashboard.needs_plan_generation = false;
-                    // Queue a non-blocking background generation
-                    self.dashboard.pending_plan_rx = Some(self.spawn_background_plan().await);
-                }
+                // Plan generation: requires explicit Alt+G.
                 // Handle rate-limited auto-retry countdown.
                 if let Some(ref mut plan) = self.dashboard.active_plan {
                     if plan.rate_limit_retry_pending {
@@ -2502,7 +2494,7 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.generate_dashboard_plan().await?;
+                    self.toast("Plan generation: use 'helm troubleshoot <issue>' from the CLI");
                     return Ok(false);
                 }
                 KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
@@ -5428,17 +5420,6 @@ Report the exit status and the concise output."
                 "You are assisting inside HELMOPS on host {host}. Stay read-only unless the operator later opens an apply flow.\n\nOperator question:\n{user_question}"
             )
         }
-    }
-
-    /// Spawn plan generation in the background without blocking the UI.
-    /// Returns a receiver that the event loop can poll for plan status.
-    async fn spawn_background_plan(&mut self) -> tokio::sync::oneshot::Receiver<PlanStatus> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        // The background generation runs in generate_dashboard_plan.
-        // Here we just create the channel — the actual work happens on Alt+G.
-        // Mark the plan as pending so the UI shows "Press Alt+G to generate"
-        let _ = tx.send(PlanStatus::Loading { started_at: chrono::Utc::now().timestamp() });
-        rx
     }
 
     async fn generate_dashboard_plan(&mut self) -> Result<()> {
