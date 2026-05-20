@@ -8827,58 +8827,40 @@ fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let key = |s: &'static str| Span::styled(s, Style::default().fg(OPS_FG));
     let sep = || Span::styled("  ", Style::default().fg(OPS_DIM));
     let desc = |s: &'static str| Span::styled(s, Style::default().fg(OPS_DIM));
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(area);
-
     let line1 = Line::from(vec![
-        key(" Tab"),
-        desc(" focus"),
+        key("Tab"),
+        desc(" focus "),
         sep(),
-        key("F5"),
-        desc(" refresh"),
+        key("F5/r"),
+        desc(" refresh "),
         sep(),
         key("Enter"),
-        desc(" select"),
+        desc(" select "),
         sep(),
         key("Alt+G"),
-        desc(" plan"),
+        desc(" plan "),
         sep(),
         key("Alt+E"),
-        desc(" evidence"),
+        desc(" evid "),
         sep(),
         key("Alt+A"),
-        desc(" apply"),
+        desc(" apply "),
         sep(),
         key("S"),
-        desc(" suppress"),
+        desc(" suppress "),
+        sep(),
+        key("R"),
+        desc(" resolve "),
+        sep(),
+        key("1-8"),
+        desc(" tabs "),
+        sep(),
+        key("Ctrl+D"),
+        desc(" daemon"),
     ]);
     Paragraph::new(line1)
         .style(Style::default().bg(OPS_SURFACE))
-        .render(rows[0], buf);
-
-    let right = "F1 help";
-    let left = " R resolve  1 incidents  2-8 evidence";
-    let pad = area
-        .width
-        .saturating_sub(left.len() as u16 + right.len() as u16) as usize;
-    let line2 = Line::from(vec![
-        key(" R"),
-        desc(" resolve"),
-        sep(),
-        key("1"),
-        desc(" incidents"),
-        sep(),
-        key("2-8"),
-        desc(" evidence"),
-        Span::styled(" ".repeat(pad), Style::default().fg(OPS_DIM)),
-        key("F1"),
-        desc(" help"),
-    ]);
-    Paragraph::new(line2)
-        .style(Style::default().bg(OPS_SURFACE))
-        .render(rows[1], buf);
+        .render(area, buf);
 }
 
 #[allow(dead_code)]
