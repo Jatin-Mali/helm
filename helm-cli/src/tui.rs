@@ -2109,30 +2109,6 @@ impl TuiApp {
                 {
                     self.toast = None;
                 }
-                // Auto-refresh dashboard data every 1 second when in Dashboard mode
-                if self.mode == AgentMode::Dashboard {
-                    let need_refresh = self
-                        .dashboard
-                        .data
-                        .last_tick_instant
-                        .map_or(true, |t| t.elapsed() >= Duration::from_secs(1));
-                    if need_refresh {
-                        // Non-blocking: fire refresh as background task
-                        let db_path = self.runtime.db_path.clone();
-                        let tx_clone = tx.clone();
-                        let _ = tokio::spawn(async move {
-                            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                                let prev = crate::load_previous_snapshot(&conn);
-                                let _ = crate::run_monitor_cycle(
-                                    MonitorProfile::Quick, None, prev,
-                                )
-                                .await;
-                            }
-                            let _ = tx_clone.send(UiEvent::DashboardRefresh);
-                        });
-                        self.dashboard.data.last_tick_instant = Some(Instant::now());
-                    }
-                }
                 // Poll the oneshot receiver for a completed LLM plan.
                 if let Some(rx) = &mut self.dashboard.pending_plan_rx {
                     if let Ok(status) = rx.try_recv() {
