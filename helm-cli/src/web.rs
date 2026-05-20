@@ -383,11 +383,17 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         })
         .collect();
 
+    let cpu_percent = if load.cpu_logical_count > 0 {
+        ((load.load_average.one / load.cpu_logical_count as f64) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
     let live = LiveSnapshot {
         hostname: snapshot.host.hostname.clone(),
         collected_at: chrono::Utc::now().format("%H:%M:%S UTC").to_string(),
         profile: "quick".to_string(),
-        cpu_percent: 0.0, // LoadSnapshot doesn't have cpu_percent directly
+        cpu_percent,
         load_1m: load.load_average.one,
         load_5m: load.load_average.five,
         load_15m: load.load_average.fifteen,
@@ -409,7 +415,16 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         services,
         containers,
         collector_health,
-        fleet_hosts: Vec::new(), // Populated from remotes in future
+        fleet_hosts: {
+            crate::remote::RemoteRegistry::load()
+                .map(|r| r.remotes.iter().map(|remote| FleetHost {
+                    hostname: remote.host.clone(),
+                    status: "unknown".to_string(),
+                    findings_count: 0,
+                    last_seen: String::new(),
+                }).collect())
+                .unwrap_or_default()
+        },
     };
 
     serde_json::to_string(&live).unwrap_or_default()
