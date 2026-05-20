@@ -522,6 +522,21 @@ function renderTabs() {
   }
   document.getElementById('tbl-disk').querySelector('tbody').innerHTML = diskRows;
 
+  // Network / Ports tab
+  let portRows = '';
+  for (const p of (d.portListeners || [])) {
+    const proc = p.process || '—';
+    portRows += `<tr><td>${p.port}</td><td style="color:var(--text-muted)">${esc(p.protocol)}</td><td>${esc(proc)}</td></tr>`;
+  }
+  if (!portRows) portRows = '<tr><td colspan="3" style="color:var(--text-muted);text-align:center;padding:12px">No listeners detected</td></tr>';
+  document.getElementById('tbl-ports').querySelector('tbody').innerHTML = portRows;
+
+  // Logs tab
+  const logLines = d.logEntries || [];
+  document.getElementById('logs-content').innerHTML = logLines.length
+    ? logLines.map(l => `<div style="margin-bottom:2px">${esc(l)}</div>`).join('')
+    : '<div style="color:var(--text-muted)">No recent errors</div>';
+
   // Fleet tab
   let fleetRows = '';
   for (const h of (d.fleetHosts || [])) {

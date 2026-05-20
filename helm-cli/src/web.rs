@@ -52,7 +52,9 @@ pub struct LiveSnapshot {
     pub total_containers: usize,
     pub running_containers: usize,
     pub listening_ports: usize,
+    pub port_listeners: Vec<PortListener>,
     pub journal_errors: u64,
+    pub log_entries: Vec<String>,
     pub backup_count: usize,
     pub stale_backups: usize,
     pub findings: Vec<FindingEntry>,
@@ -117,6 +119,14 @@ pub struct ContainerEntry {
     pub image: String,
     pub status: String,
     pub ports: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PortListener {
+    pub port: u16,
+    pub protocol: String,
+    pub process: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -304,6 +314,21 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         ports: c.ports.clone(),
     }).collect();
 
+    // Port listeners
+    let port_listeners: Vec<PortListener> = snapshot.domains.ports.listeners.iter().map(|l| PortListener {
+        port: l.local_port,
+        protocol: l.protocol.clone(),
+        process: l.process_name.clone().unwrap_or_default(),
+    }).collect();
+
+    // Log entries
+    let mut log_entries: Vec<String> = Vec::new();
+    log_entries.extend(snapshot.domains.logs.kernel_errors.iter().cloned());
+    log_entries.extend(snapshot.domains.logs.auth_failures.iter().cloned());
+    if log_entries.is_empty() {
+        log_entries.push("No recent errors detected".to_string());
+    }
+
     // Backups
     let backup_count = snapshot.domains.backups.tools_detected.len();
     let stale_backups = 0; // Future: detect stale backups
@@ -336,7 +361,9 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         total_containers,
         running_containers,
         listening_ports: snapshot.domains.ports.listeners.len(),
+        port_listeners,
         journal_errors: snapshot.domains.logs.journal_errors_last_hour,
+        log_entries,
         backup_count,
         stale_backups,
         findings,
