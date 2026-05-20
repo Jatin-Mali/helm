@@ -5320,15 +5320,15 @@ Report the exit status and the concise output."
     async fn toggle_daemon(&mut self) -> Result<()> {
         let state = crate::read_daemon_state();
         if state.as_ref().map_or(false, |s| s.status == "running") {
-            crate::run_daemon_stop().await?;
-            self.toast("Daemon stopped");
+            let msg = crate::daemon_stop_core().await?;
+            self.toast(&format!("Daemon: {msg}"));
         } else {
             let db_path = self.runtime.db_path.clone();
-            crate::run_daemon_command(
-                crate::DaemonArgs { command: crate::DaemonCommand::Start(crate::DaemonStartArgs { interval: 60 }) },
+            let msg = crate::daemon_start_core(
+                crate::DaemonStartArgs { interval: 60 },
                 &db_path,
             ).await?;
-            self.toast("Daemon started (interval: 60s)");
+            self.toast(&format!("Daemon: {msg}"));
         }
         self.refresh_dashboard();
         Ok(())
@@ -11336,8 +11336,9 @@ mod tests {
         app.mode = AgentMode::Dashboard;
         let data = test_dash_data();
         app.dashboard.data = data.clone();
-        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 36));
-        render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
+        // Use 150-char width to accommodate full header with all labels
+        let mut buf = Buffer::empty(Rect::new(0, 0, 150, 36));
+        render_dashboard(&app, Rect::new(0, 0, 150, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
             rendered.contains("CRIT 1"),

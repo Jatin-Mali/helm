@@ -4124,18 +4124,30 @@ pub(crate) fn request_daemon_refresh() -> Result<bool> {
 
 async fn run_daemon_command(args: DaemonArgs, db_path: &Path) -> Result<()> {
     match args.command {
-        DaemonCommand::Start(args) => run_daemon_start(args, db_path).await,
-        DaemonCommand::Stop => run_daemon_stop().await,
-        DaemonCommand::Status => run_daemon_status(),
+        DaemonCommand::Start(args) => {
+            let msg = daemon_start_core(args, db_path).await?;
+            println!("{msg}");
+            Ok(())
+        }
+        DaemonCommand::Stop => {
+            let msg = daemon_stop_core().await?;
+            println!("{msg}");
+            Ok(())
+        }
+        DaemonCommand::Status => {
+            let msg = daemon_status_core()?;
+            println!("{msg}");
+            Ok(())
+        }
         DaemonCommand::Run(args) => run_daemon_loop(args.interval, db_path.to_path_buf()).await,
     }
 }
 
-async fn run_daemon_start(args: DaemonStartArgs, db_path: &Path) -> Result<()> {
+/// Core daemon start — returns status message, does NOT print (TUI-safe).
+pub(crate) async fn daemon_start_core(args: DaemonStartArgs, db_path: &Path) -> Result<String> {
     if let Some(pid) = read_daemon_state().and_then(|state| state.pid) {
         if process_alive(pid) {
-            println!("helm daemon already running (pid {pid})");
-            return Ok(());
+            return Ok(format!("helm daemon already running (pid {pid})"));
         }
     }
 
@@ -4179,22 +4191,20 @@ async fn run_daemon_start(args: DaemonStartArgs, db_path: &Path) -> Result<()> {
         db_path: db_path.display().to_string(),
     };
     write_daemon_state(&state)?;
-    println!(
+    Ok(format!(
         "helm daemon started (pid {pid})\nstate: {}\nlog: {}",
         daemon_state_path().display(),
         log_path.display()
-    );
-    Ok(())
+    ))
 }
 
-async fn run_daemon_stop() -> Result<()> {
+/// Core daemon stop — returns status message, does NOT print (TUI-safe).
+pub(crate) async fn daemon_stop_core() -> Result<String> {
     let Some(mut state) = read_daemon_state() else {
-        println!("helm daemon is not running");
-        return Ok(());
+        return Ok("helm daemon is not running".to_owned());
     };
     let Some(pid) = state.pid else {
-        println!("helm daemon is not running");
-        return Ok(());
+        return Ok("helm daemon is not running".to_owned());
     };
     if !process_alive(pid) {
         state.status = "stopped".to_owned();
@@ -4202,8 +4212,7 @@ async fn run_daemon_stop() -> Result<()> {
         state.last_heartbeat = Some(now_rfc3339());
         write_daemon_state(&state)?;
         let _ = fs::remove_file(daemon_pid_path());
-        println!("helm daemon already stopped");
-        return Ok(());
+        return Ok("helm daemon already stopped".to_owned());
     }
 
     let status = std::process::Command::new("kill")
@@ -4234,14 +4243,13 @@ async fn run_daemon_stop() -> Result<()> {
         let _ = fs::remove_file(daemon_pid_path());
         let _ = fs::remove_file(daemon_refresh_request_path());
     }
-    println!("helm daemon {}", state.status);
-    Ok(())
+    Ok(format!("helm daemon {}", state.status))
 }
 
-fn run_daemon_status() -> Result<()> {
+/// Core daemon status — returns status message, does NOT print (TUI-safe).
+pub(crate) fn daemon_status_core() -> Result<String> {
     let Some(state) = read_daemon_state() else {
-        println!("helm daemon offline");
-        return Ok(());
+        return Ok("helm daemon offline".to_owned());
     };
     let pid_note = state
         .pid
@@ -4253,29 +4261,31 @@ fn run_daemon_status() -> Result<()> {
             }
         })
         .unwrap_or_else(|| "no pid".to_owned());
-    println!("helm daemon {}", state.status);
-    println!("  {}", pid_note);
-    println!("  interval: {}s", state.refresh_interval_secs);
-    println!("  db: {}", state.db_path);
+    let mut lines = vec![
+        format!("helm daemon {}", state.status),
+        format!("  {pid_note}"),
+        format!("  interval: {}s", state.refresh_interval_secs),
+        format!("  db: {}", state.db_path),
+    ];
     if let Some(ts) = state.started_at.as_deref() {
-        println!("  started: {ts}");
+        lines.push(format!("  started: {ts}"));
     }
     if let Some(ts) = state.last_heartbeat.as_deref() {
-        println!("  heartbeat: {ts}");
+        lines.push(format!("  heartbeat: {ts}"));
     }
     if let Some(ts) = state.last_success_at.as_deref() {
-        println!("  last success: {ts}");
+        lines.push(format!("  last success: {ts}"));
     }
     if let Some(snapshot_id) = state.last_snapshot_id.as_deref() {
-        println!(
+        lines.push(format!(
             "  last snapshot: {} ({} finding(s))",
             snapshot_id, state.last_finding_count
-        );
+        ));
     }
     if let Some(error) = state.last_error.as_deref() {
-        println!("  last error: {error}");
+        lines.push(format!("  last error: {error}"));
     }
-    Ok(())
+    Ok(lines.join("\n"))
 }
 
 #[allow(unused_assignments)]
