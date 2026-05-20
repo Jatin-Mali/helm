@@ -10,6 +10,7 @@ mod sandbox;
 mod secrets;
 mod telemetry;
 mod tui;
+mod web;
 
 use std::{
     env,
@@ -149,6 +150,13 @@ enum Command {
     Backup(BackupArgs),
     Runbook(RunbookArgs),
     Alerting(AlertingArgs),
+    Web(WebArgs),
+}
+
+#[derive(Debug, Args)]
+struct WebArgs {
+    #[arg(long, default_value = "9120")]
+    port: u16,
 }
 
 #[derive(Debug, Args)]
@@ -1296,6 +1304,9 @@ async fn run() -> Result<()> {
         Command::Alerting(args) => {
             run_alerting_command(args).await?;
         }
+        Command::Web(args) => {
+            web::serve(default_db_path()?, args.port).await?;
+        }
     }
     Ok(())
 }
@@ -1789,6 +1800,7 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "backup"
                 | "runbook"
                 | "alerting"
+                | "web"
         )
     )
 }

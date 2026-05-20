@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HELMOPS — System Dashboard</title>
+<style>
+/* ── Design System ─────────────────────────────────────────────────── */
+:root {
+  --bg-primary:    #0d1117;
+  --bg-secondary:  #161b22;
+  --bg-tertiary:   #21262d;
+  --border:        #30363d;
+  --text-primary:  #c9d1d9;
+  --text-secondary:#8b949e;
+  --text-muted:    #6e7681;
+  --accent-blue:   #58a6ff;
+  --accent-green:  #3fb950;
+  --accent-yellow: #d29922;
+  --accent-red:    #f85149;
+  --accent-orange: #f0883e;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Courier New', monospace;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow: hidden;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Header ────────────────────────────────────────────────────────── */
+#header {
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  padding: 5px 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-height: 32px;
+}
+#header .brand { color: var(--accent-blue); font-weight: 500; letter-spacing: .08em; }
+#header .sep { color: var(--text-muted); }
+#header .hostname { color: var(--text-primary); }
+#header .provider { color: var(--text-secondary); }
+#header .live-dot { color: var(--accent-green); }
+#header .live-text { color: var(--accent-green); margin-left: 2px; font-weight: 500; }
+#header .clock { color: var(--text-secondary); }
+#header .metrics { margin-left: auto; display: flex; gap: 0; }
+#header .metrics span { color: var(--text-muted); }
+#header .metrics .val { color: var(--accent-yellow); }
+
+/* ── Status Strip ───────────────────────────────────────────────────── */
+#status-strip {
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border);
+  padding: 4px 10px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 26px;
+}
+.badge { padding: 1px 8px; border-radius: 3px; font-weight: 500; font-size: 10.5px; }
+.badge-crit { background: #3d1a1a; color: var(--accent-red); }
+.badge-warn { background: #2d2008; color: var(--accent-yellow); }
+.badge-info { background: #0d2137; color: var(--accent-blue); }
+.badge-muted { background: var(--bg-tertiary); color: var(--text-muted); }
+.chip { font-size: 10.5px; margin-left: auto; color: var(--text-muted); }
+.chip .warn { color: var(--accent-red); }
+
+/* ── Tab Bar ────────────────────────────────────────────────────────── */
+#tabbar {
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  overflow-x: auto;
+  min-height: 30px;
+}
+.tab {
+  padding: 5px 14px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  font-size: 10.5px;
+  letter-spacing: .04em;
+  white-space: nowrap;
+  user-select: none;
+}
+.tab:hover { color: var(--text-primary); }
+.tab.active { color: var(--accent-blue); border-bottom-color: var(--accent-blue); }
+
+/* ── Main Content ───────────────────────────────────────────────────── */
+#main-content {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── Finding Queue (left sidebar) ───────────────────────────────────── */
+#queue-panel {
+  width: 240px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+#queue-header {
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  padding: 4px 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+#queue-header .label { color: var(--text-secondary); font-size: 10.5px; letter-spacing: .06em; }
+#queue-header .count { color: var(--accent-blue); font-size: 10.5px; }
+#queue-list { flex: 1; overflow-y: auto; }
+.queue-item {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--bg-tertiary);
+  cursor: pointer;
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+}
+.queue-item:hover { background: var(--bg-secondary); }
+.queue-item.selected { background: #1a2332; border-left: 2px solid var(--accent-blue); }
+.queue-item .sev { font-size: 10.5px; flex-shrink: 0; margin-top: 1px; }
+.queue-item .sev.crit { color: var(--accent-red); }
+.queue-item .sev.warn { color: var(--accent-yellow); }
+.queue-item .sev.info { color: var(--accent-blue); }
+.queue-item .info { min-width: 0; }
+.queue-item .title { font-size: 10.5px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-item .domain { font-size: 10px; color: var(--text-muted); }
+
+/* ── Detail Panel (right side) ──────────────────────────────────────── */
+#detail-panel {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+}
+.section { margin-bottom: 14px; }
+.section-title {
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  letter-spacing: .06em;
+  margin-bottom: 4px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+.section-content { color: var(--text-primary); font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+.cmd { background: var(--bg-tertiary); padding: 2px 6px; border-radius: 3px; font-size: 10.5px; display: inline-block; margin: 1px 0; }
+.risk-low { color: var(--accent-green); }
+.risk-med { color: var(--accent-yellow); }
+.risk-high { color: var(--accent-red); }
+
+/* ── Tab Content ────────────────────────────────────────────────────── */
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+.data-table th { text-align: left; color: var(--text-secondary); padding: 3px 6px; border-bottom: 1px solid var(--border); font-weight: 400; }
+.data-table td { padding: 3px 6px; border-bottom: 1px solid var(--bg-tertiary); color: var(--text-primary); }
+.data-table tr:hover td { background: var(--bg-secondary); }
+.state-ok { color: var(--accent-green); }
+.state-warn { color: var(--accent-yellow); }
+.state-fail { color: var(--accent-red); }
+
+/* ── Footer ─────────────────────────────────────────────────────────── */
+#footer {
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  padding: 4px 10px;
+  display: flex;
+  gap: 0;
+  flex-wrap: wrap;
+  font-size: 10.5px;
+  color: var(--text-muted);
+  min-height: 24px;
+}
+#footer span { margin-right: 14px; }
+#footer .key { color: var(--text-secondary); }
+
+/* ── Toast ──────────────────────────────────────────────────────────── */
+#toast {
+  position: fixed;
+  bottom: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  padding: 6px 16px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  color: var(--text-primary);
+  opacity: 0;
+  transition: opacity 0.2s;
+  pointer-events: none;
+  z-index: 100;
+}
+#toast.show { opacity: 1; }
+
+/* ── Skeleton Loading ───────────────────────────────────────────────── */
+.skeleton { background: var(--bg-tertiary); border-radius: 3px; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 0.8; } }
+
+/* ── Scrollbar ──────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--bg-tertiary); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div id="header">
+  <span class="brand">HELMOPS</span>
+  <span class="sep">|</span>
+  <span class="hostname" id="h-hostname">—</span>
+  <span class="sep">|</span>
+  <span class="provider" id="h-provider">local</span>
+  <span class="sep">|</span>
+  <span class="live-dot">●</span><span class="live-text">LIVE</span>
+  <span class="sep">|</span>
+  <span class="clock" id="h-clock">—:—:— UTC</span>
+  <span class="metrics">
+    <span>load <span class="val" id="h-load">—</span></span>
+    <span> <span class="val" id="h-load5">—</span> <span class="val" id="h-load15">—</span></span>
+    <span>  mem <span class="val" id="h-mem">—</span></span>
+    <span>  cpu <span class="val" id="h-cpu">—</span></span>
+  </span>
+</div>
+
+<!-- Status Strip -->
+<div id="status-strip">
+  <span class="badge badge-crit" id="ss-crit">CRIT —</span>
+  <span class="badge badge-warn" id="ss-warn">WARN —</span>
+  <span class="badge badge-info" id="ss-info">INFO —</span>
+  <span class="badge badge-muted" id="ss-muted">MUTED —</span>
+  <span class="chip"><span id="ss-svc">svc —</span>  <span id="ss-ctr">ctr —</span></span>
+</div>
+
+<!-- Tab Bar -->
+<div id="tabbar">
+  <div class="tab active" data-tab="alerts">ALERTS</div>
+  <div class="tab" data-tab="services">SERVICES</div>
+  <div class="tab" data-tab="containers">CONTAINERS</div>
+  <div class="tab" data-tab="processes">PROCESSES</div>
+  <div class="tab" data-tab="network">NETWORK</div>
+  <div class="tab" data-tab="disk">DISK</div>
+  <div class="tab" data-tab="logs">LOGS</div>
+  <div class="tab" data-tab="fleet">FLEET</div>
+</div>
+
+<!-- Main Content -->
+<div id="main-content">
+  <!-- Finding Queue -->
+  <div id="queue-panel">
+    <div id="queue-header">
+      <span class="label">FINDING QUEUE</span>
+      <span class="count" id="qh-count">— open</span>
+    </div>
+    <div id="queue-list"></div>
+  </div>
+
+  <!-- Detail / Tab Content -->
+  <div id="detail-panel">
+    <!-- ALERTS tab (default) — shows selected finding detail -->
+    <div class="tab-content active" id="tc-alerts">
+      <div id="finding-detail"></div>
+    </div>
+    <!-- SERVICES tab -->
+    <div class="tab-content" id="tc-services">
+      <div class="section-title">SERVICES</div>
+      <table class="data-table" id="tbl-services"><tbody></tbody></table>
+    </div>
+    <!-- CONTAINERS tab -->
+    <div class="tab-content" id="tc-containers">
+      <div class="section-title">CONTAINERS</div>
+      <table class="data-table" id="tbl-containers"><tbody></tbody></table>
+    </div>
+    <!-- PROCESSES tab -->
+    <div class="tab-content" id="tc-processes">
+      <div class="section-title">PROCESSES (top by CPU)</div>
+      <table class="data-table" id="tbl-processes"><tbody></tbody></table>
+    </div>
+    <!-- NETWORK tab -->
+    <div class="tab-content" id="tc-network">
+      <div class="section-title">LISTENING PORTS</div>
+      <table class="data-table" id="tbl-ports"><tbody></tbody></table>
+    </div>
+    <!-- DISK tab -->
+    <div class="tab-content" id="tc-disk">
+      <div class="section-title">FILESYSTEMS</div>
+      <table class="data-table" id="tbl-disk"><tbody></tbody></table>
+    </div>
+    <!-- LOGS tab -->
+    <div class="tab-content" id="tc-logs">
+      <div class="section-title">RECENT ERRORS</div>
+      <div id="logs-content" class="section-content">Loading…</div>
+    </div>
+    <!-- FLEET tab -->
+    <div class="tab-content" id="tc-fleet">
+      <div class="section-title">FLEET HOSTS</div>
+      <table class="data-table" id="tbl-fleet"><tbody></tbody></table>
+    </div>
+  </div>
+</div>
+
+<!-- Footer -->
+<div id="footer">
+  <span><span class="key">Tab</span> focus</span>
+  <span><span class="key">F5</span> refresh</span>
+  <span><span class="key">Enter</span> select</span>
+  <span><span class="key">Alt+G</span> plan</span>
+  <span><span class="key">Alt+E</span> evidence</span>
+  <span><span class="key">Alt+A</span> apply</span>
+  <span><span class="key">S</span> suppress</span>
+  <span><span class="key">R</span> resolve</span>
+  <span><span class="key">1-8</span> tabs</span>
+  <span><span class="key">?</span> help</span>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════
+// HELMOPS Web Dashboard — JavaScript
+// ═══════════════════════════════════════════════════════════════════════
+
+let state = {
+  snapshot: null,
+  findings: [],
+  selectedFindingId: null,
+  activeTab: 'alerts',
+  connected: false,
+};
+
+// ── WebSocket ─────────────────────────────────────────────────────────
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    state.connected = true;
+    toast('Connected');
+  };
+
+  ws.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      if (data.error) return;
+      state.snapshot = data;
+      state.findings = data.findings || [];
+      renderAll();
+    } catch (e) {
+      console.error('Parse error:', e);
+    }
+  };
+
+  ws.onclose = () => {
+    state.connected = false;
+    toast('Disconnected — reconnecting in 3s');
+    setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+// ── Render All ────────────────────────────────────────────────────────
+function renderAll() {
+  const d = state.snapshot;
+  if (!d) return;
+
+  // Header
+  document.getElementById('h-hostname').textContent = (d.hostname || 'localhost').toUpperCase();
+  document.getElementById('h-load').textContent = d.load1m?.toFixed(1) || '—';
+  document.getElementById('h-load5').textContent = d.load5m?.toFixed(1) || '—';
+  document.getElementById('h-load15').textContent = d.load15m?.toFixed(1) || '—';
+  document.getElementById('h-mem').textContent = d.memoryUsedPct != null ? Math.round(d.memoryUsedPct) + '%' : '—';
+  document.getElementById('h-cpu').textContent = d.cpuPercent != null ? Math.round(d.cpuPercent) + '%' : '—';
+
+  // Status strip
+  const crits = state.findings.filter(f => f.severity === 'critical');
+  const warns = state.findings.filter(f => f.severity === 'warning');
+  const infos = state.findings.filter(f => f.severity === 'info');
+  document.getElementById('ss-crit').textContent = `CRIT ${crits.length}`;
+  document.getElementById('ss-warn').textContent = `WARN ${warns.length}`;
+  document.getElementById('ss-info').textContent = `INFO ${infos.length}`;
+  document.getElementById('ss-svc').innerHTML = `svc <span class="warn">${d.failedServices || 0} fail</span>`;
+  document.getElementById('ss-ctr').textContent = `ctr ${d.runningContainers || 0}/${d.totalContainers || 0}`;
+  document.getElementById('qh-count').textContent = `${state.findings.length} open`;
+
+  // Queue
+  renderQueue();
+  // Tabs
+  renderTabs();
+  // Detail
+  if (state.selectedFindingId) {
+    renderFindingDetail(state.selectedFindingId);
+  }
+}
+
+// ── Queue ─────────────────────────────────────────────────────────────
+function renderQueue() {
+  const list = document.getElementById('queue-list');
+  const grouped = {};
+  for (const f of state.findings) {
+    const sev = f.severity || 'info';
+    if (!grouped[sev]) grouped[sev] = [];
+    grouped[sev].push(f);
+  }
+  const order = ['critical', 'warning', 'info'];
+  let html = '';
+  for (const sev of order) {
+    const items = grouped[sev] || [];
+    for (const f of items) {
+      const sel = f.id === state.selectedFindingId ? ' selected' : '';
+      html += `<div class="queue-item${sel}" data-id="${f.id}" onclick="selectFinding('${f.id}')">
+        <span class="sev ${sev.substring(0,4)}">●</span>
+        <span class="info">
+          <div class="title">${esc(f.title)}</div>
+          <div class="domain">${esc(f.category)} · ${esc(f.affectedResource)}</div>
+        </span>
+      </div>`;
+    }
+  }
+  if (!html) {
+    html = '<div style="padding:12px;color:var(--text-muted);font-size:10.5px;text-align:center">No findings<br><span style="color:var(--accent-green)">System healthy ✓</span></div>';
+  }
+  list.innerHTML = html;
+}
+
+// ── Finding Detail ────────────────────────────────────────────────────
+function selectFinding(id) {
+  state.selectedFindingId = id;
+  state.activeTab = 'alerts';
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('[data-tab="alerts"]').classList.add('active');
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.getElementById('tc-alerts').classList.add('active');
+  renderQueue();
+  renderFindingDetail(id);
+}
+
+function renderFindingDetail(id) {
+  const f = state.findings.find(x => x.id === id);
+  if (!f) {
+    document.getElementById('finding-detail').innerHTML =
+      '<div class="section-content" style="color:var(--text-muted)">Select a finding from the queue</div>';
+    return;
+  }
+  document.getElementById('finding-detail').innerHTML = `
+    <div class="section">
+      <div class="section-title">WHAT BROKE</div>
+      <div class="section-content">${esc(f.title)}</div>
+      <div style="color:var(--text-muted);font-size:10.5px;margin-top:4px">Affected: ${esc(f.affectedResource)} · Severity: ${f.severity} · Confidence: ${f.confidence}</div>
+    </div>
+    <div class="section">
+      <div class="section-title">IMPACT</div>
+      <div class="section-content">${esc(f.impact || 'Not assessed')}</div>
+    </div>
+    <div class="section">
+      <div class="section-title">EVIDENCE</div>
+      <div class="section-content"><span class="cmd">${esc(f.evidenceSummary || 'No evidence recorded')}</span></div>
+    </div>
+    <div class="section">
+      <div class="section-title">HOW TO REPRODUCE / VERIFY</div>
+      <div class="section-content">${(f.readOnlyChecks || []).map(c => `<span class="cmd">${esc(c)}</span>`).join('<br>') || 'No checks available'}</div>
+    </div>
+    <div class="section">
+      <div class="section-title">RECOMMENDED FIX</div>
+      <div class="section-content">${f.fixPlan ? `<span class="cmd">${esc(f.fixPlan)}</span>` : 'No fix plan yet — press Alt+G to generate'}</div>
+      <div style="margin-top:4px;font-size:10.5px">Risk: <span class="risk-med">MEDIUM</span> · Rollback: review before applying</div>
+    </div>
+    <div class="section">
+      <div class="section-title">LIFECYCLE</div>
+      <div class="section-content">State: ${f.lifecycleState || 'new'} · Detector: ${esc(f.detectorId)} · Occurrences: ${f.occurrenceCount || 1}</div>
+    </div>`;
+}
+
+// ── Tab Content ───────────────────────────────────────────────────────
+function renderTabs() {
+  const d = state.snapshot;
+  if (!d) return;
+
+  // Services tab
+  if (d.services) {
+    let rows = '';
+    for (const s of d.services) {
+      const cls = s.state === 'failed' ? 'state-fail' : s.state === 'running' ? 'state-ok' : 'state-warn';
+      rows += `<tr><td>${esc(s.name)}</td><td class="${cls}">${esc(s.state)}</td><td style="color:var(--text-muted)">${esc(s.description || '')}</td></tr>`;
+    }
+    document.getElementById('tbl-services').querySelector('tbody').innerHTML = rows;
+  }
+
+  // Containers tab
+  if (d.containers) {
+    let rows = '';
+    for (const c of d.containers) {
+      const cls = c.status === 'running' ? 'state-ok' : c.status === 'exited' ? 'state-warn' : 'state-fail';
+      rows += `<tr><td>${esc(c.name)}</td><td>${esc(c.image)}</td><td class="${cls}">${esc(c.status)}</td><td style="color:var(--text-muted)">${esc((c.ports || []).join(', '))}</td></tr>`;
+    }
+    document.getElementById('tbl-containers').querySelector('tbody').innerHTML = rows;
+  }
+
+  // Disk tab
+  let diskRows = '';
+  for (const disk of (d.diskEntries || [])) {
+    const pct = disk.usedPct || 0;
+    const cls = pct > 90 ? 'state-fail' : pct > 75 ? 'state-warn' : 'state-ok';
+    const bar = `<span style="display:inline-block;width:60px;height:6px;background:var(--bg-tertiary);border-radius:2px;vertical-align:middle;margin:0 4px"><span style="display:block;height:100%;width:${Math.min(pct,100)}%;background:${pct>90?'var(--accent-red)':pct>75?'var(--accent-yellow)':'var(--accent-green)'};border-radius:2px"></span></span>`;
+    diskRows += `<tr><td>${esc(disk.mount)}</td><td class="${cls}">${Math.round(pct)}% ${bar}</td><td>${disk.totalGb?.toFixed(1) || '—'} GB</td><td>${disk.availableGb?.toFixed(1) || '—'} GB</td></tr>`;
+  }
+  document.getElementById('tbl-disk').querySelector('tbody').innerHTML = diskRows;
+
+  // Fleet tab
+  let fleetRows = '';
+  for (const h of (d.fleetHosts || [])) {
+    const cls = h.status === 'online' ? 'state-ok' : h.status === 'warning' ? 'state-warn' : 'state-fail';
+    fleetRows += `<tr><td>${esc(h.hostname)}</td><td class="${cls}">● ${esc(h.status)}</td><td>${h.findingsCount || 0}</td><td style="color:var(--text-muted)">${esc(h.lastSeen || '—')}</td></tr>`;
+  }
+  if (!fleetRows) fleetRows = '<tr><td colspan="4" style="color:var(--text-muted);text-align:center;padding:12px">No fleet hosts configured</td></tr>';
+  document.getElementById('tbl-fleet').querySelector('tbody').innerHTML = fleetRows;
+}
+
+// ── Tab Switching ─────────────────────────────────────────────────────
+document.getElementById('tabbar').addEventListener('click', (e) => {
+  const tab = e.target.closest('.tab');
+  if (!tab) return;
+  const name = tab.dataset.tab;
+  state.activeTab = name;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  tab.classList.add('active');
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.getElementById('tc-' + name).classList.add('active');
+});
+
+// ── Keyboard Shortcuts ────────────────────────────────────────────────
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key;
+  if (k >= '1' && k <= '8') {
+    const tabs = ['alerts','services','containers','processes','network','disk','logs','fleet'];
+    const name = tabs[parseInt(k)-1];
+    document.querySelector(`[data-tab="${name}"]`).click();
+  }
+  if (k === 'ArrowDown' || k === 'ArrowUp') {
+    e.preventDefault();
+    const items = document.querySelectorAll('.queue-item');
+    const idx = Array.from(items).findIndex(el => el.classList.contains('selected'));
+    const next = k === 'ArrowDown' ? Math.min(idx + 1, items.length - 1) : Math.max(idx - 1, 0);
+    if (items[next]) items[next].click();
+  }
+  if (k === 'Escape') {
+    state.selectedFindingId = null;
+    renderQueue();
+    document.getElementById('finding-detail').innerHTML = '<div class="section-content" style="color:var(--text-muted)">Select a finding from the queue</div>';
+  }
+  if (k === 'g' && e.altKey) {
+    e.preventDefault();
+    if (state.selectedFindingId) {
+      toast('Plan generation: POST /api/plan — coming in Phase 3');
+    } else {
+      toast('Select a finding first, then Alt+G to generate a plan');
+    }
+  }
+  if (k === 'F5') { e.preventDefault(); location.reload(); }
+});
+
+// ── Helpers ───────────────────────────────────────────────────────────
+function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+// ── Clock ─────────────────────────────────────────────────────────────
+setInterval(() => {
+  const now = new Date();
+  document.getElementById('h-clock').textContent =
+    now.toISOString().substring(11, 19) + ' UTC';
+}, 1000);
+
+// ── Start ─────────────────────────────────────────────────────────────
+connect();
+</script>
+</body>
+</html>
