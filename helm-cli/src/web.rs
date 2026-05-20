@@ -12,13 +12,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{
-    Router,
+    Json, Router,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use helm_monitor::{MonitorProfile, Severity};
 use serde::Serialize;
@@ -164,6 +164,7 @@ pub async fn serve(db_path: PathBuf, port: u16) -> Result<()> {
         .route("/", get(serve_dashboard))
         .route("/ws", get(ws_handler))
         .route("/api/snapshot", get(api_snapshot))
+        .route("/api/plan", post(api_generate_plan))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -220,7 +221,45 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<WebState>) {
 /// REST endpoint: latest snapshot as JSON.
 async fn api_snapshot(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     let json = collect_live_snapshot(&state.db_path).await;
-    axum::response::Json(serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default())
+    Json(serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default())
+}
+
+/// POST /api/plan — generate a troubleshooting plan for a finding.
+#[derive(serde::Deserialize)]
+struct PlanRequest {
+    #[serde(rename = "findingId")]
+    finding_id: String,
+}
+
+async fn api_generate_plan(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<PlanRequest>,
+) -> impl IntoResponse {
+    let conn = match rusqlite::Connection::open(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Json(serde_json::json!({"error": format!("DB error: {e}")})),
+    };
+
+    match crate::find_finding_by_id(&conn, &req.finding_id) {
+        Some(finding) => {
+            Json(serde_json::json!({
+                "finding_id": req.finding_id,
+                "title": finding.title,
+                "severity": format!("{:?}", finding.severity),
+                "impact": finding.impact,
+                "evidence": finding.evidence.first().map(|e| &e.value),
+                "read_only_checks": finding.read_only_checks,
+                "fix_plan": finding.fix_plan,
+                "plan_note": "AI-powered plan generation: use 'helm troubleshoot <issue>' from CLI, or configure an LLM provider with 'helm init --provider ollama'"
+            }))
+        }
+        None => {
+            Json(serde_json::json!({
+                "error": "Finding not found. Run a collection first.",
+                "plan": null
+            }))
+        }
+    }
 }
 
 // ── Data Collection ────────────────────────────────────────────────────────

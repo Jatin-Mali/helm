@@ -583,7 +583,31 @@ document.addEventListener('keydown', (e) => {
   if (k === 'g' && e.altKey) {
     e.preventDefault();
     if (state.selectedFindingId) {
-      toast('Plan generation: POST /api/plan — coming in Phase 3');
+      toast('Generating plan...');
+      fetch('/api/plan', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({findingId: state.selectedFindingId})
+      })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) {
+          toast('Error: ' + data.error);
+        } else {
+          // Update the finding detail with the plan data
+          const fd = document.getElementById('finding-detail');
+          const planNote = data.plan_note || '';
+          const fixPlan = data.fix_plan
+            ? `<span class="cmd">${esc(data.fix_plan)}</span>`
+            : 'No fix plan available';
+          fd.innerHTML = fd.innerHTML.replace(
+            /No fix plan yet.*/,
+            fixPlan + '<br><span style="color:var(--text-muted);font-size:10px">' + esc(planNote) + '</span>'
+          );
+          toast('Plan loaded');
+        }
+      })
+      .catch(err => toast('Plan API error: ' + err.message));
     } else {
       toast('Select a finding first, then Alt+G to generate a plan');
     }
