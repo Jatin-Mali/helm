@@ -1,7 +1,6 @@
 //! Command-line entry point for HELM.
 
 mod bootstrap;
-mod builtin_skills;
 mod custom_commands;
 mod keybindings;
 mod paths;
@@ -24,13 +23,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use helm_core::{Capability, ContentBlock, GrantScope, HelmError, ProviderError, Secret};
 use helm_memory::{
-    AuditEventRecord, CapabilityGrantRecord, EpisodeRecord, MemoryStore, SnapshotStore,
-    SnapshotStoreRecord, StepRecord,
+    AuditEventRecord, CapabilityGrantRecord, MemoryStore, SnapshotStore, SnapshotStoreRecord,
 };
 use helm_memory::{
     AuditHashParts, ChangeSetStore, TroubleshootingPlanStore, audit_hash, latest_audit_hash,
@@ -45,7 +43,6 @@ use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
     OpenAiCompatProvider, Provider, StopReason, ToolSchema, quirks_for,
 };
-use helm_tools::{SkillTool, ToolRegistry};
 use secrets::SecretsStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -55,7 +52,7 @@ use tracing_subscriber::{EnvFilter, fmt, fmt::MakeWriter, prelude::*};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "helm",
+    name = "helmops",
     version,
     about = "HELMOPS — live Linux/DevOps troubleshooting console"
 )]
@@ -113,12 +110,6 @@ struct Cli {
     /// Execute shell-style tool calls on the named remote host (registered via `helm remote add`).
     #[arg(long, value_name = "NAME", global = true)]
     remote: Option<String>,
-    /// Resume a specific session id for the next `run`.
-    #[arg(long, value_name = "ID", global = true)]
-    resume: Option<String>,
-    /// Resume the latest session when running a new task.
-    #[arg(long = "continue", global = true)]
-    continue_last: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -413,37 +404,6 @@ struct ServeArgs {
 }
 
 #[derive(Debug, Args)]
-struct SessionsArgs {
-    #[command(subcommand)]
-    command: SessionsCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum SessionsCommand {
-    List {
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-    },
-    Delete {
-        id: String,
-    },
-    Export {
-        id: String,
-        #[arg(long, default_value = "json")]
-        format: String,
-    },
-    Resume {
-        id: String,
-        /// Continue the session by handing this task to the agent with prior conversation context.
-        #[arg(long, value_name = "TASK")]
-        task: Option<String>,
-        /// Print transcript and exit without running a follow-up task.
-        #[arg(long)]
-        show: bool,
-    },
-}
-
-#[derive(Debug, Args)]
 struct ExportArgs {
     #[arg(value_name = "EPISODE_ID")]
     episode_id: String,
@@ -457,73 +417,12 @@ struct ExportArgs {
 struct UndoArgs {
     #[arg(value_name = "N", default_value_t = 1)]
     n: u32,
-    #[arg(long)]
-    session_id: Option<String>,
     /// Actually write the snapshot content back to disk (otherwise dry-run prints diff).
     #[arg(long)]
     apply: bool,
     /// Write to this path instead of the recorded file_path.
     #[arg(long, value_name = "PATH")]
     to: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-struct StatsArgs {
-    /// Time range: "7d" (default), "30d", or "all"
-    #[arg(long, default_value = "7d", value_name = "RANGE")]
-    time_range: String,
-}
-
-#[derive(Debug, Args)]
-struct MemoryArgs {
-    #[command(subcommand)]
-    command: MemoryCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum MemoryCommand {
-    /// List entities in the knowledge graph
-    Graph {
-        #[arg(long)]
-        entity_type: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// Export memory to JSON file
-    Export {
-        #[arg(short, long)]
-        output: String,
-    },
-    /// Import memory from JSON file
-    Import {
-        #[arg(short, long)]
-        input: String,
-    },
-    /// Prune stale relations older than N days or below confidence threshold
-    Gc {
-        #[arg(long, default_value = "90")]
-        age_days: u32,
-        #[arg(long, default_value = "0.1")]
-        min_confidence: f32,
-    },
-}
-
-#[derive(Debug, Args)]
-struct ProfileArgs {
-    #[command(subcommand)]
-    command: ProfileCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum ProfileCommand {
-    /// Show top preferred tools and preferences
-    Show,
-    /// Set a preference key=value
-    Set { key: String, value: String },
-    /// Get a preference value
-    Get { key: String },
-    /// Show model routing success rates
-    Routes,
 }
 
 #[derive(Debug, Args)]
@@ -550,58 +449,6 @@ struct AuditShowArgs {
     episode: Option<String>,
     #[arg(long, value_name = "TARGET")]
     target: Option<String>,
-}
-
-#[derive(Debug, Args)]
-struct SkillsArgs {
-    #[command(subcommand)]
-    command: SkillsCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum SkillsCommand {
-    List,
-    Show(SkillShowArgs),
-    Approve(SkillApproveArgs),
-    Disable(SkillDisableArgs),
-    Test(SkillTestArgs),
-    Run(SkillRunArgs),
-}
-
-#[derive(Debug, Args)]
-struct SkillShowArgs {
-    #[arg(value_name = "ID")]
-    id: String,
-}
-
-#[derive(Debug, Args)]
-struct SkillApproveArgs {
-    #[arg(value_name = "ID")]
-    id: String,
-}
-
-#[derive(Debug, Args)]
-struct SkillDisableArgs {
-    #[arg(value_name = "ID")]
-    id: String,
-}
-
-#[derive(Debug, Args)]
-struct SkillTestArgs {
-    #[arg(value_name = "ID")]
-    id: String,
-}
-
-#[derive(Debug, Args)]
-struct SkillRunArgs {
-    #[arg(value_name = "ID")]
-    id: String,
-    /// JSON object of input values for `{{key}}` substitution (e.g. '{"branch":"main"}').
-    #[arg(long, value_name = "JSON")]
-    input: Option<String>,
-    /// Print resolved commands without executing them.
-    #[arg(long)]
-    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1098,9 +945,7 @@ async fn run() -> Result<()> {
 
     let command = match cli.command {
         Some(cmd) => cmd,
-        None => Command::Tui(TuiArgs {
-            mode: TuiMode::Dashboard,
-        }),
+        None => Command::Web(WebArgs { port: 9120 }),
     };
     match command {
         // stripped: Command::Run
@@ -1122,7 +967,6 @@ async fn run() -> Result<()> {
             }
         }
         // stripped: Command::Diagnose
-        // stripped: Command::Episodes
         Command::Permissions(args) => match args.command {
             PermissionsCommand::List => {
                 let report = render_permissions(&memory).await?;
@@ -1176,12 +1020,9 @@ async fn run() -> Result<()> {
                 print!("{report}");
             }
         },
-        // stripped: Command::Sessions
         // stripped: Command::Export
         // stripped: Command::Undo
         // stripped: Command::Redo
-        // stripped: Command::Stats
-        // stripped: Command::Skills
         // stripped: Command::Mcp
         Command::Secrets(args) => {
             run_secrets_command(args, &secrets_store)?;
@@ -1201,7 +1042,7 @@ async fn run() -> Result<()> {
         }
         Command::Completion(args) => {
             let mut cmd = Cli::command();
-            generate(args.shell, &mut cmd, "helm", &mut io::stdout());
+            generate(args.shell, &mut cmd, "helmops", &mut io::stdout());
         }
         Command::Tui(_args) => {
             let dashboard_mode = !cli.read_only && !cli.yes;
@@ -1227,7 +1068,6 @@ async fn run() -> Result<()> {
             .await?;
         }
         // stripped: Command::Memory
-        // stripped: Command::Profile
         Command::Remote(args) => {
             run_remote_command(args).await?;
         }
@@ -1248,28 +1088,8 @@ async fn run() -> Result<()> {
             }
         }
         Command::Dashboard(args) => {
-            let dashboard_mode = !cli.read_only && !cli.yes;
-            tui::run_tui(tui::TuiRuntime {
-                provider_settings,
-                db_path,
-                memory,
-                max_iterations: cli.max_iterations,
-                config_path,
-                secrets: secrets_store,
-                tui_paste_key_modal: config
-                    .as_ref()
-                    .and_then(|config| config.security.as_ref())
-                    .and_then(|security| security.tui_paste_key_modal)
-                    .unwrap_or(true),
-                auto_approve: cli.yes,
-                read_only: cli.read_only,
-                diagnose_mode: false,
-                dashboard_mode,
-                sandbox: sandbox.clone(),
-                remote_target: cli.remote.clone(),
-            })
-            .await?;
             let _ = args;
+            web::serve(db_path, 9120).await?;
         }
         Command::Daemon(args) => {
             run_daemon_command(args, &db_path).await?;
@@ -1305,7 +1125,7 @@ async fn run() -> Result<()> {
             run_alerting_command(args).await?;
         }
         Command::Web(args) => {
-            web::serve(default_db_path()?, args.port).await?;
+            web::serve(db_path, args.port).await?;
         }
     }
     Ok(())
@@ -1722,7 +1542,7 @@ fn apply_provider_defaults(settings: &mut ProviderSettings) {
 fn normalize_args(args: Vec<OsString>) -> Vec<OsString> {
     if args.len() <= 1 {
         let mut normalized = args;
-        normalized.push(OsString::from("tui"));
+        normalized.push(OsString::from("web"));
         return normalized;
     }
     let mut normalized = Vec::with_capacity(args.len().saturating_add(1));
@@ -1764,10 +1584,8 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "replay"
                 | "models"
                 | "doctor"
-                | "episodes"
                 | "permissions"
                 | "audit"
-                | "skills"
                 | "secrets"
                 | "init"
                 | "config"
@@ -1775,13 +1593,9 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "mcp"
                 | "help"
                 | "tui"
-                | "sessions"
                 | "export"
                 | "undo"
                 | "redo"
-                | "stats"
-                | "memory"
-                | "profile"
                 | "remote"
                 | "agent"
                 | "serve"
@@ -1817,8 +1631,7 @@ fn is_value_taking_flag(arg: &OsString) -> bool {
                 | "--base-url"
                 | "--ollama-url"
                 | "--sandbox-dir"
-                | "--remote"
-                | "--resume",
+                | "--remote",
         )
     )
 }
@@ -1848,7 +1661,7 @@ fn unknown_subcommand_error(args: &[OsString]) -> Option<String> {
         return None;
     }
     Some(format!(
-        "unknown subcommand: {}; use `helm troubleshoot \"...\"` or open the dashboard with `helm`",
+        "unknown subcommand: {}; use `helmops troubleshoot \"...\"` or open the dashboard with `helmops`",
         first.to_string_lossy()
     ))
 }
@@ -1859,172 +1672,6 @@ fn model_capability_warning_text() -> &'static str {
     "warning: the model emitted tool-shaped JSON in plain text. this usually means\n\
 the model does not support native tool calling. try a tools-capable model:\n\
   qwen3:4b, qwen3:8b, llama3.3:8b, hermes4:8b, mistral-small3:24b"
-}
-
-pub(crate) fn build_session_recap(
-    session: &helm_memory::SessionRecord,
-    episode: Option<&EpisodeRecord>,
-    steps: &[StepRecord],
-) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "resuming session {} ({})\nepisode: {}\ngoal: {}\n",
-        session.id, session.name, session.episode_id, session.goal,
-    ));
-    if let Some(ep) = episode {
-        out.push_str(&format!(
-            "started: {}\nprior outcome: {} ({} iters, {}/{} tokens)\n",
-            format_timestamp(ep.started_at),
-            ep.outcome.as_deref().unwrap_or("running"),
-            ep.iterations,
-            ep.tokens_in,
-            ep.tokens_out,
-        ));
-    }
-    out.push_str(&format!("prior steps: {}\n", steps.len()));
-    out
-}
-
-#[cfg(test)]
-async fn render_replay(memory: &MemoryStore, episode_id: &str) -> Result<String> {
-    let episode = memory
-        .get_episode(episode_id)
-        .await?
-        .ok_or_else(|| anyhow!("episode not found: {episode_id}"))?;
-    let steps = memory.get_steps(episode_id).await?;
-    Ok(format_transcript(&episode, &steps))
-}
-
-fn derive_session_name(goal: &str) -> String {
-    let mut parts = Vec::new();
-    for word in goal.split_whitespace() {
-        let clean: String = word
-            .chars()
-            .filter(|ch| ch.is_ascii_alphanumeric())
-            .map(|ch| ch.to_ascii_lowercase())
-            .collect();
-        if !clean.is_empty() {
-            parts.push(clean);
-        }
-        if parts.len() >= 6 {
-            break;
-        }
-    }
-    if parts.is_empty() {
-        format!("run-{}", chrono::Utc::now().format("%Y%m%d-%H%M"))
-    } else {
-        parts.join("-")
-    }
-}
-
-#[allow(dead_code)]
-async fn create_session_for_run(
-    db_path: &Path,
-    episode_id: &str,
-    goal: &str,
-    model: Option<&str>,
-    provider: Option<&str>,
-) -> Result<()> {
-    let sessions_dir = dirs::data_local_dir()
-        .ok_or_else(|| anyhow!("could not resolve data directory"))?
-        .join("helm");
-    let snapshots_dir = sessions_dir.join("snapshots");
-    let store = helm_memory::SessionStore::open(db_path, snapshots_dir).await?;
-    let session_name = derive_session_name(goal);
-    store
-        .create_session(
-            &session_name,
-            goal,
-            episode_id.to_owned(),
-            model.map(|s| s.to_owned()),
-            provider.map(|s| s.to_owned()),
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned()),
-        )
-        .await?;
-    eprintln!(
-        "[session] created session {} for episode {}",
-        session_name, episode_id
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn format_transcript(episode: &EpisodeRecord, steps: &[StepRecord]) -> String {
-    let mut output = String::new();
-    output.push_str(&format!("episode {}\n", episode.id));
-    output.push_str(&format!("goal: {}\n", episode.goal));
-    output.push_str(&format!(
-        "started: {}\n",
-        format_timestamp(episode.started_at)
-    ));
-    output.push_str(&format!(
-        "outcome: {} ({} iters, {}/{} tokens)\n",
-        episode.outcome.as_deref().unwrap_or("running"),
-        episode.iterations,
-        episode.tokens_in,
-        episode.tokens_out
-    ));
-    if episode.corrections_used > 0 {
-        output.push_str(&format!("corrections_used: {}\n", episode.corrections_used));
-    }
-    if episode.format_recovery_used {
-        output.push_str("format_recovery_used: true\n");
-    }
-    if let Some(warning) = &episode.model_capability_warning {
-        output.push_str(&format!("warning: model_capability_warning: {warning}\n"));
-    }
-    let mut tool_names_by_id = std::collections::HashMap::new();
-    for step in steps {
-        output.push('\n');
-        output.push_str(&format_step_header(step, &tool_names_by_id));
-        output.push('\n');
-        output.push_str(&format_step_content(step, &mut tool_names_by_id));
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-    }
-    output
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn format_step_header(
-    step: &StepRecord,
-    tool_names_by_id: &std::collections::HashMap<String, String>,
-) -> String {
-    let tool_name = step.content.iter().find_map(|block| match block {
-        ContentBlock::ToolResult { tool_use_id, .. } => tool_names_by_id.get(tool_use_id.as_str()),
-        _ => None,
-    });
-    match tool_name {
-        Some(name) if step.role == "tool" => {
-            format!("[step {}] tool ({name})", step.step_index)
-        }
-        _ => format!("[step {}] {}", step.step_index, step.role),
-    }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn format_step_content(
-    step: &StepRecord,
-    tool_names_by_id: &mut std::collections::HashMap<String, String>,
-) -> String {
-    let mut parts = Vec::new();
-    for block in &step.content {
-        match block {
-            ContentBlock::Text(text) => parts.push(text.clone()),
-            ContentBlock::ToolUse { id, name, input } => {
-                tool_names_by_id.insert(id.clone(), name.clone());
-                parts.push(json!({"name": name, "arguments": input}).to_string());
-            }
-            ContentBlock::ToolResult { content, .. } => parts.push(content.clone()),
-        }
-    }
-    parts.join("\n")
 }
 
 async fn render_permissions(memory: &MemoryStore) -> Result<String> {
@@ -2406,10 +2053,11 @@ async fn interactive_init(
     }
     println!();
     println!("Next steps:");
-    println!("  helm doctor       — verify everything is working");
-    println!("  helm              — open the interactive terminal UI");
-    println!("  helm monitor      — collect a fresh local monitor report");
-    println!("  helm troubleshoot \"<issue>\"  — generate a guided troubleshooting plan");
+    println!("  helmops doctor       — verify everything is working");
+    println!("  helmops              — open the web dashboard");
+    println!("  helmops tui          — open the terminal dashboard");
+    println!("  helmops monitor      — collect a fresh local monitor report");
+    println!("  helmops troubleshoot \"<issue>\"  — generate a guided troubleshooting plan");
     println!();
 
     Ok(())
@@ -2440,12 +2088,6 @@ fn parse_capability_arg(value: &str) -> Result<Capability> {
 
 fn parse_scope_arg(value: &str) -> Result<GrantScope> {
     value.parse::<GrantScope>().map_err(anyhow::Error::msg)
-}
-
-fn format_timestamp(unix_ms: i64) -> String {
-    DateTime::<Utc>::from_timestamp_millis(unix_ms)
-        .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "invalid timestamp".to_owned())
 }
 
 async fn render_models(base_url: &str) -> Result<String> {
@@ -2769,38 +2411,9 @@ async fn run_memory_doctor(db_path: &Path, memory: &MemoryStore) -> Result<Docto
     })
 }
 
-/// Build a `ToolRegistry` seeded with all default tools plus one `SkillTool` per skill.
-fn build_registry_with_skills(skills: &[helm_memory::Skill]) -> ToolRegistry {
-    let mut registry = ToolRegistry::with_default_tools();
-    for skill in skills {
-        let cmds = builtin_skills::extract_bash_commands(&skill.content);
-        if !cmds.is_empty() {
-            registry.register(Box::new(SkillTool::new(
-                &skill.id,
-                &skill.description,
-                cmds,
-            )));
-        }
-    }
-    registry
-}
-
 fn run_tools_doctor() -> Vec<DoctorToolReport> {
-    let mut tools = build_registry_with_skills(&builtin_skills::load_builtin_skills())
-        .schemas()
-        .into_iter()
-        .map(|schema| DoctorToolReport {
-            name: schema.name,
-            status: "ok".to_owned(),
-        })
-        .collect::<Vec<_>>();
-    tools.sort_by_key(|tool| match tool.name.as_str() {
-        "shell" => 0,
-        "fs_read" => 1,
-        "fs_write" => 2,
-        _ => 3,
-    });
-    tools
+    // Tools crate removed during HELMOPS Rebirth v2 consolidation.
+    Vec::new()
 }
 
 async fn run_ollama_doctor(base_url: &str) -> DoctorOllamaReport {
@@ -3111,17 +2724,10 @@ async fn run_trust_report(
         .map(|c| c.to_string())
         .collect();
 
-    // Diagnose
-    let diagnose_registry = ToolRegistry::with_diagnose_tools();
-    let full_registry = ToolRegistry::with_default_tools();
-    let tools_available = diagnose_registry.schemas().len();
-    let write_tools_blocked = full_registry
-        .schemas()
-        .len()
-        .saturating_sub(tools_available);
-    // Verify every diagnose-registry tool gates its mutating sub-actions
-    // at runtime (add/commit/push, post/put/delete/patch, kill, shell mode).
-    let write_ops_gated = diagnose_registry.verify_diagnose_write_gates();
+    // Diagnose — tools crate removed during consolidation
+    let tools_available: usize = 0;
+    let write_tools_blocked: usize = 0;
+    let write_ops_gated = true;
 
     Ok(TrustReport {
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -4035,7 +3641,7 @@ Description=HELMOPS daemon\n\
 After=default.target\n\
 \n\
 [Service]\n\
-ExecStart=%h/.helm/bin/helm daemon run --interval {interval_secs}\n\
+ExecStart=%h/.helm/bin/helmops daemon run --interval {interval_secs}\n\
 Restart=always\n\
 RestartSec=5\n\
 Environment=XDG_CONFIG_HOME=%h/.config\n\
@@ -4057,10 +3663,10 @@ systemctl --user is-active --quiet helmopsd.service"
     let detached_script = format!(
         "set -eu\n\
 mkdir -p \"$HOME/.local/state/helm/logs\"\n\
-pkill -f \"$HOME/.helm/bin/helm daemon run --interval {interval_secs}\" >/dev/null 2>&1 || true\n\
-nohup \"$HOME/.helm/bin/helm\" daemon run --interval {interval_secs} > \"$HOME/.local/state/helm/logs/helmopsd.log\" 2>&1 < /dev/null &\n\
+pkill -f \"$HOME/.helm/bin/helmops daemon run --interval {interval_secs}\" >/dev/null 2>&1 || true\n\
+nohup \"$HOME/.helm/bin/helmops\" daemon run --interval {interval_secs} > \"$HOME/.local/state/helm/logs/helmopsd.log\" 2>&1 < /dev/null &\n\
 sleep 1\n\
-pgrep -f \"$HOME/.helm/bin/helm daemon run --interval {interval_secs}\" >/dev/null"
+pgrep -f \"$HOME/.helm/bin/helmops daemon run --interval {interval_secs}\" >/dev/null"
     );
     entry.run_shell(&detached_script).await?;
     Ok(remote::AgentSupervisor::DetachedProcess)
@@ -6090,7 +5696,6 @@ mod tests {
     use std::fs;
 
     use helm_core::ContentBlock;
-    use helm_memory::{EpisodeOutcome, MemoryStore, StepRole};
     use helm_providers::{ChatResponse, MockProvider, StopReason, Usage};
     use tempfile::tempdir;
 
@@ -6111,8 +5716,8 @@ mod tests {
         DoctorProviderReport, DoctorQuirksReport, DoctorReport, DoctorSecretsReport,
         DoctorToolReport, ProviderChoice, ProviderSource, classify_exit_code, format_audit_events,
         format_models, format_permissions, load_config, parse_capability_arg, parse_cli_from,
-        parse_fallback_chain, parse_scope_arg, render_doctor, render_replay,
-        resolve_provider_choice, resolve_provider_settings_with_env, supports_tools,
+        parse_fallback_chain, parse_scope_arg, render_doctor, resolve_provider_choice,
+        resolve_provider_settings_with_env, supports_tools,
     };
 
     fn empty_env(_name: &str) -> Option<String> {
@@ -6284,12 +5889,11 @@ mod tests {
     }
 
     #[test]
-    fn no_args_opens_tui() {
-        let parsed = parse_cli_from(["helm"]).unwrap();
-        // bare `helm` → defaults to tui dashboard (may parse as None or Tui depending on clap version)
+    fn no_args_open_web() {
+        let parsed = parse_cli_from(["helmops"]).unwrap();
         assert!(
-            parsed.command.is_none() || matches!(parsed.command, Some(super::Command::Tui(_))),
-            "bare helm should default to tui/dashboard"
+            matches!(parsed.command, Some(super::Command::Web(_))),
+            "bare helmops should default to the web dashboard"
         );
     }
 
@@ -6418,15 +6022,6 @@ mod tests {
     }
 
     #[test]
-    fn derive_session_name_prefers_goal_words() {
-        assert_eq!(
-            super::derive_session_name("Find why nginx leaks memory and patch it"),
-            "find-why-nginx-leaks-memory-and"
-        );
-        assert!(super::derive_session_name("!!!").starts_with("run-"));
-    }
-
-    #[test]
     fn init_subcommand_writes_config_happy_path() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -6504,87 +6099,6 @@ mod tests {
         let error = parse_cli_from(["helm", "badcmd", "arg"]).unwrap_err();
 
         assert!(error.to_string().contains("unknown subcommand: badcmd"));
-    }
-
-    #[tokio::test]
-    async fn replay_prints_transcript_with_warning() {
-        let dir = tempdir().unwrap();
-        let store = MemoryStore::open(&dir.path().join("helm.db"))
-            .await
-            .unwrap();
-        let id = store
-            .start_episode("echo hello to /tmp/test.txt")
-            .await
-            .unwrap();
-        store
-            .log_step(
-                &id,
-                0,
-                StepRole::User,
-                &[ContentBlock::Text("echo hello to /tmp/test.txt".to_owned())],
-                0,
-                0,
-            )
-            .await
-            .unwrap();
-        store
-            .log_step(
-                &id,
-                1,
-                StepRole::Assistant,
-                &[ContentBlock::ToolUse {
-                    id: "toolu_1".to_owned(),
-                    name: "shell".to_owned(),
-                    input: serde_json::json!({"command":"echo"}),
-                }],
-                4,
-                2,
-            )
-            .await
-            .unwrap();
-        store
-            .log_step(
-                &id,
-                2,
-                StepRole::Tool,
-                &[ContentBlock::ToolResult {
-                    tool_use_id: "toolu_1".to_owned(),
-                    content: "exit 0\nhello world".to_owned(),
-                    is_error: false,
-                }],
-                0,
-                0,
-            )
-            .await
-            .unwrap();
-        store
-            .set_model_capability_warning(&id, "model emitted tool-shaped text")
-            .await
-            .unwrap();
-        store
-            .finish_episode(&id, EpisodeOutcome::Partial, Some("partial"), Some("warn"))
-            .await
-            .unwrap();
-
-        let transcript = render_replay(&store, &id).await.unwrap();
-
-        assert!(transcript.contains("goal: echo hello"));
-        assert!(transcript.contains("outcome: partial"));
-        assert!(transcript.contains("warning: model_capability_warning"));
-        assert!(transcript.contains("[step 2] tool (shell)"));
-        assert!(transcript.contains("hello world"));
-    }
-
-    #[tokio::test]
-    async fn replay_missing_episode_errors() {
-        let dir = tempdir().unwrap();
-        let store = MemoryStore::open(&dir.path().join("helm.db"))
-            .await
-            .unwrap();
-
-        let error = render_replay(&store, "missing").await.unwrap_err();
-
-        assert!(error.to_string().contains("episode not found"));
     }
 
     #[test]
@@ -6852,8 +6366,8 @@ mod tests {
                 auto_granted: vec!["fs.read".into(), "fs.write".into()],
             },
             diagnose: super::TrustDiagnoseSummary {
-                tools_available: 9,
-                write_tools_blocked: 8,
+                tools_available: 0,
+                write_tools_blocked: 0,
                 write_ops_gated: true,
             },
         };
@@ -6911,8 +6425,8 @@ mod tests {
                 auto_granted: vec![],
             },
             diagnose: super::TrustDiagnoseSummary {
-                tools_available: 9,
-                write_tools_blocked: 8,
+                tools_available: 0,
+                write_tools_blocked: 0,
                 write_ops_gated: true,
             },
         };

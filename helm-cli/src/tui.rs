@@ -492,11 +492,8 @@ enum CommandAction {
     Model,
     Permissions,
     Audit,
-    Skills,
     Browser,
     Init,
-    Sessions,
-    Resume,
     Config,
     Theme,
     Keybindings,
@@ -596,11 +593,8 @@ impl CommandAction {
             Self::Model,
             Self::Permissions,
             Self::Audit,
-            Self::Skills,
             Self::Browser,
             Self::Init,
-            Self::Sessions,
-            Self::Resume,
             Self::Config,
             Self::Theme,
             Self::Keybindings,
@@ -632,11 +626,8 @@ impl CommandAction {
             Self::Model => "Model Selector",
             Self::Permissions => "Permissions",
             Self::Audit => "Audit Verify",
-            Self::Skills => "Skills",
             Self::Browser => "Browser Status",
             Self::Init => "Init AGENTS.md",
-            Self::Sessions => "Sessions",
-            Self::Resume => "Resume",
             Self::Config => "Config Editor",
             Self::Theme => "Theme Selector",
             Self::Keybindings => "Keybindings",
@@ -668,11 +659,8 @@ impl CommandAction {
             Self::Model => "model",
             Self::Permissions => "permissions",
             Self::Audit => "audit",
-            Self::Skills => "skills",
             Self::Browser => "browser",
             Self::Init => "init",
-            Self::Sessions => "sessions",
-            Self::Resume => "resume",
             Self::Config => "config",
             Self::Theme => "theme",
             Self::Keybindings => "keybindings",
@@ -704,11 +692,8 @@ impl CommandAction {
             Self::Model => "edit active model id",
             Self::Permissions => "grant or inspect capabilities",
             Self::Audit => "verify audit log chain",
-            Self::Skills => "inspect local skill library",
             Self::Browser => "browser automation status",
             Self::Init => "generate AGENTS.md in the current project",
-            Self::Sessions => "show session-resume guidance",
-            Self::Resume => "show resume guidance",
             Self::Config => "view or edit config inline (/config key=value)",
             Self::Theme => "switch theme (/theme dracula)",
             Self::Keybindings => "show keybinding overrides in the HELM XDG config directory",
@@ -741,11 +726,8 @@ impl CommandAction {
             Self::Model => slug == "model",
             Self::Permissions => slug == "permissions",
             Self::Audit => slug == "audit",
-            Self::Skills => slug == "skills",
             Self::Browser => slug == "browser",
             Self::Init => slug == "init",
-            Self::Sessions => slug == "sessions",
-            Self::Resume => slug == "resume",
             Self::Config => slug == "config",
             Self::Theme => slug == "theme",
             Self::Keybindings => matches!(slug, "keybindings" | "keybinds" | "keys"),
@@ -1940,7 +1922,6 @@ pub struct TuiApp {
     task_started: Option<Instant>,
     session_tokens_in: u32,
     session_tokens_out: u32,
-    resume_context: Option<String>,
     #[allow(dead_code)]
     theme: Theme,
     dashboard: DashboardState,
@@ -2030,7 +2011,6 @@ impl TuiApp {
             task_started: None,
             session_tokens_in: 0,
             session_tokens_out: 0,
-            resume_context: None,
             theme: Theme::default(),
             dashboard: DashboardState::new(),
             audited_transitions: HashSet::new(),
@@ -3398,12 +3378,7 @@ Report the exit status and the concise output."
         self.status_note = "running".to_owned();
         self.active_run_id = self.active_run_id.saturating_add(1);
         self.session.transcript_scroll = 0;
-        let contextual_task = if let Some(context) = self.resume_context.as_deref() {
-            format!("{context}\n\nUser asks now: {task}")
-        } else {
-            task.clone()
-        };
-        let effective_task = wrap_for_remote(&contextual_task, self.active_remote.as_ref());
+        let effective_task = wrap_for_remote(&task, self.active_remote.as_ref());
         let settings = self.active_settings.clone();
 
         let response = match build_provider(&settings, &self.runtime.secrets) {
@@ -3524,8 +3499,7 @@ Report the exit status and the concise output."
     fn quick_memory_report(&self, raw_query: &str) -> String {
         let query = raw_query.trim();
         if query.is_empty() {
-            return "[memory] usage: `# <query>` — searches recent episodes and graph entities."
-                .to_owned();
+            return "[memory] usage: `# <query>` — searches recent episodes.".to_owned();
         }
         let query = query.to_owned();
         let memory = Arc::clone(&self.runtime.memory);
@@ -3546,30 +3520,13 @@ Report the exit status and the concise output."
                     })
                     .collect::<Vec<_>>();
 
-                let graph_lines = dirs::data_local_dir()
-                    .map(|root| root.join("helm").join("graph.db"))
-                    .and_then(|path| helm_memory::EntityGraph::open(&path).ok())
-                    .and_then(|graph| graph.find_entities(None, Some(&query)).ok())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .take(5)
-                    .map(|entity| format!("  - {} [{}]", entity.name, entity.kind))
-                    .collect::<Vec<_>>();
-
                 let episodes = if episode_lines.is_empty() {
                     "  - no recent episode matches".to_owned()
                 } else {
                     episode_lines.join("\n")
                 };
-                let graph = if graph_lines.is_empty() {
-                    "  - no graph entities match".to_owned()
-                } else {
-                    graph_lines.join("\n")
-                };
 
-                format!(
-                    "[memory] query: {query}\nrecent episodes:\n{episodes}\ngraph entities:\n{graph}"
-                )
+                format!("[memory] query: {query}\nrecent episodes:\n{episodes}")
             })
         })
     }
@@ -3792,7 +3749,6 @@ Report the exit status and the concise output."
         self.session = SessionState::default();
         self.session_tokens_in = 0;
         self.session_tokens_out = 0;
-        self.resume_context = None;
         self.input.clear();
         self.push_chat(MessageRole::System, "New session started.");
         self.modal = None;
@@ -4160,9 +4116,6 @@ Report the exit status and the concise output."
             CommandAction::Audit => {
                 self.record_tool_event("audit", "verify", "run `helm audit verify`")
             }
-            CommandAction::Skills => {
-                self.record_tool_event("skills", "library", "run `helm skills list`")
-            }
             CommandAction::Browser => self.push_chat(MessageRole::System, self.browser_hint()),
             CommandAction::Init => match crate::generate_agents_md_for_dir(
                 &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -4180,14 +4133,6 @@ Report the exit status and the concise output."
                     format!("failed to generate AGENTS.md: {error}"),
                 ),
             },
-            CommandAction::Sessions => {
-                let body = self.render_sessions_inline(20);
-                self.push_chat(
-                    MessageRole::System,
-                    format!("Sessions (recent 20):\n{body}"),
-                );
-            }
-            CommandAction::Resume => self.execute_resume_inline(""),
             CommandAction::Config => self.execute_config_inline(""),
             CommandAction::Theme => self.open_theme_selector(),
             CommandAction::Keybindings => self.execute_keybindings_inline(),
@@ -4235,15 +4180,6 @@ Report the exit status and the concise output."
             CommandAction::Config if !args.is_empty() => self.execute_config_inline(args),
             CommandAction::Theme if !args.is_empty() => self.apply_theme_by_name(args),
             CommandAction::Diff if !args.is_empty() => self.execute_diff_inline(args),
-            CommandAction::Sessions if !args.is_empty() => {
-                let limit = args.parse::<u32>().unwrap_or(20);
-                let body = self.render_sessions_inline(limit);
-                self.push_chat(
-                    MessageRole::System,
-                    format!("Sessions (recent {limit}):\n{body}"),
-                );
-            }
-            CommandAction::Resume => self.execute_resume_inline(args),
             CommandAction::Compact if !args.is_empty() => {
                 self.push_chat(
                     MessageRole::System,
@@ -4445,24 +4381,10 @@ Report the exit status and the concise output."
     }
 
     fn execute_mcp_list_inline(&mut self) {
-        let path_label = helm_tools::mcp::default_mcp_config_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(no XDG config path)".to_owned());
-        let body = match helm_tools::mcp::load_mcp_config() {
-            Ok(cfg) if cfg.servers.is_empty() => {
-                format!("no MCP servers configured at {path_label}. Run `helm mcp add`.")
-            }
-            Ok(cfg) => {
-                let lines: Vec<String> = cfg
-                    .servers
-                    .iter()
-                    .map(|s| format!("  {} → {}", s.name, s.command))
-                    .collect();
-                format!("MCP servers ({path_label}):\n{}", lines.join("\n"))
-            }
-            Err(error) => format!("(failed to load MCP config at {path_label}: {error})"),
-        };
-        self.push_chat(MessageRole::System, format!("[mcp] {body}"));
+        self.push_chat(
+            MessageRole::System,
+            "[mcp] MCP tools support has been removed during consolidation.".to_owned(),
+        );
     }
 
     fn execute_compact_inline(&mut self) {
@@ -4485,99 +4407,6 @@ Report the exit status and the concise output."
             },
         );
         self.session.transcript_scroll = 0;
-    }
-
-    fn session_store(&self) -> Result<helm_memory::SessionStore, String> {
-        let sessions_dir = self
-            .runtime
-            .db_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(helm_memory::SessionStore::open(
-                    &self.runtime.db_path,
-                    sessions_dir.join("snapshots"),
-                ))
-                .map_err(|error| error.to_string())
-        })
-    }
-
-    fn render_sessions_inline(&self, limit: u32) -> String {
-        match self.session_store() {
-            Ok(store) => tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    match store.list_sessions(limit).await {
-                        Ok(list) if list.is_empty() => "(no sessions yet)".to_owned(),
-                        Ok(list) => list
-                            .into_iter()
-                            .map(|s| {
-                                format!(
-                                    "[{}] {} — {}",
-                                    s.id,
-                                    s.name,
-                                    s.goal.chars().take(60).collect::<String>()
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        Err(error) => format!("error listing sessions: {error}"),
-                    }
-                })
-            }),
-            Err(error) => format!("error opening session store: {error}"),
-        }
-    }
-
-    fn execute_resume_inline(&mut self, raw: &str) {
-        let target = raw.trim();
-        let store = match self.session_store() {
-            Ok(store) => store,
-            Err(error) => {
-                self.push_chat(MessageRole::Error, format!("resume failed: {error}"));
-                return;
-            }
-        };
-        let target = target.to_owned();
-        let memory = Arc::clone(&self.runtime.memory);
-        let loaded = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let session = if target.is_empty() || target == "latest" {
-                    store.latest_session().await
-                } else {
-                    store.get_session(&target).await
-                }?;
-                let Some(session) = session else {
-                    return Ok::<
-                        Option<(
-                            helm_memory::SessionRecord,
-                            Option<helm_memory::EpisodeRecord>,
-                            Vec<helm_memory::StepRecord>,
-                        )>,
-                        helm_core::MemoryError,
-                    >(None);
-                };
-                let episode = memory.episode_by_id(&session.episode_id).await?;
-                let steps = memory.get_steps(&session.episode_id).await?;
-                Ok(Some((session, episode, steps)))
-            })
-        });
-        match loaded {
-            Ok(Some((session, episode, steps))) => {
-                let recap = crate::build_session_recap(&session, episode.as_ref(), &steps);
-                self.resume_context = Some(recap.clone());
-                self.session.episode_id = Some(session.episode_id.clone());
-                self.push_chat(
-                    MessageRole::System,
-                    format!(
-                        "{recap}\nFuture prompts will include this session context until `/new`."
-                    ),
-                );
-            }
-            Ok(None) => self.push_chat(MessageRole::System, "No sessions available to resume."),
-            Err(error) => self.push_chat(MessageRole::Error, format!("resume failed: {error}")),
-        }
     }
 
     fn execute_diff_inline(&mut self, path_arg: &str) {
@@ -4610,25 +4439,9 @@ Report the exit status and the concise output."
     }
 
     fn execute_tools_inline(&mut self) {
-        let registry = helm_tools::ToolRegistry::default();
-        let schemas = registry.schemas();
-        let count = schemas.len();
-        let mut names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
-        names.sort();
-        let body = names
-            .chunks(4)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|n| format!("{:<14}", n))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
         self.push_chat(
             MessageRole::System,
-            format!("[tools] {count} loaded:\n{body}"),
+            "[tools] Agent tools have been removed during consolidation. Use helmops monitoring commands instead.".to_owned(),
         );
     }
 
@@ -9787,7 +9600,7 @@ fn visible_activity_text(item: &ToolTimelineItem) -> Option<String> {
         "recover" => Some(format!("recovered tool-call format: {}", item.detail)),
         "correct" => Some(format!("corrected {} ({})", item.tool, item.detail)),
         "cancel" => Some("task cancelled".to_owned()),
-        "audit" | "skills" => Some(format!("{}: {}", item.tool, item.detail)),
+        "audit" => Some(format!("{}: {}", item.tool, item.detail)),
         _ => Some(format!(
             "{} {} — {}",
             item.status,

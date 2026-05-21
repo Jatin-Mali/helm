@@ -1,44 +1,51 @@
 //! HELMOPS web dashboard — production HTTP/WebSocket server.
-//! Started via `helm web [--port PORT]`.
-//!
-//! Architecture:
-//!   Background collector (tokio::spawn) → broadcast::channel → WebSocket → browser
-//!   The HTML dashboard connects via WebSocket and renders live data.
+//! Started via `helmops web [--port PORT]`.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
     routing::{get, post},
 };
-use helm_monitor::{MonitorProfile, Severity};
+use helm_memory::{FindingStateStore, SnapshotStore};
+use helm_monitor::{
+    Finding, HostIdentity, MonitorProfile, Severity, SnapshotDomains, SystemSnapshot,
+    collectors::{
+        Collector, db_health::DbHealthCollector, db_health::DbInstance,
+        web_servers::WebServerCollector, web_servers::WebSite,
+    },
+};
 use serde::Serialize;
 use tokio::sync::broadcast;
-
-// ── Application State ──────────────────────────────────────────────────────
 
 struct WebState {
     db_path: PathBuf,
     snapshot_tx: broadcast::Sender<String>,
 }
 
-// ── Live Snapshot (pushed to browser every N seconds) ──────────────────────
-
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveSnapshot {
     pub hostname: String,
+    pub host: HostIdentity,
     pub collected_at: String,
     pub profile: String,
+    pub snapshot_source: String,
+    pub scope: String,
+    pub provider: String,
+    pub ai_state: String,
     pub cpu_percent: f64,
     pub load_1m: f64,
     pub load_5m: f64,
@@ -46,32 +53,22 @@ pub struct LiveSnapshot {
     pub memory_used_pct: f64,
     pub memory_total_gb: f64,
     pub swap_used_pct: f64,
-    pub disk_entries: Vec<DiskEntry>,
     pub total_services: usize,
     pub failed_services: usize,
     pub total_containers: usize,
     pub running_containers: usize,
     pub listening_ports: usize,
-    pub port_listeners: Vec<PortListener>,
     pub journal_errors: u64,
-    pub log_entries: Vec<String>,
     pub backup_count: usize,
     pub stale_backups: usize,
     pub findings: Vec<FindingEntry>,
-    pub services: Vec<ServiceEntry>,
-    pub containers: Vec<ContainerEntry>,
-    pub processes: Vec<ProcessEntry>,
     pub collector_health: Vec<CollectorHealth>,
     pub fleet_hosts: Vec<FleetHost>,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct DiskEntry {
-    pub mount: String,
-    pub used_pct: f64,
-    pub total_gb: f64,
-    pub available_gb: f64,
+    pub daemon: DaemonSummary,
+    pub log_entries: Vec<String>,
+    pub inventory: SnapshotDomains,
+    pub databases: Vec<DbInstance>,
+    pub websites: Vec<WebSite>,
 }
 
 #[derive(Serialize, Clone)]
@@ -85,6 +82,9 @@ pub struct FindingEntry {
     pub title: String,
     pub affected_resource: String,
     pub evidence_summary: String,
+    pub evidence: Vec<EvidenceEntry>,
+    pub assumptions: Vec<String>,
+    pub missing_data: Vec<String>,
     pub impact: String,
     pub read_only_checks: Vec<String>,
     pub fix_plan: Option<String>,
@@ -99,6 +99,14 @@ pub struct FindingEntry {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct EvidenceEntry {
+    pub source: String,
+    pub value: String,
+    pub note: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct CollectorHealth {
     pub domain: String,
     pub healthy: bool,
@@ -107,49 +115,48 @@ pub struct CollectorHealth {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct ServiceEntry {
-    pub name: String,
-    pub state: String,
-    pub description: String,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ContainerEntry {
-    pub name: String,
-    pub image: String,
-    pub status: String,
-    pub ports: Vec<String>,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct PortListener {
-    pub port: u16,
-    pub protocol: String,
-    pub process: String,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ProcessEntry {
-    pub name: String,
-    pub pid: Option<u32>,
-    pub ports: Vec<u16>,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct FleetHost {
     pub hostname: String,
+    pub transport: String,
     pub status: String,
     pub findings_count: usize,
+    pub critical_count: usize,
+    pub warning_count: usize,
+    pub info_count: usize,
     pub last_seen: String,
+    pub load_1m: Option<f64>,
+    pub cpu_percent: Option<f64>,
+    pub memory_used_pct: Option<f64>,
+    pub failed_services: Option<usize>,
+    pub running_containers: Option<usize>,
+    pub total_containers: Option<usize>,
 }
 
-// ── Server Entry Point ─────────────────────────────────────────────────────
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonSummary {
+    pub running: bool,
+    pub status: String,
+    pub started_at: Option<String>,
+    pub last_heartbeat: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error: Option<String>,
+    pub refresh_interval_secs: u64,
+}
 
-/// Start the HELMOPS web dashboard server.
+#[derive(Default)]
+struct FindingHistory {
+    first_seen_ts: i64,
+    last_seen_ts: i64,
+    count: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct PlanRequest {
+    #[serde(rename = "findingId")]
+    finding_id: String,
+}
+
 pub async fn serve(db_path: PathBuf, port: u16) -> Result<()> {
     let (tx, _) = broadcast::channel::<String>(32);
     let state = Arc::new(WebState {
@@ -157,7 +164,6 @@ pub async fn serve(db_path: PathBuf, port: u16) -> Result<()> {
         snapshot_tx: tx.clone(),
     });
 
-    // Background collector: run Quick profile every 5 seconds, broadcast to clients
     let bg_db = db_path.clone();
     let bg_tx = tx.clone();
     tokio::spawn(async move {
@@ -173,12 +179,13 @@ pub async fn serve(db_path: PathBuf, port: u16) -> Result<()> {
         .route("/", get(serve_dashboard))
         .route("/ws", get(ws_handler))
         .route("/api/snapshot", get(api_snapshot))
+        .route("/api/refresh", post(api_refresh))
         .route("/api/plan", post(api_generate_plan))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     println!("╔══════════════════════════════════════════════╗");
-    println!("║   HELMOPS Web Dashboard                      ║");
+    println!("║   HELMOPS Web Console                       ║");
     println!("╠══════════════════════════════════════════════╣");
     println!("║   Dashboard  → http://{addr}        ║");
     println!("║   WebSocket  → ws://{addr}/ws          ║");
@@ -188,32 +195,24 @@ pub async fn serve(db_path: PathBuf, port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .context("binding web server address")?;
-
     axum::serve(listener, app).await.context("web server")?;
-
     Ok(())
 }
 
-// ── Route Handlers ─────────────────────────────────────────────────────────
-
-/// Serve the dashboard HTML (embedded at compile time).
 async fn serve_dashboard() -> impl IntoResponse {
     axum::response::Html(include_str!("web/dashboard.html"))
 }
 
-/// WebSocket upgrade — each connected browser receives live snapshot stream.
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<WebState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<WebState>) {
     let mut rx = state.snapshot_tx.subscribe();
-    // Send initial snapshot immediately
     let initial = collect_live_snapshot(&state.db_path).await;
     if socket.send(Message::Text(initial.into())).await.is_err() {
         return;
     }
-    // Stream subsequent updates
     loop {
         match rx.recv().await {
             Ok(json) => {
@@ -227,17 +226,20 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<WebState>) {
     }
 }
 
-/// REST endpoint: latest snapshot as JSON.
 async fn api_snapshot(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     let json = collect_live_snapshot(&state.db_path).await;
     Json(serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default())
 }
 
-/// POST /api/plan — generate a troubleshooting plan for a finding.
-#[derive(serde::Deserialize)]
-struct PlanRequest {
-    #[serde(rename = "findingId")]
-    finding_id: String,
+async fn api_refresh(State(state): State<Arc<WebState>>) -> impl IntoResponse {
+    let daemon_requested = crate::request_daemon_refresh().unwrap_or(false);
+    let json = collect_live_snapshot(&state.db_path).await;
+    let snapshot = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
+    Json(serde_json::json!({
+        "ok": true,
+        "daemonRequested": daemon_requested,
+        "snapshot": snapshot
+    }))
 }
 
 async fn api_generate_plan(
@@ -250,28 +252,22 @@ async fn api_generate_plan(
     };
 
     match crate::find_finding_by_id(&conn, &req.finding_id) {
-        Some(finding) => {
-            Json(serde_json::json!({
-                "finding_id": req.finding_id,
-                "title": finding.title,
-                "severity": format!("{:?}", finding.severity),
-                "impact": finding.impact,
-                "evidence": finding.evidence.first().map(|e| &e.value),
-                "read_only_checks": finding.read_only_checks,
-                "fix_plan": finding.fix_plan,
-                "plan_note": "AI-powered plan generation: use 'helm troubleshoot <issue>' from CLI, or configure an LLM provider with 'helm init --provider ollama'"
-            }))
-        }
-        None => {
-            Json(serde_json::json!({
-                "error": "Finding not found. Run a collection first.",
-                "plan": null
-            }))
-        }
+        Some(finding) => Json(serde_json::json!({
+            "finding_id": req.finding_id,
+            "title": finding.title,
+            "severity": finding.severity.as_str(),
+            "impact": finding.impact,
+            "evidence": finding.evidence.first().map(|e| &e.value),
+            "read_only_checks": finding.read_only_checks,
+            "fix_plan": finding.fix_plan,
+            "plan_note": "AI-backed plans remain available through `helmops troubleshoot <issue>` when you want a reviewed remediation path."
+        })),
+        None => Json(serde_json::json!({
+            "error": "Finding not found. Run a collection first.",
+            "plan": null
+        })),
     }
 }
-
-// ── Data Collection ────────────────────────────────────────────────────────
 
 async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
     let conn = match rusqlite::Connection::open(db_path) {
@@ -279,10 +275,29 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         Err(_) => return r#"{"error":"cannot open database"}"#.to_string(),
     };
 
-    let prev = crate::load_previous_snapshot(&conn);
-    let report = crate::run_monitor_cycle(MonitorProfile::Quick, None, prev).await;
+    let daemon_running = crate::daemon_is_running();
+    let (snapshot, findings, snapshot_source) =
+        if daemon_running && let Some((snapshot, findings)) = latest_snapshot_and_findings(&conn) {
+            (snapshot, findings, "daemon".to_owned())
+        } else {
+            let previous = crate::load_previous_snapshot(&conn);
+            let report = crate::run_monitor_cycle(MonitorProfile::Quick, None, previous).await;
+            (report.snapshot, report.findings, "live".to_owned())
+        };
 
-    let snapshot = &report.snapshot;
+    let history = load_finding_history(&conn);
+    let state_by_fingerprint = load_finding_states(&conn);
+    let daemon = daemon_summary();
+    let (provider, ai_state) = provider_context();
+
+    let db_future = DbHealthCollector.collect(snapshot.profile);
+    let web_future = WebServerCollector.collect(snapshot.profile);
+    let fleet_future = collect_fleet_hosts();
+    let (db_result, web_result, fleet_hosts) = tokio::join!(db_future, web_future, fleet_future);
+
+    let databases = db_result.map(|s| s.instances).unwrap_or_default();
+    let websites = web_result.map(|s| s.sites).unwrap_or_default();
+
     let load = &snapshot.domains.load;
     let mem_total = load.memory.total;
     let mem_used = load.memory.used;
@@ -296,135 +311,46 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
     } else {
         0.0
     };
-
-    // Disk entries
-    let disk_entries: Vec<DiskEntry> = snapshot
-        .domains
-        .disks
-        .filesystems
-        .iter()
-        .map(|fs| DiskEntry {
-            mount: fs.mount_point.clone(),
-            used_pct: if fs.total_bytes > 0 {
-                (fs.used_bytes as f64 / fs.total_bytes as f64) * 100.0
-            } else {
-                0.0
-            },
-            total_gb: fs.total_bytes as f64 / 1_073_741_824.0,
-            available_gb: fs.available_bytes as f64 / 1_073_741_824.0,
-        })
-        .collect();
-
-    // Findings
-    let findings: Vec<FindingEntry> = report
-        .findings
-        .iter()
-        .map(|f| FindingEntry {
-            id: f.id.to_string(),
-            fingerprint: f.fingerprint.clone(),
-            severity: severity_str(&f.severity),
-            confidence: format!("{:?}", f.confidence).to_lowercase(),
-            category: format!("{:?}", f.category).to_lowercase(),
-            title: f.title.clone(),
-            affected_resource: f.affected_resource.clone(),
-            evidence_summary: f.evidence.first().map(|e| e.value.clone()).unwrap_or_default(),
-            impact: f.impact.clone(),
-            read_only_checks: f.read_only_checks.clone(),
-            fix_plan: f.fix_plan.clone(),
-            risk: "medium".to_string(),
-            lifecycle_state: format!("{:?}", f.lifecycle).to_lowercase(),
-            first_seen: String::new(),  // Populated from memory store
-            last_seen: String::new(),
-            occurrence_count: 1,
-            detector_id: f.detector_id.clone(),
-            correlated_ids: Vec::new(),
-        })
-        .collect();
-
-    // Services
-    let units = &snapshot.domains.services.units;
-    let total_services = units.len();
-    let failed_services = units.iter().filter(|u| u.active == "failed").count();
-    let services: Vec<ServiceEntry> = units.iter().map(|u| ServiceEntry {
-        name: u.name.clone(),
-        state: u.active.clone(),
-        description: u.description.clone(),
-    }).collect();
-
-    // Containers
-    let containers_raw = &snapshot.domains.containers.containers;
-    let total_containers = containers_raw.len();
-    let running_containers = containers_raw.iter().filter(|c| c.status == "running").count();
-    let containers: Vec<ContainerEntry> = containers_raw.iter().map(|c| ContainerEntry {
-        name: c.name.clone(),
-        image: c.image.clone(),
-        status: c.status.clone(),
-        ports: c.ports.clone(),
-    }).collect();
-
-    // Port listeners
-    let port_listeners: Vec<PortListener> = snapshot.domains.ports.listeners.iter().map(|l| PortListener {
-        port: l.local_port,
-        protocol: l.protocol.clone(),
-        process: l.process_name.clone().unwrap_or_default(),
-    }).collect();
-
-    // Processes — derived from port listeners (unique process names)
-    let mut process_map: std::collections::HashMap<String, (Option<u32>, Vec<u16>)> = std::collections::HashMap::new();
-    for l in &snapshot.domains.ports.listeners {
-        if let Some(ref name) = l.process_name {
-            let entry = process_map.entry(name.clone()).or_insert((l.pid, Vec::new()));
-            entry.1.push(l.local_port);
-        }
-    }
-    let processes: Vec<ProcessEntry> = process_map.into_iter().map(|(name, (pid, ports))| ProcessEntry {
-        name,
-        pid,
-        ports,
-    }).collect();
-
-    // Log entries
-    let mut log_entries: Vec<String> = Vec::new();
-    log_entries.extend(snapshot.domains.logs.kernel_errors.iter().cloned());
-    log_entries.extend(snapshot.domains.logs.auth_failures.iter().cloned());
-    if log_entries.is_empty() {
-        log_entries.push("No recent errors detected".to_string());
-    }
-
-    // Backups
-    let backup_count = snapshot.domains.backups.tools_detected.len();
-    let stale_backups = 0; // Future: detect stale backups
-
-    // Collector health — all domains, marking unhealthy ones from errors
-    let unhealthy: std::collections::HashSet<String> = snapshot
-        .collector_errors
-        .iter()
-        .map(|e| format!("{:?}", e.domain).to_lowercase())
-        .collect();
-    let collector_health: Vec<CollectorHealth> = helm_monitor::SnapshotDomains::domain_names()
-        .iter()
-        .map(|&d| {
-            let name = d.to_string();
-            let is_healthy = !unhealthy.contains(&name);
-            let error = if is_healthy { None } else {
-                snapshot.collector_errors.iter()
-                    .find(|e| format!("{:?}", e.domain).to_lowercase() == name)
-                    .map(|e| e.message.clone())
-            };
-            CollectorHealth { domain: name, healthy: is_healthy, error }
-        })
-        .collect();
-
     let cpu_percent = if load.cpu_logical_count > 0 {
         ((load.load_average.one / load.cpu_logical_count as f64) * 100.0).clamp(0.0, 100.0)
     } else {
         0.0
     };
 
+    let services = &snapshot.domains.services.units;
+    let total_services = services.len();
+    let failed_services = services
+        .iter()
+        .filter(|unit| unit.active == "failed")
+        .count();
+
+    let containers = &snapshot.domains.containers.containers;
+    let total_containers = containers.len();
+    let running_containers = containers
+        .iter()
+        .filter(|container| container.status == "running")
+        .count();
+
+    let log_entries = log_entries(&snapshot);
+    let collector_health = collector_health(&snapshot);
+    let findings = findings
+        .iter()
+        .map(|finding| finding_entry(finding, &history, &state_by_fingerprint))
+        .collect::<Vec<_>>();
+
     let live = LiveSnapshot {
         hostname: snapshot.host.hostname.clone(),
-        collected_at: chrono::Utc::now().format("%H:%M:%S UTC").to_string(),
-        profile: "quick".to_string(),
+        host: snapshot.host.clone(),
+        collected_at: snapshot.collected_at.to_rfc3339(),
+        profile: monitor_profile_label(snapshot.profile),
+        snapshot_source,
+        scope: if fleet_hosts.is_empty() {
+            "local".to_owned()
+        } else {
+            "fleet".to_owned()
+        },
+        provider,
+        ai_state,
         cpu_percent,
         load_1m: load.load_average.one,
         load_5m: load.load_average.five,
@@ -432,41 +358,384 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         memory_used_pct: mem_pct,
         memory_total_gb: mem_total as f64 / 1_073_741_824.0,
         swap_used_pct: swap_pct,
-        disk_entries,
         total_services,
         failed_services,
         total_containers,
         running_containers,
         listening_ports: snapshot.domains.ports.listeners.len(),
-        port_listeners,
         journal_errors: snapshot.domains.logs.journal_errors_last_hour,
-        log_entries,
-        backup_count,
-        stale_backups,
+        backup_count: snapshot.domains.backups.tools_detected.len(),
+        stale_backups: 0,
         findings,
-        services,
-        containers,
-        processes,
         collector_health,
-        fleet_hosts: {
-            crate::remote::RemoteRegistry::load()
-                .map(|r| r.remotes.iter().map(|remote| FleetHost {
-                    hostname: remote.host.clone(),
-                    status: "unknown".to_string(),
-                    findings_count: 0,
-                    last_seen: String::new(),
-                }).collect())
-                .unwrap_or_default()
-        },
+        fleet_hosts,
+        daemon,
+        log_entries,
+        inventory: snapshot.domains.clone(),
+        databases,
+        websites,
     };
 
     serde_json::to_string(&live).unwrap_or_default()
 }
 
-fn severity_str(s: &Severity) -> String {
-    match s {
-        Severity::Critical => "critical".to_string(),
-        Severity::Warning => "warning".to_string(),
-        Severity::Info => "info".to_string(),
+fn latest_snapshot_and_findings(
+    conn: &rusqlite::Connection,
+) -> Option<(SystemSnapshot, Vec<Finding>)> {
+    let record = SnapshotStore::latest(conn).ok().flatten()?;
+    let domains: SnapshotDomains = serde_json::from_str(&record.domains_json).ok()?;
+    let findings = serde_json::from_str::<Vec<Finding>>(&record.findings_json).unwrap_or_default();
+    Some((crate::reconstruct_snapshot(&record, domains), findings))
+}
+
+fn load_finding_history(conn: &rusqlite::Connection) -> HashMap<String, FindingHistory> {
+    let mut history = HashMap::new();
+    let Ok(records) = SnapshotStore::list(conn, 200) else {
+        return history;
+    };
+
+    for record in records {
+        let findings =
+            serde_json::from_str::<Vec<Finding>>(&record.findings_json).unwrap_or_default();
+        for finding in findings {
+            let key = finding_key(&finding);
+            let entry = history.entry(key).or_insert_with(|| FindingHistory {
+                first_seen_ts: record.collected_at,
+                last_seen_ts: record.collected_at,
+                count: 0,
+            });
+            entry.first_seen_ts = entry.first_seen_ts.min(record.collected_at);
+            entry.last_seen_ts = entry.last_seen_ts.max(record.collected_at);
+            entry.count += 1;
+        }
     }
+
+    history
+}
+
+fn load_finding_states(
+    conn: &rusqlite::Connection,
+) -> HashMap<String, helm_memory::FindingStateRecord> {
+    FindingStateStore::list(conn)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| (record.fingerprint.clone(), record))
+        .collect()
+}
+
+fn finding_entry(
+    finding: &Finding,
+    history: &HashMap<String, FindingHistory>,
+    states: &HashMap<String, helm_memory::FindingStateRecord>,
+) -> FindingEntry {
+    let key = finding_key(finding);
+    let lifecycle_state = states
+        .get(&finding.fingerprint)
+        .map(|record| record.status.as_str().to_owned())
+        .unwrap_or_else(|| format!("{:?}", finding.lifecycle).to_lowercase());
+    let history = history.get(&key);
+
+    FindingEntry {
+        id: finding.id.clone(),
+        fingerprint: finding.fingerprint.clone(),
+        severity: finding.severity.as_str().to_owned(),
+        confidence: finding.confidence.as_str().to_owned(),
+        category: finding.category.as_str().to_owned(),
+        title: finding.title.clone(),
+        affected_resource: finding.affected_resource.clone(),
+        evidence_summary: finding
+            .evidence
+            .first()
+            .map(|evidence| evidence.value.clone())
+            .unwrap_or_default(),
+        evidence: finding
+            .evidence
+            .iter()
+            .map(|evidence| EvidenceEntry {
+                source: evidence.source.clone(),
+                value: evidence.value.clone(),
+                note: evidence.note.clone(),
+            })
+            .collect(),
+        assumptions: finding.assumptions.clone(),
+        missing_data: finding.missing_data.clone(),
+        impact: finding.impact.clone(),
+        read_only_checks: finding.read_only_checks.clone(),
+        fix_plan: finding.fix_plan.clone(),
+        risk: risk_label(finding.severity).to_owned(),
+        lifecycle_state,
+        first_seen: history
+            .map(|h| timestamp_to_rfc3339(h.first_seen_ts))
+            .unwrap_or_default(),
+        last_seen: history
+            .map(|h| timestamp_to_rfc3339(h.last_seen_ts))
+            .unwrap_or_default(),
+        occurrence_count: history.map(|h| h.count).unwrap_or(1),
+        detector_id: finding.detector_id.clone(),
+        correlated_ids: Vec::new(),
+    }
+}
+
+fn finding_key(finding: &Finding) -> String {
+    if finding.fingerprint.is_empty() {
+        finding.id.clone()
+    } else {
+        finding.fingerprint.clone()
+    }
+}
+
+fn risk_label(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical => "high",
+        Severity::Warning => "medium",
+        Severity::Info => "low",
+    }
+}
+
+fn log_entries(snapshot: &SystemSnapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.extend(snapshot.domains.logs.kernel_errors.iter().cloned());
+    lines.extend(snapshot.domains.logs.auth_failures.iter().cloned());
+    if lines.is_empty() {
+        lines.push("No recent kernel or auth errors detected.".to_owned());
+    }
+    lines
+}
+
+fn collector_health(snapshot: &SystemSnapshot) -> Vec<CollectorHealth> {
+    let unhealthy: HashSet<String> = snapshot
+        .collector_errors
+        .iter()
+        .map(|error| error.domain.to_lowercase())
+        .collect();
+
+    SnapshotDomains::domain_names()
+        .iter()
+        .map(|domain| {
+            let name = (*domain).to_owned();
+            let error = snapshot
+                .collector_errors
+                .iter()
+                .find(|collector_error| collector_error.domain.eq_ignore_ascii_case(domain))
+                .map(|collector_error| collector_error.message.clone());
+            CollectorHealth {
+                domain: name.clone(),
+                healthy: !unhealthy.contains(&name),
+                error,
+            }
+        })
+        .collect()
+}
+
+async fn collect_fleet_hosts() -> Vec<FleetHost> {
+    let Ok(registry) = crate::remote::RemoteRegistry::load() else {
+        return Vec::new();
+    };
+    if registry.remotes.is_empty() {
+        return Vec::new();
+    }
+
+    let entries = registry.remotes.clone();
+    let by_id = entries
+        .iter()
+        .map(|entry| (entry.host_id, entry.clone()))
+        .collect::<HashMap<_, _>>();
+
+    let results =
+        tokio::time::timeout(Duration::from_secs(12), registry.parallel_collect_reports()).await;
+
+    match results {
+        Ok(results) => results
+            .into_iter()
+            .map(|(host_id, result)| match result {
+                Ok(report) => {
+                    let transport = by_id
+                        .get(&host_id)
+                        .map(|entry| entry.summary_label())
+                        .unwrap_or_else(|| "ssh".to_owned());
+                    let critical_count = report
+                        .findings
+                        .iter()
+                        .filter(|finding| matches!(finding.severity, Severity::Critical))
+                        .count();
+                    let warning_count = report
+                        .findings
+                        .iter()
+                        .filter(|finding| matches!(finding.severity, Severity::Warning))
+                        .count();
+                    let info_count = report
+                        .findings
+                        .iter()
+                        .filter(|finding| matches!(finding.severity, Severity::Info))
+                        .count();
+                    let (
+                        last_seen,
+                        load_1m,
+                        cpu_percent,
+                        memory_used_pct,
+                        failed_services,
+                        running_containers,
+                        total_containers,
+                    ) = match report.snapshot.as_ref() {
+                        Some(snapshot) => {
+                            let load = &snapshot.domains.load;
+                            let cpu = if load.cpu_logical_count > 0 {
+                                ((load.load_average.one / load.cpu_logical_count as f64) * 100.0)
+                                    .clamp(0.0, 100.0)
+                            } else {
+                                0.0
+                            };
+                            let mem = if load.memory.total > 0 {
+                                (load.memory.used as f64 / load.memory.total as f64) * 100.0
+                            } else {
+                                0.0
+                            };
+                            (
+                                snapshot.collected_at.to_rfc3339(),
+                                Some(load.load_average.one),
+                                Some(cpu),
+                                Some(mem),
+                                Some(
+                                    snapshot
+                                        .domains
+                                        .services
+                                        .units
+                                        .iter()
+                                        .filter(|unit| unit.active == "failed")
+                                        .count(),
+                                ),
+                                Some(
+                                    snapshot
+                                        .domains
+                                        .containers
+                                        .containers
+                                        .iter()
+                                        .filter(|container| container.status == "running")
+                                        .count(),
+                                ),
+                                Some(snapshot.domains.containers.containers.len()),
+                            )
+                        }
+                        None => (String::new(), None, None, None, None, None, None),
+                    };
+
+                    FleetHost {
+                        hostname: report.host_name,
+                        transport,
+                        status: if critical_count > 0 {
+                            "critical".to_owned()
+                        } else if warning_count > 0 {
+                            "warning".to_owned()
+                        } else {
+                            "online".to_owned()
+                        },
+                        findings_count: report.findings.len(),
+                        critical_count,
+                        warning_count,
+                        info_count,
+                        last_seen,
+                        load_1m,
+                        cpu_percent,
+                        memory_used_pct,
+                        failed_services,
+                        running_containers,
+                        total_containers,
+                    }
+                }
+                Err(_) => {
+                    let entry = by_id.get(&host_id);
+                    FleetHost {
+                        hostname: entry
+                            .map(|remote| remote.name.clone())
+                            .unwrap_or_else(|| host_id.to_string()),
+                        transport: entry
+                            .map(|remote| remote.summary_label())
+                            .unwrap_or_else(|| "ssh".to_owned()),
+                        status: "offline".to_owned(),
+                        findings_count: 0,
+                        critical_count: 0,
+                        warning_count: 0,
+                        info_count: 0,
+                        last_seen: String::new(),
+                        load_1m: None,
+                        cpu_percent: None,
+                        memory_used_pct: None,
+                        failed_services: None,
+                        running_containers: None,
+                        total_containers: None,
+                    }
+                }
+            })
+            .collect(),
+        Err(_) => entries
+            .into_iter()
+            .map(|entry| FleetHost {
+                hostname: entry.name.clone(),
+                transport: entry.summary_label(),
+                status: "configured".to_owned(),
+                findings_count: 0,
+                critical_count: 0,
+                warning_count: 0,
+                info_count: 0,
+                last_seen: String::new(),
+                load_1m: None,
+                cpu_percent: None,
+                memory_used_pct: None,
+                failed_services: None,
+                running_containers: None,
+                total_containers: None,
+            })
+            .collect(),
+    }
+}
+
+fn daemon_summary() -> DaemonSummary {
+    crate::read_daemon_state()
+        .map(|state| DaemonSummary {
+            running: crate::daemon_is_running(),
+            status: state.status,
+            started_at: state.started_at,
+            last_heartbeat: state.last_heartbeat,
+            last_success_at: state.last_success_at,
+            last_error: state.last_error,
+            refresh_interval_secs: state.refresh_interval_secs,
+        })
+        .unwrap_or_default()
+}
+
+fn provider_context() -> (String, String) {
+    let config_path = match crate::default_config_path() {
+        Ok(path) => path,
+        Err(_) => return ("unconfigured".to_owned(), "off".to_owned()),
+    };
+    let config = match crate::load_config(&config_path) {
+        Ok(config) => config,
+        Err(_) => return ("unconfigured".to_owned(), "off".to_owned()),
+    };
+    let settings = match crate::resolve_provider_settings(config.as_ref(), None, None, None, None) {
+        Ok(settings) => settings,
+        Err(_) => return ("unconfigured".to_owned(), "off".to_owned()),
+    };
+
+    let provider = crate::provider_choice_name(settings.choice).to_owned();
+    let ai_state = if matches!(settings.choice, crate::ProviderChoice::Ollama) {
+        "local".to_owned()
+    } else {
+        "api".to_owned()
+    };
+    (provider, ai_state)
+}
+
+fn monitor_profile_label(profile: MonitorProfile) -> String {
+    match profile {
+        MonitorProfile::Quick => "quick".to_owned(),
+        MonitorProfile::Standard => "standard".to_owned(),
+        MonitorProfile::Deep => "deep".to_owned(),
+    }
+}
+
+fn timestamp_to_rfc3339(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
 }

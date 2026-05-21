@@ -3,8 +3,8 @@
 //! Two-step install onto a reachable Linux host:
 //!
 //! 1. Detect remote OS + architecture via `ssh <host> uname -srm`.
-//! 2. Copy the locally-running helm binary to `~/.helm/bin/helm` on the
-//!    remote, chmod +x, and verify with `helm --version`.
+//! 2. Copy the locally-running helm binary to `~/.helm/bin/helmops` on the
+//!    remote, chmod +x, and verify with `helmops --version`.
 //!
 //! When a `--release` URL is supplied the binary is downloaded on the remote
 //! via `curl -fsSL`; otherwise the local binary is uploaded via `scp`. After
@@ -83,20 +83,24 @@ pub async fn run(plan: BootstrapPlan, local_binary: PathBuf) -> Result<Bootstrap
     let install_root = "$HOME/.helm/bin";
     run_ssh(&target, &port_args, &common, &["mkdir", "-p", install_root]).await?;
 
-    let installed_path = "$HOME/.helm/bin/helm".to_owned();
+    let installed_path = "$HOME/.helm/bin/helmops".to_owned();
     if let Some(url) = plan.release_url.as_deref() {
         let curl_cmd = format!(
-            "curl -fsSL {} -o $HOME/.helm/bin/helm && chmod +x $HOME/.helm/bin/helm",
+            "curl -fsSL {} -o $HOME/.helm/bin/helmops && chmod +x $HOME/.helm/bin/helmops && ln -sf $HOME/.helm/bin/helmops $HOME/.helm/bin/helm",
             shell_escape(url)
         );
         run_ssh(&target, &port_args, &common, &["sh", "-c", &curl_cmd]).await?;
     } else {
-        scp_upload(&local_binary, &target, plan.port, "$HOME/.helm/bin/helm").await?;
+        scp_upload(&local_binary, &target, plan.port, "$HOME/.helm/bin/helmops").await?;
         run_ssh(
             &target,
             &port_args,
             &common,
-            &["chmod", "+x", "$HOME/.helm/bin/helm"],
+            &[
+                "sh",
+                "-c",
+                "chmod +x $HOME/.helm/bin/helmops && ln -sf $HOME/.helm/bin/helmops $HOME/.helm/bin/helm",
+            ],
         )
         .await?;
     }
@@ -105,7 +109,7 @@ pub async fn run(plan: BootstrapPlan, local_binary: PathBuf) -> Result<Bootstrap
         &target,
         &port_args,
         &common,
-        &["$HOME/.helm/bin/helm", "--version"],
+        &["$HOME/.helm/bin/helmops", "--version"],
     )
     .await
     .context("verifying remote helm install via --version")?;

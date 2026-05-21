@@ -7,7 +7,7 @@ use std::{
 };
 
 use chrono::Utc;
-use helm_core::{Capability, ContentBlock, GrantScope, MemoryError, Taint};
+use helm_core::{Capability, GrantScope, MemoryError, Taint};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -74,31 +74,6 @@ impl EpisodeOutcome {
     }
 }
 
-/// Role attached to a persisted episode step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StepRole {
-    /// System prompt step.
-    System,
-    /// User message step.
-    User,
-    /// Assistant message step.
-    Assistant,
-    /// Tool result step.
-    Tool,
-}
-
-impl StepRole {
-    /// Returns the SQLite representation required by the schema.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::Tool => "tool",
-        }
-    }
-}
-
 /// Read model for a persisted episode row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpisodeRecord {
@@ -112,7 +87,7 @@ pub struct EpisodeRecord {
     pub ended_at: Option<i64>,
     /// Stored outcome string, if finished.
     pub outcome: Option<String>,
-    /// Number of logged steps or iterations recorded for the episode.
+    /// Number of iterations recorded for the episode.
     pub iterations: u32,
     /// Total provider input tokens recorded for the episode.
     pub tokens_in: u32,
@@ -145,25 +120,6 @@ pub struct EpisodeOutcomeCounts {
     pub partial: u32,
     /// Episodes with `failure` outcome.
     pub failure: u32,
-}
-
-/// Read model for a persisted episode step.
-#[derive(Debug, Clone, PartialEq)]
-pub struct StepRecord {
-    /// Episode UUID that owns this step.
-    pub episode_id: EpisodeId,
-    /// Step index assigned by the ReAct loop.
-    pub step_index: u32,
-    /// Stored role string for the step.
-    pub role: String,
-    /// Deserialized content blocks for this step.
-    pub content: Vec<ContentBlock>,
-    /// Provider input tokens recorded for this step.
-    pub tokens_in: u32,
-    /// Provider output tokens recorded for this step.
-    pub tokens_out: u32,
-    /// Creation timestamp in Unix milliseconds.
-    pub created_at: i64,
 }
 
 /// Read model for a persisted capability grant.
@@ -266,6 +222,10 @@ impl MemoryStore {
         let path = path.to_path_buf();
         let audit_dir = path.parent().map(|p| p.join("audit"));
         let conn = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| MemoryError::Other(error.to_string()))?;
+            }
             let conn = Connection::open(path).map_err(sqlite_error)?;
             run_migrations(&conn)?;
             Ok::<Connection, MemoryError>(conn)
@@ -333,53 +293,6 @@ impl MemoryStore {
         .map_err(|error| MemoryError::Join(error.to_string()))?
     }
 
-    /// Logs one episode step with serialized content blocks and token counts.
-    pub async fn log_step(
-        &self,
-        episode_id: &str,
-        step_index: u32,
-        role: StepRole,
-        content: &[ContentBlock],
-        tokens_in: u32,
-        tokens_out: u32,
-    ) -> Result<(), MemoryError> {
-        let conn = Arc::clone(&self.conn);
-        let episode_id = episode_id.to_owned();
-        let content_json = serde_json::to_string(content)?;
-        let content_json = helm_core::redact_secrets(&content_json);
-        tokio::task::spawn_blocking(move || {
-            let guard = lock_conn(&conn)?;
-            guard
-                .execute(
-                    "INSERT INTO episode_steps \
-                     (episode_id, step_index, role, content_json, tokens_in, tokens_out, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        episode_id,
-                        i64::from(step_index),
-                        role.as_str(),
-                        content_json,
-                        i64::from(tokens_in),
-                        i64::from(tokens_out),
-                        now_ms()
-                    ],
-                )
-                .map_err(sqlite_error)?;
-            guard
-                .execute(
-                    "UPDATE episodes \
-                     SET tokens_in = tokens_in + ?2, \
-                         tokens_out = tokens_out + ?3 \
-                     WHERE id = ?1",
-                    params![episode_id, i64::from(tokens_in), i64::from(tokens_out)],
-                )
-                .map_err(sqlite_error)?;
-            Ok::<(), MemoryError>(())
-        })
-        .await
-        .map_err(|error| MemoryError::Join(error.to_string()))?
-    }
-
     /// Marks an episode as finished and records final text or error details.
     pub async fn finish_episode(
         &self,
@@ -399,7 +312,6 @@ impl MemoryStore {
                     "UPDATE episodes \
                      SET ended_at = ?2, \
                          outcome = ?3, \
-                         iterations = (SELECT COUNT(*) FROM episode_steps WHERE episode_id = ?1 AND role = 'assistant'), \
                          final_message = ?4, \
                          error = ?5 \
                      WHERE id = ?1",
@@ -535,25 +447,6 @@ impl MemoryStore {
         .map_err(|error| MemoryError::Join(error.to_string()))?
     }
 
-    /// Returns the number of steps stored for an episode.
-    pub async fn step_count(&self, episode_id: &str) -> Result<u32, MemoryError> {
-        let conn = Arc::clone(&self.conn);
-        let episode_id = episode_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let guard = lock_conn(&conn)?;
-            let count: i64 = guard
-                .query_row(
-                    "SELECT COUNT(*) FROM episode_steps WHERE episode_id = ?1",
-                    params![episode_id],
-                    |row| row.get(0),
-                )
-                .map_err(sqlite_error)?;
-            u32::try_from(count).map_err(|error| MemoryError::Migration(error.to_string()))
-        })
-        .await
-        .map_err(|error| MemoryError::Join(error.to_string()))?
-    }
-
     /// Returns one episode by ID, or `None` if it does not exist.
     pub async fn episode_by_id(
         &self,
@@ -583,31 +476,6 @@ impl MemoryStore {
                 )
                 .optional()
                 .map_err(sqlite_error)
-        })
-        .await
-        .map_err(|error| MemoryError::Join(error.to_string()))?
-    }
-
-    /// Returns all stored steps for an episode ordered by step index.
-    pub async fn get_steps(&self, episode_id: &str) -> Result<Vec<StepRecord>, MemoryError> {
-        let conn = Arc::clone(&self.conn);
-        let episode_id = episode_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let guard = lock_conn(&conn)?;
-            let mut stmt = guard
-                .prepare(
-                    "SELECT episode_id, step_index, role, content_json, tokens_in, tokens_out, \
-                     created_at FROM episode_steps WHERE episode_id = ?1 ORDER BY step_index ASC",
-                )
-                .map_err(sqlite_error)?;
-            let rows = stmt
-                .query_map(params![episode_id], row_to_step)
-                .map_err(sqlite_error)?;
-            let mut records = Vec::new();
-            for row in rows {
-                records.push(row.map_err(sqlite_error)?);
-            }
-            Ok::<Vec<StepRecord>, MemoryError>(records)
         })
         .await
         .map_err(|error| MemoryError::Join(error.to_string()))?
@@ -1383,22 +1251,6 @@ fn row_to_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRecord> {
     })
 }
 
-fn row_to_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRecord> {
-    let content_json: String = row.get(3)?;
-    let content = serde_json::from_str(&content_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
-    })?;
-    Ok(StepRecord {
-        episode_id: row.get(0)?,
-        step_index: i64_to_u32(row.get(1)?)?,
-        role: row.get(2)?,
-        content,
-        tokens_in: i64_to_u32(row.get(4)?)?,
-        tokens_out: i64_to_u32(row.get(5)?)?,
-        created_at: row.get(6)?,
-    })
-}
-
 fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<CapabilityGrantRecord> {
     let capability_text: String = row.get(1)?;
     let scope_text: String = row.get(2)?;
@@ -1558,12 +1410,10 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use helm_core::ContentBlock;
     use rusqlite::Connection;
-    use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{Capability, EpisodeOutcome, GrantScope, MIGRATION_0001, MemoryStore, StepRole};
+    use super::{Capability, EpisodeOutcome, GrantScope, MIGRATION_0001, MemoryStore};
 
     async fn store() -> (tempfile::TempDir, MemoryStore) {
         let dir = tempdir().unwrap();
@@ -1588,55 +1438,12 @@ mod tests {
         let (_dir, store) = store().await;
         let id = store.start_episode("goal").await.unwrap();
         store
-            .log_step(
-                &id,
-                0,
-                StepRole::User,
-                &[ContentBlock::Text("goal".to_owned())],
-                1,
-                0,
-            )
-            .await
-            .unwrap();
-        store
-            .log_step(
-                &id,
-                1,
-                StepRole::Assistant,
-                &[ContentBlock::Text("thinking".to_owned())],
-                2,
-                3,
-            )
-            .await
-            .unwrap();
-        store
-            .log_step(
-                &id,
-                2,
-                StepRole::Tool,
-                &[ContentBlock::ToolResult {
-                    tool_use_id: "toolu".to_owned(),
-                    content: "ok".to_owned(),
-                    is_error: false,
-                }],
-                0,
-                0,
-            )
-            .await
-            .unwrap();
-        store
             .finish_episode(&id, EpisodeOutcome::Success, Some("done"), None)
             .await
             .unwrap();
 
         let episode = store.episode_by_id(&id).await.unwrap().unwrap();
         assert_eq!(episode.outcome, Some("success".to_owned()));
-        assert_eq!(episode.iterations, 1);
-        assert_eq!(episode.tokens_in, 3);
-        assert_eq!(store.step_count(&id).await.unwrap(), 3);
-        let steps = store.get_steps(&id).await.unwrap();
-        assert_eq!(steps.len(), 3);
-        assert_eq!(steps[0].role, "user");
     }
 
     #[tokio::test]
@@ -1738,16 +1545,6 @@ mod tests {
         let episode = store.get_episode("missing").await.unwrap();
 
         assert!(episode.is_none());
-    }
-
-    #[tokio::test]
-    async fn get_steps_empty_episode_edge_case() {
-        let (_dir, store) = store().await;
-        let id = store.start_episode("goal").await.unwrap();
-
-        let steps = store.get_steps(&id).await.unwrap();
-
-        assert!(steps.is_empty());
     }
 
     #[tokio::test]
@@ -1916,47 +1713,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_log_step_does_not_corrupt_error_path() {
-        let (_dir, store) = store().await;
-        let id = store.start_episode("goal").await.unwrap();
-        let left_content = [ContentBlock::Text("a".to_owned())];
-        let right_content = [ContentBlock::Text("b".to_owned())];
-        let left = store.log_step(&id, 0, StepRole::Assistant, &left_content, 1, 1);
-        let right = store.log_step(&id, 1, StepRole::Assistant, &right_content, 1, 1);
-
-        let (left_result, right_result) = tokio::join!(left, right);
-
-        left_result.unwrap();
-        right_result.unwrap();
-        assert_eq!(store.step_count(&id).await.unwrap(), 2);
-    }
-
-    #[tokio::test]
     async fn recent_episodes_respects_limit() {
         let (_dir, store) = store().await;
-        let first = store.start_episode("first").await.unwrap();
-        store
-            .log_step(
-                &first,
-                0,
-                StepRole::User,
-                &[ContentBlock::Text(json!("one").to_string())],
-                0,
-                0,
-            )
-            .await
-            .unwrap();
-        let second = store.start_episode("second").await.unwrap();
+        let _first = store.start_episode("first").await.unwrap();
+        let _second = store.start_episode("second").await.unwrap();
 
         let episodes = store.recent_episodes(1).await.unwrap();
 
         assert_eq!(episodes.len(), 1);
-        assert!(episodes[0].id == first || episodes[0].id == second);
     }
 
     #[test]
     fn enum_strings_match_schema() {
         assert_eq!(EpisodeOutcome::Partial.as_str(), "partial");
-        assert_eq!(StepRole::System.as_str(), "system");
     }
 }

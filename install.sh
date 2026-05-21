@@ -46,8 +46,10 @@ if ! curl -fsSL "$url" -o "$tmp"; then
   exit 1
 fi
 chmod +x "$tmp"
-mv "$tmp" "$install_dir/helm"
-echo "installed $install_dir/helm"
+mv "$tmp" "$install_dir/helmops"
+ln -sf "$install_dir/helmops" "$install_dir/helm"
+echo "installed $install_dir/helmops"
+echo "compatibility alias: $install_dir/helm"
 
 # Add install_dir to PATH if it isn't already there
 add_to_path() {
@@ -72,7 +74,7 @@ case "${SHELL:-}" in
   *)      add_to_path "$HOME/.bashrc" ;;
 esac
 
-if ! command -v helm >/dev/null 2>&1 || [ "$(command -v helm)" != "$install_dir/helm" ]; then
+if ! command -v helmops >/dev/null 2>&1 || [ "$(command -v helmops)" != "$install_dir/helmops" ]; then
   echo ""
   echo "  NOTE: $install_dir is not in your current PATH."
   echo "  Either restart your shell or run:"
@@ -80,4 +82,4 @@ if ! command -v helm >/dev/null 2>&1 || [ "$(command -v helm)" != "$install_dir/
 fi
 
 echo ""
-echo "  Next: helm init"
+echo "  Next: helmops init"

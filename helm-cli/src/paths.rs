@@ -88,11 +88,6 @@ pub fn default_secrets_path() -> PathBuf {
 }
 
 #[allow(dead_code)]
-pub fn default_skills_path() -> PathBuf {
-    data_dir().join("skills")
-}
-
-#[allow(dead_code)]
 pub fn default_hooks_path() -> PathBuf {
     config_file("hooks.toml")
 }

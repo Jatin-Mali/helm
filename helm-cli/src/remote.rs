@@ -128,7 +128,7 @@ fn default_agent_service_name() -> String {
 }
 
 fn default_agent_install_path() -> String {
-    "$HOME/.helm/bin/helm".to_owned()
+    "$HOME/.helm/bin/helmops".to_owned()
 }
 
 fn default_agent_interval_secs() -> u64 {
@@ -279,7 +279,7 @@ impl RemoteEntry {
         self.agent
             .as_ref()
             .map(|agent| agent.install_path.clone())
-            .unwrap_or_else(|| "helm".to_owned())
+            .unwrap_or_else(|| "helmops".to_owned())
     }
 
     pub fn summary_label(&self) -> String {
@@ -574,7 +574,7 @@ mod tests {
         };
 
         assert_eq!(entry.summary_label(), "agent/systemd-user");
-        assert_eq!(entry.remote_helm_command(), "$HOME/.helm/bin/helm");
+        assert_eq!(entry.remote_helm_command(), "$HOME/.helm/bin/helmops");
     }
 
     #[test]

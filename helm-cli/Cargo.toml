@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
+name = "helmops"
+path = "src/main.rs"
+
+[[bin]]
 name = "helm"
 path = "src/main.rs"
 
@@ -22,7 +26,6 @@ helm-core.workspace = true
 helm-memory.workspace = true
 helm-providers.workspace = true
 helm-monitor.workspace = true
-helm-tools.workspace = true
 uuid.workspace = true
 nix.workspace = true
 reqwest.workspace = true

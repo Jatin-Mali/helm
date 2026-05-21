@@ -1,22 +1,23 @@
-# HELM
+# HELMOPS
 
-> A terminal-native Linux monitoring and troubleshooting assistant.
+> A web-first Linux, DevOps, and fleet monitoring console.
 
-HELM is a read-only-first ops console. It collects system context, surfaces
+HELMOPS is a read-only-first ops console. It collects system context, surfaces
 findings that operators miss, shows the evidence, and guides reviewed fixes.
 It changes nothing unless you explicitly approve a plan step.
 
-`helm` with no arguments opens the dashboard.
+`helmops` with no arguments opens the web dashboard. `helm` remains as a compatibility alias.
 
 ## What HELM Is Now
 
 Current default product surface:
 
-- dashboard-first TUI: `helm`
-- typed system snapshots: `helm snapshot`
-- local monitoring reports: `helm monitor`
-- finding-driven troubleshooting: `helm troubleshoot`
-- reviewed execution only after approval: `helm apply-plan`
+- web console: `helmops`
+- terminal dashboard: `helmops tui`
+- typed system snapshots: `helmops snapshot`
+- local monitoring reports: `helmops monitor`
+- finding-driven troubleshooting: `helmops troubleshoot`
+- reviewed execution only after approval: `helmops apply-plan`
 
 Current shipped core:
 
@@ -36,66 +37,61 @@ Current shipped core:
 
 ```sh
 # Configure provider/model once
-helm init
+helmops init
 
-# Open the monitoring dashboard
-helm
+# Open the web dashboard
+helmops
+
+# Open the terminal dashboard
+helmops tui
 ```
 
-Dashboard shortcuts:
+Web console shortcuts:
 
-- `F5` refresh system state
-- `Tab` move between filters, queue, and detail
-- `1` / `2` / `3` switch Review, Cleanup, and Remediate workflow tabs
-- `Enter` open the selected finding
-- `Alt+E` open evidence
-- `Alt+F` run a read-only follow-up check for the selected finding
-- `Alt+G` generate a troubleshooting plan
-- `Alt+A` open the reviewed apply flow for the active plan
-- `Alt+S` suppress a finding
-- `Alt+R` mark a finding resolved
-- `Alt+U` reopen a suppressed or resolved finding
-- `Shift+Tab` cycle Dashboard → Chat → Plan → Diagnose
+- `1-9` switch workspaces
+- `Enter` open the selected incident
+- `Escape` clear the selection
+- `Alt+G` load plan guidance for the selected incident
+- `F5` reload the page
 
 ### Web Dashboard
 
 ```sh
 # Start the live web dashboard
-helm web
+helmops web
 
 # Custom port
-helm web --port 8080
+helmops web --port 8080
 ```
 
 Open http://localhost:9120 in your browser. The web dashboard provides:
 
-- **Live system overview**: CPU, memory, load, disk usage — updates every 5 seconds
-- **Finding queue**: severity-grouped alerts with click-to-inspect
-- **Detail panel**: WHAT BROKE → IMPACT → EVIDENCE → FIX PLAN
-- **8 tabs**: ALERTS, SERVICES, CONTAINERS, PROCESSES, NETWORK, DISK, LOGS, FLEET
-- **Keyboard shortcuts**: `1-8` tabs, `↑/↓` queue, `Enter` select, `Escape` deselect, `Alt+G` plan, `F5` refresh
-- **Dark theme**: GitHub-dark inspired, zero-dependency single HTML file
+- **Incident-first layout**: a larger queue, richer evidence panel, and guided remediation context
+- **Infrastructure coverage**: services, containers, compose, Kubernetes, databases, websites, network, storage, certificates, and fleet
+- **Live operator cards**: daemon status, update pressure, storage risk, runtime counts, and collector health
+- **Keyboard shortcuts**: `1-9` tabs, `Enter` select, `Escape` clear, `Alt+G` plan, `F5` refresh
+- **Single-file frontend**: no JS framework, no build step, live updates over WebSocket
 
 The web dashboard connects via WebSocket to the helm daemon for real-time data.
-Start the daemon first for continuous data: `helm daemon start`
+Start the daemon first for continuous data: `helmops daemon start`
 
 ## Safe CLI Flows
 
 ```sh
 # Collect a typed system snapshot
-helm snapshot --profile standard
+helmops snapshot --profile standard
 
 # Produce findings without allowing mutation
-helm monitor --domain disk,services,containers,ports,load,logs,backups
+helmops monitor --domain disk,services,containers,ports,load,logs,backups
 
 # Explain one stored finding in detail
-helm explain <finding-id>
+helmops explain <finding-id>
 
 # Build a guided troubleshooting plan
-helm troubleshoot --from-finding <finding-id>
+helmops troubleshoot --from-finding <finding-id>
 
 # Verify trust boundaries and active permissions
-helm trust-report
+helmops trust-report
 ```
 
 ## Install
@@ -104,8 +100,8 @@ helm trust-report
 
 ```sh
 curl -fsSL https://github.com/Jatin-Mali/helm/releases/latest/download/install.sh | sh
-helm init
-helm
+helmops init
+helmops
 ```
 
 If your architecture does not have a published release asset yet, the installer
@@ -117,16 +113,16 @@ fails with clear source-build instructions.
 git clone https://github.com/Jatin-Mali/helm.git
 cd helm
 cargo build --release -p helm-cli
-./target/release/helm init
-./target/release/helm doctor
-./target/release/helm
+./target/release/helmops init
+./target/release/helmops doctor
+./target/release/helmops
 ```
 
 Minimum supported Rust version: `1.85`.
 
 ## First Run Setup
 
-`helm init` asks for:
+`helmops init` asks for:
 
 1. provider
 2. model
@@ -151,9 +147,9 @@ HELM follows XDG paths:
 
 ```sh
 export OPENROUTER_API_KEY='sk-or-...'
-./target/release/helm init --force --provider openrouter
-./target/release/helm doctor
-./target/release/helm
+./target/release/helmops init --force --provider openrouter
+./target/release/helmops doctor
+./target/release/helmops
 ```
 
 ### Gemini
@@ -161,51 +157,44 @@ export OPENROUTER_API_KEY='sk-or-...'
 ```sh
 export GOOGLE_API_KEY='...'
 # GEMINI_API_KEY is also accepted
-./target/release/helm init --force --provider gemini --model gemini-2.5-flash
-./target/release/helm doctor
-./target/release/helm
+./target/release/helmops init --force --provider gemini --model gemini-2.5-flash
+./target/release/helmops doctor
+./target/release/helmops
 ```
 
 ### Ollama (local, no API key needed)
 
 ```sh
 ollama pull qwen3:4b
-./target/release/helm init --force --provider ollama --model qwen3:4b
-./target/release/helm doctor
-./target/release/helm
+./target/release/helmops init --force --provider ollama --model qwen3:4b
+./target/release/helmops doctor
+./target/release/helmops
 ```
 
 ## Core Commands
 
 ```sh
-helm                                  # open the dashboard
-helm tui --mode dashboard             # explicit dashboard launch
-helm tui --mode chat                  # chat-first TUI
-helm tui --mode diagnose              # read-only diagnose TUI
-helm snapshot --profile standard      # typed system snapshot
-helm monitor                          # findings report from latest snapshot
-helm monitor --watch --interval 60s   # read-only local watch loop
-helm explain <finding-id>             # show evidence and likely impact
-helm troubleshoot "<problem>"         # build a guided plan
-helm troubleshoot --from-finding <id> # finding-driven plan
-helm apply-plan <plan-id>             # reviewed execution
-helm change-set list                  # recent approved changes
-helm diagnose "<question>"            # read-only system inspection
-helm trust-report                     # verify trust boundaries
-helm init                             # configure provider/model/key
-helm doctor                           # verify provider, DB, tools, secrets
-helm models                           # list models for the active provider
-helm episodes --limit 10              # recent runs
-helm replay <episode_id>              # replay a run
-helm audit verify                     # verify audit chain integrity
-helm permissions list                 # current capability grants
-helm secrets list                     # stored provider keys
-helm skills list                      # built-in and user skills
-helm remote list                      # registered SSH targets
-helm bootstrap user@host --register-as prod-1
-helm monitor --remote prod-1
-helm config path                      # config file location
-helm completion bash                  # shell completion
+helmops                               # open the web dashboard
+helmops tui                           # open the terminal dashboard
+helmops snapshot --profile standard   # typed system snapshot
+helmops monitor                       # findings report from latest snapshot
+helmops explain <finding-id>          # show evidence and likely impact
+helmops troubleshoot "<problem>"      # build a guided plan
+helmops troubleshoot --from-finding <id>
+helmops apply-plan <plan-id>          # reviewed execution
+helmops change-set list               # recent approved changes
+helmops trust-report                  # verify trust boundaries
+helmops init                          # configure provider/model/key
+helmops doctor                        # verify provider, DB, tools, secrets
+helmops models                        # list models for the active provider
+helmops audit verify                  # verify audit chain integrity
+helmops permissions list              # current capability grants
+helmops secrets list                  # stored provider keys
+helmops remote list                   # registered SSH targets
+helmops bootstrap user@host --register-as prod-1
+helmops web --port 9120               # explicit web launch
+helmops daemon start                  # background collector loop
+helmops completion bash               # shell completion
 ```
 
 ## Security Notes
@@ -224,7 +213,7 @@ helm completion bash                  # shell completion
 ## Remote Mode
 
 Remote targets use SSH for read-only inspection and, when explicitly approved,
-execution. The local client starts the remote `helm` binary and replays
+execution. The local client starts the remote `helmops` binary and replays
 `AgentEvent` results into the local CLI or TUI. See `docs/agent-on-remote.md`.
 
 ## Use HELM If
