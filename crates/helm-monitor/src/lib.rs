@@ -2,6 +2,7 @@
 
 pub mod alerting;
 pub mod collectors;
+pub mod custom_rules;
 pub mod detectors;
 pub mod engine;
 pub mod execute;
@@ -13,6 +14,10 @@ pub mod snapshot;
 pub mod thresholds;
 pub mod troubleshoot;
 
+pub use custom_rules::{
+    CompareOp, CustomRule, CustomRulesEngine, LogicOp, RuleCondition, RuleValidationError,
+    ThresholdValue, default_rules_path,
+};
 pub use engine::{AlertingEngine, collect_snapshot};
 pub use execute::{
     ChangeSet, ChangeSetStatus, ChangeSetStep, ExecutionEngine, PreChangeBackup, StepOutcome,

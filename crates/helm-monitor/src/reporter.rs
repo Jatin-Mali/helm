@@ -3,6 +3,7 @@
 
 use crate::{
     collect_snapshot,
+    custom_rules::CustomRulesEngine,
     detectors::DetectorRegistry,
     findings::{Finding, MonitorDomain, Severity},
     snapshot::{MonitorProfile, SystemSnapshot},
@@ -37,9 +38,17 @@ impl MonitorReporter {
     ) -> MonitorReport {
         let snapshot = collect_snapshot(profile).await;
         let previous_snapshot_id = previous_snapshot.as_ref().map(|p| p.id.clone());
-        let findings = self
-            .registry
-            .detect(&snapshot, domain_filter, previous_snapshot.as_ref());
+        let mut findings =
+            self.registry
+                .detect(&snapshot, domain_filter, previous_snapshot.as_ref());
+        findings.extend(
+            CustomRulesEngine::load_default()
+                .evaluate(&snapshot)
+                .into_iter()
+                .filter(|finding| {
+                    domain_filter.is_none_or(|domains| domains.contains(&finding.category))
+                }),
+        );
         let domains_checked = if let Some(doms) = domain_filter {
             doms.to_vec()
         } else {

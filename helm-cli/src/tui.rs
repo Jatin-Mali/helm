@@ -373,11 +373,6 @@ enum ModalState {
     ThemeSelector {
         selected: usize,
     },
-    CostMeter {
-        session_tokens_in: u64,
-        session_tokens_out: u64,
-        session_cost_usd: f64,
-    },
     /// Command-by-command plan execution approval.
     PlanExecution {
         plan_id: String,
@@ -469,14 +464,12 @@ enum CommandAction {
     Config,
     Theme,
     Keybindings,
-    Stats,
     Mcp,
     Compact,
     Diff,
     Tools,
     Undo,
     Redo,
-    Cost,
     Quit,
     Help,
     Diagnose,
@@ -570,14 +563,12 @@ impl CommandAction {
             Self::Config,
             Self::Theme,
             Self::Keybindings,
-            Self::Stats,
             Self::Mcp,
             Self::Compact,
             Self::Diff,
             Self::Tools,
             Self::Undo,
             Self::Redo,
-            Self::Cost,
             Self::Quit,
             Self::Help,
             Self::Diagnose,
@@ -603,14 +594,12 @@ impl CommandAction {
             Self::Config => "Config Editor",
             Self::Theme => "Theme Selector",
             Self::Keybindings => "Keybindings",
-            Self::Stats => "Stats",
             Self::Mcp => "MCP Servers",
             Self::Compact => "Compact",
             Self::Diff => "Diff Last Edit",
             Self::Tools => "Tools",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
-            Self::Cost => "Cost Meter",
             Self::Quit => "Quit",
             Self::Help => "Help",
             Self::Diagnose => "Diagnose Mode",
@@ -636,14 +625,12 @@ impl CommandAction {
             Self::Config => "config",
             Self::Theme => "theme",
             Self::Keybindings => "keybindings",
-            Self::Stats => "stats",
             Self::Mcp => "mcp",
             Self::Compact => "compact",
             Self::Diff => "diff",
             Self::Tools => "tools",
             Self::Undo => "undo",
             Self::Redo => "redo",
-            Self::Cost => "cost",
             Self::Quit => "quit",
             Self::Help => "help",
             Self::Diagnose => "diagnose",
@@ -669,14 +656,12 @@ impl CommandAction {
             Self::Config => "view or edit config inline (/config key=value)",
             Self::Theme => "switch theme (/theme dracula)",
             Self::Keybindings => "show keybinding overrides in the HELM XDG config directory",
-            Self::Stats => "show token usage and cost since today",
             Self::Mcp => "list MCP servers",
             Self::Compact => "summarize transcript to reclaim context",
             Self::Diff => "show diff of the last fs_write",
             Self::Tools => "list loaded tools and capabilities",
             Self::Undo => "undo last agent file edit",
             Self::Redo => "redo last undone agent edit",
-            Self::Cost => "open the session cost meter",
             Self::Quit => "exit HELM",
             Self::Help => "keyboard shortcuts and commands",
             Self::Diagnose => "switch to diagnose mode (read-only, limited tools)",
@@ -703,14 +688,12 @@ impl CommandAction {
             Self::Config => slug == "config",
             Self::Theme => slug == "theme",
             Self::Keybindings => matches!(slug, "keybindings" | "keybinds" | "keys"),
-            Self::Stats => matches!(slug, "stats" | "usage"),
             Self::Mcp => slug == "mcp",
             Self::Compact => slug == "compact",
             Self::Diff => slug == "diff",
             Self::Tools => slug == "tools",
             Self::Undo => slug == "undo",
             Self::Redo => slug == "redo",
-            Self::Cost => slug == "cost",
             Self::Help => slug == "help",
             Self::Diagnose => slug == "diagnose",
             Self::Evidence => slug == "evidence",
@@ -4108,14 +4091,12 @@ Report the exit status and the concise output."
             CommandAction::Config => self.execute_config_inline(""),
             CommandAction::Theme => self.open_theme_selector(),
             CommandAction::Keybindings => self.execute_keybindings_inline(),
-            CommandAction::Stats => self.execute_stats_inline(),
             CommandAction::Mcp => self.execute_mcp_list_inline(),
             CommandAction::Compact => self.execute_compact_inline(),
             CommandAction::Diff => self.execute_diff_inline(""),
             CommandAction::Tools => self.execute_tools_inline(),
             CommandAction::Undo => self.execute_undo_inline(false),
             CommandAction::Redo => self.execute_undo_inline(true),
-            CommandAction::Cost => self.open_cost_meter(),
             CommandAction::Diagnose => {
                 self.mode = AgentMode::Dashboard;
                 self.push_chat(
@@ -4321,35 +4302,6 @@ Report the exit status and the concise output."
             )
         };
         self.push_chat(MessageRole::System, body);
-    }
-
-    fn execute_stats_inline(&mut self) {
-        let memory = Arc::clone(&self.runtime.memory);
-        let summary = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let counts = match memory.episode_outcome_counts().await {
-                    Ok(c) => c,
-                    Err(error) => return format!("(stats unavailable: {error})"),
-                };
-                let recents = memory.recent_episodes(50).await.unwrap_or_default();
-                let tokens_in: u64 = recents.iter().map(|e| e.tokens_in as u64).sum();
-                let tokens_out: u64 = recents.iter().map(|e| e.tokens_out as u64).sum();
-                format!(
-                    "episodes: {} (ok {} / partial {} / fail {})\nlast {} runs · tokens in {} · tokens out {}",
-                    counts.total,
-                    counts.success,
-                    counts.partial,
-                    counts.failure,
-                    recents.len(),
-                    tokens_in,
-                    tokens_out
-                )
-            })
-        });
-        self.push_chat(
-            MessageRole::System,
-            format!("[stats]\n{summary}\nUse the dashboard summary for daemon-side rollups."),
-        );
     }
 
     fn execute_mcp_list_inline(&mut self) {
@@ -5987,27 +5939,6 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             }
         }
         self.dashboard.error = None;
-    }
-
-    fn open_cost_meter(&mut self) {
-        let memory = Arc::clone(&self.runtime.memory);
-        let (tokens_in, tokens_out) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let recents = memory.recent_episodes(20).await.unwrap_or_default();
-                (
-                    recents.iter().map(|e| e.tokens_in as u64).sum::<u64>(),
-                    recents.iter().map(|e| e.tokens_out as u64).sum::<u64>(),
-                )
-            })
-        });
-        // Very rough USD estimate using $5 per 1M in, $15 per 1M out (Anthropic mid-tier baseline).
-        let cost_usd =
-            (tokens_in as f64 / 1_000_000.0) * 5.0 + (tokens_out as f64 / 1_000_000.0) * 15.0;
-        self.modal = Some(ModalState::CostMeter {
-            session_tokens_in: tokens_in,
-            session_tokens_out: tokens_out,
-            session_cost_usd: cost_usd,
-        });
     }
 
     fn apply_remote_target(&mut self, args: &str) {
@@ -9250,20 +9181,6 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
             )]));
             Paragraph::new(lines)
                 .block(modal_block(" Theme "))
-                .wrap(Wrap { trim: false })
-                .render(area, buf);
-        }
-        ModalState::CostMeter {
-            session_tokens_in,
-            session_tokens_out,
-            session_cost_usd,
-        } => {
-            let content = format!(
-                "Session Stats\n\nTokens in: {}\nTokens out: {}\nEst. cost: ${:.4}",
-                session_tokens_in, session_tokens_out, session_cost_usd
-            );
-            Paragraph::new(content)
-                .block(modal_block(" Cost Meter "))
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
