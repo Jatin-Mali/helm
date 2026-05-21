@@ -191,6 +191,30 @@ body::before {
 
 .metric-trend strong { color: var(--text); }
 
+.metric-spark {
+  margin-top: 14px;
+  height: 34px;
+}
+
+.metric-spark svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.metric-spark polyline {
+  fill: none;
+  stroke: rgba(102, 227, 255, 0.9);
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.metric-spark .spark-fill {
+  fill: rgba(102, 227, 255, 0.12);
+  stroke: none;
+}
+
 .workspace {
   display: grid;
   grid-template-columns: 370px 1fr;
@@ -718,36 +742,42 @@ function renderHero() {
       value: String(state.findings.length),
       sub: `${crit} critical · ${warn} warning · ${info} info`,
       trend: ['selected', selectedFinding()?.title || 'none'],
+      spark: d.metricHistory?.load || [],
     },
     {
       label: 'host load',
       value: `${Math.round(d.cpuPercent || 0)}%`,
       sub: `1m ${fmt1(d.load1m)} · 5m ${fmt1(d.load5m)} · 15m ${fmt1(d.load15m)}`,
       trend: ['memory', `${Math.round(d.memoryUsedPct || 0)}% of ${fmt1(d.memoryTotalGb)} GB`],
+      spark: d.metricHistory?.cpu || [],
     },
     {
       label: 'service health',
       value: `${d.failedServices || 0}`,
       sub: `${d.totalServices || 0} units monitored`,
       trend: ['daemon', daemonSummary()],
+      spark: d.metricHistory?.network || [],
     },
     {
       label: 'containers',
       value: `${d.runningContainers || 0}/${d.totalContainers || 0}`,
       sub: `${composeProjects} compose projects · ${pods} pods`,
       trend: ['runtime', inv.containers?.runtime || 'none'],
+      spark: d.metricHistory?.memory || [],
     },
     {
       label: 'storage risk',
       value: maxDisk ? `${Math.round(percent(maxDisk.used_bytes, maxDisk.total_bytes))}%` : '0%',
       sub: maxDisk ? `${maxDisk.mount_point} under the most pressure` : 'no filesystems discovered',
       trend: ['smart', `${inv.disks?.smart_devices?.length || 0} devices checked`],
+      spark: d.metricHistory?.disk || [],
     },
     {
       label: 'updates and backup',
       value: `${inv.packages?.upgradable_count ?? 0}`,
       sub: `${securityUpdates} security updates · ${d.backupCount || 0} backup tools`,
       trend: ['source', d.snapshotSource || 'live'],
+      spark: d.metricHistory?.swap || [],
     },
   ];
 
@@ -757,6 +787,7 @@ function renderHero() {
       <div class="metric-value">${esc(card.value)}</div>
       <div class="metric-sub">${esc(card.sub)}</div>
       <div class="metric-trend"><span>${esc(card.trend[0])}</span><strong>${esc(card.trend[1])}</strong></div>
+      <div class="metric-spark">${sparkline(card.spark)}</div>
     </section>
   `).join('');
 }
@@ -1226,6 +1257,28 @@ function sortFindings(findings) {
 function percent(used, total) {
   if (!total) return 0;
   return (used / total) * 100;
+}
+
+function sparkline(values) {
+  const series = (values || []).map(Number).filter(v => Number.isFinite(v));
+  if (series.length < 2) return '';
+  const min = Math.min(...series);
+  const max = Math.max(...series);
+  const span = Math.max(max - min, 1);
+  const width = 240;
+  const height = 34;
+  const points = series.map((value, index) => {
+    const x = (index / Math.max(series.length - 1, 1)) * width;
+    const y = height - ((value - min) / span) * (height - 4) - 2;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const fillPoints = [`0,${height}`, ...points, `${width},${height}`].join(' ');
+  return `
+    <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+      <polygon class="spark-fill" points="${fillPoints}"></polygon>
+      <polyline points="${points.join(' ')}"></polyline>
+    </svg>
+  `;
 }
 
 function bytesToGb(bytes) {

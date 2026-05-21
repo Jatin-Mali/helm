@@ -10,6 +10,7 @@ description = "Monitoring engine for HELM — typed system snapshots and collect
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+dirs.workspace = true
 futures.workspace = true
 helm-core.workspace = true
 reqwest.workspace = true
@@ -21,4 +22,5 @@ hex.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 uuid.workspace = true

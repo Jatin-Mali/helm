@@ -4,9 +4,39 @@ use crate::{
     detectors::Detector,
     findings::{Confidence, Finding, MonitorDomain, Severity},
     snapshot::SystemSnapshot,
+    thresholds::DetectorThresholdOverride,
 };
 
-pub struct SwapExhaustionDetector;
+pub struct SwapExhaustionDetector {
+    warning_pct: f64,
+    critical_pct: f64,
+}
+
+impl SwapExhaustionDetector {
+    pub fn from_thresholds(override_cfg: Option<&DetectorThresholdOverride>) -> Self {
+        let defaults = Self::default();
+        let warning_pct = override_cfg
+            .and_then(|cfg| cfg.warning)
+            .unwrap_or(defaults.warning_pct);
+        let critical_pct = override_cfg
+            .and_then(|cfg| cfg.critical)
+            .unwrap_or(defaults.critical_pct)
+            .max(warning_pct);
+        Self {
+            warning_pct,
+            critical_pct,
+        }
+    }
+}
+
+impl Default for SwapExhaustionDetector {
+    fn default() -> Self {
+        Self {
+            warning_pct: 90.0,
+            critical_pct: 97.0,
+        }
+    }
+}
 
 impl Detector for SwapExhaustionDetector {
     fn id(&self) -> &'static str {
@@ -26,13 +56,18 @@ impl Detector for SwapExhaustionDetector {
         let pct = (snapshot.domains.load.swap_used as f64
             / snapshot.domains.load.swap_total as f64)
             * 100.0;
-        if pct >= 90.0 {
+        if pct >= self.warning_pct {
+            let severity = if pct >= self.critical_pct {
+                Severity::Critical
+            } else {
+                Severity::Warning
+            };
             vec![Finding::new(
                 &snapshot.id,
                 self.id(),
                 "system",
-                &format!("Swap usage is critical ({:.0}% used)", pct),
-                Severity::Warning,
+                &format!("Swap usage is high ({:.0}% used)", pct),
+                severity,
                 Confidence::High,
                 MonitorDomain::Load,
             )

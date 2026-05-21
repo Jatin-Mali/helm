@@ -35,9 +35,10 @@ use helm_memory::{
     stable_hash_hex,
 };
 use helm_monitor::{
-    CommandPreview, ExecutionEngine, Finding, HostIdentity, MonitorDomain, MonitorProfile,
-    MonitorReport, MonitorReporter, PlanSource, SnapshotDomains, SystemSnapshot, collect_snapshot,
-    explain_finding, format_change_set, plan_from_finding, plan_from_problem,
+    CommandPreview, ExecutionEngine, Finding, HostIdentity, MetricHistory, MonitorDomain,
+    MonitorProfile, MonitorReport, MonitorReporter, PlanSource, SnapshotDomains, SystemSnapshot,
+    collect_snapshot, explain_finding, format_change_set, load_thresholds_config,
+    plan_from_finding, plan_from_problem,
 };
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
@@ -166,14 +167,14 @@ enum DaemonCommand {
 
 #[derive(Debug, Args)]
 struct DaemonStartArgs {
-    #[arg(long, default_value_t = 60)]
-    interval: u64,
+    #[arg(long)]
+    interval: Option<u64>,
 }
 
 #[derive(Debug, Args)]
 struct DaemonRunArgs {
-    #[arg(long, default_value_t = 60)]
-    interval: u64,
+    #[arg(long)]
+    interval: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -3684,6 +3685,8 @@ pub(crate) struct DaemonState {
     pub last_finding_count: usize,
     pub refresh_interval_secs: u64,
     pub db_path: String,
+    #[serde(default)]
+    pub metric_history: MetricHistory,
 }
 
 fn daemon_state_path() -> PathBuf {
@@ -3708,6 +3711,10 @@ fn process_alive(pid: u32) -> bool {
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn configured_refresh_interval(override_secs: Option<u64>) -> u64 {
+    override_secs.unwrap_or_else(|| load_thresholds_config().refresh_interval_secs)
 }
 
 fn write_daemon_state(state: &DaemonState) -> Result<()> {
@@ -3757,7 +3764,13 @@ async fn run_daemon_command(args: DaemonArgs, db_path: &Path) -> Result<()> {
             println!("{msg}");
             Ok(())
         }
-        DaemonCommand::Run(args) => run_daemon_loop(args.interval, db_path.to_path_buf()).await,
+        DaemonCommand::Run(args) => {
+            run_daemon_loop(
+                configured_refresh_interval(args.interval),
+                db_path.to_path_buf(),
+            )
+            .await
+        }
     }
 }
 
@@ -3769,6 +3782,7 @@ pub(crate) async fn daemon_start_core(args: DaemonStartArgs, db_path: &Path) -> 
         }
     }
 
+    let refresh_interval_secs = configured_refresh_interval(args.interval);
     let exe = env::current_exe().context("locating current helm binary")?;
     let log_path = daemon_log_path();
     ensure_parent_dir(&log_path)?;
@@ -3788,7 +3802,7 @@ pub(crate) async fn daemon_start_core(args: DaemonStartArgs, db_path: &Path) -> 
         .arg("daemon")
         .arg("run")
         .arg("--interval")
-        .arg(args.interval.to_string())
+        .arg(refresh_interval_secs.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(stdout))
         .stderr(std::process::Stdio::from(stderr));
@@ -3805,8 +3819,9 @@ pub(crate) async fn daemon_start_core(args: DaemonStartArgs, db_path: &Path) -> 
         last_error: None,
         last_snapshot_id: None,
         last_finding_count: 0,
-        refresh_interval_secs: args.interval,
+        refresh_interval_secs,
         db_path: db_path.display().to_string(),
+        metric_history: MetricHistory::new(load_thresholds_config().sparkline_history_depth),
     };
     write_daemon_state(&state)?;
     Ok(format!(
@@ -3910,6 +3925,8 @@ pub(crate) fn daemon_status_core() -> Result<String> {
 async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
     ensure_parent_dir(&db_path)?;
     ensure_parent_dir(&daemon_pid_path())?;
+    let thresholds = load_thresholds_config();
+    let mut metric_history = MetricHistory::new(thresholds.sparkline_history_depth);
     let pid = std::process::id();
     fs::write(daemon_pid_path(), pid.to_string()).ok();
     let mut state = DaemonState {
@@ -3923,6 +3940,7 @@ async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
         last_finding_count: 0,
         refresh_interval_secs: interval,
         db_path: db_path.display().to_string(),
+        metric_history: metric_history.clone(),
     };
     write_daemon_state(&state)?;
 
@@ -3945,11 +3963,13 @@ async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
             // Run collection cycle; catch errors so daemon survives failures
             match run_single_collection_cycle(&db_path, interval).await {
                 Ok(report) => {
+                    metric_history.push_snapshot(&report.snapshot);
                     state.status = "running".to_owned();
                     state.last_success_at = Some(now_rfc3339());
                     state.last_error = None;
                     state.last_snapshot_id = Some(report.snapshot.id);
                     state.last_finding_count = report.findings.len();
+                    state.metric_history = metric_history.clone();
                 }
                 Err(e) => {
                     state.status = "running".to_owned();

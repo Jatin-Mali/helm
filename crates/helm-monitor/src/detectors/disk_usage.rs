@@ -4,9 +4,45 @@ use crate::{
     detectors::Detector,
     findings::{Confidence, Finding, MonitorDomain, Severity},
     snapshot::SystemSnapshot,
+    thresholds::DetectorThresholdOverride,
 };
 
-pub struct DiskUsageDetector;
+pub struct DiskUsageDetector {
+    info_pct: f64,
+    warning_pct: f64,
+    critical_pct: f64,
+}
+
+impl DiskUsageDetector {
+    pub fn from_thresholds(override_cfg: Option<&DetectorThresholdOverride>) -> Self {
+        let defaults = Self::default();
+        let warning_pct = override_cfg
+            .and_then(|cfg| cfg.warning)
+            .unwrap_or(defaults.warning_pct);
+        let critical_pct = override_cfg
+            .and_then(|cfg| cfg.critical)
+            .unwrap_or(defaults.critical_pct)
+            .max(warning_pct);
+        let info_pct = override_cfg
+            .and_then(|cfg| cfg.info)
+            .unwrap_or((warning_pct - 10.0).max(0.0));
+        Self {
+            info_pct,
+            warning_pct,
+            critical_pct,
+        }
+    }
+}
+
+impl Default for DiskUsageDetector {
+    fn default() -> Self {
+        Self {
+            info_pct: 80.0,
+            warning_pct: 90.0,
+            critical_pct: 95.0,
+        }
+    }
+}
 
 impl Detector for DiskUsageDetector {
     fn id(&self) -> &'static str {
@@ -26,11 +62,11 @@ impl Detector for DiskUsageDetector {
                 continue;
             }
             let usage_pct = (fs.used_bytes as f64 / fs.total_bytes as f64) * 100.0;
-            let severity = if usage_pct >= 95.0 {
+            let severity = if usage_pct >= self.critical_pct {
                 Severity::Critical
-            } else if usage_pct >= 90.0 {
+            } else if usage_pct >= self.warning_pct {
                 Severity::Warning
-            } else if usage_pct >= 80.0 {
+            } else if usage_pct >= self.info_pct {
                 Severity::Info
             } else {
                 continue;
@@ -89,7 +125,7 @@ mod tests {
     #[test]
     fn detects_high_disk_usage() {
         let snap = snapshot_with_fs("/", 500_000_000_000, 475_000_000_000);
-        let findings = DiskUsageDetector.detect(&snap, None);
+        let findings = DiskUsageDetector::default().detect(&snap, None);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Critical);
         assert!(findings[0].title.contains("95%"));
@@ -98,8 +134,21 @@ mod tests {
     #[test]
     fn skips_normal_usage() {
         let snap = snapshot_with_fs("/", 500_000_000_000, 200_000_000_000);
-        let findings = DiskUsageDetector.detect(&snap, None);
+        let findings = DiskUsageDetector::default().detect(&snap, None);
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn supports_threshold_overrides() {
+        let snap = snapshot_with_fs("/", 100, 86);
+        let detector = DiskUsageDetector::from_thresholds(Some(&DetectorThresholdOverride {
+            info: Some(70.0),
+            warning: Some(85.0),
+            critical: Some(92.0),
+        }));
+        let findings = detector.detect(&snap, None);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
     }
 
     fn snapshot_with_fs(mount: &str, total: u64, used: u64) -> SystemSnapshot {

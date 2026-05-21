@@ -4,9 +4,39 @@ use crate::{
     detectors::Detector,
     findings::{Confidence, Finding, MonitorDomain, Severity},
     snapshot::SystemSnapshot,
+    thresholds::DetectorThresholdOverride,
 };
 
-pub struct InodeUsageDetector;
+pub struct InodeUsageDetector {
+    warning_pct: f64,
+    critical_pct: f64,
+}
+
+impl InodeUsageDetector {
+    pub fn from_thresholds(override_cfg: Option<&DetectorThresholdOverride>) -> Self {
+        let defaults = Self::default();
+        let warning_pct = override_cfg
+            .and_then(|cfg| cfg.warning)
+            .unwrap_or(defaults.warning_pct);
+        let critical_pct = override_cfg
+            .and_then(|cfg| cfg.critical)
+            .unwrap_or(defaults.critical_pct)
+            .max(warning_pct);
+        Self {
+            warning_pct,
+            critical_pct,
+        }
+    }
+}
+
+impl Default for InodeUsageDetector {
+    fn default() -> Self {
+        Self {
+            warning_pct: 85.0,
+            critical_pct: 95.0,
+        }
+    }
+}
 
 impl Detector for InodeUsageDetector {
     fn id(&self) -> &'static str {
@@ -30,10 +60,10 @@ impl Detector for InodeUsageDetector {
                     return None;
                 }
                 let pct = (inode.used as f64 / inode.total as f64) * 100.0;
-                if pct < 85.0 {
+                if pct < self.warning_pct {
                     return None;
                 }
-                let severity = if pct >= 95.0 {
+                let severity = if pct >= self.critical_pct {
                     Severity::Critical
                 } else {
                     Severity::Warning

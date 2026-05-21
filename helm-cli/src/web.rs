@@ -21,7 +21,8 @@ use axum::{
 };
 use helm_memory::{FindingStateStore, SnapshotStore};
 use helm_monitor::{
-    Finding, HostIdentity, MonitorProfile, Severity, SnapshotDomains, SystemSnapshot,
+    Finding, HostIdentity, MetricHistory, MonitorProfile, Severity, SnapshotDomains,
+    SystemSnapshot,
     collectors::{
         Collector, db_health::DbHealthCollector, db_health::DbInstance,
         web_servers::WebServerCollector, web_servers::WebSite,
@@ -65,10 +66,23 @@ pub struct LiveSnapshot {
     pub collector_health: Vec<CollectorHealth>,
     pub fleet_hosts: Vec<FleetHost>,
     pub daemon: DaemonSummary,
+    pub metric_history: MetricHistoryPayload,
     pub log_entries: Vec<String>,
     pub inventory: SnapshotDomains,
     pub databases: Vec<DbInstance>,
     pub websites: Vec<WebSite>,
+}
+
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricHistoryPayload {
+    pub cpu: Vec<f64>,
+    pub memory: Vec<f64>,
+    pub disk: Vec<f64>,
+    pub network: Vec<f64>,
+    pub load: Vec<f64>,
+    pub swap: Vec<f64>,
+    pub io_pressure: Vec<f64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -163,11 +177,14 @@ pub async fn serve(db_path: PathBuf, port: u16) -> Result<()> {
         db_path: db_path.clone(),
         snapshot_tx: tx.clone(),
     });
+    let web_refresh_secs = helm_monitor::load_thresholds_config()
+        .refresh_interval_secs
+        .clamp(5, 300);
 
     let bg_db = db_path.clone();
     let bg_tx = tx.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(Duration::from_secs(web_refresh_secs));
         loop {
             interval.tick().await;
             let json = collect_live_snapshot(&bg_db).await;
@@ -288,6 +305,7 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
     let history = load_finding_history(&conn);
     let state_by_fingerprint = load_finding_states(&conn);
     let daemon = daemon_summary();
+    let metric_history = load_metric_history(&conn);
     let (provider, ai_state) = provider_context();
 
     let db_future = DbHealthCollector.collect(snapshot.profile);
@@ -370,6 +388,7 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         collector_health,
         fleet_hosts,
         daemon,
+        metric_history,
         log_entries,
         inventory: snapshot.domains.clone(),
         databases,
@@ -411,6 +430,30 @@ fn load_finding_history(conn: &rusqlite::Connection) -> HashMap<String, FindingH
     }
 
     history
+}
+
+fn load_metric_history(conn: &rusqlite::Connection) -> MetricHistoryPayload {
+    let depth = crate::read_daemon_state()
+        .map(|state| state.metric_history.cpu.len().max(10))
+        .unwrap_or_else(|| helm_monitor::load_thresholds_config().sparkline_history_depth);
+    let mut history = MetricHistory::new(depth);
+    let records = SnapshotStore::list(conn, depth as u32).unwrap_or_default();
+    for record in records.into_iter().rev() {
+        if let Ok(domains) = serde_json::from_str::<SnapshotDomains>(&record.domains_json) {
+            let snapshot = crate::reconstruct_snapshot(&record, domains);
+            history.push_snapshot(&snapshot);
+        }
+    }
+
+    MetricHistoryPayload {
+        cpu: history.cpu_values(),
+        memory: history.memory_values(),
+        disk: history.disk_values(),
+        network: history.network_values(),
+        load: history.load_values(),
+        swap: history.swap_values(),
+        io_pressure: history.io_pressure_values(),
+    }
 }
 
 fn load_finding_states(

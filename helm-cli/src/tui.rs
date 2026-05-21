@@ -2,7 +2,7 @@
 
 use std::cell::Cell as StdCell;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     io,
     path::PathBuf,
     sync::{
@@ -28,8 +28,8 @@ use helm_memory::{
     MemoryStore, TroubleshootingPlanRecord,
 };
 use helm_monitor::{
-    CollectorError, CommandValidator, Finding, FindingSummaryFields, MonitorProfile,
-    SnapshotDomains, build_narrative_prompt, parse_llm_response,
+    CollectorError, CommandValidator, Finding, FindingSummaryFields, MetricHistory, MonitorProfile,
+    SnapshotDomains, build_narrative_prompt, load_thresholds_config, parse_llm_response,
 };
 use helm_providers::ChatRequest;
 use ratatui::{
@@ -51,34 +51,6 @@ use crate::{
     remote::RemoteRegistry, wrap_for_remote, write_helm_config,
 };
 use crate::{sandbox::ResolvedSandbox, secrets::SecretsStore};
-
-/// Sparkline / trend configuration loaded from thresholds.toml.
-#[derive(Debug, Clone, Deserialize)]
-struct ThresholdsConfig {
-    #[serde(default = "default_sparkline_depth")]
-    sparkline_history_depth: usize,
-}
-
-fn default_sparkline_depth() -> usize {
-    60
-}
-
-impl Default for ThresholdsConfig {
-    fn default() -> Self {
-        Self {
-            sparkline_history_depth: default_sparkline_depth(),
-        }
-    }
-}
-
-fn load_thresholds_config() -> ThresholdsConfig {
-    let config_path = crate::paths::config_dir().join("thresholds.toml");
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        toml::from_str(&content).unwrap_or_default()
-    } else {
-        ThresholdsConfig::default()
-    }
-}
 
 const APP_BG: Color = Color::Rgb(11, 19, 30);
 const APP_FG: Color = Color::Rgb(208, 214, 224);
@@ -1033,11 +1005,8 @@ struct DashboardData {
     tick_count: u64,
     ticks_skipped: u64,
     consecutive_skips: u64,
-    /// Ring buffers for sparkline rendering (cap 60 points each).
-    cpu_history: VecDeque<f64>,
-    mem_history: VecDeque<f64>,
-    load_history: VecDeque<f64>,
-    disk_history: VecDeque<f64>,
+    /// Shared history buffer for dashboard trends.
+    metric_history: MetricHistory,
     /// Per-host fleet status for multi-host view.
     fleet_hosts: Vec<FleetHostStatus>,
 }
@@ -1168,7 +1137,10 @@ impl DashboardState {
     fn new() -> Self {
         let thresholds = load_thresholds_config();
         Self {
-            data: DashboardData::default(),
+            data: DashboardData {
+                metric_history: MetricHistory::new(thresholds.sparkline_history_depth),
+                ..DashboardData::default()
+            },
             view: DashboardView::Overview,
             pane: DashboardFocus::Table,
             active_tab: OpsTab::Alerts,
@@ -1181,7 +1153,7 @@ impl DashboardState {
             pending_plan_rx: None,
             error: None,
             overlap_guard: None,
-            sparkline_history_depth: thresholds.sparkline_history_depth.clamp(10, 300),
+            sparkline_history_depth: thresholds.sparkline_history_depth,
             fleet_selected_row: None,
             plan_cache: HashMap::new(),
             needs_plan_generation: false,
@@ -4376,7 +4348,7 @@ Report the exit status and the concise output."
         });
         self.push_chat(
             MessageRole::System,
-            format!("[stats]\n{summary}\nRun `helm stats` for the daemon-side rollup."),
+            format!("[stats]\n{summary}\nUse the dashboard summary for daemon-side rollups."),
         );
     }
 
@@ -5492,10 +5464,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         let clear_dashboard = |dashboard: &mut DashboardState| {
             let old = std::mem::take(&mut dashboard.data);
             let fresh = DashboardData {
-                cpu_history: old.cpu_history,
-                mem_history: old.mem_history,
-                load_history: old.load_history,
-                disk_history: old.disk_history,
+                metric_history: old.metric_history,
                 ..DashboardData::default()
             };
             dashboard.data = fresh;
@@ -5550,8 +5519,9 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         };
         let domains: SnapshotDomains =
             serde_json::from_str(&record.domains_json).unwrap_or_default();
+        let snapshot_for_history = crate::reconstruct_snapshot(&record, domains.clone());
 
-        let hostname = record.host_hostname;
+        let hostname = record.host_hostname.clone();
         let snapshot_id = record.id.clone();
         let load = &domains.load;
         let mem = &load.memory;
@@ -5944,22 +5914,10 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         let mut age_distribution = age_distribution.into_iter().collect::<Vec<_>>();
         age_distribution.sort_by(|left, right| left.0.cmp(&right.0));
 
-        // Push history before reassigning.
-        let cap = self.dashboard.sparkline_history_depth;
-        let push = |buf: &mut VecDeque<f64>, val: f64| {
-            buf.push_back(val);
-            if buf.len() > cap {
-                buf.pop_front();
-            }
-        };
-        push(&mut self.dashboard.data.cpu_history, cpu_percent);
-        push(&mut self.dashboard.data.mem_history, memory_used_pct);
-        push(&mut self.dashboard.data.load_history, load.load_average.one);
-        let max_disk_pct = disk_bars
-            .iter()
-            .map(|(_, pct)| *pct as f64)
-            .fold(0.0f64, f64::max);
-        push(&mut self.dashboard.data.disk_history, max_disk_pct);
+        self.dashboard
+            .data
+            .metric_history
+            .push_snapshot(&snapshot_for_history);
 
         self.dashboard.data = DashboardData {
             hostname,
@@ -5994,10 +5952,10 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             plans,
             change_sets,
             audit_events,
-            cpu_history: std::mem::take(&mut self.dashboard.data.cpu_history),
-            mem_history: std::mem::take(&mut self.dashboard.data.mem_history),
-            load_history: std::mem::take(&mut self.dashboard.data.load_history),
-            disk_history: std::mem::take(&mut self.dashboard.data.disk_history),
+            metric_history: std::mem::replace(
+                &mut self.dashboard.data.metric_history,
+                MetricHistory::new(self.dashboard.sparkline_history_depth),
+            ),
             ..Default::default()
         };
         // Restore previous fingerprint if it still exists in the new findings list.
