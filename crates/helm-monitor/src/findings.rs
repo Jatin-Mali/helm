@@ -160,6 +160,12 @@ pub struct Finding {
     pub fix_plan: Option<String>,
     #[serde(default)]
     pub lifecycle: FindingLifecycle,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub root_cause_finding_id: Option<String>,
+    #[serde(default)]
+    pub correlated_finding_ids: Vec<String>,
 }
 
 /// Concrete reference to a snapshot field or measurement.
@@ -208,6 +214,9 @@ impl Finding {
             read_only_checks: Vec::new(),
             fix_plan: None,
             lifecycle: FindingLifecycle::Open,
+            correlation_id: None,
+            root_cause_finding_id: None,
+            correlated_finding_ids: Vec::new(),
         }
     }
 
@@ -251,6 +260,12 @@ impl Finding {
         } else {
             self.fingerprint.clone()
         }
+    }
+
+    pub fn clear_correlation(&mut self) {
+        self.correlation_id = None;
+        self.root_cause_finding_id = None;
+        self.correlated_finding_ids.clear();
     }
 }
 
@@ -299,6 +314,9 @@ mod tests {
         assert_eq!(f.confidence, Confidence::High);
         assert_eq!(f.evidence.len(), 1);
         assert_eq!(f.read_only_checks.len(), 1);
+        assert!(f.correlation_id.is_none());
+        assert!(f.root_cause_finding_id.is_none());
+        assert!(f.correlated_finding_ids.is_empty());
     }
 
     #[test]

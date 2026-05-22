@@ -3,6 +3,7 @@
 
 use crate::{
     collect_snapshot,
+    correlation::{CorrelationEngine, CorrelationGroup},
     custom_rules::CustomRulesEngine,
     custom_service::ServiceRegistry,
     detectors::DetectorRegistry,
@@ -15,6 +16,7 @@ use crate::{
 pub struct MonitorReport {
     pub snapshot: SystemSnapshot,
     pub findings: Vec<Finding>,
+    pub correlation_groups: Vec<CorrelationGroup>,
     pub domains_checked: Vec<MonitorDomain>,
     pub previous_snapshot_id: Option<String>,
 }
@@ -22,17 +24,45 @@ pub struct MonitorReport {
 /// Orchestrate a full monitor cycle.
 pub struct MonitorReporter {
     pub registry: DetectorRegistry,
+    pub correlation_engine: CorrelationEngine,
 }
 
 impl MonitorReporter {
     pub fn new() -> Self {
         Self {
             registry: DetectorRegistry::default_registry(),
+            correlation_engine: CorrelationEngine::default(),
         }
     }
 
     pub async fn run(
         &self,
+        profile: MonitorProfile,
+        domain_filter: Option<&[MonitorDomain]>,
+        previous_snapshot: Option<SystemSnapshot>,
+    ) -> MonitorReport {
+        let mut engine = self.correlation_engine.clone();
+        self.run_with_engine(&mut engine, profile, domain_filter, previous_snapshot)
+            .await
+    }
+
+    pub async fn run_stateful(
+        &mut self,
+        profile: MonitorProfile,
+        domain_filter: Option<&[MonitorDomain]>,
+        previous_snapshot: Option<SystemSnapshot>,
+    ) -> MonitorReport {
+        let mut engine = self.correlation_engine.clone();
+        let report = self
+            .run_with_engine(&mut engine, profile, domain_filter, previous_snapshot)
+            .await;
+        self.correlation_engine = engine;
+        report
+    }
+
+    async fn run_with_engine(
+        &self,
+        engine: &mut CorrelationEngine,
         profile: MonitorProfile,
         domain_filter: Option<&[MonitorDomain]>,
         previous_snapshot: Option<SystemSnapshot>,
@@ -61,14 +91,16 @@ impl MonitorReporter {
                     }),
             );
         }
+        let correlation = engine.correlate(&snapshot, &findings);
         let domains_checked = if let Some(doms) = domain_filter {
             doms.to_vec()
         } else {
-            findings.iter().map(|f| f.category).collect()
+            correlation.findings.iter().map(|f| f.category).collect()
         };
         MonitorReport {
             snapshot,
-            findings,
+            findings: correlation.findings,
+            correlation_groups: correlation.groups,
             domains_checked,
             previous_snapshot_id,
         }
@@ -115,6 +147,24 @@ impl MonitorReport {
         if self.findings.is_empty() {
             out.push_str("No issues detected.\n");
             return out;
+        }
+
+        if !self.correlation_groups.is_empty() {
+            out.push_str("Correlations:\n");
+            for group in &self.correlation_groups {
+                if let Some(primary) = self
+                    .findings
+                    .iter()
+                    .find(|finding| finding.id == group.primary_finding_id)
+                {
+                    out.push_str(&format!(
+                        "  - {} (×{})\n",
+                        primary.title,
+                        group.finding_ids.len()
+                    ));
+                }
+            }
+            out.push('\n');
         }
 
         for severity in &[Severity::Critical, Severity::Warning, Severity::Info] {
@@ -178,6 +228,24 @@ impl MonitorReport {
         if self.findings.is_empty() {
             out.push_str("*No issues detected.*\n");
             return out;
+        }
+
+        if !self.correlation_groups.is_empty() {
+            out.push_str("## Correlations\n\n");
+            for group in &self.correlation_groups {
+                if let Some(primary) = self
+                    .findings
+                    .iter()
+                    .find(|finding| finding.id == group.primary_finding_id)
+                {
+                    out.push_str(&format!(
+                        "- **{}** groups {} related finding(s)\n",
+                        primary.title,
+                        group.finding_ids.len().saturating_sub(1)
+                    ));
+                }
+            }
+            out.push('\n');
         }
 
         for severity in &[Severity::Critical, Severity::Warning, Severity::Info] {

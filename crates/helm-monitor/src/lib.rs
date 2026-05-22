@@ -2,6 +2,7 @@
 
 pub mod alerting;
 pub mod collectors;
+pub mod correlation;
 pub mod custom_rules;
 pub mod custom_service;
 pub mod detectors;
@@ -15,6 +16,9 @@ pub mod snapshot;
 pub mod thresholds;
 pub mod troubleshoot;
 
+pub use correlation::{
+    CausalLink, CausalRelationship, CorrelationEngine, CorrelationGroup, CorrelationResult,
+};
 pub use custom_rules::{
     CompareOp, CustomRule, CustomRulesEngine, LogicOp, RuleCondition, RuleValidationError,
     ThresholdValue, default_rules_path,

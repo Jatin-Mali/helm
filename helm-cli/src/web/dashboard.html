@@ -814,6 +814,10 @@ function renderQueue() {
 
   list.innerHTML = incidents.map(f => {
     const active = f.id === state.selectedFindingId ? ' active' : '';
+    const relatedCount = Array.isArray(f.correlatedIds) ? f.correlatedIds.length : 0;
+    const correlationLabel = relatedCount
+      ? (f.id === f.rootCauseFindingId ? `root cause × ${relatedCount + 1}` : `grouped × ${relatedCount + 1}`)
+      : '';
     return `
       <article class="incident-row${active}" data-id="${f.id}">
         <div class="incident-top">
@@ -824,6 +828,7 @@ function renderQueue() {
           <span>${esc(f.category)}</span>
           <span>${esc(f.affectedResource || 'host')}</span>
           <span>${esc(f.lifecycleState || 'open')}</span>
+          ${correlationLabel ? `<span>${esc(correlationLabel)}</span>` : ''}
         </div>
         <div class="incident-times">
           <span>open ${fmtAgo(f.firstSeen)}</span>
@@ -902,7 +907,7 @@ function renderOverview() {
         </section>
         <section class="card">
           <h3>What changed before it broke</h3>
-          <p>The monitor currently captures snapshots, finding history, lifecycle state, and reviewed change sets in the CLI path. The web console now surfaces timing and recurrence, but deploy correlation is still shallow and should be expanded in the persistence model.</p>
+          <p>The monitor now groups related findings with root-cause metadata, recurrence history, and dependency-aware clustering. Snapshot persistence still stores per-finding correlation state, so older records may show the legacy fallback until they are refreshed by a new monitor cycle.</p>
         </section>
         <section class="card">
           <h3>Daemon posture</h3>
@@ -1169,6 +1174,14 @@ function incidentDetailCard(finding) {
               <div class="kv-row">
                 <div class="kv-label">Timing</div>
                 <div class="kv-value">open ${fmtAgo(finding.firstSeen)} · seen ${fmtAgo(finding.lastSeen)} · ${esc(String(finding.occurrenceCount || 1))} occurrence(s)</div>
+              </div>
+              <div class="kv-row">
+                <div class="kv-label">Correlation</div>
+                <div class="kv-value">${
+                  Array.isArray(finding.correlatedIds) && finding.correlatedIds.length
+                    ? `${finding.id === finding.rootCauseFindingId ? 'Root cause' : 'Grouped symptom'} in a ${esc(String(finding.correlatedIds.length + 1))}-finding cluster`
+                    : 'No correlated findings in the current cluster'
+                }</div>
               </div>
             </div>
           </section>

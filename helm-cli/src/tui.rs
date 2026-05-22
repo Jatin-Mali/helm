@@ -1335,7 +1335,7 @@ fn finding_summary_from_finding(
             .unwrap_or_else(|| "read-only / not applicable".to_owned()),
         command_preview: finding.read_only_checks.join("\n"),
         detector_id: finding.detector_id.clone(),
-        correlated_finding_ids: Vec::new(),
+        correlated_finding_ids: finding.correlated_finding_ids.clone(),
     }
 }
 
@@ -5755,16 +5755,19 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                     .unwrap_or_else(|| "read-only / not applicable".to_owned()),
                 command_preview: aggregate.latest.read_only_checks.join("\n"),
                 detector_id: aggregate.latest.detector_id.clone(),
-                correlated_finding_ids: Vec::new(),
+                correlated_finding_ids: aggregate.latest.correlated_finding_ids.clone(),
             });
         }
 
-        // ── Correlation engine ──
-        // For each finding, find other findings where domains match OR
-        // affected_resource is a case-insensitive substring of the other's affected_resource.
+        // Fallback correlation for older persisted snapshots that predate
+        // monitor-side correlation metadata.
         {
             let mut correlations: Vec<Vec<String>> = vec![Vec::new(); finding_summaries.len()];
             for (i, left) in finding_summaries.iter().enumerate() {
+                if !left.correlated_finding_ids.is_empty() {
+                    correlations[i] = left.correlated_finding_ids.clone();
+                    continue;
+                }
                 for (j, right) in finding_summaries.iter().enumerate() {
                     if i == j {
                         continue;
@@ -5784,7 +5787,9 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                 }
             }
             for (i, correlated) in correlations.into_iter().enumerate() {
-                finding_summaries[i].correlated_finding_ids = correlated;
+                if finding_summaries[i].correlated_finding_ids.is_empty() {
+                    finding_summaries[i].correlated_finding_ids = correlated;
+                }
             }
         }
 

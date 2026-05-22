@@ -267,6 +267,7 @@ fn monitor_report_severity_counts() {
     let report = MonitorReport {
         snapshot: snap,
         findings,
+        correlation_groups: vec![],
         domains_checked: vec![MonitorDomain::Disks],
         previous_snapshot_id: None,
     };
@@ -291,6 +292,7 @@ fn monitor_report_text_contains_findings() {
     let report = MonitorReport {
         snapshot: snap,
         findings,
+        correlation_groups: vec![],
         domains_checked: vec![],
         previous_snapshot_id: None,
     };
@@ -315,6 +317,7 @@ fn monitor_report_json_is_valid() {
     let report = MonitorReport {
         snapshot: snap,
         findings,
+        correlation_groups: vec![],
         domains_checked: vec![],
         previous_snapshot_id: None,
     };
@@ -332,6 +335,7 @@ fn monitor_report_markdown_contains_table() {
     let report = MonitorReport {
         snapshot: snap,
         findings,
+        correlation_groups: vec![],
         domains_checked: vec![],
         previous_snapshot_id: None,
     };
@@ -416,6 +420,7 @@ fn monitor_json_redacts_secrets() {
     let report = MonitorReport {
         snapshot: snap,
         findings,
+        correlation_groups: vec![],
         domains_checked: vec![],
         previous_snapshot_id: None,
     };
@@ -507,6 +512,7 @@ fn baseline_report_shows_previous_snapshot_id_in_text() {
     let report = MonitorReport {
         snapshot: snap,
         findings,
+        correlation_groups: vec![],
         domains_checked: vec![MonitorDomain::Logs],
         previous_snapshot_id: Some("baseline-snap-123".into()),
     };
@@ -522,6 +528,7 @@ fn baseline_without_previous_does_not_show_baseline_line() {
     let report = MonitorReport {
         snapshot: snap,
         findings,
+        correlation_groups: vec![],
         domains_checked: vec![],
         previous_snapshot_id: None,
     };

@@ -3937,6 +3937,7 @@ async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
     let request_path = daemon_refresh_request_path();
     let mut next_run = std::time::Instant::now();
     let mut collecting = false; // overlap guard
+    let mut reporter = MonitorReporter::new();
     loop {
         let requested = request_path.exists();
         let due = std::time::Instant::now() >= next_run;
@@ -3951,7 +3952,7 @@ async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
             let _ = write_daemon_state(&state);
 
             // Run collection cycle; catch errors so daemon survives failures
-            match run_single_collection_cycle(&db_path, interval).await {
+            match run_single_collection_cycle(&db_path, interval, &mut reporter).await {
                 Ok(report) => {
                     metric_history.push_snapshot(&report.snapshot);
                     state.status = "running".to_owned();
@@ -3991,11 +3992,13 @@ struct DaemonCycleReport {
 async fn run_single_collection_cycle(
     db_path: &Path,
     _interval: u64,
+    reporter: &mut MonitorReporter,
 ) -> Result<DaemonCycleReport, anyhow::Error> {
     let conn = rusqlite::Connection::open(db_path)
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
     let prev = load_previous_snapshot(&conn);
-    let report = run_monitor_cycle(MonitorProfile::Standard, None, prev).await;
+    let report =
+        run_monitor_cycle_with_reporter(reporter, MonitorProfile::Standard, None, prev).await;
     persist_monitor_snapshot(
         &conn,
         &report.snapshot,
@@ -4524,9 +4527,16 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
 
     if args.watch {
+        let mut reporter = MonitorReporter::new();
         loop {
             let prev = load_previous_snapshot(&conn);
-            let report = run_monitor_cycle(profile, domain_filter.as_deref(), prev).await;
+            let report = run_monitor_cycle_with_reporter(
+                &mut reporter,
+                profile,
+                domain_filter.as_deref(),
+                prev,
+            )
+            .await;
             persist_monitor_snapshot(
                 &conn,
                 &report.snapshot,
@@ -4617,9 +4627,18 @@ pub(crate) async fn run_monitor_cycle(
     domain_filter: Option<&[MonitorDomain]>,
     previous_snapshot: Option<SystemSnapshot>,
 ) -> MonitorReport {
-    let reporter = MonitorReporter::new();
+    let mut reporter = MonitorReporter::new();
+    run_monitor_cycle_with_reporter(&mut reporter, profile, domain_filter, previous_snapshot).await
+}
+
+pub(crate) async fn run_monitor_cycle_with_reporter(
+    reporter: &mut MonitorReporter,
+    profile: MonitorProfile,
+    domain_filter: Option<&[MonitorDomain]>,
+    previous_snapshot: Option<SystemSnapshot>,
+) -> MonitorReport {
     reporter
-        .run(profile, domain_filter, previous_snapshot)
+        .run_stateful(profile, domain_filter, previous_snapshot)
         .await
 }
 

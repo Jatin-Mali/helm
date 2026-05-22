@@ -108,6 +108,8 @@ pub struct FindingEntry {
     pub last_seen: String,
     pub occurrence_count: u64,
     pub detector_id: String,
+    pub correlation_id: Option<String>,
+    pub root_cause_finding_id: Option<String>,
     pub correlated_ids: Vec<String>,
 }
 
@@ -515,7 +517,9 @@ fn finding_entry(
             .unwrap_or_default(),
         occurrence_count: history.map(|h| h.count).unwrap_or(1),
         detector_id: finding.detector_id.clone(),
-        correlated_ids: Vec::new(),
+        correlation_id: finding.correlation_id.clone(),
+        root_cause_finding_id: finding.root_cause_finding_id.clone(),
+        correlated_ids: finding.correlated_finding_ids.clone(),
     }
 }
 
