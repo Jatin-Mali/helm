@@ -7,6 +7,7 @@ mod paths;
 mod remote;
 mod sandbox;
 mod secrets;
+mod service_form;
 mod telemetry;
 mod tui;
 mod web;
@@ -35,10 +36,10 @@ use helm_memory::{
     stable_hash_hex,
 };
 use helm_monitor::{
-    CommandPreview, ExecutionEngine, Finding, HostIdentity, MetricHistory, MonitorDomain,
-    MonitorProfile, MonitorReport, MonitorReporter, PlanSource, SnapshotDomains, SystemSnapshot,
-    collect_snapshot, explain_finding, format_change_set, load_thresholds_config,
-    plan_from_finding, plan_from_problem,
+    CommandPreview, DbKind, ExecutionEngine, Finding, HostIdentity, MetricHistory, MonitorDomain,
+    MonitorProfile, MonitorReport, MonitorReporter, PlanSource, RegisteredService, ServiceRegistry,
+    SnapshotDomains, SystemSnapshot, collect_snapshot, explain_finding, format_change_set,
+    load_thresholds_config, plan_from_finding, plan_from_problem,
 };
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
@@ -47,6 +48,7 @@ use helm_providers::{
 use secrets::SecretsStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use service_form::{ServiceKind, ServiceRegistrationDraft};
 use thiserror::Error;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, fmt::MakeWriter, prelude::*};
@@ -124,6 +126,7 @@ enum Command {
     Secrets(SecretsArgs),
     Init(InitArgs),
     Config(ConfigArgs),
+    Service(ServiceArgs),
     Completion(CompletionArgs),
     Tui(TuiArgs),
     Remote(RemoteArgs),
@@ -558,6 +561,76 @@ struct InitArgs {
 struct ConfigArgs {
     #[command(subcommand)]
     command: ConfigCommand,
+}
+
+#[derive(Debug, Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    Add(Box<ServiceAddArgs>),
+    List,
+    Remove(ServiceRemoveArgs),
+}
+
+#[derive(Debug, Args, Clone, Default)]
+struct ServiceAddArgs {
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long = "type", value_enum)]
+    service_type: Option<ServiceKind>,
+    #[arg(long)]
+    environment: Option<String>,
+    #[arg(long)]
+    team: Option<String>,
+    #[arg(long)]
+    docker_name_or_label: Option<String>,
+    #[arg(long, value_enum)]
+    db_kind: Option<DbKindArg>,
+    #[arg(long)]
+    connection_string: Option<String>,
+    #[arg(long)]
+    kubeconfig_path: Option<PathBuf>,
+    #[arg(long)]
+    endpoint: Option<String>,
+    #[arg(long)]
+    url: Option<String>,
+    #[arg(long)]
+    expected_status: Option<u16>,
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long)]
+    port: Option<u16>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ServiceRemoveArgs {
+    #[arg(value_name = "ID")]
+    id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DbKindArg {
+    PostgreSQL,
+    MySQL,
+    Redis,
+    MongoDB,
+}
+
+impl From<DbKindArg> for DbKind {
+    fn from(value: DbKindArg) -> Self {
+        match value {
+            DbKindArg::PostgreSQL => Self::PostgreSQL,
+            DbKindArg::MySQL => Self::MySQL,
+            DbKindArg::Redis => Self::Redis,
+            DbKindArg::MongoDB => Self::MongoDB,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1040,6 +1113,9 @@ async fn run() -> Result<()> {
         }
         Command::Config(args) => {
             run_config_command(args, &config_path)?;
+        }
+        Command::Service(args) => {
+            run_service_command(args)?;
         }
         Command::Completion(args) => {
             let mut cmd = Cli::command();
@@ -1590,6 +1666,7 @@ fn is_known_command(arg: &OsString) -> bool {
                 | "secrets"
                 | "init"
                 | "config"
+                | "service"
                 | "completion"
                 | "mcp"
                 | "help"
@@ -1802,6 +1879,258 @@ fn prompt(label: &str) -> Result<String> {
     let mut buf = String::new();
     io::stdin().read_line(&mut buf)?;
     Ok(buf.trim().to_owned())
+}
+
+fn prompt_with_default(label: &str, current: &str) -> Result<String> {
+    let suffix = if current.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" [{current}]")
+    };
+    let answer = prompt(&format!("{label}{suffix}: "))?;
+    if answer.trim().is_empty() {
+        Ok(current.to_owned())
+    } else {
+        Ok(answer)
+    }
+}
+
+fn run_service_command(args: ServiceArgs) -> Result<()> {
+    match args.command {
+        ServiceCommand::Add(args) => run_service_add_command(*args),
+        ServiceCommand::List => {
+            let registry = ServiceRegistry::load_default()?;
+            if registry.services().is_empty() {
+                println!("no custom services registered");
+                return Ok(());
+            }
+            for service in registry.services() {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    service.id,
+                    describe_service_type(&service.service_type),
+                    service.environment,
+                    service.team,
+                    service.name
+                );
+            }
+            Ok(())
+        }
+        ServiceCommand::Remove(args) => {
+            let mut registry = ServiceRegistry::load_default()?;
+            registry.remove(&args.id)?;
+            println!("removed service {}", args.id);
+            Ok(())
+        }
+    }
+}
+
+fn run_service_add_command(args: ServiceAddArgs) -> Result<()> {
+    let mut draft = service_draft_from_args(&args);
+    let interactive = io::stdin().is_terminal() && !service_add_args_complete(&draft);
+
+    if interactive {
+        loop {
+            prompt_service_draft(&mut draft)?;
+            match persist_service_draft(&draft) {
+                Ok(service) => {
+                    println!(
+                        "registered service {} ({}) in {}",
+                        service.id,
+                        service.name,
+                        helm_monitor::default_services_path().display()
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    eprintln!("service registration failed: {error}");
+                    eprintln!(
+                        "previously entered fields were preserved. Update the values and press Enter again.\n"
+                    );
+                }
+            }
+        }
+    }
+
+    let service = persist_service_draft(&draft)?;
+    println!(
+        "registered service {} ({}) in {}",
+        service.id,
+        service.name,
+        helm_monitor::default_services_path().display()
+    );
+    Ok(())
+}
+
+fn persist_service_draft(draft: &ServiceRegistrationDraft) -> Result<RegisteredService> {
+    let service = draft.build_service().map_err(|error| anyhow!(error))?;
+    let mut registry = ServiceRegistry::load_default()?;
+    registry.add(service.clone())?;
+    Ok(service)
+}
+
+fn service_add_args_complete(draft: &ServiceRegistrationDraft) -> bool {
+    draft.build_service().is_ok()
+}
+
+fn service_draft_from_args(args: &ServiceAddArgs) -> ServiceRegistrationDraft {
+    let mut draft = ServiceRegistrationDraft::default();
+    if let Some(id) = args.id.as_ref() {
+        draft.id = id.clone();
+    }
+    if let Some(name) = args.name.as_ref() {
+        draft.name = name.clone();
+    }
+    if let Some(kind) = args.service_type {
+        draft.service_kind = kind;
+    }
+    if let Some(environment) = args.environment.as_ref() {
+        draft.environment = environment.clone();
+    }
+    if let Some(team) = args.team.as_ref() {
+        draft.team = team.clone();
+    }
+    if let Some(name_or_label) = args.docker_name_or_label.as_ref() {
+        draft.docker_name_or_label = name_or_label.clone();
+    }
+    if let Some(kind) = args.db_kind {
+        draft.database_kind = kind.into();
+    }
+    if let Some(connection_string) = args.connection_string.as_ref() {
+        draft.database_connection_string = connection_string.clone();
+    }
+    if let Some(kubeconfig_path) = args.kubeconfig_path.as_ref() {
+        draft.kubeconfig_path = kubeconfig_path.display().to_string();
+    }
+    if let Some(endpoint) = args.endpoint.as_ref() {
+        match draft.service_kind {
+            ServiceKind::Pipeline => draft.pipeline_endpoint = endpoint.clone(),
+            _ => draft.pipeline_endpoint = endpoint.clone(),
+        }
+    }
+    if let Some(url) = args.url.as_ref() {
+        match draft.service_kind {
+            ServiceKind::WebServer => draft.web_url = url.clone(),
+            ServiceKind::HttpEndpoint => draft.http_url = url.clone(),
+            _ => {
+                draft.http_url = url.clone();
+                draft.web_url = url.clone();
+            }
+        }
+    }
+    if let Some(expected_status) = args.expected_status {
+        let value = expected_status.to_string();
+        draft.web_expected_status = value.clone();
+        draft.http_expected_status = value;
+    }
+    if let Some(host) = args.host.as_ref() {
+        draft.tcp_host = host.clone();
+    }
+    if let Some(port) = args.port {
+        draft.tcp_port = port.to_string();
+    }
+    draft
+}
+
+fn prompt_service_draft(draft: &mut ServiceRegistrationDraft) -> Result<()> {
+    draft.name = prompt_with_default("Service name", &draft.name)?;
+    draft.id = prompt_with_default("Service id (blank = derived)", &draft.id)?;
+    draft.service_kind = prompt_service_kind(draft.service_kind)?;
+    draft.environment = prompt_with_default("Environment", &draft.environment)?;
+    draft.team = prompt_with_default("Team", &draft.team)?;
+
+    match draft.service_kind {
+        ServiceKind::DockerContainer => {
+            draft.docker_name_or_label =
+                prompt_with_default("Docker container or label", &draft.docker_name_or_label)?;
+        }
+        ServiceKind::Database => {
+            draft.database_kind = prompt_db_kind(draft.database_kind)?;
+            draft.database_connection_string = prompt_with_default(
+                "Database connection string",
+                &draft.database_connection_string,
+            )?;
+        }
+        ServiceKind::Kubernetes => {
+            draft.kubeconfig_path = prompt_with_default("Kubeconfig path", &draft.kubeconfig_path)?;
+        }
+        ServiceKind::Pipeline => {
+            draft.pipeline_endpoint =
+                prompt_with_default("Pipeline endpoint", &draft.pipeline_endpoint)?;
+        }
+        ServiceKind::WebServer => {
+            draft.web_url = prompt_with_default("Web URL", &draft.web_url)?;
+            draft.web_expected_status =
+                prompt_with_default("Expected HTTP status", &draft.web_expected_status)?;
+        }
+        ServiceKind::TcpEndpoint => {
+            draft.tcp_host = prompt_with_default("TCP host", &draft.tcp_host)?;
+            draft.tcp_port = prompt_with_default("TCP port", &draft.tcp_port)?;
+        }
+        ServiceKind::HttpEndpoint => {
+            draft.http_url = prompt_with_default("HTTP URL", &draft.http_url)?;
+            draft.http_expected_status = prompt_with_default(
+                "Expected HTTP status (blank = any 2xx)",
+                &draft.http_expected_status,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn prompt_service_kind(current: ServiceKind) -> Result<ServiceKind> {
+    println!("Service type:");
+    for (index, kind) in ServiceKind::all().iter().enumerate() {
+        let marker = if *kind == current { "*" } else { " " };
+        println!("  {} {}. {}", marker, index + 1, kind.label());
+    }
+    let answer = prompt(&format!("Enter number [{}]: ", current.label()))?;
+    if answer.trim().is_empty() {
+        return Ok(current);
+    }
+    let parsed = answer
+        .parse::<usize>()
+        .map_err(|_| anyhow!("invalid service type selection `{answer}`"))?;
+    ServiceKind::all()
+        .get(parsed.saturating_sub(1))
+        .copied()
+        .ok_or_else(|| anyhow!("service type selection `{answer}` is out of range"))
+}
+
+fn prompt_db_kind(current: DbKind) -> Result<DbKind> {
+    let all = [
+        DbKind::PostgreSQL,
+        DbKind::MySQL,
+        DbKind::Redis,
+        DbKind::MongoDB,
+    ];
+    println!("Database type:");
+    for (index, kind) in all.iter().enumerate() {
+        let marker = if *kind == current { "*" } else { " " };
+        println!("  {} {}. {:?}", marker, index + 1, kind);
+    }
+    let answer = prompt(&format!("Enter number [{current:?}]: "))?;
+    if answer.trim().is_empty() {
+        return Ok(current);
+    }
+    let parsed = answer
+        .parse::<usize>()
+        .map_err(|_| anyhow!("invalid database type selection `{answer}`"))?;
+    all.get(parsed.saturating_sub(1))
+        .copied()
+        .ok_or_else(|| anyhow!("database type selection `{answer}` is out of range"))
+}
+
+fn describe_service_type(service_type: &helm_monitor::ServiceType) -> &'static str {
+    match service_type {
+        helm_monitor::ServiceType::DockerContainer { .. } => "docker_container",
+        helm_monitor::ServiceType::Database { .. } => "database",
+        helm_monitor::ServiceType::Kubernetes { .. } => "kubernetes",
+        helm_monitor::ServiceType::Pipeline { .. } => "pipeline",
+        helm_monitor::ServiceType::WebServer { .. } => "web_server",
+        helm_monitor::ServiceType::TcpEndpoint { .. } => "tcp_endpoint",
+        helm_monitor::ServiceType::HttpEndpoint { .. } => "http_endpoint",
+    }
 }
 
 fn provider_key_url(choice: ProviderChoice) -> Option<&'static str> {
@@ -5974,6 +6303,38 @@ mod tests {
             agent.command,
             Some(super::Command::Agent(super::AgentArgs {
                 command: super::AgentCommand::Register(_)
+            }))
+        ));
+    }
+
+    #[test]
+    fn service_commands_parse() {
+        let add = parse_cli_from([
+            "helmops",
+            "service",
+            "add",
+            "--name",
+            "Payments API",
+            "--type",
+            "http-endpoint",
+            "--url",
+            "https://example.com/health",
+            "--expected-status",
+            "200",
+        ])
+        .unwrap();
+        let remove = parse_cli_from(["helmops", "service", "remove", "payments-api"]).unwrap();
+
+        assert!(matches!(
+            add.command,
+            Some(super::Command::Service(super::ServiceArgs {
+                command: super::ServiceCommand::Add(_)
+            }))
+        ));
+        assert!(matches!(
+            remove.command,
+            Some(super::Command::Service(super::ServiceArgs {
+                command: super::ServiceCommand::Remove(_)
             }))
         ));
     }

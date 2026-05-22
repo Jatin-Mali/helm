@@ -29,7 +29,8 @@ use helm_memory::{
 };
 use helm_monitor::{
     CollectorError, CommandValidator, Finding, FindingSummaryFields, MetricHistory, MonitorProfile,
-    SnapshotDomains, build_narrative_prompt, load_thresholds_config, parse_llm_response,
+    ServiceRegistry, SnapshotDomains, build_narrative_prompt, load_thresholds_config,
+    parse_llm_response,
 };
 use helm_providers::ChatRequest;
 use ratatui::{
@@ -47,8 +48,12 @@ use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
 
 use crate::{
     ProviderChoice, ProviderSettings, TroubleshootingPlanStore, build_provider, custom_commands,
-    default_api_key_env, default_model_name, keybindings::KeyMap, provider_choice_name,
-    remote::RemoteRegistry, wrap_for_remote, write_helm_config,
+    default_api_key_env, default_model_name,
+    keybindings::KeyMap,
+    provider_choice_name,
+    remote::RemoteRegistry,
+    service_form::{ServiceFormField, ServiceRegistrationDraft},
+    wrap_for_remote, write_helm_config,
 };
 use crate::{sandbox::ResolvedSandbox, secrets::SecretsStore};
 
@@ -373,6 +378,11 @@ enum ModalState {
     ThemeSelector {
         selected: usize,
     },
+    ServiceRegistration {
+        draft: ServiceRegistrationDraft,
+        selected: usize,
+        error: Option<String>,
+    },
     /// Command-by-command plan execution approval.
     PlanExecution {
         plan_id: String,
@@ -476,6 +486,7 @@ enum CommandAction {
     Evidence,
     ApplyPlan,
     Dashboard,
+    Service,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -575,6 +586,7 @@ impl CommandAction {
             Self::Evidence,
             Self::ApplyPlan,
             Self::Dashboard,
+            Self::Service,
         ]
     }
 
@@ -606,6 +618,7 @@ impl CommandAction {
             Self::Evidence => "Evidence Report",
             Self::ApplyPlan => "Execute Plan",
             Self::Dashboard => "Dashboard",
+            Self::Service => "Service Registry",
         }
     }
 
@@ -637,6 +650,7 @@ impl CommandAction {
             Self::Evidence => "evidence",
             Self::ApplyPlan => "apply-plan",
             Self::Dashboard => "dashboard",
+            Self::Service => "service",
         }
     }
 
@@ -668,6 +682,7 @@ impl CommandAction {
             Self::Evidence => "show evidence report for last tool call",
             Self::ApplyPlan => "execute a troubleshooting plan with step approval",
             Self::Dashboard => "switch to monitoring dashboard",
+            Self::Service => "register, list, or remove monitored services",
         }
     }
 
@@ -699,6 +714,7 @@ impl CommandAction {
             Self::Evidence => slug == "evidence",
             Self::ApplyPlan => slug == "apply-plan",
             Self::Dashboard => matches!(slug, "dashboard" | "monitor"),
+            Self::Service => slug == "service",
         }
     }
 
@@ -3099,6 +3115,33 @@ impl TuiApp {
                 }
                 _ => {}
             },
+            Some(ModalState::ServiceRegistration { .. }) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Up => self.move_service_form_selection(-1),
+                KeyCode::Down | KeyCode::Tab => self.move_service_form_selection(1),
+                KeyCode::BackTab => self.move_service_form_selection(-1),
+                KeyCode::Left => self.cycle_service_form_field(-1),
+                KeyCode::Right => self.cycle_service_form_field(1),
+                KeyCode::Enter => {
+                    if self.service_form_selected_field() == Some(ServiceFormField::Submit) {
+                        self.submit_service_registration();
+                    } else {
+                        self.move_service_form_selection(1);
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.edit_service_form_field(|value| {
+                        value.pop();
+                    });
+                }
+                KeyCode::Delete => {
+                    self.edit_service_form_field(|value| value.clear());
+                }
+                KeyCode::Char(ch) => {
+                    self.edit_service_form_field(|value| value.push(ch));
+                }
+                _ => {}
+            },
             Some(ModalState::PlanExecution {
                 ref plan_id,
                 ref step_index,
@@ -3217,6 +3260,8 @@ impl TuiApp {
             let args = parts.next().unwrap_or("").trim();
             if slug == "remote" {
                 self.apply_remote_target(args);
+            } else if slug == "service" {
+                self.execute_service_inline(args);
             } else if let Some(command) = CommandAction::from_slug(slug) {
                 self.execute_command_with_args(command, args);
             } else if let Some(command) = self
@@ -4130,6 +4175,9 @@ Report the exit status and the concise output."
                 self.refresh_dashboard();
                 self.toast("Dashboard mode");
             }
+            CommandAction::Service => {
+                self.execute_service_inline("");
+            }
         }
     }
 
@@ -4150,8 +4198,181 @@ Report the exit status and the concise output."
             CommandAction::ApplyPlan if !args.is_empty() => {
                 self.execute_apply_plan_inline(args);
             }
+            CommandAction::Service => self.execute_service_inline(args),
             _ => self.execute_command(command),
         }
+    }
+
+    fn execute_service_inline(&mut self, raw: &str) {
+        let mut parts = raw.split_whitespace();
+        match parts.next() {
+            None | Some("add") => self.open_service_registration(),
+            Some("list") => {
+                let registry = ServiceRegistry::load_default();
+                match registry {
+                    Ok(registry) if registry.services().is_empty() => self.push_chat(
+                        MessageRole::System,
+                        "[service] no custom services registered.",
+                    ),
+                    Ok(registry) => {
+                        let lines = registry
+                            .services()
+                            .iter()
+                            .map(|service| {
+                                format!(
+                                    "  - {} [{}] {} · {} · {}",
+                                    service.name,
+                                    service.id,
+                                    service_type_label(&service.service_type),
+                                    service.environment,
+                                    service.team
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        self.push_chat(
+                            MessageRole::System,
+                            format!("[service] registered services\n{lines}"),
+                        );
+                    }
+                    Err(error) => self.push_chat(
+                        MessageRole::Error,
+                        format!("[service] failed to load registry: {error}"),
+                    ),
+                }
+            }
+            Some("remove") => {
+                let id = parts.collect::<Vec<_>>().join(" ");
+                if id.trim().is_empty() {
+                    self.push_chat(
+                        MessageRole::System,
+                        "Usage: /service remove <id>",
+                    );
+                    return;
+                }
+                match ServiceRegistry::load_default().and_then(|mut registry| registry.remove(id.trim())) {
+                    Ok(()) => {
+                        self.toast_variant("Service removed", ToastVariant::Success);
+                        self.push_chat(
+                            MessageRole::System,
+                            format!("[service] removed {}", id.trim()),
+                        );
+                    }
+                    Err(error) => self.push_chat(
+                        MessageRole::Error,
+                        format!("[service] remove failed: {error}"),
+                    ),
+                }
+            }
+            Some(other) => self.push_chat(
+                MessageRole::System,
+                format!(
+                    "Usage: /service add | /service list | /service remove <id>\nUnknown action `{other}`."
+                ),
+            ),
+        }
+    }
+
+    fn open_service_registration(&mut self) {
+        self.modal = Some(ModalState::ServiceRegistration {
+            draft: ServiceRegistrationDraft::default(),
+            selected: 0,
+            error: None,
+        });
+    }
+
+    fn service_form_selected_field(&self) -> Option<ServiceFormField> {
+        match &self.modal {
+            Some(ModalState::ServiceRegistration {
+                draft, selected, ..
+            }) => draft.field_specs().get(*selected).map(|spec| spec.field),
+            _ => None,
+        }
+    }
+
+    fn move_service_form_selection(&mut self, delta: isize) {
+        if let Some(ModalState::ServiceRegistration {
+            draft, selected, ..
+        }) = &mut self.modal
+        {
+            let len = draft.field_specs().len();
+            if len == 0 {
+                *selected = 0;
+                return;
+            }
+            let current = *selected as isize;
+            let next = (current + delta).rem_euclid(len as isize) as usize;
+            *selected = next;
+        }
+    }
+
+    fn cycle_service_form_field(&mut self, delta: i32) {
+        if let Some(ModalState::ServiceRegistration {
+            draft,
+            selected,
+            error,
+        }) = &mut self.modal
+            && let Some(field) = draft.field_specs().get(*selected).map(|spec| spec.field)
+            && draft.cycle_field(field, delta)
+        {
+            *error = None;
+            let max = draft.field_specs().len().saturating_sub(1);
+            *selected = (*selected).min(max);
+        }
+    }
+
+    fn edit_service_form_field(&mut self, edit: impl FnOnce(&mut String)) {
+        if let Some(ModalState::ServiceRegistration {
+            draft,
+            selected,
+            error,
+        }) = &mut self.modal
+            && let Some(field) = draft.field_specs().get(*selected).map(|spec| spec.field)
+            && let Some(value) = draft.text_field_mut(field)
+        {
+            edit(value);
+            *error = None;
+        }
+    }
+
+    fn submit_service_registration(&mut self) {
+        let Some(ModalState::ServiceRegistration { draft, .. }) = self.modal.clone() else {
+            return;
+        };
+
+        let service = match draft.build_service() {
+            Ok(service) => service,
+            Err(error) => {
+                self.set_service_registration_error(error);
+                return;
+            }
+        };
+
+        match ServiceRegistry::load_default().and_then(|mut registry| registry.add(service.clone()))
+        {
+            Ok(()) => {
+                self.modal = None;
+                self.toast_variant("Service registered", ToastVariant::Success);
+                self.push_chat(
+                    MessageRole::System,
+                    format!(
+                        "[service] registered {} [{}] as {} in {}",
+                        service.name,
+                        service.id,
+                        service_type_label(&service.service_type),
+                        service.environment
+                    ),
+                );
+            }
+            Err(error) => self.set_service_registration_error(error.to_string()),
+        }
+    }
+
+    fn set_service_registration_error(&mut self, error_text: impl Into<String>) {
+        if let Some(ModalState::ServiceRegistration { error, .. }) = &mut self.modal {
+            *error = Some(error_text.into());
+        }
+        self.toast_variant("Service registration needs fixes", ToastVariant::Error);
     }
 
     fn execute_config_inline(&mut self, raw: &str) {
@@ -9196,6 +9417,51 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
+        ModalState::ServiceRegistration {
+            draft,
+            selected,
+            error,
+        } => {
+            let fields = draft.field_specs();
+            let mut lines = vec![
+                Line::from(
+                    "Register a custom monitored service. Up/Down moves, Left/Right cycles type fields.",
+                ),
+                Line::from("Enter advances or saves. Backspace edits text. Esc cancels."),
+                Line::from(""),
+            ];
+            for (index, field) in fields.iter().enumerate() {
+                let style = if index == *selected {
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(HEADER_BORDER)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MODAL_FG).bg(MODAL_BG)
+                };
+                let row = if field.field == ServiceFormField::Submit {
+                    format!("{:<12} {}", field.label, field.value)
+                } else {
+                    format!("{:<12} {:<32} {}", field.label, field.value, field.hint)
+                };
+                lines.push(Line::styled(row, style));
+            }
+            if let Some(error) = error.as_ref() {
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    error.as_str(),
+                    Style::default().fg(ERROR_FG).add_modifier(Modifier::BOLD),
+                ));
+                lines.push(Line::styled(
+                    "The form stays open with your existing values intact.",
+                    Style::default().fg(DIM_FG),
+                ));
+            }
+            Paragraph::new(lines)
+                .block(modal_block(" Service Registration "))
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
+        }
         ModalState::PlanExecution {
             plan_id,
             plan_title,
@@ -9678,6 +9944,18 @@ fn sanitize_one_line(text: &str) -> String {
         .lines()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn service_type_label(service_type: &helm_monitor::ServiceType) -> &'static str {
+    match service_type {
+        helm_monitor::ServiceType::DockerContainer { .. } => "docker_container",
+        helm_monitor::ServiceType::Database { .. } => "database",
+        helm_monitor::ServiceType::Kubernetes { .. } => "kubernetes",
+        helm_monitor::ServiceType::Pipeline { .. } => "pipeline",
+        helm_monitor::ServiceType::WebServer { .. } => "web_server",
+        helm_monitor::ServiceType::TcpEndpoint { .. } => "tcp_endpoint",
+        helm_monitor::ServiceType::HttpEndpoint { .. } => "http_endpoint",
+    }
 }
 
 fn format_duration(d: Duration) -> String {
@@ -10327,6 +10605,58 @@ mod tests {
             filtered.first(),
             Some(SlashItem::Custom(command)) if command.name == "triage"
         ));
+    }
+
+    #[test]
+    fn slash_popup_includes_service_command() {
+        let mut app = app();
+        app.input.text = "/serv".to_owned();
+
+        let filtered = app.slash_filtered();
+
+        assert!(
+            filtered
+                .iter()
+                .any(|item| matches!(item, SlashItem::BuiltIn(CommandAction::Service)))
+        );
+    }
+
+    #[test]
+    fn service_add_command_opens_registration_modal() {
+        let mut app = app();
+        app.execute_service_inline("add");
+
+        assert!(matches!(
+            app.modal,
+            Some(ModalState::ServiceRegistration { .. })
+        ));
+    }
+
+    #[test]
+    fn service_registration_failure_preserves_entered_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+        app.open_service_registration();
+        if let Some(ModalState::ServiceRegistration { draft, .. }) = &mut app.modal {
+            draft.name = "API".to_owned();
+            draft.environment = "production".to_owned();
+            draft.team = "platform".to_owned();
+            draft.http_url = "not-a-url".to_owned();
+        }
+
+        app.submit_service_registration();
+
+        match app.modal {
+            Some(ModalState::ServiceRegistration {
+                draft,
+                error: Some(_),
+                ..
+            }) => {
+                assert_eq!(draft.name, "API");
+                assert_eq!(draft.http_url, "not-a-url");
+            }
+            other => panic!("expected service registration modal with error, got {other:?}"),
+        }
     }
 
     #[test]
