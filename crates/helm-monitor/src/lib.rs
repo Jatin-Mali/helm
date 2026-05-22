@@ -3,6 +3,7 @@
 pub mod alerting;
 pub mod collectors;
 pub mod custom_rules;
+pub mod custom_service;
 pub mod detectors;
 pub mod engine;
 pub mod execute;
@@ -17,6 +18,10 @@ pub mod troubleshoot;
 pub use custom_rules::{
     CompareOp, CustomRule, CustomRulesEngine, LogicOp, RuleCondition, RuleValidationError,
     ThresholdValue, default_rules_path,
+};
+pub use custom_service::{
+    DbKind, RegisteredService, ServiceRegistry, ServiceRegistryError, ServiceType,
+    default_services_path,
 };
 pub use engine::{AlertingEngine, collect_snapshot};
 pub use execute::{

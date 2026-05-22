@@ -4,6 +4,7 @@
 use crate::{
     collect_snapshot,
     custom_rules::CustomRulesEngine,
+    custom_service::ServiceRegistry,
     detectors::DetectorRegistry,
     findings::{Finding, MonitorDomain, Severity},
     snapshot::{MonitorProfile, SystemSnapshot},
@@ -49,6 +50,17 @@ impl MonitorReporter {
                     domain_filter.is_none_or(|domains| domains.contains(&finding.category))
                 }),
         );
+        if let Ok(mut service_registry) = ServiceRegistry::load_default() {
+            findings.extend(
+                service_registry
+                    .check_health()
+                    .await
+                    .into_iter()
+                    .filter(|finding| {
+                        domain_filter.is_none_or(|domains| domains.contains(&finding.category))
+                    }),
+            );
+        }
         let domains_checked = if let Some(doms) = domain_filter {
             doms.to_vec()
         } else {
