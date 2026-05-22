@@ -3454,36 +3454,43 @@ Report the exit status and the concise output."
     fn quick_memory_report(&self, raw_query: &str) -> String {
         let query = raw_query.trim();
         if query.is_empty() {
-            return "[memory] usage: `# <query>` — searches recent episodes.".to_owned();
+            return "[memory] usage: `# <query>` — searches current dashboard findings.".to_owned();
         }
-        let query = query.to_owned();
-        let memory = Arc::clone(&self.runtime.memory);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let query_lower = query.to_ascii_lowercase();
-                let recent = memory.recent_episodes(20).await.unwrap_or_default();
-                let episode_lines = recent
-                    .into_iter()
-                    .filter(|episode| episode.goal.to_ascii_lowercase().contains(&query_lower))
-                    .take(5)
-                    .map(|episode| {
-                        format!(
-                            "  - [{}] {}",
-                            episode.id,
-                            episode.goal.chars().take(80).collect::<String>()
-                        )
-                    })
-                    .collect::<Vec<_>>();
-
-                let episodes = if episode_lines.is_empty() {
-                    "  - no recent episode matches".to_owned()
-                } else {
-                    episode_lines.join("\n")
-                };
-
-                format!("[memory] query: {query}\nrecent episodes:\n{episodes}")
+        let query_lower = query.to_ascii_lowercase();
+        let matches = self
+            .dashboard
+            .data
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.title.to_ascii_lowercase().contains(&query_lower)
+                    || finding
+                        .affected_resource
+                        .to_ascii_lowercase()
+                        .contains(&query_lower)
+                    || finding.domain.to_ascii_lowercase().contains(&query_lower)
+                    || finding.kind.to_ascii_lowercase().contains(&query_lower)
+                    || finding
+                        .evidence_text
+                        .to_ascii_lowercase()
+                        .contains(&query_lower)
             })
-        })
+            .take(5)
+            .map(|finding| {
+                format!(
+                    "  - [{}] {} | {} | {}",
+                    finding.severity, finding.title, finding.affected_resource, finding.domain
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let findings = if matches.is_empty() {
+            "  - no current dashboard findings match".to_owned()
+        } else {
+            matches.join("\n")
+        };
+
+        format!("[memory] query: {query}\ncurrent findings:\n{findings}")
     }
 
     fn remote_hint(&self) -> String {

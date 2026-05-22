@@ -109,19 +109,6 @@ pub struct EpisodeRecord {
     pub total_turns_summarized: u32,
 }
 
-/// Aggregate episode outcome counts for diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EpisodeOutcomeCounts {
-    /// Total number of episodes.
-    pub total: u32,
-    /// Episodes with `success` outcome.
-    pub success: u32,
-    /// Episodes with `partial` outcome.
-    pub partial: u32,
-    /// Episodes with `failure` outcome.
-    pub failure: u32,
-}
-
 /// Read model for a persisted capability grant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityGrantRecord {
@@ -384,33 +371,6 @@ impl MemoryStore {
         .map_err(|error| MemoryError::Join(error.to_string()))?
     }
 
-    /// Returns the most recently started episodes up to `limit`.
-    pub async fn recent_episodes(&self, limit: u32) -> Result<Vec<EpisodeRecord>, MemoryError> {
-        let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || {
-            let guard = lock_conn(&conn)?;
-            let mut stmt = guard
-                .prepare(
-                    "SELECT id, goal, started_at, ended_at, outcome, iterations, tokens_in, \
-                     tokens_out, final_message, error, model_capability_warning, \
-                     corrections_used, format_recovery_used, response_format_log, \
-                     total_turns_summarized \
-                     FROM episodes ORDER BY started_at DESC LIMIT ?1",
-                )
-                .map_err(sqlite_error)?;
-            let rows = stmt
-                .query_map(params![i64::from(limit)], row_to_episode)
-                .map_err(sqlite_error)?;
-            let mut records = Vec::new();
-            for row in rows {
-                records.push(row.map_err(sqlite_error)?);
-            }
-            Ok::<Vec<EpisodeRecord>, MemoryError>(records)
-        })
-        .await
-        .map_err(|error| MemoryError::Join(error.to_string()))?
-    }
-
     /// Returns the number of episodes in the database.
     pub async fn episode_count(&self) -> Result<u32, MemoryError> {
         let conn = Arc::clone(&self.conn);
@@ -420,28 +380,6 @@ impl MemoryStore {
                 .query_row("SELECT COUNT(*) FROM episodes", [], |row| row.get(0))
                 .map_err(sqlite_error)?;
             u32::try_from(count).map_err(|error| MemoryError::Migration(error.to_string()))
-        })
-        .await
-        .map_err(|error| MemoryError::Join(error.to_string()))?
-    }
-
-    /// Returns aggregate counts grouped by final episode outcome.
-    pub async fn episode_outcome_counts(&self) -> Result<EpisodeOutcomeCounts, MemoryError> {
-        let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || {
-            let guard = lock_conn(&conn)?;
-            let total: i64 = guard
-                .query_row("SELECT COUNT(*) FROM episodes", [], |row| row.get(0))
-                .map_err(sqlite_error)?;
-            let success = count_outcome(&guard, EpisodeOutcome::Success.as_str())?;
-            let partial = count_outcome(&guard, EpisodeOutcome::Partial.as_str())?;
-            let failure = count_outcome(&guard, EpisodeOutcome::Failure.as_str())?;
-            Ok::<EpisodeOutcomeCounts, MemoryError>(EpisodeOutcomeCounts {
-                total: i64_to_u32(total).map_err(|error| MemoryError::Sqlite(error.to_string()))?,
-                success,
-                partial,
-                failure,
-            })
         })
         .await
         .map_err(|error| MemoryError::Join(error.to_string()))?
@@ -841,48 +779,6 @@ impl MemoryStore {
         .await
         .map_err(|e| MemoryError::Join(e.to_string()))?
     }
-
-    /// Aggregate routing stats grouped by model.
-    pub async fn routing_stats(&self) -> Result<Vec<RoutingStat>, MemoryError> {
-        let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || {
-            let guard = conn
-                .lock()
-                .map_err(|e| MemoryError::Sqlite(e.to_string()))?;
-            let mut stmt = guard
-                .prepare(
-                    "SELECT model, \
-                            COUNT(*) AS total, \
-                            SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS ok, \
-                            AVG(latency_ms) AS avg_latency, \
-                            SUM(cost_usd) AS total_cost \
-                     FROM router_outcomes GROUP BY model ORDER BY total DESC",
-                )
-                .map_err(sqlite_error)?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let total: i64 = row.get(1)?;
-                    let ok: i64 = row.get(2)?;
-                    let avg_latency: Option<f64> = row.get(3)?;
-                    let total_cost: Option<f64> = row.get(4)?;
-                    Ok(RoutingStat {
-                        model: row.get(0)?,
-                        total: total as u64,
-                        successes: ok as u64,
-                        avg_latency_ms: avg_latency.unwrap_or(0.0),
-                        total_cost_usd: total_cost.unwrap_or(0.0),
-                    })
-                })
-                .map_err(sqlite_error)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(sqlite_error)?);
-            }
-            Ok::<Vec<RoutingStat>, MemoryError>(out)
-        })
-        .await
-        .map_err(|e| MemoryError::Join(e.to_string()))?
-    }
 }
 
 pub fn verify_partitioned_audit_events(
@@ -935,36 +831,6 @@ pub fn verify_partitioned_audit_events(
         failed_at: None,
         reason: None,
     })
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RoutingStat {
-    pub model: String,
-    pub total: u64,
-    pub successes: u64,
-    pub avg_latency_ms: f64,
-    pub total_cost_usd: f64,
-}
-
-impl RoutingStat {
-    pub fn success_rate(&self) -> f64 {
-        if self.total == 0 {
-            0.0
-        } else {
-            (self.successes as f64) / (self.total as f64)
-        }
-    }
-}
-
-fn count_outcome(conn: &Connection, outcome: &str) -> Result<u32, MemoryError> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM episodes WHERE outcome = ?1",
-            params![outcome],
-            |row| row.get(0),
-        )
-        .map_err(sqlite_error)?;
-    i64_to_u32(count).map_err(|error| MemoryError::Sqlite(error.to_string()))
 }
 
 fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
@@ -1512,33 +1378,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outcome_counts_group_finished_episodes() {
-        let (_dir, store) = store().await;
-        let success = store.start_episode("success").await.unwrap();
-        let partial = store.start_episode("partial").await.unwrap();
-        let failure = store.start_episode("failure").await.unwrap();
-        store
-            .finish_episode(&success, EpisodeOutcome::Success, Some("ok"), None)
-            .await
-            .unwrap();
-        store
-            .finish_episode(&partial, EpisodeOutcome::Partial, Some("p"), None)
-            .await
-            .unwrap();
-        store
-            .finish_episode(&failure, EpisodeOutcome::Failure, Some("f"), Some("bad"))
-            .await
-            .unwrap();
-
-        let counts = store.episode_outcome_counts().await.unwrap();
-
-        assert_eq!(counts.total, 3);
-        assert_eq!(counts.success, 1);
-        assert_eq!(counts.partial, 1);
-        assert_eq!(counts.failure, 1);
-    }
-
-    #[tokio::test]
     async fn get_episode_missing_returns_none_error_path() {
         let (_dir, store) = store().await;
 
@@ -1710,17 +1549,6 @@ mod tests {
         let (_dir, store) = store().await;
 
         assert_eq!(store.journal_mode().await.unwrap().to_lowercase(), "wal");
-    }
-
-    #[tokio::test]
-    async fn recent_episodes_respects_limit() {
-        let (_dir, store) = store().await;
-        let _first = store.start_episode("first").await.unwrap();
-        let _second = store.start_episode("second").await.unwrap();
-
-        let episodes = store.recent_episodes(1).await.unwrap();
-
-        assert_eq!(episodes.len(), 1);
     }
 
     #[test]

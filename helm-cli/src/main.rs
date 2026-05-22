@@ -2154,9 +2154,6 @@ struct DoctorMemoryReport {
     database: String,
     schema_version: u32,
     episodes: u32,
-    success: u32,
-    partial: u32,
-    failure: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -2401,14 +2398,10 @@ fn response_has_tool_use(response: &ChatResponse) -> bool {
 }
 
 async fn run_memory_doctor(db_path: &Path, memory: &MemoryStore) -> Result<DoctorMemoryReport> {
-    let counts = memory.episode_outcome_counts().await?;
     Ok(DoctorMemoryReport {
         database: db_path.display().to_string(),
         schema_version: memory.schema_version().await?,
-        episodes: counts.total,
-        success: counts.success,
-        partial: counts.partial,
-        failure: counts.failure,
+        episodes: memory.episode_count().await?,
     })
 }
 
@@ -2522,10 +2515,7 @@ fn render_doctor(report: &DoctorReport) -> String {
         "  schema_version: {}\n",
         report.memory.schema_version
     ));
-    output.push_str(&format!(
-        "  episodes: {} ({} success, {} partial, {} failure)\n\n",
-        report.memory.episodes, report.memory.success, report.memory.partial, report.memory.failure
-    ));
+    output.push_str(&format!("  episodes: {}\n\n", report.memory.episodes));
     output.push_str("[tools]\n");
     for tool in &report.tools {
         output.push_str(&format!("  {}: {}\n", tool.name, tool.status));
@@ -6169,9 +6159,6 @@ mod tests {
                 database: "/tmp/helm.db".to_owned(),
                 schema_version: 2,
                 episodes: 14,
-                success: 12,
-                partial: 1,
-                failure: 1,
             },
             tools: vec![
                 DoctorToolReport {
@@ -6250,9 +6237,6 @@ mod tests {
                 database: "/tmp/helm.db".to_owned(),
                 schema_version: 2,
                 episodes: 0,
-                success: 0,
-                partial: 0,
-                failure: 0,
             },
             tools: Vec::new(),
             ollama: DoctorOllamaReport {
