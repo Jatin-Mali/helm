@@ -34,7 +34,8 @@ pub use execute::{
     StepStatus, format_change_set,
 };
 pub use findings::{
-    Confidence, EvidenceRef, Finding, FindingId, FindingLifecycle, MonitorDomain, PlanId, Severity,
+    Confidence, EvidenceRef, Finding, FindingId, FindingLifecycle, FindingValidationError,
+    MonitorDomain, PlanId, Severity, self_resolved_findings, sort_findings,
 };
 pub use metric_history::MetricHistory;
 pub use plan_cache::{DEFAULT_PLAN_CACHE_TTL_SECS, PlanCache};

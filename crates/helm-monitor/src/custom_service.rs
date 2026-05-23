@@ -484,6 +484,7 @@ fn build_service_finding(service: &RegisteredService, severity: Severity, detail
     )
     .with_impact(impact)
     .with_read_only_check(check_hint)
+    .normalize_for_emission("custom-service", Utc::now())
 }
 
 fn service_monitor_domain(service_type: &ServiceType) -> MonitorDomain {

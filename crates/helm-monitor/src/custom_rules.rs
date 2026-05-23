@@ -585,8 +585,9 @@ fn build_finding(
     snapshot_value: &serde_json::Value,
 ) -> Finding {
     let resource = first_metric_path(&rule.condition)
-        .unwrap_or("custom-rule")
-        .to_owned();
+        .and_then(domain_from_metric_path)
+        .map(|domain| domain.as_str().to_owned())
+        .unwrap_or_else(|| "custom rule".to_owned());
     let mut finding = Finding::new(
         &snapshot.id,
         &format!("custom-rule:{}", rule.id),
@@ -611,7 +612,7 @@ fn build_finding(
     if let Some(fix_hint) = &rule.fix_hint {
         finding.fix_plan = Some(fix_hint.clone());
     }
-    finding
+    finding.normalize_for_emission(&format!("custom-rule:{}", rule.id), snapshot.collected_at)
 }
 
 fn infer_domain(rule: &CustomRule) -> MonitorDomain {
@@ -738,6 +739,8 @@ threshold = 90
         let findings = engine.evaluate(&snapshot_with_metrics(4.0, 20, 1));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Critical);
+        assert!(findings[0].validate_for_emission().is_ok());
+        assert!(findings[0].title_is_readable());
     }
 
     #[test]
@@ -788,13 +791,19 @@ window_seconds = 300
         assert!(
             second
                 .iter()
-                .any(|finding| finding.title == "Pressure stack")
+                .any(|finding| finding.title.contains("Pressure stack"))
         );
         assert!(
             second
                 .iter()
-                .any(|finding| finding.title == "Journal error burst")
+                .any(|finding| finding.title.contains("Journal error burst"))
         );
+        assert!(
+            second
+                .iter()
+                .all(|finding| finding.validate_for_emission().is_ok())
+        );
+        assert!(second.iter().all(|finding| finding.title_is_readable()));
     }
 
     #[test]

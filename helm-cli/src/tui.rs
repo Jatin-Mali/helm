@@ -5884,16 +5884,28 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             let kind = infer_finding_kind(&aggregate.latest);
             let state_record = state_map.get(&fingerprint);
             let state = if aggregate.is_current {
-                match state_record.map(|record| record.status) {
-                    Some(FindingStateStatus::Suppressed) => DashboardFindingState::Suppressed,
-                    Some(FindingStateStatus::Resolved) => DashboardFindingState::Resolved,
-                    _ if aggregate.occurrence_count == 1
-                        && age_bucket(aggregate.first_seen) == DashboardAgeFilter::UnderOneDay =>
-                    {
-                        DashboardFindingState::New
+                match aggregate.latest.lifecycle {
+                    helm_monitor::FindingLifecycle::Resolved => DashboardFindingState::Resolved,
+                    helm_monitor::FindingLifecycle::SelfResolved => {
+                        DashboardFindingState::SelfResolved
                     }
-                    _ if aggregate.occurrence_count > 1 => DashboardFindingState::Recurring,
-                    _ => DashboardFindingState::Open,
+                    helm_monitor::FindingLifecycle::Suppressed => DashboardFindingState::Suppressed,
+                    helm_monitor::FindingLifecycle::Open => {
+                        match state_record.map(|record| record.status) {
+                            Some(FindingStateStatus::Suppressed) => {
+                                DashboardFindingState::Suppressed
+                            }
+                            Some(FindingStateStatus::Resolved) => DashboardFindingState::Resolved,
+                            _ if aggregate.occurrence_count == 1
+                                && age_bucket(aggregate.first_seen)
+                                    == DashboardAgeFilter::UnderOneDay =>
+                            {
+                                DashboardFindingState::New
+                            }
+                            _ if aggregate.occurrence_count > 1 => DashboardFindingState::Recurring,
+                            _ => DashboardFindingState::Open,
+                        }
+                    }
                 }
             } else {
                 match state_record.map(|record| record.status) {

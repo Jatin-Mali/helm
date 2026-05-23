@@ -7,7 +7,7 @@ use crate::{
     custom_rules::CustomRulesEngine,
     custom_service::ServiceRegistry,
     detectors::DetectorRegistry,
-    findings::{Finding, MonitorDomain, Severity},
+    findings::{Finding, MonitorDomain, Severity, self_resolved_findings, sort_findings},
     snapshot::{MonitorProfile, SystemSnapshot},
 };
 
@@ -25,6 +25,7 @@ pub struct MonitorReport {
 pub struct MonitorReporter {
     pub registry: DetectorRegistry,
     pub correlation_engine: CorrelationEngine,
+    previous_findings: Vec<Finding>,
 }
 
 impl MonitorReporter {
@@ -32,6 +33,7 @@ impl MonitorReporter {
         Self {
             registry: DetectorRegistry::default_registry(),
             correlation_engine: CorrelationEngine::default(),
+            previous_findings: Vec::new(),
         }
     }
 
@@ -42,7 +44,7 @@ impl MonitorReporter {
         previous_snapshot: Option<SystemSnapshot>,
     ) -> MonitorReport {
         let mut engine = self.correlation_engine.clone();
-        self.run_with_engine(&mut engine, profile, domain_filter, previous_snapshot)
+        self.run_with_engine(&mut engine, profile, domain_filter, previous_snapshot, None)
             .await
     }
 
@@ -54,9 +56,21 @@ impl MonitorReporter {
     ) -> MonitorReport {
         let mut engine = self.correlation_engine.clone();
         let report = self
-            .run_with_engine(&mut engine, profile, domain_filter, previous_snapshot)
+            .run_with_engine(
+                &mut engine,
+                profile,
+                domain_filter,
+                previous_snapshot,
+                Some(&self.previous_findings),
+            )
             .await;
         self.correlation_engine = engine;
+        self.previous_findings = report
+            .findings
+            .iter()
+            .filter(|finding| !finding.lifecycle.is_resolved())
+            .cloned()
+            .collect();
         report
     }
 
@@ -66,40 +80,58 @@ impl MonitorReporter {
         profile: MonitorProfile,
         domain_filter: Option<&[MonitorDomain]>,
         previous_snapshot: Option<SystemSnapshot>,
+        previous_findings: Option<&[Finding]>,
     ) -> MonitorReport {
         let snapshot = collect_snapshot(profile).await;
         let previous_snapshot_id = previous_snapshot.as_ref().map(|p| p.id.clone());
-        let mut findings =
+        let mut active_findings =
             self.registry
                 .detect(&snapshot, domain_filter, previous_snapshot.as_ref());
-        findings.extend(
+        active_findings.extend(
             CustomRulesEngine::load_default()
                 .evaluate(&snapshot)
                 .into_iter()
+                .map(|finding| finding.normalize_for_emission("custom-rule", snapshot.collected_at))
+                .filter(|finding| finding.validate_for_emission().is_ok())
                 .filter(|finding| {
                     domain_filter.is_none_or(|domains| domains.contains(&finding.category))
                 }),
         );
         if let Ok(mut service_registry) = ServiceRegistry::load_default() {
-            findings.extend(
+            active_findings.extend(
                 service_registry
                     .check_health()
                     .await
                     .into_iter()
+                    .map(|finding| {
+                        finding.normalize_for_emission("custom-service", snapshot.collected_at)
+                    })
+                    .filter(|finding| finding.validate_for_emission().is_ok())
                     .filter(|finding| {
                         domain_filter.is_none_or(|domains| domains.contains(&finding.category))
                     }),
             );
         }
-        let correlation = engine.correlate(&snapshot, &findings);
+        sort_findings(&mut active_findings);
+        let correlation = engine.correlate(&snapshot, &active_findings);
+        let mut findings = correlation.findings;
+        if let Some(previous_findings) = previous_findings {
+            findings.extend(self_resolved_findings(
+                previous_findings,
+                &findings,
+                &snapshot.id,
+                snapshot.collected_at,
+            ));
+        }
+        sort_findings(&mut findings);
         let domains_checked = if let Some(doms) = domain_filter {
             doms.to_vec()
         } else {
-            correlation.findings.iter().map(|f| f.category).collect()
+            findings.iter().map(|f| f.category).collect()
         };
         MonitorReport {
             snapshot,
-            findings: correlation.findings,
+            findings,
             correlation_groups: correlation.groups,
             domains_checked,
             previous_snapshot_id,

@@ -76,11 +76,23 @@ impl DetectorRegistry {
         domains: Option<&[MonitorDomain]>,
         previous: Option<&SystemSnapshot>,
     ) -> Vec<Finding> {
-        self.detectors
+        let mut findings = self
+            .detectors
             .iter()
             .filter(|d| domains.is_none_or(|doms| doms.contains(&d.domain())))
-            .flat_map(|d| d.detect(snapshot, previous))
-            .collect()
+            .flat_map(|detector| {
+                detector
+                    .detect(snapshot, previous)
+                    .into_iter()
+                    .map(|finding| {
+                        finding.normalize_for_emission(detector.id(), snapshot.collected_at)
+                    })
+                    .filter(|finding| finding.validate_for_emission().is_ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        crate::findings::sort_findings(&mut findings);
+        findings
     }
 
     /// Return all registered detector IDs for auditing.
@@ -318,5 +330,79 @@ fn register_if_enabled(
 ) {
     if config.detector_enabled(detector_id) {
         registry.register(detector);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use proptest::prelude::*;
+
+    fn synthetic_snapshot(
+        load_one: f64,
+        disk_percent: u8,
+        inode_percent: u8,
+        mem_percent: u8,
+        swap_percent: u8,
+    ) -> SystemSnapshot {
+        let mut domains = crate::snapshot::SnapshotDomains::default();
+        domains.load.load_average.one = load_one;
+        domains.load.cpu_logical_count = 1;
+        domains.load.memory.total = 100;
+        domains.load.memory.used = mem_percent as u64;
+        domains.load.memory.available = Some(100u64.saturating_sub(mem_percent as u64));
+        domains.load.swap_total = 100;
+        domains.load.swap_used = swap_percent as u64;
+        domains
+            .disks
+            .filesystems
+            .push(crate::snapshot::FilesystemEntry {
+                device: "/dev/sda1".to_owned(),
+                mount_point: "/".to_owned(),
+                fs_type: "ext4".to_owned(),
+                total_bytes: 100,
+                used_bytes: disk_percent as u64,
+                available_bytes: 100u64.saturating_sub(disk_percent as u64),
+            });
+        domains.disks.inodes.push(crate::snapshot::InodeEntry {
+            device: "/dev/sda1".to_owned(),
+            mount_point: "/".to_owned(),
+            total: 100,
+            used: inode_percent as u64,
+            free: 100u64.saturating_sub(inode_percent as u64),
+        });
+        let mut snapshot = SystemSnapshot::new(
+            "prop-snapshot".to_owned(),
+            crate::snapshot::HostIdentity::default(),
+            crate::snapshot::MonitorProfile::Quick,
+            domains,
+        );
+        snapshot.collected_at = Utc::now();
+        snapshot
+    }
+
+    proptest! {
+        #[test]
+        fn property_field_completeness(
+            load_one in 0.0f64..32.0,
+            disk_percent in 0u8..=100,
+            inode_percent in 0u8..=100,
+            mem_percent in 0u8..=100,
+            swap_percent in 0u8..=100,
+        ) {
+            let snapshot = synthetic_snapshot(
+                load_one,
+                disk_percent,
+                inode_percent,
+                mem_percent,
+                swap_percent,
+            );
+            let findings = DetectorRegistry::default_registry().detect(&snapshot, None, None);
+            for finding in findings {
+                prop_assert!(finding.validate_for_emission().is_ok());
+                prop_assert!(finding.title_is_readable());
+            }
+        }
     }
 }
