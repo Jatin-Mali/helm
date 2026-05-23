@@ -7,6 +7,8 @@ use super::{AlertPayload, AlertSink, SendFuture};
 
 pub struct WebhookSink {
     pub url: String,
+    retry_max: u32,
+    retry_backoff_ms: u64,
     client: reqwest::Client,
 }
 
@@ -14,8 +16,16 @@ impl WebhookSink {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            retry_max: 3,
+            retry_backoff_ms: 1000,
             client: reqwest::Client::new(),
         }
+    }
+
+    pub fn with_retry_policy(mut self, retry_max: u32, retry_backoff_ms: u64) -> Self {
+        self.retry_max = retry_max.max(1);
+        self.retry_backoff_ms = retry_backoff_ms.max(1);
+        self
     }
 }
 
@@ -23,9 +33,13 @@ impl AlertSink for WebhookSink {
     fn send<'a>(&'a self, alert: &'a AlertPayload) -> SendFuture<'a> {
         Box::pin(async move {
             let body = serde_json::to_string(alert)?;
-            for attempt in 0u32..3 {
+            for attempt in 0u32..self.retry_max {
                 if attempt > 0 {
-                    sleep(Duration::from_secs(2u64.pow(attempt - 1))).await;
+                    let multiplier = 2u64.pow(attempt - 1);
+                    sleep(Duration::from_millis(
+                        self.retry_backoff_ms.saturating_mul(multiplier),
+                    ))
+                    .await;
                 }
                 let result = self
                     .client
@@ -42,14 +56,24 @@ impl AlertSink for WebhookSink {
                         } else if status.is_client_error() {
                             return Err(format!("Webhook rejected ({})", status).into());
                         }
-                        eprintln!("WARN webhook attempt {}/{} got {}", attempt + 1, 3, status);
+                        eprintln!(
+                            "WARN webhook attempt {}/{} got {}",
+                            attempt + 1,
+                            self.retry_max,
+                            status
+                        );
                     }
                     Err(e) => {
-                        eprintln!("WARN webhook attempt {}/{} error: {}", attempt + 1, 3, e);
+                        eprintln!(
+                            "WARN webhook attempt {}/{} error: {}",
+                            attempt + 1,
+                            self.retry_max,
+                            e
+                        );
                     }
                 }
             }
-            Err("Webhook delivery failed after 3 attempts".into())
+            Err(format!("Webhook delivery failed after {} attempts", self.retry_max).into())
         })
     }
 }

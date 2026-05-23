@@ -244,6 +244,7 @@ mod tests {
             min_severity: Severity::Critical,
             dedup_window_secs: 0,
             rate_limit_per_min: 60,
+            sinks: Vec::new(),
         };
         let router = AlertRouter::new(config).with_sink(sink);
 

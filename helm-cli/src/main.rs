@@ -35,6 +35,10 @@ use helm_memory::{
     AuditHashParts, ChangeSetStore, TroubleshootingPlanStore, audit_hash, latest_audit_hash,
     stable_hash_hex,
 };
+use helm_monitor::alerting::{
+    AlertConfig as MonitorAlertConfig, AlertRouter as MonitorAlertRouter,
+    default_config_path as default_alerting_config_path,
+};
 use helm_monitor::{
     CommandPreview, DbKind, ExecutionEngine, Finding, HostIdentity, MetricHistory, MonitorDomain,
     MonitorProfile, MonitorReport, MonitorReporter, PlanCache, PlanSource, RegisteredService,
@@ -4302,6 +4306,13 @@ async fn run_daemon_loop(
     let mut next_run = std::time::Instant::now();
     let mut collecting = false; // overlap guard
     let mut reporter = MonitorReporter::new();
+    let mut alert_router = match helm_monitor::alerting::load_config() {
+        Ok(config) => MonitorAlertRouter::new(config),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load alerting.toml; using defaults");
+            MonitorAlertRouter::new(MonitorAlertConfig::default())
+        }
+    };
     loop {
         let requested = request_path.exists();
         let due = std::time::Instant::now() >= next_run;
@@ -4320,6 +4331,7 @@ async fn run_daemon_loop(
                 &db_path,
                 interval,
                 &mut reporter,
+                &mut alert_router,
                 plan_runtime.as_ref(),
             )
             .await
@@ -4364,6 +4376,7 @@ async fn run_single_collection_cycle(
     db_path: &Path,
     _interval: u64,
     reporter: &mut MonitorReporter,
+    alert_router: &mut MonitorAlertRouter,
     plan_runtime: Option<&PlanGenerationRuntime>,
 ) -> Result<DaemonCycleReport, anyhow::Error> {
     let conn = rusqlite::Connection::open(db_path)
@@ -4385,6 +4398,16 @@ async fn run_single_collection_cycle(
                     "failed to queue background plan generation"
                 );
             }
+        }
+    }
+    for finding in &report.findings {
+        if let Err(error) = alert_router.route(finding).await {
+            tracing::warn!(
+                finding_id = %finding.id,
+                fingerprint = %finding.fingerprint,
+                error = %error,
+                "failed to route finding through alert router"
+            );
         }
     }
     Ok(DaemonCycleReport {
@@ -6353,23 +6376,33 @@ async fn run_alerting_command(args: AlertingArgs) -> Result<()> {
             let config = helm_monitor::alerting::load_config()
                 .unwrap_or_else(|_| helm_monitor::alerting::AlertConfig::default());
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "min_severity": config.min_severity.as_str(),
-                        "dedup_window_secs": config.dedup_window_secs,
-                        "rate_limit_per_min": config.rate_limit_per_min,
-                    }))?
-                );
+                println!("{}", serde_json::to_string_pretty(&config)?);
             } else {
                 println!("Alerting Configuration");
                 println!("{}", "─".repeat(50));
+                println!(
+                    "Config file:    {}",
+                    default_alerting_config_path().display()
+                );
                 println!("Min severity:  {}", config.min_severity.as_str());
                 println!("Dedup window:  {}s", config.dedup_window_secs);
                 println!("Rate limit:    {}/min", config.rate_limit_per_min);
                 println!();
-                println!("Alerting sinks are configured separately in config.toml.");
-                println!("Run `helm config` to view and edit configuration.");
+                if config.sinks.is_empty() {
+                    println!("Sinks:          none configured");
+                } else {
+                    println!("Sinks:");
+                    for sink in &config.sinks {
+                        let policy = sink.policy().resolve(&config);
+                        println!(
+                            "  - {:<10} severity>={} dedup={}s rate={}/min",
+                            sink.kind().as_str(),
+                            policy.min_severity.as_str(),
+                            policy.dedup_window_secs,
+                            policy.rate_limit_per_min
+                        );
+                    }
+                }
             }
         }
     }
