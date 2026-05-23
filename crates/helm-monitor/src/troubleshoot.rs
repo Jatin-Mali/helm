@@ -1,5 +1,8 @@
 //! Guided troubleshooting types and planner. Per TRD §4.4, §4.5 and ROADMAP v1.9.
 
+use std::str::FromStr;
+
+use helm_core::Capability;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -377,8 +380,11 @@ pub struct LlmNarrative {
 pub struct LlmFixStep {
     pub command: String,
     pub purpose: String,
+    pub expected_effect: String,
     pub risk: RiskLevel,
+    pub blast_radius: String,
     pub rollback: String,
+    pub required_capability: String,
     #[serde(default)]
     pub binary_warnings: Vec<String>,
 }
@@ -409,6 +415,37 @@ pub enum LlmPlanStatus {
     /// Response included a command blocked by the validator.
     DangerousCommand(String),
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanValidationError {
+    MissingCommand(usize),
+    MissingPurpose(usize),
+    MissingExpectedEffect(usize),
+    MissingBlastRadius(usize),
+    MissingRollback(usize),
+    MissingCapability(usize),
+    InvalidCapability { step: usize, value: String },
+}
+
+impl std::fmt::Display for PlanValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingCommand(step) => write!(f, "step {step} is missing COMMAND"),
+            Self::MissingPurpose(step) => write!(f, "step {step} is missing PURPOSE"),
+            Self::MissingExpectedEffect(step) => {
+                write!(f, "step {step} is missing EFFECT")
+            }
+            Self::MissingBlastRadius(step) => write!(f, "step {step} is missing BLAST"),
+            Self::MissingRollback(step) => write!(f, "step {step} is missing ROLLBACK"),
+            Self::MissingCapability(step) => write!(f, "step {step} is missing CAPABILITY"),
+            Self::InvalidCapability { step, value } => {
+                write!(f, "step {step} has invalid CAPABILITY `{value}`")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PlanValidationError {}
 
 impl std::fmt::Display for LlmPlanStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -477,18 +514,25 @@ Respond EXACTLY in this format:\n\
 ---FIX PLAN---\n\
 COMMAND: <exact command to run>\n\
 PURPOSE: <what this command does>\n\
+EFFECT: <expected result after the command succeeds>\n\
 RISK: <none|low|medium|high>\n\
+BLAST: <what scope is affected, e.g. single service, host, directory>\n\
 ROLLBACK: <command to undo, or \"none\">\n\
+CAPABILITY: <fs.read|fs.write|fs.delete|shell.exec|shell.shell|system.service|pkg.install|browser.control|network.out|kubectl.read|sudo>\n\
 ---\n\
 COMMAND: <second command if needed>\n\
 PURPOSE: <what it does>\n\
+EFFECT: <expected result after the command succeeds>\n\
 RISK: <none|low|medium|high>\n\
+BLAST: <affected scope>\n\
 ROLLBACK: <command to undo, or \"none\">\n\
+CAPABILITY: <required capability>\n\
 ---\n\
 \n\
 Rules:\n\
-- COMMAND, PURPOSE, RISK, and ROLLBACK are required for each step.\n\
+- COMMAND, PURPOSE, EFFECT, RISK, BLAST, ROLLBACK, and CAPABILITY are required for each step.\n\
 - RISK must be one of: none, low, medium, high.\n\
+- CAPABILITY must be one of the dotted HELM capability names listed above.\n\
 - If no rollback is possible, write ROLLBACK: none.\n\
 - Each step must be separated by --- on its own line.\n\
 - Use only Linux commands safe for production hosts.\n\
@@ -511,6 +555,8 @@ pub enum ParseError {
     NoCommandsFound,
     /// A RISK field contained an unrecognised value.
     InvalidRiskLevel(String),
+    /// Parsed plan failed the required field checks.
+    InvalidPlan(String),
 }
 
 impl std::fmt::Display for ParseError {
@@ -523,6 +569,7 @@ impl std::fmt::Display for ParseError {
                 f,
                 "Unknown risk level '{v}' — expected none|low|medium|high"
             ),
+            Self::InvalidPlan(message) => write!(f, "{message}"),
         }
     }
 }
@@ -577,6 +624,8 @@ pub fn parse_llm_response(text: &str) -> Result<LlmFixPlan, ParseError> {
         return Err(ParseError::NoCommandsFound);
     }
 
+    validate_fix_plan_steps(&steps).map_err(|error| ParseError::InvalidPlan(error.to_string()))?;
+
     Ok(LlmFixPlan {
         narrative: LlmNarrative {
             text: narrative_text,
@@ -603,8 +652,11 @@ fn extract_section<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> O
 fn parse_fix_step(block: &str) -> Result<Option<LlmFixStep>, ParseError> {
     let mut command = String::new();
     let mut purpose = String::new();
+    let mut expected_effect = String::new();
     let mut risk_str = String::new();
+    let mut blast_radius = String::new();
     let mut rollback = String::new();
+    let mut required_capability = String::new();
 
     for line in block.lines() {
         let trimmed = line.trim();
@@ -612,10 +664,16 @@ fn parse_fix_step(block: &str) -> Result<Option<LlmFixStep>, ParseError> {
             command = val.trim().to_string();
         } else if let Some(val) = trimmed.strip_prefix("PURPOSE:") {
             purpose = val.trim().to_string();
+        } else if let Some(val) = trimmed.strip_prefix("EFFECT:") {
+            expected_effect = val.trim().to_string();
         } else if let Some(val) = trimmed.strip_prefix("RISK:") {
             risk_str = val.trim().to_lowercase();
+        } else if let Some(val) = trimmed.strip_prefix("BLAST:") {
+            blast_radius = val.trim().to_string();
         } else if let Some(val) = trimmed.strip_prefix("ROLLBACK:") {
             rollback = val.trim().to_string();
+        } else if let Some(val) = trimmed.strip_prefix("CAPABILITY:") {
+            required_capability = val.trim().to_string();
         }
     }
 
@@ -635,10 +693,44 @@ fn parse_fix_step(block: &str) -> Result<Option<LlmFixStep>, ParseError> {
     Ok(Some(LlmFixStep {
         command,
         purpose,
+        expected_effect,
         risk,
+        blast_radius,
         rollback,
+        required_capability,
         binary_warnings: Vec::new(),
     }))
+}
+
+pub fn validate_fix_plan_steps(steps: &[LlmFixStep]) -> Result<(), PlanValidationError> {
+    for (index, step) in steps.iter().enumerate() {
+        let number = index + 1;
+        if step.command.trim().is_empty() {
+            return Err(PlanValidationError::MissingCommand(number));
+        }
+        if step.purpose.trim().is_empty() {
+            return Err(PlanValidationError::MissingPurpose(number));
+        }
+        if step.expected_effect.trim().is_empty() {
+            return Err(PlanValidationError::MissingExpectedEffect(number));
+        }
+        if step.blast_radius.trim().is_empty() {
+            return Err(PlanValidationError::MissingBlastRadius(number));
+        }
+        if step.rollback.trim().is_empty() {
+            return Err(PlanValidationError::MissingRollback(number));
+        }
+        if step.required_capability.trim().is_empty() {
+            return Err(PlanValidationError::MissingCapability(number));
+        }
+        if Capability::from_str(step.required_capability.trim()).is_err() {
+            return Err(PlanValidationError::InvalidCapability {
+                step: number,
+                value: step.required_capability.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 // ── TRD §4.4 ────────────────────────────────────────────────────────────────
@@ -1309,6 +1401,7 @@ fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::snapshot::{HostIdentity, MonitorProfile, SnapshotDomains};
+    use proptest::prelude::*;
 
     #[test]
     fn plan_from_problem_generates_hypotheses() {
@@ -1505,13 +1598,19 @@ This consumed 12 GB in /var/log/journal, leaving only 5% free space.
 ---FIX PLAN---
 COMMAND: journalctl --vacuum-time=7d
 PURPOSE: Remove journal entries older than 7 days to free space
+EFFECT: Journal storage shrinks and disk pressure decreases
 RISK: low
+BLAST: single host journal storage
 ROLLBACK: none
+CAPABILITY: shell.shell
 ---
 COMMAND: sed -i 's/MaxRetentionSec=90day/MaxRetentionSec=7day/' /etc/systemd/journald.conf
 PURPOSE: Reduce log retention from 90 days to 7 days to prevent recurrence
+EFFECT: Future journal growth is capped sooner
 RISK: medium
+BLAST: journald configuration on one host
 ROLLBACK: sed -i 's/MaxRetentionSec=7day/MaxRetentionSec=90day/' /etc/systemd/journald.conf
+CAPABILITY: fs.write
 ---
 ";
 
@@ -1525,8 +1624,13 @@ ROLLBACK: sed -i 's/MaxRetentionSec=7day/MaxRetentionSec=90day/' /etc/systemd/jo
 
         let step0 = &plan.steps[0];
         assert_eq!(step0.command, "journalctl --vacuum-time=7d");
+        assert_eq!(
+            step0.expected_effect,
+            "Journal storage shrinks and disk pressure decreases"
+        );
         assert_eq!(step0.risk, RiskLevel::Low);
         assert_eq!(step0.rollback, "none");
+        assert_eq!(step0.required_capability, "shell.shell");
 
         let step1 = &plan.steps[1];
         assert_eq!(
@@ -1547,8 +1651,11 @@ ROLLBACK: sed -i 's/MaxRetentionSec=7day/MaxRetentionSec=90day/' /etc/systemd/jo
         let response = "\
 COMMAND: df -h
 PURPOSE: Check disk space
+EFFECT: Show current disk usage
 RISK: none
+BLAST: read-only inspection
 ROLLBACK: none
+CAPABILITY: fs.read
 ";
         let result = parse_llm_response(response);
         assert!(result.is_err(), "should error on missing narrative");
@@ -1566,8 +1673,11 @@ Something is broken.
 ---FIX PLAN---
 COMMAND: restart-foo
 PURPOSE: Restart the foo service
+EFFECT: Service should recover
 RISK: apocalyptic
+BLAST: single service
 ROLLBACK: none
+CAPABILITY: system.service
 ---
 ";
         let result = parse_llm_response(response);
@@ -1603,7 +1713,10 @@ Disk is getting full due to accumulated package caches.
 ---FIX PLAN---
 COMMAND: apt-get clean
 PURPOSE: Clear package cache to free space
+EFFECT: Package cache usage drops
+BLAST: local package cache
 ROLLBACK: none
+CAPABILITY: pkg.install
 ---
 ";
         let plan = parse_llm_response(response).expect("should parse even without RISK");
@@ -1670,24 +1783,45 @@ nginx is returning 5xx errors because the upstream auth-svc is down.
 ---FIX PLAN---
 COMMAND: systemctl status auth-svc
 PURPOSE: Check auth-svc current state
+EFFECT: Current service state is visible
 RISK: none
+BLAST: read-only service inspection
 ROLLBACK: none
+CAPABILITY: system.service
 ---
 COMMAND: systemctl restart auth-svc
 PURPOSE: Restart the failing service
+EFFECT: auth-svc returns to active state
 RISK: low
+BLAST: single service
 ROLLBACK: systemctl stop auth-svc
+CAPABILITY: system.service
 ---
 COMMAND: curl -sf http://localhost:8080/healthz
 PURPOSE: Verify auth-svc is healthy after restart
+EFFECT: Health endpoint returns success
 RISK: none
+BLAST: one local HTTP endpoint
 ROLLBACK: none
+CAPABILITY: network.out
 ";
         let plan = parse_llm_response(fixture).expect("fixture should parse cleanly");
         assert_eq!(plan.steps.len(), 3, "expected 3 steps");
         for step in &plan.steps {
             assert!(!step.command.is_empty(), "each step must have a command");
             assert!(!step.purpose.is_empty(), "each step must have a purpose");
+            assert!(
+                !step.expected_effect.is_empty(),
+                "each step must have an expected effect"
+            );
+            assert!(
+                !step.blast_radius.is_empty(),
+                "each step must have a blast radius"
+            );
+            assert!(
+                !step.required_capability.is_empty(),
+                "each step must have a capability"
+            );
         }
         for step in &plan.steps {
             assert!(
@@ -1695,6 +1829,115 @@ ROLLBACK: none
                 "fixture command '{}' should be safe",
                 step.command
             );
+        }
+    }
+
+    #[test]
+    fn parser_rejects_missing_capability() {
+        let response = "\
+---NARRATIVE---
+nginx needs a restart after the config was fixed.
+---FIX PLAN---
+COMMAND: systemctl restart nginx
+PURPOSE: Restart nginx
+EFFECT: nginx picks up the fixed config
+RISK: low
+BLAST: single service
+ROLLBACK: systemctl stop nginx
+---
+";
+        let result = parse_llm_response(response);
+        assert!(matches!(result, Err(ParseError::InvalidPlan(_))));
+    }
+
+    #[test]
+    fn parser_rejects_unknown_capability() {
+        let response = "\
+---NARRATIVE---
+nginx needs a restart after the config was fixed.
+---FIX PLAN---
+COMMAND: systemctl restart nginx
+PURPOSE: Restart nginx
+EFFECT: nginx picks up the fixed config
+RISK: low
+BLAST: single service
+ROLLBACK: systemctl stop nginx
+CAPABILITY: root.everything
+---
+";
+        let result = parse_llm_response(response);
+        assert!(matches!(result, Err(ParseError::InvalidPlan(_))));
+    }
+
+    proptest! {
+        #[test]
+        fn property_plan_step_completeness(
+            has_command in any::<bool>(),
+            has_purpose in any::<bool>(),
+            has_effect in any::<bool>(),
+            has_blast in any::<bool>(),
+            has_rollback in any::<bool>(),
+            capability_mode in 0u8..3,
+        ) {
+            let capability = match capability_mode {
+                0 => Capability::SystemService.as_str().to_owned(),
+                1 => String::new(),
+                _ => "root.everything".to_owned(),
+            };
+            let step = LlmFixStep {
+                command: if has_command {
+                    "systemctl restart nginx".to_owned()
+                } else {
+                    String::new()
+                },
+                purpose: if has_purpose {
+                    "Restart nginx".to_owned()
+                } else {
+                    String::new()
+                },
+                expected_effect: if has_effect {
+                    "nginx returns to active state".to_owned()
+                } else {
+                    String::new()
+                },
+                risk: RiskLevel::Low,
+                blast_radius: if has_blast {
+                    "single service".to_owned()
+                } else {
+                    String::new()
+                },
+                rollback: if has_rollback {
+                    "systemctl stop nginx".to_owned()
+                } else {
+                    String::new()
+                },
+                required_capability: capability.clone(),
+                binary_warnings: Vec::new(),
+            };
+
+            let result = validate_fix_plan_steps(&[step]);
+            let expected = if !has_command {
+                Err(PlanValidationError::MissingCommand(1))
+            } else if !has_purpose {
+                Err(PlanValidationError::MissingPurpose(1))
+            } else if !has_effect {
+                Err(PlanValidationError::MissingExpectedEffect(1))
+            } else if !has_blast {
+                Err(PlanValidationError::MissingBlastRadius(1))
+            } else if !has_rollback {
+                Err(PlanValidationError::MissingRollback(1))
+            } else if capability_mode == 1 {
+                Err(PlanValidationError::MissingCapability(1))
+            } else if capability_mode == 2 {
+                Err(PlanValidationError::InvalidCapability {
+                    step: 1,
+                    value: capability,
+                })
+            } else {
+                Ok(())
+            };
+
+            prop_assert_eq!(result, expected);
         }
     }
 }

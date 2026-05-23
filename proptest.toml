@@ -1,0 +1,3 @@
+[default]
+cases = 100
+max_shrink_iters = 1000

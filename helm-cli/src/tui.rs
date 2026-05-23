@@ -1033,8 +1033,11 @@ enum DashboardView {
 struct ValidatedFixStep {
     command: String,
     purpose: String,
+    expected_effect: String,
     risk: String,
+    blast_radius: String,
     rollback: String,
+    required_capability: String,
     binary_warnings: Vec<String>,
 }
 
@@ -2120,6 +2123,7 @@ impl TuiApp {
                                     self.restore_active_dashboard_plan(
                                         &conn,
                                         &finding.id,
+                                        &finding.fingerprint,
                                         Some(&plan_id),
                                     );
                                 }
@@ -4784,12 +4788,14 @@ Report the exit status and the concise output."
                         "tool": "shell",
                         "input": { "command": step.command },
                         "command_text": step.command,
-                        "expected_effect": step.purpose,
+                        "expected_effect": step.expected_effect,
                         "risk": step.risk,
-                        "blast_radius": "Unknown",
+                        "blast_radius": step.blast_radius,
                         "rollback": step.rollback,
+                        "required_capability": step.required_capability,
                         "verification": []
                     },
+                    "purpose": step.purpose,
                     "hypothesis_id": serde_json::Value::Null,
                     "expected_output": serde_json::Value::Null,
                     "interpretation_guide": serde_json::Value::Null
@@ -4899,10 +4905,23 @@ Report the exit status and the concise output."
                     return None;
                 }
                 let purpose = step
+                    .get("purpose")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        step.get("command")
+                            .and_then(|command| command.get("purpose"))
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .unwrap_or_default()
+                    .to_owned();
+                let expected_effect = step
                     .get("command")
                     .and_then(|command| command.get("expected_effect"))
                     .and_then(serde_json::Value::as_str)
-                    .or_else(|| step.get("purpose").and_then(serde_json::Value::as_str))
+                    .or_else(|| {
+                        step.get("expected_effect")
+                            .and_then(serde_json::Value::as_str)
+                    })
                     .unwrap_or_default()
                     .to_owned();
                 let risk = step
@@ -4919,11 +4938,31 @@ Report the exit status and the concise output."
                     .or_else(|| step.get("rollback").and_then(serde_json::Value::as_str))
                     .unwrap_or("none")
                     .to_owned();
+                let blast_radius = step
+                    .get("command")
+                    .and_then(|command| command.get("blast_radius"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| step.get("blast_radius").and_then(serde_json::Value::as_str))
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let required_capability = step
+                    .get("command")
+                    .and_then(|command| command.get("required_capability"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        step.get("required_capability")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .unwrap_or("shell.shell")
+                    .to_owned();
                 Some(ValidatedFixStep {
                     command,
                     purpose,
+                    expected_effect,
                     risk,
+                    blast_radius,
                     rollback,
+                    required_capability,
                     binary_warnings: Vec::new(),
                 })
             })
@@ -4986,6 +5025,7 @@ Report the exit status and the concise output."
             conn,
             plan_id,
             &finding.id,
+            &finding.fingerprint,
             &read_only_steps_json,
             &proposed_fix_steps_json,
             &narrative_summary,
@@ -5002,6 +5042,7 @@ Report the exit status and the concise output."
         &mut self,
         conn: &rusqlite::Connection,
         finding_id: &str,
+        finding_fingerprint: &str,
         preferred_plan_id: Option<&str>,
     ) {
         let record = preferred_plan_id
@@ -5013,6 +5054,15 @@ Report the exit status and the concise output."
             .or_else(|| {
                 TroubleshootingPlanStore::latest_for_finding(conn, finding_id)
                     .ok()
+                    .flatten()
+            })
+            .or_else(|| {
+                (!finding_fingerprint.trim().is_empty())
+                    .then(|| {
+                        TroubleshootingPlanStore::latest_for_fingerprint(conn, finding_fingerprint)
+                            .ok()
+                            .flatten()
+                    })
                     .flatten()
             });
 
@@ -5421,6 +5471,7 @@ Report the exit status and the concise output."
             &plan_id,
             &source,
             &finding.snapshot_id,
+            &summary.fingerprint,
             "[]",
             "[]",
             "[]",
@@ -5553,8 +5604,11 @@ Report the exit status and the concise output."
                     validated_steps.push(ValidatedFixStep {
                         command: step.command.clone(),
                         purpose: step.purpose.clone(),
+                        expected_effect: step.expected_effect.clone(),
                         risk: step.risk.as_str().to_string(),
+                        blast_radius: step.blast_radius.clone(),
                         rollback: step.rollback.clone(),
+                        required_capability: step.required_capability.clone(),
                         binary_warnings,
                     });
                 }
@@ -5594,7 +5648,7 @@ Report the exit status and the concise output."
         let plan_id = match &self.dashboard.active_plan {
             Some(plan) if plan.finding_id == summary.id => plan.plan_id.clone(),
             _ => {
-                self.restore_active_dashboard_plan(&conn, &summary.id, None);
+                self.restore_active_dashboard_plan(&conn, &summary.id, &summary.fingerprint, None);
                 match &self.dashboard.active_plan {
                     Some(plan) if plan.finding_id == summary.id => plan.plan_id.clone(),
                     _ => {
@@ -6161,11 +6215,21 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         }
         match (prev_plan_finding_id.as_deref(), prev_plan_id.as_deref()) {
             (Some(finding_id), preferred_plan_id) => {
-                self.restore_active_dashboard_plan(&conn, finding_id, preferred_plan_id);
+                self.restore_active_dashboard_plan(
+                    &conn,
+                    finding_id,
+                    prev_fingerprint.as_deref().unwrap_or_default(),
+                    preferred_plan_id,
+                );
             }
             (None, _) => {
                 if let Some(finding) = self.current_dashboard_finding().cloned() {
-                    self.restore_active_dashboard_plan(&conn, &finding.id, None);
+                    self.restore_active_dashboard_plan(
+                        &conn,
+                        &finding.id,
+                        &finding.fingerprint,
+                        None,
+                    );
                 } else {
                     self.dashboard.active_plan = None;
                 }
@@ -7227,6 +7291,24 @@ fn render_ops_alerts(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                             Span::styled(step.purpose.as_str(), Style::default().fg(OPS_FG)),
                         ]));
                     }
+                    if !step.expected_effect.trim().is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled("    effect ", Style::default().fg(OPS_DIM)),
+                            Span::styled(
+                                step.expected_effect.as_str(),
+                                Style::default().fg(OPS_FG),
+                            ),
+                        ]));
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled("    blast ", Style::default().fg(OPS_DIM)),
+                        Span::styled(step.blast_radius.as_str(), Style::default().fg(OPS_MUTED)),
+                        Span::styled("   cap ", Style::default().fg(OPS_DIM)),
+                        Span::styled(
+                            step.required_capability.as_str(),
+                            Style::default().fg(OPS_MUTED),
+                        ),
+                    ]));
                 }
             }
             _ => lines.push(Line::from(Span::styled(
@@ -7433,11 +7515,14 @@ fn render_ops_troubleshoot_plan(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                     s.push_str("\n\n── FIX PLAN ──\n");
                     for (i, step) in fix_steps.iter().enumerate() {
                         s.push_str(&format!(
-                            "\nStep {}:  COMMAND   {}\n          PURPOSE   {}\n          RISK      {}\n          ROLLBACK  {}\n",
+                            "\nStep {}:  COMMAND   {}\n          PURPOSE   {}\n          EFFECT    {}\n          RISK      {}\n          BLAST     {}\n          CAP       {}\n          ROLLBACK  {}\n",
                             i + 1,
                             step.command,
                             step.purpose,
+                            step.expected_effect,
                             step.risk,
+                            step.blast_radius,
+                            step.required_capability,
                             step.rollback,
                         ));
                         if !step.binary_warnings.is_empty() {
@@ -12309,8 +12394,11 @@ mod tests {
                 fix_steps: vec![ValidatedFixStep {
                     command: "du -sh /var/log/*".into(),
                     purpose: "Identify large log directories".into(),
+                    expected_effect: "Large log paths are visible for cleanup".into(),
                     risk: "none".into(),
+                    blast_radius: "read-only filesystem inspection".into(),
                     rollback: "no rollback needed".into(),
+                    required_capability: "fs.read".into(),
                     binary_warnings: vec![],
                 }],
             },

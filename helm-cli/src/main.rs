@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -37,9 +37,10 @@ use helm_memory::{
 };
 use helm_monitor::{
     CommandPreview, DbKind, ExecutionEngine, Finding, HostIdentity, MetricHistory, MonitorDomain,
-    MonitorProfile, MonitorReport, MonitorReporter, PlanSource, RegisteredService, ServiceRegistry,
-    SnapshotDomains, SystemSnapshot, collect_snapshot, explain_finding, format_change_set,
-    load_thresholds_config, plan_from_finding, plan_from_problem,
+    MonitorProfile, MonitorReport, MonitorReporter, PlanCache, PlanSource, RegisteredService,
+    ServiceRegistry, SnapshotDomains, SystemSnapshot, build_narrative_prompt, collect_snapshot,
+    explain_finding, format_change_set, load_thresholds_config, parse_llm_response,
+    plan_from_finding, plan_from_problem,
 };
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
@@ -1166,10 +1167,22 @@ async fn run() -> Result<()> {
         }
         Command::Dashboard(args) => {
             let _ = args;
-            web::serve(db_path, 9120).await?;
+            web::serve(
+                db_path,
+                9120,
+                provider_settings.clone(),
+                secrets_store.clone(),
+            )
+            .await?;
         }
         Command::Daemon(args) => {
-            run_daemon_command(args, &db_path).await?;
+            run_daemon_command(
+                args,
+                &db_path,
+                provider_settings.clone(),
+                secrets_store.clone(),
+            )
+            .await?;
         }
         Command::Incident(args) => {
             run_incident_command(args).await?;
@@ -1202,7 +1215,13 @@ async fn run() -> Result<()> {
             run_alerting_command(args).await?;
         }
         Command::Web(args) => {
-            web::serve(db_path, args.port).await?;
+            web::serve(
+                db_path,
+                args.port,
+                provider_settings.clone(),
+                secrets_store.clone(),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -4066,7 +4085,12 @@ pub(crate) fn request_daemon_refresh() -> Result<bool> {
     Ok(true)
 }
 
-async fn run_daemon_command(args: DaemonArgs, db_path: &Path) -> Result<()> {
+async fn run_daemon_command(
+    args: DaemonArgs,
+    db_path: &Path,
+    provider_settings: ProviderSettings,
+    secrets_store: SecretsStore,
+) -> Result<()> {
     match args.command {
         DaemonCommand::Start(args) => {
             let msg = daemon_start_core(args, db_path).await?;
@@ -4084,9 +4108,16 @@ async fn run_daemon_command(args: DaemonArgs, db_path: &Path) -> Result<()> {
             Ok(())
         }
         DaemonCommand::Run(args) => {
+            let plan_runtime =
+                llm_provider_usable(&provider_settings).then(|| PlanGenerationRuntime {
+                    provider_settings,
+                    secrets: secrets_store,
+                    cache: PlanCache::default(),
+                });
             run_daemon_loop(
                 configured_refresh_interval(args.interval),
                 db_path.to_path_buf(),
+                plan_runtime,
             )
             .await
         }
@@ -4241,7 +4272,11 @@ pub(crate) fn daemon_status_core() -> Result<String> {
 }
 
 #[allow(unused_assignments)]
-async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
+async fn run_daemon_loop(
+    interval: u64,
+    db_path: PathBuf,
+    plan_runtime: Option<PlanGenerationRuntime>,
+) -> Result<()> {
     ensure_parent_dir(&db_path)?;
     ensure_parent_dir(&daemon_pid_path())?;
     let thresholds = load_thresholds_config();
@@ -4281,7 +4316,14 @@ async fn run_daemon_loop(interval: u64, db_path: PathBuf) -> Result<()> {
             let _ = write_daemon_state(&state);
 
             // Run collection cycle; catch errors so daemon survives failures
-            match run_single_collection_cycle(&db_path, interval, &mut reporter).await {
+            match run_single_collection_cycle(
+                &db_path,
+                interval,
+                &mut reporter,
+                plan_runtime.as_ref(),
+            )
+            .await
+            {
                 Ok(report) => {
                     metric_history.push_snapshot(&report.snapshot);
                     state.status = "running".to_owned();
@@ -4322,6 +4364,7 @@ async fn run_single_collection_cycle(
     db_path: &Path,
     _interval: u64,
     reporter: &mut MonitorReporter,
+    plan_runtime: Option<&PlanGenerationRuntime>,
 ) -> Result<DaemonCycleReport, anyhow::Error> {
     let conn = rusqlite::Connection::open(db_path)
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
@@ -4333,6 +4376,17 @@ async fn run_single_collection_cycle(
         &report.snapshot,
         &serde_json::to_string(&report.findings).unwrap_or_default(),
     );
+    if let Some(runtime) = plan_runtime {
+        for finding in &report.findings {
+            if let Err(error) = queue_background_plan_generation(runtime, db_path, finding) {
+                tracing::warn!(
+                    fingerprint = %finding.fingerprint,
+                    error = %error,
+                    "failed to queue background plan generation"
+                );
+            }
+        }
+    }
     Ok(DaemonCycleReport {
         snapshot: report.snapshot,
         findings: report.findings,
@@ -4369,6 +4423,7 @@ async fn run_incident_command(args: IncidentArgs) -> Result<()> {
                 &plan.id,
                 &source,
                 &plan.snapshot_id,
+                &finding.fingerprint,
                 &helm_core::redact_secrets(
                     &serde_json::to_string(&plan.hypotheses).unwrap_or_default(),
                 ),
@@ -4394,14 +4449,23 @@ async fn run_incident_command(args: IncidentArgs) -> Result<()> {
             let plan_id = if id_or_plan_id.starts_with("plan-") {
                 id_or_plan_id
             } else {
-                TroubleshootingPlanStore::latest_for_finding(&conn, &id_or_plan_id)
-                    .with_context(|| {
-                        format!("looking up latest plan for finding '{id_or_plan_id}'")
-                    })?
-                    .map(|record| record.id)
-                    .ok_or_else(|| {
-                        anyhow!("no persisted plan found for finding '{id_or_plan_id}'")
-                    })?
+                let record = find_finding_by_id(&conn, &id_or_plan_id)
+                    .and_then(|finding| {
+                        TroubleshootingPlanStore::latest_for_fingerprint(
+                            &conn,
+                            &finding.fingerprint,
+                        )
+                        .ok()
+                        .flatten()
+                    })
+                    .or_else(|| {
+                        TroubleshootingPlanStore::latest_for_finding(&conn, &id_or_plan_id)
+                            .ok()
+                            .flatten()
+                    });
+                record.map(|record| record.id).ok_or_else(|| {
+                    anyhow!("no persisted plan found for finding '{id_or_plan_id}'")
+                })?
             };
             let _ = run_apply_plan_command_at_path(db_path, ApplyPlanArgs { plan_id, yes, json })
                 .await?;
@@ -4943,6 +5007,283 @@ pub(crate) fn load_previous_snapshot(conn: &rusqlite::Connection) -> Option<Syst
     })
 }
 
+#[derive(Clone)]
+pub(crate) struct PlanGenerationRuntime {
+    pub(crate) provider_settings: ProviderSettings,
+    pub(crate) secrets: SecretsStore,
+    pub(crate) cache: PlanCache,
+}
+
+pub(crate) fn llm_provider_usable(settings: &ProviderSettings) -> bool {
+    matches!(settings.choice, ProviderChoice::Ollama)
+        || settings
+            .api_key
+            .as_ref()
+            .is_some_and(|key| !key.trim().is_empty())
+        || default_api_key_env(settings.choice)
+            .and_then(|name| std::env::var(name).ok())
+            .is_some_and(|key| !key.trim().is_empty())
+}
+
+pub(crate) async fn generate_llm_plan_status(
+    finding: &Finding,
+    active_settings: ProviderSettings,
+    secrets: SecretsStore,
+) -> helm_monitor::LlmPlanStatus {
+    use helm_core::ContentBlock;
+    use helm_core::ProviderError;
+
+    let summary_fields = helm_monitor::FindingSummaryFields::from(finding);
+    let prompt = build_narrative_prompt(&summary_fields);
+    let (provider, model) = match build_provider(&active_settings, &secrets) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("401") || msg.contains("403") || msg.contains("auth") {
+                return helm_monitor::LlmPlanStatus::AuthFailed;
+            }
+            return helm_monitor::LlmPlanStatus::MalformedResponse;
+        }
+    };
+
+    let request = ChatRequest {
+        model,
+        system: None,
+        messages: vec![helm_core::Message::user(&prompt)],
+        tools: vec![],
+        max_tokens: 4096,
+        temperature: 0.4,
+    };
+
+    let chat_result = tokio::time::timeout(Duration::from_secs(30), provider.chat(request)).await;
+    let response = match chat_result {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(error)) => match error {
+            ProviderError::Timeout => return helm_monitor::LlmPlanStatus::Timeout,
+            ProviderError::HttpStatus { status, .. } => {
+                if status == 401 || status == 403 {
+                    return helm_monitor::LlmPlanStatus::AuthFailed;
+                }
+                if status == 429 {
+                    return helm_monitor::LlmPlanStatus::RateLimited(30);
+                }
+                return helm_monitor::LlmPlanStatus::MalformedResponse;
+            }
+            _ => return helm_monitor::LlmPlanStatus::MalformedResponse,
+        },
+        Err(_) => return helm_monitor::LlmPlanStatus::Timeout,
+    };
+
+    let text = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        return helm_monitor::LlmPlanStatus::MalformedResponse;
+    }
+
+    let mut fix_plan = match parse_llm_response(&text) {
+        Ok(plan) => plan,
+        Err(error) => {
+            tracing::debug!(
+                "LLM plan parse error for {}: {}",
+                finding.fingerprint,
+                error
+            );
+            return helm_monitor::LlmPlanStatus::MalformedResponse;
+        }
+    };
+    if let Err(error) = helm_monitor::validate_fix_plan_steps(&fix_plan.steps) {
+        tracing::debug!(
+            "LLM plan validation error for {}: {}",
+            finding.fingerprint,
+            error
+        );
+        return helm_monitor::LlmPlanStatus::MalformedResponse;
+    }
+
+    for step in &mut fix_plan.steps {
+        match helm_monitor::CommandValidator::validate_command(&step.command) {
+            Ok(()) => {
+                step.binary_warnings =
+                    helm_monitor::CommandValidator::check_all_binaries(&step.command)
+                        .into_iter()
+                        .map(|warning| warning.warning)
+                        .collect();
+            }
+            Err(patterns) => {
+                return helm_monitor::LlmPlanStatus::DangerousCommand(patterns.join(", "));
+            }
+        }
+    }
+
+    helm_monitor::LlmPlanStatus::Ready(fix_plan)
+}
+
+fn llm_plan_steps_json(plan: &helm_monitor::LlmFixPlan) -> String {
+    serde_json::to_string(&plan.steps).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn verification_steps_for_finding(finding: &Finding) -> Vec<String> {
+    if !finding.read_only_checks.is_empty() {
+        finding.read_only_checks.clone()
+    } else {
+        vec![
+            format!(
+                "Confirm `{}` is no longer active in the incident queue.",
+                finding.title
+            ),
+            format!(
+                "Re-run a targeted health check for `{}`.",
+                finding.affected_resource
+            ),
+        ]
+    }
+}
+
+pub(crate) fn persist_llm_plan_status(
+    conn: &rusqlite::Connection,
+    finding: &Finding,
+    plan_id: &str,
+    status: &helm_monitor::LlmPlanStatus,
+) {
+    let (dashboard_plan_status, generation_error, proposed_fix_steps_json, narrative_summary) =
+        match status {
+            helm_monitor::LlmPlanStatus::Loading => {
+                ("loading", String::new(), "[]".to_owned(), String::new())
+            }
+            helm_monitor::LlmPlanStatus::Ready(plan) => (
+                "ready",
+                String::new(),
+                llm_plan_steps_json(plan),
+                plan.narrative.text.clone(),
+            ),
+            helm_monitor::LlmPlanStatus::Timeout => {
+                ("timeout", String::new(), "[]".to_owned(), String::new())
+            }
+            helm_monitor::LlmPlanStatus::RateLimited(retry_after_secs) => (
+                "rate_limited",
+                format!("retry_after_secs={retry_after_secs}"),
+                "[]".to_owned(),
+                String::new(),
+            ),
+            helm_monitor::LlmPlanStatus::AuthFailed => {
+                ("auth_failed", String::new(), "[]".to_owned(), String::new())
+            }
+            helm_monitor::LlmPlanStatus::MalformedResponse => (
+                "malformed_response",
+                String::new(),
+                "[]".to_owned(),
+                String::new(),
+            ),
+            helm_monitor::LlmPlanStatus::DangerousCommand(pattern) => (
+                "dangerous_command",
+                pattern.clone(),
+                "[]".to_owned(),
+                String::new(),
+            ),
+        };
+
+    let verification_steps_json = serde_json::to_string(&verification_steps_for_finding(finding))
+        .unwrap_or_else(|_| "[]".to_owned());
+    let reproduction_steps_json =
+        serde_json::to_string(&finding.read_only_checks).unwrap_or_else(|_| "[]".to_owned());
+
+    if let Err(error) = TroubleshootingPlanStore::update_dashboard_plan(
+        conn,
+        plan_id,
+        &finding.id,
+        &finding.fingerprint,
+        &reproduction_steps_json,
+        &proposed_fix_steps_json,
+        &narrative_summary,
+        dashboard_plan_status,
+        &generation_error,
+        &verification_steps_json,
+        &reproduction_steps_json,
+    ) {
+        tracing::warn!(plan_id = %plan_id, error = %error, "failed to persist LLM plan");
+    }
+}
+
+fn has_fresh_persisted_plan(
+    conn: &rusqlite::Connection,
+    finding_fingerprint: &str,
+    ttl_secs: u64,
+) -> bool {
+    TroubleshootingPlanStore::latest_for_fingerprint(conn, finding_fingerprint)
+        .ok()
+        .flatten()
+        .is_some_and(|record| {
+            record.dashboard_plan_status == "ready"
+                && (Utc::now().timestamp() - record.updated_at) <= ttl_secs as i64
+        })
+}
+
+pub(crate) fn queue_background_plan_generation(
+    runtime: &PlanGenerationRuntime,
+    db_path: &Path,
+    finding: &Finding,
+) -> Result<(), anyhow::Error> {
+    let conn = rusqlite::Connection::open(db_path)
+        .with_context(|| format!("failed to open db at {}", db_path.display()))?;
+    let ttl_secs = runtime.cache.ttl().as_secs().max(1);
+    if has_fresh_persisted_plan(&conn, &finding.fingerprint, ttl_secs) {
+        return Ok(());
+    }
+
+    let plan_id = format!("plan-{}", uuid::Uuid::new_v4());
+    let source = format!("finding:{}", finding.id);
+    let read_only_steps_json =
+        serde_json::to_string(&finding.read_only_checks).unwrap_or_else(|_| "[]".to_owned());
+    let finding_clone = finding.clone();
+    let settings = runtime.provider_settings.clone();
+    let secrets = runtime.secrets.clone();
+    let plan_db_path = db_path.to_path_buf();
+    let plan_id_clone = plan_id.clone();
+    let source_clone = source.clone();
+    let read_only_steps_json_clone = read_only_steps_json.clone();
+    if !runtime
+        .cache
+        .ensure_plan(finding.fingerprint.clone(), move || async move {
+            if let Ok(conn) = rusqlite::Connection::open(&plan_db_path) {
+                let _ = TroubleshootingPlanStore::insert(
+                    &conn,
+                    &plan_id_clone,
+                    &source_clone,
+                    &finding_clone.snapshot_id,
+                    &finding_clone.fingerprint,
+                    "[]",
+                    &read_only_steps_json_clone,
+                    "[]",
+                    false,
+                    "",
+                );
+                persist_llm_plan_status(
+                    &conn,
+                    &finding_clone,
+                    &plan_id_clone,
+                    &helm_monitor::LlmPlanStatus::Loading,
+                );
+            }
+            let status =
+                generate_llm_plan_status(&finding_clone, settings.clone(), secrets.clone()).await;
+            if let Ok(conn) = rusqlite::Connection::open(&plan_db_path) {
+                persist_llm_plan_status(&conn, &finding_clone, &plan_id_clone, &status);
+            }
+            status
+        })
+    {
+        return Ok(());
+    }
+    Ok(())
+}
+
 fn format_report(report: &MonitorReport, format: &str) -> String {
     match format {
         "json" => report.render_json(),
@@ -5034,6 +5375,7 @@ async fn run_troubleshoot_command(args: TroubleshootArgs) -> Result<()> {
                 &plan.id,
                 &source,
                 &plan.snapshot_id,
+                "",
                 &helm_core::redact_secrets(&hypotheses_json),
                 &helm_core::redact_secrets(&read_only_steps_json),
                 &helm_core::redact_secrets(&proposed_fix_steps_json),

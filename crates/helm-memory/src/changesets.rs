@@ -314,6 +314,7 @@ pub struct TroubleshootingPlanRecord {
     pub source: String,
     pub snapshot_id: String,
     pub finding_id: String,
+    pub finding_fingerprint: String,
     pub hypotheses_json: String,
     pub read_only_steps_json: String,
     pub proposed_fix_steps_json: String,
@@ -338,6 +339,7 @@ impl TroubleshootingPlanStore {
         id: &str,
         source: &str,
         snapshot_id: &str,
+        finding_fingerprint: &str,
         hypotheses_json: &str,
         read_only_steps_json: &str,
         proposed_fix_steps_json: &str,
@@ -356,17 +358,18 @@ impl TroubleshootingPlanStore {
         };
         conn.execute(
             "INSERT INTO troubleshooting_plans (
-                id, source, snapshot_id, finding_id, hypotheses_json, read_only_steps_json,
+                id, source, snapshot_id, finding_id, finding_fingerprint, hypotheses_json, read_only_steps_json,
                 proposed_fix_steps_json, approval_required, created_at, updated_at,
                 verdict_summary, narrative_summary, dashboard_plan_status, generation_error,
                 verification_steps_json, reproduction_steps_json
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, '', '[]', '[]')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, '', '[]', '[]')",
             params![
                 id,
                 source,
                 snapshot_id,
                 finding_id,
+                finding_fingerprint,
                 hypotheses_json,
                 read_only_steps_json,
                 proposed_fix_steps_json,
@@ -387,6 +390,7 @@ impl TroubleshootingPlanStore {
         conn: &Connection,
         id: &str,
         finding_id: &str,
+        finding_fingerprint: &str,
         read_only_steps_json: &str,
         proposed_fix_steps_json: &str,
         narrative_summary: &str,
@@ -399,19 +403,21 @@ impl TroubleshootingPlanStore {
         conn.execute(
             "UPDATE troubleshooting_plans
              SET finding_id = ?2,
-                 read_only_steps_json = ?3,
-                 proposed_fix_steps_json = ?4,
-                 verdict_summary = ?5,
-                 narrative_summary = ?5,
-                 dashboard_plan_status = ?6,
-                 generation_error = ?7,
-                 verification_steps_json = ?8,
-                 reproduction_steps_json = ?9,
-                 updated_at = ?10
+                 finding_fingerprint = ?3,
+                 read_only_steps_json = ?4,
+                 proposed_fix_steps_json = ?5,
+                 verdict_summary = ?6,
+                 narrative_summary = ?6,
+                 dashboard_plan_status = ?7,
+                 generation_error = ?8,
+                 verification_steps_json = ?9,
+                 reproduction_steps_json = ?10,
+                 updated_at = ?11
              WHERE id = ?1",
             params![
                 id,
                 finding_id,
+                finding_fingerprint,
                 read_only_steps_json,
                 proposed_fix_steps_json,
                 narrative_summary,
@@ -432,7 +438,8 @@ impl TroubleshootingPlanStore {
     ) -> Result<Option<TroubleshootingPlanRecord>, MemoryError> {
         let result = conn
             .query_row(
-                "SELECT id, source, snapshot_id, finding_id, hypotheses_json, read_only_steps_json,
+                "SELECT id, source, snapshot_id, finding_id, finding_fingerprint,
+                        hypotheses_json, read_only_steps_json,
                         proposed_fix_steps_json, approval_required, created_at, updated_at,
                         verdict_summary, narrative_summary, dashboard_plan_status,
                         generation_error, verification_steps_json, reproduction_steps_json
@@ -445,18 +452,19 @@ impl TroubleshootingPlanStore {
                         source: row.get(1)?,
                         snapshot_id: row.get(2)?,
                         finding_id: row.get(3)?,
-                        hypotheses_json: row.get(4)?,
-                        read_only_steps_json: row.get(5)?,
-                        proposed_fix_steps_json: row.get(6)?,
-                        approval_required: row.get::<_, i64>(7)? != 0,
-                        created_at: row.get(8)?,
-                        updated_at: row.get(9)?,
-                        verdict_summary: row.get(10)?,
-                        narrative_summary: row.get(11)?,
-                        dashboard_plan_status: row.get(12)?,
-                        generation_error: row.get(13)?,
-                        verification_steps_json: row.get(14)?,
-                        reproduction_steps_json: row.get(15)?,
+                        finding_fingerprint: row.get(4)?,
+                        hypotheses_json: row.get(5)?,
+                        read_only_steps_json: row.get(6)?,
+                        proposed_fix_steps_json: row.get(7)?,
+                        approval_required: row.get::<_, i64>(8)? != 0,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                        verdict_summary: row.get(11)?,
+                        narrative_summary: row.get(12)?,
+                        dashboard_plan_status: row.get(13)?,
+                        generation_error: row.get(14)?,
+                        verification_steps_json: row.get(15)?,
+                        reproduction_steps_json: row.get(16)?,
                     })
                 },
             )
@@ -471,7 +479,8 @@ impl TroubleshootingPlanStore {
     ) -> Result<Option<TroubleshootingPlanRecord>, MemoryError> {
         let result = conn
             .query_row(
-                "SELECT id, source, snapshot_id, finding_id, hypotheses_json, read_only_steps_json,
+                "SELECT id, source, snapshot_id, finding_id, finding_fingerprint,
+                        hypotheses_json, read_only_steps_json,
                         proposed_fix_steps_json, approval_required, created_at, updated_at,
                         verdict_summary, narrative_summary, dashboard_plan_status,
                         generation_error, verification_steps_json, reproduction_steps_json
@@ -486,18 +495,62 @@ impl TroubleshootingPlanStore {
                         source: row.get(1)?,
                         snapshot_id: row.get(2)?,
                         finding_id: row.get(3)?,
-                        hypotheses_json: row.get(4)?,
-                        read_only_steps_json: row.get(5)?,
-                        proposed_fix_steps_json: row.get(6)?,
-                        approval_required: row.get::<_, i64>(7)? != 0,
-                        created_at: row.get(8)?,
-                        updated_at: row.get(9)?,
-                        verdict_summary: row.get(10)?,
-                        narrative_summary: row.get(11)?,
-                        dashboard_plan_status: row.get(12)?,
-                        generation_error: row.get(13)?,
-                        verification_steps_json: row.get(14)?,
-                        reproduction_steps_json: row.get(15)?,
+                        finding_fingerprint: row.get(4)?,
+                        hypotheses_json: row.get(5)?,
+                        read_only_steps_json: row.get(6)?,
+                        proposed_fix_steps_json: row.get(7)?,
+                        approval_required: row.get::<_, i64>(8)? != 0,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                        verdict_summary: row.get(11)?,
+                        narrative_summary: row.get(12)?,
+                        dashboard_plan_status: row.get(13)?,
+                        generation_error: row.get(14)?,
+                        verification_steps_json: row.get(15)?,
+                        reproduction_steps_json: row.get(16)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MemoryError::Other(e.to_string()))?;
+        Ok(result)
+    }
+
+    pub fn latest_for_fingerprint(
+        conn: &Connection,
+        finding_fingerprint: &str,
+    ) -> Result<Option<TroubleshootingPlanRecord>, MemoryError> {
+        let result = conn
+            .query_row(
+                "SELECT id, source, snapshot_id, finding_id, finding_fingerprint,
+                        hypotheses_json, read_only_steps_json, proposed_fix_steps_json,
+                        approval_required, created_at, updated_at, verdict_summary,
+                        narrative_summary, dashboard_plan_status, generation_error,
+                        verification_steps_json, reproduction_steps_json
+                 FROM troubleshooting_plans
+                 WHERE finding_fingerprint = ?1
+                 ORDER BY updated_at DESC, created_at DESC
+                 LIMIT 1",
+                params![finding_fingerprint],
+                |row| {
+                    Ok(TroubleshootingPlanRecord {
+                        id: row.get(0)?,
+                        source: row.get(1)?,
+                        snapshot_id: row.get(2)?,
+                        finding_id: row.get(3)?,
+                        finding_fingerprint: row.get(4)?,
+                        hypotheses_json: row.get(5)?,
+                        read_only_steps_json: row.get(6)?,
+                        proposed_fix_steps_json: row.get(7)?,
+                        approval_required: row.get::<_, i64>(8)? != 0,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                        verdict_summary: row.get(11)?,
+                        narrative_summary: row.get(12)?,
+                        dashboard_plan_status: row.get(13)?,
+                        generation_error: row.get(14)?,
+                        verification_steps_json: row.get(15)?,
+                        reproduction_steps_json: row.get(16)?,
                     })
                 },
             )
@@ -512,7 +565,8 @@ impl TroubleshootingPlanStore {
     ) -> Result<Vec<TroubleshootingPlanRecord>, MemoryError> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, source, snapshot_id, finding_id, hypotheses_json, read_only_steps_json,
+                "SELECT id, source, snapshot_id, finding_id, finding_fingerprint,
+                        hypotheses_json, read_only_steps_json,
                         proposed_fix_steps_json, approval_required, created_at, updated_at,
                         verdict_summary, narrative_summary, dashboard_plan_status,
                         generation_error, verification_steps_json, reproduction_steps_json
@@ -528,18 +582,19 @@ impl TroubleshootingPlanStore {
                     source: row.get(1)?,
                     snapshot_id: row.get(2)?,
                     finding_id: row.get(3)?,
-                    hypotheses_json: row.get(4)?,
-                    read_only_steps_json: row.get(5)?,
-                    proposed_fix_steps_json: row.get(6)?,
-                    approval_required: row.get::<_, i64>(7)? != 0,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                    verdict_summary: row.get(10)?,
-                    narrative_summary: row.get(11)?,
-                    dashboard_plan_status: row.get(12)?,
-                    generation_error: row.get(13)?,
-                    verification_steps_json: row.get(14)?,
-                    reproduction_steps_json: row.get(15)?,
+                    finding_fingerprint: row.get(4)?,
+                    hypotheses_json: row.get(5)?,
+                    read_only_steps_json: row.get(6)?,
+                    proposed_fix_steps_json: row.get(7)?,
+                    approval_required: row.get::<_, i64>(8)? != 0,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    verdict_summary: row.get(11)?,
+                    narrative_summary: row.get(12)?,
+                    dashboard_plan_status: row.get(13)?,
+                    generation_error: row.get(14)?,
+                    verification_steps_json: row.get(15)?,
+                    reproduction_steps_json: row.get(16)?,
                 })
             })
             .map_err(|e| MemoryError::Other(e.to_string()))?;
@@ -560,6 +615,8 @@ mod tests {
         conn.execute_batch(include_str!("../migrations/0008_changesets.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../migrations/0010_dashboard_plans.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/0012_plan_fingerprint.sql"))
             .unwrap();
         conn
     }
@@ -702,6 +759,7 @@ mod tests {
             "plan-meta",
             "finding: finding-1",
             "snap-1",
+            "fingerprint-1",
             "[]",
             "[]",
             "[]",
@@ -714,6 +772,7 @@ mod tests {
             &conn,
             "plan-meta",
             "finding-1",
+            "fingerprint-1",
             r#"["journalctl -u nginx -n 50"]"#,
             r#"[{"title":"restart service","command":{"tool":"shell","command_text":"systemctl restart nginx","expected_effect":"restart nginx","risk":"medium"}}]"#,
             "Nginx failed after a bad config reload.",
@@ -737,5 +796,6 @@ mod tests {
             record.verification_steps_json,
             r#"["systemctl is-active nginx"]"#
         );
+        assert_eq!(record.finding_fingerprint, "fingerprint-1");
     }
 }

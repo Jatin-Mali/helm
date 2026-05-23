@@ -21,7 +21,7 @@ use axum::{
 };
 use helm_memory::{FindingStateStore, SnapshotStore};
 use helm_monitor::{
-    Finding, HostIdentity, MetricHistory, MonitorProfile, Severity, SnapshotDomains,
+    Finding, HostIdentity, MetricHistory, MonitorProfile, PlanCache, Severity, SnapshotDomains,
     SystemSnapshot,
     collectors::{
         Collector, db_health::DbHealthCollector, db_health::DbInstance,
@@ -31,9 +31,14 @@ use helm_monitor::{
 use serde::Serialize;
 use tokio::sync::broadcast;
 
+use crate::{ProviderSettings, llm_provider_usable, secrets::SecretsStore};
+
 struct WebState {
     db_path: PathBuf,
     snapshot_tx: broadcast::Sender<String>,
+    plan_cache: PlanCache,
+    provider_settings: ProviderSettings,
+    secrets: SecretsStore,
 }
 
 #[derive(Serialize, Clone)]
@@ -173,11 +178,19 @@ struct PlanRequest {
     finding_id: String,
 }
 
-pub async fn serve(db_path: PathBuf, port: u16) -> Result<()> {
+pub async fn serve(
+    db_path: PathBuf,
+    port: u16,
+    provider_settings: ProviderSettings,
+    secrets: SecretsStore,
+) -> Result<()> {
     let (tx, _) = broadcast::channel::<String>(32);
     let state = Arc::new(WebState {
         db_path: db_path.clone(),
         snapshot_tx: tx.clone(),
+        plan_cache: PlanCache::default(),
+        provider_settings,
+        secrets,
     });
     let web_refresh_secs = helm_monitor::load_thresholds_config()
         .refresh_interval_secs
@@ -271,21 +284,98 @@ async fn api_generate_plan(
     };
 
     match crate::find_finding_by_id(&conn, &req.finding_id) {
-        Some(finding) => Json(serde_json::json!({
-            "finding_id": req.finding_id,
-            "title": finding.title,
-            "severity": finding.severity.as_str(),
-            "impact": finding.impact,
-            "evidence": finding.evidence.first().map(|e| &e.value),
-            "read_only_checks": finding.read_only_checks,
-            "fix_plan": finding.fix_plan,
-            "plan_note": "AI-backed plans remain available through `helmops troubleshoot <issue>` when you want a reviewed remediation path."
-        })),
+        Some(finding) => {
+            if let Ok(Some(record)) = helm_memory::TroubleshootingPlanStore::latest_for_fingerprint(
+                &conn,
+                &finding.fingerprint,
+            ) {
+                return Json(serde_json::json!({
+                    "finding_id": req.finding_id,
+                    "title": finding.title,
+                    "severity": finding.severity.as_str(),
+                    "impact": finding.impact,
+                    "evidence": finding.evidence.first().map(|e| &e.value),
+                    "read_only_checks": finding.read_only_checks,
+                    "fix_plan": web_plan_summary(&record),
+                    "plan_status": record.dashboard_plan_status,
+                }));
+            }
+
+            if llm_provider_usable(&state.provider_settings) {
+                let runtime = crate::PlanGenerationRuntime {
+                    provider_settings: state.provider_settings.clone(),
+                    secrets: state.secrets.clone(),
+                    cache: state.plan_cache.clone(),
+                };
+                if let Err(error) =
+                    crate::queue_background_plan_generation(&runtime, &state.db_path, &finding)
+                {
+                    return Json(
+                        serde_json::json!({"error": format!("Plan queue failed: {error}")}),
+                    );
+                }
+                Json(serde_json::json!({
+                    "finding_id": req.finding_id,
+                    "title": finding.title,
+                    "severity": finding.severity.as_str(),
+                    "impact": finding.impact,
+                    "evidence": finding.evidence.first().map(|e| &e.value),
+                    "read_only_checks": finding.read_only_checks,
+                    "fix_plan": "Generating plan... retry in a few seconds.",
+                    "plan_status": "loading",
+                }))
+            } else {
+                Json(serde_json::json!({
+                    "finding_id": req.finding_id,
+                    "title": finding.title,
+                    "severity": finding.severity.as_str(),
+                    "impact": finding.impact,
+                    "evidence": finding.evidence.first().map(|e| &e.value),
+                    "read_only_checks": finding.read_only_checks,
+                    "fix_plan": finding.fix_plan,
+                    "plan_status": "disabled",
+                    "plan_note": "No LLM provider is configured for cached remediation plans yet."
+                }))
+            }
+        }
         None => Json(serde_json::json!({
             "error": "Finding not found. Run a collection first.",
             "plan": null
         })),
     }
+}
+
+fn web_plan_summary(record: &helm_memory::TroubleshootingPlanRecord) -> String {
+    let mut lines = Vec::new();
+    if !record.narrative_summary.trim().is_empty() {
+        lines.push(record.narrative_summary.clone());
+    }
+    let steps: Vec<serde_json::Value> =
+        serde_json::from_str(&record.proposed_fix_steps_json).unwrap_or_default();
+    for (index, step) in steps.iter().enumerate() {
+        let command = step
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                step.get("command")
+                    .and_then(|command| command.get("command_text"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or_default();
+        let effect = step
+            .get("expected_effect")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                step.get("command")
+                    .and_then(|command| command.get("expected_effect"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or_default();
+        if !command.is_empty() {
+            lines.push(format!("{}. {} — {}", index + 1, command, effect));
+        }
+    }
+    lines.join("\n")
 }
 
 async fn collect_live_snapshot(db_path: &std::path::Path) -> String {

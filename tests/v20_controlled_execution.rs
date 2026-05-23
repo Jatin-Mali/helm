@@ -58,6 +58,10 @@ fn plan_store_roundtrip() {
         "../crates/helm-memory/migrations/0010_dashboard_plans.sql"
     ))
     .unwrap();
+    conn.execute_batch(include_str!(
+        "../crates/helm-memory/migrations/0012_plan_fingerprint.sql"
+    ))
+    .unwrap();
 
     let steps_json = r#"[{"title":"check disk","command":{"tool":"shell","input":{"command":"df -h"},"command_text":"df -h","expected_effect":"check disk","risk":"none","blast_radius":"Unknown","rollback":"NotNeeded","verification":[]},"hypothesis_id":null,"expected_output":null,"interpretation_guide":null}]"#;
     TroubleshootingPlanStore::insert(
@@ -65,6 +69,7 @@ fn plan_store_roundtrip() {
         "plan-1",
         "user: test",
         "snap-1",
+        "",
         "[]",
         "[]",
         steps_json,
@@ -148,6 +153,10 @@ fn change_set_persistence_roundtrip() {
     .unwrap();
     conn.execute_batch(include_str!(
         "../crates/helm-memory/migrations/0010_dashboard_plans.sql"
+    ))
+    .unwrap();
+    conn.execute_batch(include_str!(
+        "../crates/helm-memory/migrations/0012_plan_fingerprint.sql"
     ))
     .unwrap();
 

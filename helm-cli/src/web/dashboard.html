@@ -1419,7 +1419,13 @@ document.getElementById('btn-plan').addEventListener('click', async () => {
   }
   state.activeTab = 'incidents';
   renderActiveTab();
-  toast('Plan metadata loaded');
+  if (data.plan_status === 'loading') {
+    toast('Plan generation started');
+  } else if (data.plan_status === 'ready') {
+    toast('Cached plan loaded');
+  } else {
+    toast('Plan metadata loaded');
+  }
 });
 
 document.addEventListener('keydown', (event) => {

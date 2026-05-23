@@ -10,6 +10,7 @@ pub mod engine;
 pub mod execute;
 pub mod findings;
 pub mod metric_history;
+pub mod plan_cache;
 pub mod reporter;
 pub mod ring_buffer;
 pub mod snapshot;
@@ -36,6 +37,7 @@ pub use findings::{
     Confidence, EvidenceRef, Finding, FindingId, FindingLifecycle, MonitorDomain, PlanId, Severity,
 };
 pub use metric_history::MetricHistory;
+pub use plan_cache::{DEFAULT_PLAN_CACHE_TTL_SECS, PlanCache};
 pub use reporter::{MonitorReport, MonitorReporter};
 pub use ring_buffer::RingBuffer;
 pub use snapshot::{
@@ -53,7 +55,7 @@ pub use thresholds::{
 pub use troubleshoot::{
     BlastRadius, CommandPreview, CommandValidator, FindingSummaryFields, Hypothesis, LlmFixPlan,
     LlmFixStep, LlmNarrative, LlmPlanStatus, MissingBinaryWarning, ParseError, PlanSource,
-    PlanStep, RiskLevel, RollbackStatus, TroubleshootingPlan, build_narrative_prompt,
-    explain_finding, parse_llm_response, plan_from_finding, plan_from_problem,
-    plan_from_problem_with_snapshot,
+    PlanStep, PlanValidationError, RiskLevel, RollbackStatus, TroubleshootingPlan,
+    build_narrative_prompt, explain_finding, parse_llm_response, plan_from_finding,
+    plan_from_problem, plan_from_problem_with_snapshot, validate_fix_plan_steps,
 };
