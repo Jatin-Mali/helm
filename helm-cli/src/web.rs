@@ -33,6 +33,8 @@ use tokio::sync::broadcast;
 
 use crate::{ProviderSettings, llm_provider_usable, secrets::SecretsStore};
 
+const DASHBOARD_HTML: &str = include_str!("web/dashboard.html");
+
 struct WebState {
     db_path: PathBuf,
     snapshot_tx: broadcast::Sender<String>,
@@ -232,7 +234,7 @@ pub async fn serve(
 }
 
 async fn serve_dashboard() -> impl IntoResponse {
-    axum::response::Html(include_str!("web/dashboard.html"))
+    axum::response::Html(DASHBOARD_HTML)
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<WebState>>) -> impl IntoResponse {
@@ -266,6 +268,7 @@ async fn api_snapshot(State(state): State<Arc<WebState>>) -> impl IntoResponse {
 async fn api_refresh(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     let daemon_requested = crate::request_daemon_refresh().unwrap_or(false);
     let json = collect_live_snapshot(&state.db_path).await;
+    let _ = state.snapshot_tx.send(json.clone());
     let snapshot = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
     Json(serde_json::json!({
         "ok": true,
@@ -875,4 +878,18 @@ fn timestamp_to_rfc3339(timestamp: i64) -> String {
     chrono::DateTime::from_timestamp(timestamp, 0)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DASHBOARD_HTML;
+
+    #[test]
+    fn dashboard_html_exposes_mobile_and_live_console_hooks() {
+        assert!(DASHBOARD_HTML.contains("width=device-width, initial-scale=1.0"));
+        assert!(DASHBOARD_HTML.contains("new WebSocket"));
+        assert!(DASHBOARD_HTML.contains("F5"));
+        assert!(DASHBOARD_HTML.contains("Alt+G"));
+        assert!(DASHBOARD_HTML.contains("1-9"));
+    }
 }
