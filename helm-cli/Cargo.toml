@@ -51,3 +51,4 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", 
 
 [dev-dependencies]
 mockito.workspace = true
+proptest.workspace = true

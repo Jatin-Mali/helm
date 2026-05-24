@@ -91,6 +91,10 @@ const OPS_BLUE: Color = Color::Rgb(88, 166, 255);
 const OPS_GREEN: Color = Color::Rgb(63, 185, 80);
 const OPS_YELLOW: Color = Color::Rgb(210, 153, 34);
 const OPS_RED: Color = Color::Rgb(248, 81, 73);
+const DASHBOARD_MIN_WIDTH: u16 = 60;
+const DASHBOARD_MIN_HEIGHT: u16 = 10;
+const DASHBOARD_COLLAPSE_WIDTH: u16 = 120;
+const DASHBOARD_REFRESH_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Theme {
@@ -784,12 +788,10 @@ enum DashboardFocus {
 pub enum OpsTab {
     Alerts,
     Services,
-    Processes,
+    Resources,
     Logs,
-    Network,
-    Disk,
-    Changes,
     Fleet,
+    Changes,
 }
 
 impl OpsTab {
@@ -797,24 +799,44 @@ impl OpsTab {
         &[
             Self::Alerts,
             Self::Services,
-            Self::Processes,
+            Self::Resources,
             Self::Logs,
-            Self::Network,
-            Self::Disk,
-            Self::Changes,
             Self::Fleet,
+            Self::Changes,
         ]
     }
     fn label(self) -> &'static str {
         match self {
             Self::Alerts => "ALERTS",
             Self::Services => "SERVICES",
-            Self::Processes => "PROCESSES",
+            Self::Resources => "RESOURCES",
             Self::Logs => "LOGS",
-            Self::Network => "NETWORK",
-            Self::Disk => "DISK",
-            Self::Changes => "CHANGES",
             Self::Fleet => "FLEET",
+            Self::Changes => "CHANGES",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ResourceSection {
+    #[default]
+    CpuMemory,
+    Disk,
+    Network,
+    Processes,
+}
+
+impl ResourceSection {
+    fn all() -> &'static [Self] {
+        &[Self::CpuMemory, Self::Disk, Self::Network, Self::Processes]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CpuMemory => "CPU/MEM",
+            Self::Disk => "DISK",
+            Self::Network => "NETWORK",
+            Self::Processes => "PROCESSES",
         }
     }
 }
@@ -1113,10 +1135,12 @@ struct DashboardState {
     view: DashboardView,
     pane: DashboardFocus,
     active_tab: OpsTab,
+    resource_section: ResourceSection,
     selected_fingerprint: Option<String>,
     pinned_incident: Option<PinnedIncidentState>,
     table_scroll: usize,
     detail_scroll: usize,
+    beginner_mode: bool,
     finding_state_filter: DashboardFindingStateFilter,
     active_plan: Option<DashboardPlan>,
     pending_plan_rx: Option<tokio::sync::oneshot::Receiver<PlanStatus>>,
@@ -1133,6 +1157,7 @@ struct DashboardState {
     /// Flag to prevent double-spawning of fleet collection tasks.
     fleet_collection_in_flight: bool,
     pending_fleet_rx: Option<tokio::sync::oneshot::Receiver<Vec<FleetHostStatus>>>,
+    last_refresh_at: Instant,
 }
 
 impl DashboardState {
@@ -1146,10 +1171,12 @@ impl DashboardState {
             view: DashboardView::Overview,
             pane: DashboardFocus::Table,
             active_tab: OpsTab::Alerts,
+            resource_section: ResourceSection::CpuMemory,
             selected_fingerprint: None,
             pinned_incident: None,
             table_scroll: 0,
             detail_scroll: 0,
+            beginner_mode: true,
             finding_state_filter: DashboardFindingStateFilter::default(),
             active_plan: None,
             pending_plan_rx: None,
@@ -1161,6 +1188,7 @@ impl DashboardState {
             needs_plan_generation: false,
             fleet_collection_in_flight: false,
             pending_fleet_rx: None,
+            last_refresh_at: Instant::now(),
         }
     }
 }
@@ -1204,6 +1232,110 @@ fn format_dashboard_when(timestamp: i64) -> String {
         format!("{}d ago", age_secs / 86_400)
     };
     format!("{ts} ({rel})")
+}
+
+fn format_uptime_compact(uptime_seconds: u64) -> String {
+    let days = uptime_seconds / 86_400;
+    let hours = (uptime_seconds % 86_400) / 3_600;
+    let mins = (uptime_seconds % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{mins}m")
+    } else {
+        format!("{mins}m")
+    }
+}
+
+fn is_active_dashboard_finding(state: DashboardFindingState) -> bool {
+    matches!(
+        state,
+        DashboardFindingState::Open | DashboardFindingState::New | DashboardFindingState::Recurring
+    )
+}
+
+fn build_dashboard_summary_line(findings: &[FindingSummary], max_chars: usize) -> String {
+    let critical_count = findings
+        .iter()
+        .filter(|finding| finding.severity.eq_ignore_ascii_case("critical"))
+        .filter(|finding| is_active_dashboard_finding(finding.status))
+        .count();
+    let warning_count = findings
+        .iter()
+        .filter(|finding| finding.severity.eq_ignore_ascii_case("warning"))
+        .filter(|finding| is_active_dashboard_finding(finding.status))
+        .count();
+    let mut parts = Vec::new();
+    for finding in findings
+        .iter()
+        .filter(|finding| is_active_dashboard_finding(finding.status))
+        .take(3)
+    {
+        parts.push(truncate_cell(&finding.title, 28));
+    }
+    let mut summary = if critical_count == 0 && warning_count == 0 {
+        "CRIT 0 healthy: no active incidents".to_owned()
+    } else {
+        let headline = if parts.is_empty() {
+            "active issues present".to_owned()
+        } else {
+            parts.join("; ")
+        };
+        format!("CRIT {critical_count} WARN {warning_count}: {headline}")
+    };
+    if summary.chars().count() > max_chars {
+        summary = truncate_cell(&summary, max_chars);
+    }
+    summary
+}
+
+fn restore_dashboard_selection(
+    findings: &[FindingSummary],
+    filter: DashboardFindingStateFilter,
+    preferred_fingerprint: Option<&str>,
+    fallback_visible_pos: Option<usize>,
+) -> Option<String> {
+    let visible: Vec<&FindingSummary> = findings
+        .iter()
+        .filter(|finding| match filter {
+            DashboardFindingStateFilter::Active => matches!(
+                finding.status,
+                DashboardFindingState::Open
+                    | DashboardFindingState::New
+                    | DashboardFindingState::Recurring
+            ),
+            DashboardFindingStateFilter::All => true,
+            DashboardFindingStateFilter::NewOnly => finding.status == DashboardFindingState::New,
+            DashboardFindingStateFilter::OpenOnly => finding.status == DashboardFindingState::Open,
+            DashboardFindingStateFilter::RecurringOnly => {
+                finding.status == DashboardFindingState::Recurring
+            }
+            DashboardFindingStateFilter::SuppressedOnly => {
+                finding.status == DashboardFindingState::Suppressed
+            }
+            DashboardFindingStateFilter::ResolvedOnly => {
+                finding.status == DashboardFindingState::Resolved
+            }
+        })
+        .collect();
+    if visible.is_empty() {
+        return None;
+    }
+    if let Some(preferred) = preferred_fingerprint {
+        if let Some(found) = visible
+            .iter()
+            .find(|finding| finding.fingerprint == preferred)
+            .map(|finding| finding.fingerprint.clone())
+        {
+            return Some(found);
+        }
+    }
+    let index = fallback_visible_pos
+        .unwrap_or(0)
+        .min(visible.len().saturating_sub(1));
+    visible
+        .get(index)
+        .map(|finding| finding.fingerprint.clone())
 }
 
 fn finding_id_from_source(source: &str) -> Option<&str> {
@@ -2444,7 +2576,16 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.toast("Plan generation: use 'helm troubleshoot <issue>' from the CLI");
+                    self.generate_dashboard_plan().await?;
+                    return Ok(false);
+                }
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.dashboard.beginner_mode = !self.dashboard.beginner_mode;
+                    self.toast(if self.dashboard.beginner_mode {
+                        "Beginner help enabled"
+                    } else {
+                        "Beginner help hidden"
+                    });
                     return Ok(false);
                 }
                 KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
@@ -2549,35 +2690,59 @@ impl TuiApp {
                     return Ok(false);
                 }
                 KeyCode::Char('1') => {
-                    self.dashboard.active_tab = OpsTab::Alerts;
+                    self.set_dashboard_tab(OpsTab::Alerts);
                     return Ok(false);
                 }
                 KeyCode::Char('2') => {
-                    self.dashboard.active_tab = OpsTab::Services;
+                    self.set_dashboard_tab(OpsTab::Services);
                     return Ok(false);
                 }
                 KeyCode::Char('3') => {
-                    self.dashboard.active_tab = OpsTab::Processes;
+                    self.set_dashboard_tab(OpsTab::Resources);
                     return Ok(false);
                 }
                 KeyCode::Char('4') => {
-                    self.dashboard.active_tab = OpsTab::Logs;
+                    self.set_dashboard_tab(OpsTab::Logs);
                     return Ok(false);
                 }
                 KeyCode::Char('5') => {
-                    self.dashboard.active_tab = OpsTab::Network;
+                    self.set_dashboard_tab(OpsTab::Fleet);
                     return Ok(false);
                 }
                 KeyCode::Char('6') => {
-                    self.dashboard.active_tab = OpsTab::Disk;
+                    self.set_dashboard_tab(OpsTab::Changes);
                     return Ok(false);
                 }
-                KeyCode::Char('7') => {
-                    self.dashboard.active_tab = OpsTab::Changes;
+                KeyCode::Char('c')
+                    if self.dashboard.active_tab == OpsTab::Resources
+                        && key.modifiers.is_empty() =>
+                {
+                    self.dashboard.resource_section = ResourceSection::CpuMemory;
+                    self.dashboard.detail_scroll = 0;
                     return Ok(false);
                 }
-                KeyCode::Char('8') => {
-                    self.dashboard.active_tab = OpsTab::Fleet;
+                KeyCode::Char('d')
+                    if self.dashboard.active_tab == OpsTab::Resources
+                        && key.modifiers.is_empty() =>
+                {
+                    self.dashboard.resource_section = ResourceSection::Disk;
+                    self.dashboard.detail_scroll = 0;
+                    return Ok(false);
+                }
+                KeyCode::Char('n')
+                    if self.dashboard.active_tab == OpsTab::Resources
+                        && key.modifiers.is_empty() =>
+                {
+                    self.dashboard.resource_section = ResourceSection::Network;
+                    self.dashboard.detail_scroll = 0;
+                    return Ok(false);
+                }
+                KeyCode::Char('p')
+                    if self.dashboard.active_tab == OpsTab::Resources
+                        && key.modifiers.is_empty() =>
+                {
+                    self.dashboard.resource_section = ResourceSection::Processes;
+                    self.dashboard.detail_scroll = 0;
                     return Ok(false);
                 }
                 _ => {}
@@ -2694,7 +2859,7 @@ impl TuiApp {
                     .position(|t| *t == self.dashboard.active_tab)
                     .unwrap_or(0);
                 let prev = current.saturating_sub(1);
-                self.dashboard.active_tab = tabs[prev];
+                self.set_dashboard_tab(tabs[prev]);
             }
             KeyCode::Right
                 if self.mode == AgentMode::Dashboard
@@ -2708,7 +2873,38 @@ impl TuiApp {
                     .position(|t| *t == self.dashboard.active_tab)
                     .unwrap_or(0);
                 let next = (current + 1).min(tabs.len().saturating_sub(1));
-                self.dashboard.active_tab = tabs[next];
+                self.set_dashboard_tab(tabs[next]);
+            }
+            KeyCode::Left
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.active_tab == OpsTab::Resources
+                    && self.input.text.is_empty()
+                    && matches!(self.dashboard.pane, DashboardFocus::Detail)
+                    && matches!(self.dashboard.view, DashboardView::Overview) =>
+            {
+                let sections = ResourceSection::all();
+                let current = sections
+                    .iter()
+                    .position(|section| *section == self.dashboard.resource_section)
+                    .unwrap_or(0);
+                self.dashboard.resource_section = sections[current.saturating_sub(1)];
+                self.dashboard.detail_scroll = 0;
+            }
+            KeyCode::Right
+                if self.mode == AgentMode::Dashboard
+                    && self.dashboard.active_tab == OpsTab::Resources
+                    && self.input.text.is_empty()
+                    && matches!(self.dashboard.pane, DashboardFocus::Detail)
+                    && matches!(self.dashboard.view, DashboardView::Overview) =>
+            {
+                let sections = ResourceSection::all();
+                let current = sections
+                    .iter()
+                    .position(|section| *section == self.dashboard.resource_section)
+                    .unwrap_or(0);
+                let next = (current + 1).min(sections.len().saturating_sub(1));
+                self.dashboard.resource_section = sections[next];
+                self.dashboard.detail_scroll = 0;
             }
             // ── Dashboard filter cycling (Table or Detail focus) ──
             KeyCode::Left
@@ -2716,7 +2912,8 @@ impl TuiApp {
                     && self.dashboard.view == DashboardView::Overview
                     && self.input.text.is_empty()
                     && (self.dashboard.pane == DashboardFocus::Table
-                        || self.dashboard.pane == DashboardFocus::Detail) =>
+                        || (self.dashboard.pane == DashboardFocus::Detail
+                            && self.dashboard.active_tab != OpsTab::Resources)) =>
             {
                 self.cycle_dashboard_filter(-1);
             }
@@ -2725,7 +2922,8 @@ impl TuiApp {
                     && self.dashboard.view == DashboardView::Overview
                     && self.input.text.is_empty()
                     && (self.dashboard.pane == DashboardFocus::Table
-                        || self.dashboard.pane == DashboardFocus::Detail) =>
+                        || (self.dashboard.pane == DashboardFocus::Detail
+                            && self.dashboard.active_tab != OpsTab::Resources)) =>
             {
                 self.cycle_dashboard_filter(1);
             }
@@ -5248,6 +5446,14 @@ Report the exit status and the concise output."
         self.dashboard.detail_scroll = 0;
     }
 
+    fn set_dashboard_tab(&mut self, tab: OpsTab) {
+        self.dashboard.active_tab = tab;
+        self.dashboard.detail_scroll = 0;
+        if tab != OpsTab::Alerts {
+            self.dashboard.view = DashboardView::Overview;
+        }
+    }
+
     async fn handle_dashboard_enter(&mut self, tx: mpsc::UnboundedSender<UiEvent>) -> Result<()> {
         match self.dashboard.view {
             DashboardView::Overview => match self.dashboard.pane {
@@ -5263,6 +5469,8 @@ Report the exit status and the concise output."
                                 self.toast(format!("Active remote set to {}", host.name));
                             }
                         }
+                    } else if self.dashboard.active_tab != OpsTab::Alerts {
+                        self.toast("Use 1 for alerts, or switch sections with 1-6.");
                     } else if let Some(idx) = self.dashboard_selected_finding_index() {
                         self.dashboard.view = DashboardView::FindingDetail(idx);
                         self.dashboard.detail_scroll = 0;
@@ -5714,6 +5922,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                     .and_then(|idx| self.dashboard.data.findings.get(idx))
                     .map(|f| f.fingerprint.clone())
             });
+        let prev_visible_pos = self.selected_visible_index();
         let prev_plan_id = self
             .dashboard
             .active_plan
@@ -6209,19 +6418,14 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             ),
             ..Default::default()
         };
-        // Restore previous fingerprint if it still exists in the new findings list.
-        if let Some(ref fp) = prev_fingerprint {
-            if self
-                .dashboard
-                .data
-                .findings
-                .iter()
-                .any(|f| &f.fingerprint == fp)
-            {
-                self.dashboard.selected_fingerprint = Some(fp.clone());
-            }
-        }
+        self.dashboard.selected_fingerprint = restore_dashboard_selection(
+            &self.dashboard.data.findings,
+            self.dashboard.finding_state_filter,
+            prev_fingerprint.as_deref(),
+            prev_visible_pos,
+        );
         self.clamp_dashboard_selection();
+        self.dashboard.last_refresh_at = Instant::now();
         if !matches!(self.dashboard.view, DashboardView::Overview) {
             self.persist_pinned_incident_from_current();
         }
@@ -6465,8 +6669,8 @@ fn render_sidebar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
 /// Render the monitoring dashboard with compact system panels.
 fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    if area.width < 40 || area.height < 10 {
-        Paragraph::new("Dashboard needs a larger terminal")
+    if area.width < DASHBOARD_MIN_WIDTH || area.height < DASHBOARD_MIN_HEIGHT {
+        Paragraph::new("Larger terminal required: HELMOPS dashboard needs at least 60x10")
             .style(Style::default().fg(DIM_FG))
             .render(area, buf);
         return;
@@ -6481,13 +6685,6 @@ fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                     .title(" Dashboard ")
                     .border_style(Style::default().fg(HEADER_BORDER)),
             )
-            .render(area, buf);
-        return;
-    }
-
-    if area.width < 60 || area.height < 12 {
-        Paragraph::new("HELMOPS needs a larger terminal")
-            .style(Style::default().fg(OPS_MUTED))
             .render(area, buf);
         return;
     }
@@ -6522,24 +6719,20 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     } else {
         &d.hostname
     };
-    let display_name = hostname.to_ascii_uppercase();
-    let time_str = if d.collected_at.is_empty() {
-        "--:-- UTC"
-    } else {
-        &d.collected_at
-    };
-
-    // Scope: show host or fleet context
-    let scope_label = if let Some(remote) = app.active_remote.as_deref() {
-        format!("host {remote}")
-    } else if app.dashboard.active_tab == OpsTab::Fleet {
-        "fleet".to_owned()
-    } else {
-        display_name.clone()
-    };
-
-    let _ai_label = provider_boundary_label(app);
-    let provider_model_label = provider_model_label(app);
+    let now_str = Utc::now().format("%H:%M:%S UTC").to_string();
+    let kernel_label = format!(
+        "{} {}",
+        d.domains.host.kernel_name,
+        truncate_cell(&d.domains.host.kernel_release, 18)
+    )
+    .trim()
+    .to_owned();
+    let uptime_label = format!(
+        "up {}",
+        format_uptime_compact(d.domains.host.uptime_seconds)
+    );
+    let provider_status = provider_boundary_label(app);
+    let provider_label = provider_model_label(app);
     let daemon_label = crate::read_daemon_state()
         .map(|state| {
             if !crate::daemon_is_running() {
@@ -6583,177 +6776,73 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     } else {
         OPS_MUTED
     };
+    let fleet_status = if d.fleet_hosts.is_empty() {
+        "fleet local".to_owned()
+    } else {
+        let reachable = d.fleet_hosts.iter().filter(|host| host.reachable).count();
+        format!("fleet {reachable}/{} up", d.fleet_hosts.len())
+    };
+    let load_label = format!("load {:.1}/{:.1}/{:.1}", d.load_1m, d.load_5m, d.load_15m);
+    let memory_label = format!("mem {:.0}%", d.memory_used_pct);
+    let cpu_label = format!("cpu {:.0}%", d.cpu_percent);
 
-    // Right-aligned metrics
-    let right_metrics = format!(
-        "load {:.1} {:.1} {:.1}  mem {:.0}%  cpu {:.0}% ",
-        d.load_1m, d.load_5m, d.load_15m, d.memory_used_pct, d.cpu_percent
-    );
-    let right_w = right_metrics.chars().count() as u16;
-
-    let horiz = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
-        .split(area);
-
-    // Left side: HELMOPS | hostname | ai state | daemon | LIVE | time | collectors
-    Paragraph::new(Line::from(vec![
+    let line = Line::from(vec![
         Span::styled(
             " HELMOPS",
             Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" | ", Style::default().fg(OPS_DIM)),
-        Span::styled(scope_label, Style::default().fg(OPS_FG)),
+        Span::styled(hostname.to_ascii_uppercase(), Style::default().fg(OPS_FG)),
         Span::styled(" | ", Style::default().fg(OPS_DIM)),
-        Span::styled(provider_model_label, Style::default().fg(OPS_MUTED)),
+        Span::styled(kernel_label, Style::default().fg(OPS_MUTED)),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled(uptime_label, Style::default().fg(OPS_MUTED)),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled(fleet_status, Style::default().fg(OPS_BLUE)),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled(now_str, Style::default().fg(OPS_MUTED)),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            provider_status,
+            Style::default().fg(if app.is_llm_provider_configured() {
+                OPS_GREEN
+            } else {
+                OPS_YELLOW
+            }),
+        ),
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled(provider_label, Style::default().fg(OPS_MUTED)),
         Span::styled(" | ", Style::default().fg(OPS_DIM)),
         Span::styled(daemon_label, Style::default().fg(OPS_MUTED)),
         Span::styled(" | ", Style::default().fg(OPS_DIM)),
-        Span::styled("\u{25CF}", Style::default().fg(OPS_GREEN)),
-        Span::styled(
-            " LIVE",
-            Style::default().fg(OPS_GREEN).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" | ", Style::default().fg(OPS_DIM)),
-        Span::styled(time_str, Style::default().fg(OPS_MUTED)),
-        Span::styled(" | ", Style::default().fg(OPS_DIM)),
         Span::styled(collector_label, Style::default().fg(collector_color)),
-    ]))
-    .style(Style::default().bg(OPS_SURFACE))
-    .render(horiz[0], buf);
+        Span::styled(" | ", Style::default().fg(OPS_DIM)),
+        Span::styled(load_label, Style::default().fg(load_color)),
+        Span::styled(" ", Style::default()),
+        Span::styled(memory_label, Style::default().fg(mem_color)),
+        Span::styled(" ", Style::default()),
+        Span::styled(cpu_label, Style::default().fg(cpu_color)),
+    ]);
 
-    // Right side: load + mem + cpu metrics
-    Paragraph::new(Line::from(vec![
-        Span::styled("load ", Style::default().fg(OPS_DIM)),
-        Span::styled(format!("{:.1}", d.load_1m), Style::default().fg(load_color)),
-        Span::styled(
-            format!(" {:.1} {:.1}", d.load_5m, d.load_15m),
-            Style::default().fg(OPS_MUTED),
-        ),
-        Span::styled("  mem ", Style::default().fg(OPS_DIM)),
-        Span::styled(
-            format!("{:.0}%", d.memory_used_pct),
-            Style::default().fg(mem_color),
-        ),
-        Span::styled("  cpu ", Style::default().fg(OPS_DIM)),
-        Span::styled(
-            format!("{:.0}%", d.cpu_percent),
-            Style::default().fg(cpu_color),
-        ),
-        Span::raw(" "),
-    ]))
-    .style(Style::default().bg(OPS_SURFACE))
-    .render(horiz[1], buf);
+    Paragraph::new(line)
+        .style(Style::default().bg(OPS_SURFACE))
+        .render(area, buf);
 }
 
 fn render_ops_status_strip(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let d = &app.dashboard.data;
-    let m = &d.metrics;
-    let badge = |label: &str, value: usize, fg: Color, bg: Color| {
-        Span::styled(
-            format!(" {label} {value} "),
-            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
-        )
-    };
-    let meter = |mount: &str, pct: u8| {
-        let filled = ((pct as usize * 10) / 100).min(10);
-        let empty = 10usize.saturating_sub(filled);
-        let color = if pct >= 90 {
-            OPS_RED
-        } else if pct >= 75 {
-            OPS_YELLOW
-        } else {
-            OPS_GREEN
-        };
-        let bar_bg = Color::Rgb(0x21, 0x26, 0x2d);
-        let filled_bg = if color == OPS_RED {
-            Color::Rgb(0xf8, 0x51, 0x49)
-        } else if color == OPS_YELLOW {
-            Color::Rgb(0xd2, 0x99, 0x22)
-        } else {
-            Color::Rgb(0x3f, 0xb9, 0x50)
-        };
-        vec![
-            Span::styled(format!("{mount}: "), Style::default().fg(OPS_MUTED)),
-            Span::styled(
-                format!("{pct}%"),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" ", Style::default()),
-            Span::styled(" ".repeat(filled), Style::default().bg(filled_bg)),
-            Span::styled(" ".repeat(empty), Style::default().bg(bar_bg)),
-        ]
-    };
-
-    let left = Line::from(vec![
-        badge("CRIT", m.critical, OPS_RED, Color::Rgb(0x3d, 0x1a, 0x1a)),
-        Span::raw(" "),
-        badge("WARN", m.warning, OPS_YELLOW, Color::Rgb(0x2d, 0x20, 0x08)),
-        Span::raw(" "),
-        badge(
-            "INFO",
-            d.finding_count.saturating_sub(m.critical + m.warning),
-            OPS_BLUE,
-            Color::Rgb(0x0d, 0x21, 0x37),
-        ),
-        Span::raw(" "),
-        badge("MUTED", m.suppressed, OPS_DIM, Color::Rgb(0x1d, 0x22, 0x2a)),
-    ]);
-    let mut right_spans = Vec::new();
-    let service_color = if d.failed_services > 0 {
-        OPS_RED
-    } else {
-        OPS_GREEN
-    };
-    let container_color = if d.total_containers > 0 && d.running_containers < d.total_containers {
-        OPS_YELLOW
-    } else {
-        OPS_GREEN
-    };
-    right_spans.push(Span::styled("svc ", Style::default().fg(OPS_DIM)));
-    right_spans.push(Span::styled(
-        format!("{} fail", d.failed_services),
-        Style::default()
-            .fg(service_color)
-            .add_modifier(Modifier::BOLD),
-    ));
-    right_spans.push(Span::styled("  ctr ", Style::default().fg(OPS_DIM)));
-    right_spans.push(Span::styled(
-        format!("{}/{}", d.running_containers, d.total_containers),
-        Style::default()
-            .fg(container_color)
-            .add_modifier(Modifier::BOLD),
-    ));
-    for (mount, pct) in d.disk_bars.iter().take(2) {
-        right_spans.push(Span::styled("  ", Style::default()));
-        right_spans.extend(meter(mount, *pct));
-    }
-    let right = Line::from(right_spans);
-    let right_w = right.width() as u16;
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(right_w)])
-        .split(area);
-
-    Paragraph::new(left)
-        .style(Style::default().bg(OPS_BG))
-        .render(chunks[0], buf);
-    Paragraph::new(right)
-        .style(Style::default().bg(OPS_BG))
-        .render(chunks[1], buf);
+    let summary = build_dashboard_summary_line(&app.dashboard.data.findings, 120);
+    Paragraph::new(Line::from(vec![
+        Span::styled(" summary ", Style::default().fg(OPS_DIM)),
+        Span::styled(summary, Style::default().fg(OPS_FG)),
+    ]))
+    .style(Style::default().bg(OPS_BG))
+    .render(area, buf);
 }
 
 fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let mut spans = Vec::new();
     let tabs = OpsTab::all();
     for (i, tab) in tabs.iter().enumerate() {
-        // Add separator before first evidence tab (SERVICES)
-        if *tab == OpsTab::Services {
-            spans.push(Span::styled(
-                " │ ",
-                Style::default().fg(OPS_DIM).bg(OPS_SURFACE),
-            ));
-        }
         let active = *tab == app.dashboard.active_tab;
         let fg = if active { OPS_FG } else { OPS_DIM };
         let bg = if active { OPS_BG } else { OPS_SURFACE };
@@ -6765,7 +6854,7 @@ fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 Modifier::empty()
             }),
         ));
-        if i < tabs.len() - 1 && tabs[i + 1] != OpsTab::Services {
+        if i < tabs.len() - 1 {
             spans.push(Span::styled(" ", Style::default().bg(OPS_SURFACE)));
         }
     }
@@ -6788,43 +6877,58 @@ fn render_ops_tabbar(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 }
                 break;
             }
-            // Account for separator spacing before SERVICES
-            x = if tab == &OpsTab::Alerts
-                && *tabs.get(pos + 1).unwrap_or(&OpsTab::Fleet) == OpsTab::Services
-            {
-                x.saturating_add(width + 1 + 3) // " │ " is 3 chars
-            } else {
-                x.saturating_add(width + 1)
-            };
+            x = x.saturating_add(width + 1);
         }
     }
 }
 
 fn render_ops_body(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let horiz = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
-        .split(area);
-    render_ops_queue(app, horiz[0], buf);
-    match (app.dashboard.active_tab, app.dashboard.view) {
-        (OpsTab::Alerts, DashboardView::EvidenceView(_)) => render_ops_evidence(app, horiz[1], buf),
-        (OpsTab::Alerts, DashboardView::TroubleshootPlan(_)) => {
-            render_ops_troubleshoot_plan(app, horiz[1], buf)
+    if area.width < DASHBOARD_COLLAPSE_WIDTH {
+        match (app.dashboard.active_tab, app.dashboard.view) {
+            (OpsTab::Alerts, DashboardView::Overview) => render_ops_queue(app, area, buf),
+            (OpsTab::Alerts, DashboardView::EvidenceView(_)) => render_ops_evidence(app, area, buf),
+            (OpsTab::Alerts, DashboardView::TroubleshootPlan(_)) => {
+                render_ops_troubleshoot_plan(app, area, buf)
+            }
+            (OpsTab::Alerts, _) => render_ops_alerts(app, area, buf),
+            (OpsTab::Services, _) => render_ops_services(app, area, buf),
+            (OpsTab::Resources, _) => render_ops_resources(app, area, buf),
+            (OpsTab::Logs, _) => render_ops_logs(app, area, buf),
+            (OpsTab::Fleet, _) => render_fleet_tab(
+                app,
+                area,
+                buf,
+                &app.dashboard.data.fleet_hosts,
+                app.dashboard.fleet_selected_row,
+            ),
+            (OpsTab::Changes, _) => render_ops_changes(app, area, buf),
         }
-        (OpsTab::Alerts, _) => render_ops_alerts(app, horiz[1], buf),
-        (OpsTab::Services, _) => render_ops_services(app, horiz[1], buf),
-        (OpsTab::Processes, _) => render_ops_processes(app, horiz[1], buf),
-        (OpsTab::Logs, _) => render_ops_logs(app, horiz[1], buf),
-        (OpsTab::Network, _) => render_ops_network(app, horiz[1], buf),
-        (OpsTab::Disk, _) => render_ops_storage(app, horiz[1], buf),
-        (OpsTab::Changes, _) => render_ops_changes(app, horiz[1], buf),
-        (OpsTab::Fleet, _) => render_fleet_tab(
-            app,
-            horiz[1],
-            buf,
-            &app.dashboard.data.fleet_hosts,
-            app.dashboard.fleet_selected_row,
-        ),
+    } else {
+        let horiz = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+            .split(area);
+        render_ops_queue(app, horiz[0], buf);
+        match (app.dashboard.active_tab, app.dashboard.view) {
+            (OpsTab::Alerts, DashboardView::EvidenceView(_)) => {
+                render_ops_evidence(app, horiz[1], buf)
+            }
+            (OpsTab::Alerts, DashboardView::TroubleshootPlan(_)) => {
+                render_ops_troubleshoot_plan(app, horiz[1], buf)
+            }
+            (OpsTab::Alerts, _) => render_ops_alerts(app, horiz[1], buf),
+            (OpsTab::Services, _) => render_ops_services(app, horiz[1], buf),
+            (OpsTab::Resources, _) => render_ops_resources(app, horiz[1], buf),
+            (OpsTab::Logs, _) => render_ops_logs(app, horiz[1], buf),
+            (OpsTab::Fleet, _) => render_fleet_tab(
+                app,
+                horiz[1],
+                buf,
+                &app.dashboard.data.fleet_hosts,
+                app.dashboard.fleet_selected_row,
+            ),
+            (OpsTab::Changes, _) => render_ops_changes(app, horiz[1], buf),
+        }
     }
 }
 
@@ -6879,21 +6983,7 @@ fn render_ops_queue(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .render(hdr[1], buf);
     }
 
-    if app.dashboard.active_tab != OpsTab::Alerts {
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                " Evidence view active",
-                Style::default().fg(OPS_DIM),
-            )),
-            Line::from(Span::styled(
-                " Press 1 or Left to return to INCIDENTS",
-                Style::default().fg(OPS_DIM),
-            )),
-        ])
-        .style(Style::default().bg(OPS_BG))
-        .render(vert[1], buf);
-    } else if visible.is_empty() {
+    if visible.is_empty() {
         Paragraph::new(Line::from(Span::styled(
             " No active incidents",
             Style::default().fg(OPS_MUTED),
@@ -7600,6 +7690,157 @@ fn render_ops_troubleshoot_plan(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .scroll((app.dashboard.detail_scroll as u16, 0))
         .wrap(Wrap { trim: false })
         .render(inner, buf);
+}
+
+fn render_ops_resources(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .title(" RESOURCES ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(4)])
+        .split(inner);
+
+    let mut spans = Vec::new();
+    for (index, section) in ResourceSection::all().iter().enumerate() {
+        let hotkey = match section {
+            ResourceSection::CpuMemory => "C",
+            ResourceSection::Disk => "D",
+            ResourceSection::Network => "N",
+            ResourceSection::Processes => "P",
+        };
+        let active = *section == app.dashboard.resource_section;
+        spans.push(Span::styled(
+            format!(" {hotkey}:{} ", section.label()),
+            Style::default()
+                .fg(if active { OPS_FG } else { OPS_DIM })
+                .bg(if active { OPS_SURFACE } else { OPS_BG })
+                .add_modifier(if active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ));
+        if index + 1 < ResourceSection::all().len() {
+            spans.push(Span::styled(" ", Style::default().bg(OPS_BG)));
+        }
+    }
+    Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(OPS_BG))
+        .render(layout[0], buf);
+
+    match app.dashboard.resource_section {
+        ResourceSection::CpuMemory => render_ops_cpu_memory(app, layout[1], buf),
+        ResourceSection::Disk => render_ops_storage(app, layout[1], buf),
+        ResourceSection::Network => render_ops_network(app, layout[1], buf),
+        ResourceSection::Processes => render_ops_processes(app, layout[1], buf),
+    }
+}
+
+fn render_ops_cpu_memory(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let domains = &app.dashboard.data.domains;
+    let load = &domains.load;
+    let mem = &load.memory;
+    let mem_total = fmt_bytes(mem.total);
+    let mem_used = fmt_bytes(mem.used);
+    let mem_available = fmt_bytes(mem.available.unwrap_or(0));
+    let swap_total = fmt_bytes(load.swap_total);
+    let swap_used = fmt_bytes(load.swap_used);
+    let cpu_series = app.dashboard.data.metric_history.cpu_values();
+    let mem_series = app.dashboard.data.metric_history.memory_values();
+    let swap_series = app.dashboard.data.metric_history.swap_values();
+    let io_pressure = load
+        .io_pressure
+        .as_ref()
+        .and_then(|pressure| pressure.avg10.or(pressure.avg60).or(pressure.avg300))
+        .unwrap_or(0.0);
+
+    let trend = |values: &[f64]| -> String {
+        let tail = values
+            .iter()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|value| format!("{:>3.0}", value))
+            .collect::<Vec<_>>();
+        if tail.is_empty() {
+            "no history".to_owned()
+        } else {
+            tail.join(" ")
+        }
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "CPU / MEMORY",
+                Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " live host pressure and headroom",
+                Style::default().fg(OPS_DIM),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("load       ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                format!(
+                    "{:.2} / {:.2} / {:.2} on {} cores",
+                    load.load_average.one,
+                    load.load_average.five,
+                    load.load_average.fifteen,
+                    load.cpu_logical_count
+                ),
+                Style::default().fg(OPS_FG),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("memory     ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                format!(
+                    "{} used of {} ({:.0}%)",
+                    mem_used, mem_total, app.dashboard.data.memory_used_pct
+                ),
+                Style::default().fg(OPS_FG),
+            ),
+            Span::styled("  avail ", Style::default().fg(OPS_DIM)),
+            Span::styled(mem_available, Style::default().fg(OPS_BLUE)),
+        ]),
+        Line::from(vec![
+            Span::styled("swap       ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                format!("{} used of {}", swap_used, swap_total),
+                Style::default().fg(OPS_FG),
+            ),
+            Span::styled("  io psi ", Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{io_pressure:.1}"), Style::default().fg(OPS_YELLOW)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("cpu trend  ", Style::default().fg(OPS_DIM)),
+            Span::styled(trend(&cpu_series), Style::default().fg(OPS_GREEN)),
+        ]),
+        Line::from(vec![
+            Span::styled("mem trend  ", Style::default().fg(OPS_DIM)),
+            Span::styled(trend(&mem_series), Style::default().fg(OPS_BLUE)),
+        ]),
+        Line::from(vec![
+            Span::styled("swap trend ", Style::default().fg(OPS_DIM)),
+            Span::styled(trend(&swap_series), Style::default().fg(OPS_YELLOW)),
+        ]),
+    ];
+
+    Paragraph::new(lines)
+        .style(Style::default().bg(OPS_BG))
+        .scroll((app.dashboard.detail_scroll as u16, 0))
+        .render(area, buf);
 }
 
 fn render_ops_services(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -8792,10 +9033,12 @@ fn render_ops_changes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .render(area, buf);
 }
 
-fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_ops_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let key = |s: &'static str| Span::styled(s, Style::default().fg(OPS_FG));
     let sep = || Span::styled("  ", Style::default().fg(OPS_DIM));
     let desc = |s: &'static str| Span::styled(s, Style::default().fg(OPS_DIM));
+    let elapsed = app.dashboard.last_refresh_at.elapsed().as_secs();
+    let countdown = DASHBOARD_REFRESH_SECS.saturating_sub(elapsed.min(DASHBOARD_REFRESH_SECS));
     let line1 = Line::from(vec![
         key("Tab"),
         desc(" focus "),
@@ -8809,11 +9052,11 @@ fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
         key("Alt+G"),
         desc(" plan "),
         sep(),
-        key("Alt+E"),
-        desc(" evid "),
-        sep(),
         key("Alt+A"),
         desc(" apply "),
+        sep(),
+        key("Alt+H"),
+        desc(" help "),
         sep(),
         key("S"),
         desc(" suppress "),
@@ -8821,13 +9064,45 @@ fn render_ops_footer(_app: &TuiApp, area: Rect, buf: &mut Buffer) {
         key("R"),
         desc(" resolve "),
         sep(),
-        key("1-8"),
+        key("1-6"),
         desc(" tabs "),
+        sep(),
+        key("auto"),
+        desc(" "),
+        Span::styled(format!("{countdown}s"), Style::default().fg(OPS_BLUE)),
         sep(),
         key("Ctrl+D"),
         desc(" quit"),
     ]);
-    Paragraph::new(line1)
+    let tooltip = if app.dashboard.beginner_mode {
+        let text = match app.dashboard.active_tab {
+            OpsTab::Alerts => {
+                "Alerts: queue on the left, incident detail on Enter, evidence on Alt+E."
+            }
+            OpsTab::Services => {
+                "Services: review failed units first, then timers and journal-backed state."
+            }
+            OpsTab::Resources => {
+                "Resources: use C/D/N/P or Left/Right in detail pane to switch CPU, disk, network, and processes."
+            }
+            OpsTab::Logs => {
+                "Logs: scan new kernel/auth errors and confirm whether the spike is still active."
+            }
+            OpsTab::Fleet => {
+                "Fleet: Up/Down selects a host, Enter pins that host as the active remote target."
+            }
+            OpsTab::Changes => {
+                "Changes: audit recent reviewed actions, their outputs, and rollback context."
+            }
+        };
+        Line::from(vec![
+            Span::styled(" help ", Style::default().fg(OPS_DIM)),
+            Span::styled(text, Style::default().fg(OPS_MUTED)),
+        ])
+    } else {
+        Line::from("")
+    };
+    Paragraph::new(vec![line1, tooltip])
         .style(Style::default().bg(OPS_SURFACE))
         .render(area, buf);
 }
@@ -9482,7 +9757,7 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
         }
         ModalState::Help => {
             Paragraph::new(if app.mode == AgentMode::Dashboard {
-                "Dashboard: Tab focus panes | Left/Right or 1-8 switch tabs | 1 returns to incidents | 2-8 open evidence views | Up/Down move queue | Enter open incident | Alt+E evidence | Alt+F follow-up | Alt+G guided plan | Alt+A apply | S mute | R resolve | U reopen | F5 refresh | Ctrl+P palette | Ctrl+H/? help"
+                "Dashboard: 1-6 switch tabs | Alerts, Services, Resources, Logs, Fleet, Changes | Left/Right on tabbar changes tabs | Up/Down move queue or fleet rows | Enter opens incident detail in Alerts or selects fleet host | Resources: C/D/N/P change subsection | Alt+E evidence | Alt+F follow-up | Alt+G guided plan | Alt+A apply | Alt+H tooltip mode | S mute | R resolve | U reopen | F5 refresh | Ctrl+P palette | Ctrl+H/? help"
             } else {
                 "Enter submit | Alt+Enter newline | Ctrl+P commands | Ctrl+N new session | Ctrl+C cancel running task, then Ctrl+C again to quit | PageUp/PageDown scroll | Ctrl+T toggle sidebar | Ctrl+H/? help"
             })
@@ -10531,6 +10806,7 @@ fn friendly_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use ratatui::backend::TestBackend;
     use std::sync::{Mutex, OnceLock};
 
@@ -10614,6 +10890,56 @@ mod tests {
             entries.extend(static_model_catalog_for(choice));
         }
         entries
+    }
+
+    fn finding_with(
+        fingerprint: String,
+        title: String,
+        severity: &str,
+        status: DashboardFindingState,
+    ) -> FindingSummary {
+        FindingSummary {
+            id: format!("id-{fingerprint}"),
+            fingerprint,
+            severity: severity.to_owned(),
+            confidence: "high".into(),
+            title,
+            affected_resource: "resource".into(),
+            snapshot_id: "snap-001".into(),
+            domain: "system".into(),
+            kind: "Generic".into(),
+            host: "testbox".into(),
+            status,
+            occurrence_count: 1,
+            first_seen: Utc::now().timestamp() - 60,
+            last_seen: Utc::now().timestamp(),
+            age_label: "1m".into(),
+            sample: String::new(),
+            state_note: String::new(),
+            evidence_text: String::new(),
+            evidence_sources: Vec::new(),
+            impact: String::new(),
+            assumptions: Vec::new(),
+            missing_data: Vec::new(),
+            read_only_checks: Vec::new(),
+            fix_plan: None,
+            risk: "low".into(),
+            rollback: String::new(),
+            command_preview: String::new(),
+            detector_id: "test-detector".into(),
+            correlated_finding_ids: Vec::new(),
+        }
+    }
+
+    fn arb_status() -> impl Strategy<Value = DashboardFindingState> {
+        prop_oneof![
+            Just(DashboardFindingState::Open),
+            Just(DashboardFindingState::New),
+            Just(DashboardFindingState::Recurring),
+            Just(DashboardFindingState::Resolved),
+            Just(DashboardFindingState::Suppressed),
+            Just(DashboardFindingState::SelfResolved),
+        ]
     }
 
     fn render_to_buffer(mut app: TuiApp, width: u16, height: u16) -> Buffer {
@@ -11368,7 +11694,10 @@ mod tests {
         );
         assert!(rendered.contains("CRIT 1"), "should show CRIT count");
         assert!(rendered.contains("WARN 1"), "should show WARN count");
-        assert!(rendered.contains("MUTED 0"), "should show muted count");
+        assert!(
+            rendered.contains("summary"),
+            "should show single-line summary strip"
+        );
         assert!(
             rendered.contains("Disk /var 78% full"),
             "should show selected finding detail"
@@ -11395,9 +11724,9 @@ mod tests {
         app.mode = AgentMode::Dashboard;
         let data = test_dash_data();
         app.dashboard.data = data.clone();
-        // Use 150-char width to accommodate full header with all labels
-        let mut buf = Buffer::empty(Rect::new(0, 0, 150, 36));
-        render_dashboard(&app, Rect::new(0, 0, 150, 36), &mut buf);
+        // Use wide width to accommodate the single-line ops header.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 220, 36));
+        render_dashboard(&app, Rect::new(0, 0, 220, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
             rendered.contains("CRIT 1"),
@@ -11408,7 +11737,7 @@ mod tests {
             "should show WARN count in header: got '{rendered}'"
         );
         assert!(
-            rendered.contains("load 1.5 0.8 0.6"),
+            rendered.contains("load 1.5/0.8/0.6"),
             "should show load strip in header: got '{rendered}'"
         );
         assert!(
@@ -11416,12 +11745,12 @@ mod tests {
             "should show mem percent in header: got '{rendered}'"
         );
         assert!(
-            rendered.contains("col ok/"),
-            "should show collector health summary: got '{rendered}'"
+            rendered.contains("ai local") || rendered.contains("ollama/qwen3:4b"),
+            "should show provider status in header: got '{rendered}'"
         );
         assert!(
-            rendered.contains("svc 2 fail"),
-            "should show service failure chip: got '{rendered}'"
+            rendered.contains("col ok/"),
+            "should show collector health summary: got '{rendered}'"
         );
     }
 
@@ -11435,7 +11764,7 @@ mod tests {
         let rendered = buf_to_string(&buf);
         assert!(!rendered.is_empty(), "buffer should not be empty at 30x8");
         assert!(
-            rendered.contains("larger terminal") || rendered.contains("Dashboard needs"),
+            rendered.contains("Larger terminal"),
             "too-small hint should show: got '{rendered}'"
         );
     }
@@ -11567,18 +11896,19 @@ mod tests {
     // ── New tab renderer tests ─────────────────────────────────────────
 
     #[test]
-    fn dash_containers_tab_renders_empty_state() {
+    fn dash_resources_processes_tab_renders_state() {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.active_tab = OpsTab::Processes;
+        app.dashboard.active_tab = OpsTab::Resources;
+        app.dashboard.resource_section = ResourceSection::Processes;
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
-        assert!(!rendered.is_empty(), "containers tab should render");
+        assert!(!rendered.is_empty(), "resources tab should render");
         assert!(
             rendered.contains("TOP PROCESSES"),
-            "should show processes tab content"
+            "should show processes subsection content"
         );
     }
 
@@ -11599,12 +11929,13 @@ mod tests {
     }
 
     #[test]
-    fn dash_storage_tab_shows_disk_info() {
+    fn dash_resources_disk_tab_shows_disk_info() {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
         app.dashboard.data.disk_bars = vec![("/".into(), 45), ("/home".into(), 12)];
-        app.dashboard.active_tab = OpsTab::Disk;
+        app.dashboard.active_tab = OpsTab::Resources;
+        app.dashboard.resource_section = ResourceSection::Disk;
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
         render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
         let rendered = buf_to_string(&buf);
@@ -11671,8 +12002,8 @@ mod tests {
         let mut data = test_dash_data();
         data.cpu_percent = 45.0;
         app.dashboard.data = data;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
-        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 180, 30));
+        render_dashboard(&app, Rect::new(0, 0, 180, 30), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(rendered.contains("45%"), "CPU should show 45%: {rendered}");
     }
@@ -11698,22 +12029,22 @@ mod tests {
     }
 
     #[test]
-    fn dash_queue_visible_on_all_tabs() {
-        // Even on non-Alerts tabs, queue should still render
+    fn dash_queue_visible_on_all_tabs_when_wide() {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
-        app.dashboard.active_tab = OpsTab::Network;
-        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
-        render_dashboard(&app, Rect::new(0, 0, 100, 30), &mut buf);
+        app.dashboard.active_tab = OpsTab::Resources;
+        app.dashboard.resource_section = ResourceSection::Network;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 140, 30));
+        render_dashboard(&app, Rect::new(0, 0, 140, 30), &mut buf);
         let rendered = buf_to_string(&buf);
         assert!(
-            rendered.contains("QUEUE"),
+            rendered.contains("FINDING QUEUE"),
             "queue should be visible on all tabs: {rendered}"
         );
         assert!(
-            rendered.contains("Evidence view active"),
-            "non-incident tabs should be explicitly framed as evidence: {rendered}"
+            rendered.contains("LISTENING PORTS"),
+            "wide resources view should render network subsection beside the queue: {rendered}"
         );
     }
 
@@ -11726,7 +12057,7 @@ mod tests {
         render_dashboard(&app, Rect::new(0, 0, 120, 36), &mut buf);
         let rendered = buf_to_string(&buf);
         // Footer text should appear at most once
-        let footer_count = rendered.matches("full refresh").count();
+        let footer_count = rendered.matches("Ctrl+D").count();
         assert!(
             footer_count <= 1,
             "footer should not be duplicated: {footer_count} found in\n{rendered}"
@@ -11765,7 +12096,7 @@ mod tests {
             "should render HELMOPS branding in header"
         );
         assert!(
-            rendered.contains("testbox"),
+            rendered.contains("TESTBOX"),
             "should show hostname in header"
         );
     }
@@ -13347,5 +13678,68 @@ mod tests {
             status_str, "fleet: 2/2 up",
             "Status format should match expected"
         );
+    }
+
+    proptest! {
+        #[test]
+        fn property_29_summary_line_length(
+            inputs in prop::collection::vec(("[a-z0-9 ]{1,24}", prop_oneof![Just("critical"), Just("warning"), Just("info")], arb_status()), 0..24)
+        ) {
+            let findings = inputs.into_iter().enumerate().map(|(idx, (title, severity, status))| {
+                finding_with(format!("fp-{idx}"), title, severity, status)
+            }).collect::<Vec<_>>();
+
+            let summary = build_dashboard_summary_line(&findings, 120);
+            let expected_critical = findings.iter()
+                .filter(|finding| finding.severity == "critical")
+                .filter(|finding| is_active_dashboard_finding(finding.status))
+                .count();
+            let expected_marker = format!("CRIT {expected_critical}");
+
+            prop_assert!(summary.chars().count() <= 120);
+            prop_assert!(summary.contains(&expected_marker));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn property_6_fingerprint_selection_stability(
+            titles in prop::collection::vec("[a-z0-9 ]{1,20}", 1..20),
+            selected_seed in 0usize..20,
+            remove_selected in any::<bool>(),
+        ) {
+            let len = titles.len();
+            let selected_pos = selected_seed % len;
+            let findings = titles.into_iter().enumerate().map(|(idx, title)| {
+                finding_with(format!("fp-{idx}"), title, "warning", DashboardFindingState::Open)
+            }).collect::<Vec<_>>();
+            let selected_fingerprint = findings[selected_pos].fingerprint.clone();
+
+            let mut refreshed = findings.clone();
+            if remove_selected {
+                refreshed.remove(selected_pos);
+            } else if refreshed.len() > 1 {
+                refreshed.reverse();
+            }
+
+            let resolved = restore_dashboard_selection(
+                &refreshed,
+                DashboardFindingStateFilter::Active,
+                Some(&selected_fingerprint),
+                Some(selected_pos),
+            );
+
+            if refreshed.is_empty() {
+                prop_assert_eq!(resolved, None);
+            } else if remove_selected {
+                let expected_index = selected_pos.min(refreshed.len() - 1);
+                prop_assert_eq!(
+                    resolved,
+                    Some(refreshed[expected_index].fingerprint.clone())
+                );
+            } else {
+                prop_assert_eq!(resolved, Some(selected_fingerprint));
+            }
+        }
     }
 }
