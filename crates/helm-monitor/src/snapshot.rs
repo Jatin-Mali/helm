@@ -283,6 +283,7 @@ pub struct ListenerEntry {
 // ── Logs ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LogSnapshot {
     /// Journal summary — error count in the last window.
     pub journal_errors_last_hour: u64,
@@ -292,6 +293,59 @@ pub struct LogSnapshot {
     pub auth_failures: Vec<String>,
     /// Rate-per-minute spike detection.
     pub error_rate_per_minute: Option<f64>,
+    /// Grouped journal patterns for anomaly review.
+    pub patterns: Vec<JournalPattern>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum LogSeverity {
+    #[default]
+    Warning,
+    Error,
+    Critical,
+}
+
+impl LogSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn from_priority(priority: u8) -> Self {
+        match priority {
+            0..=2 => Self::Critical,
+            3 => Self::Error,
+            _ => Self::Warning,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct JournalPattern {
+    pub pattern_id: String,
+    pub unit: String,
+    pub severity: LogSeverity,
+    pub normalized_message: String,
+    pub sample_message: String,
+    pub occurrence_count: u64,
+    pub first_seen_unix_ms: i64,
+    pub last_seen_unix_ms: i64,
+    #[serde(default)]
+    pub context_lines: Vec<JournalContextLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct JournalContextLine {
+    pub offset: i8,
+    pub timestamp: String,
+    pub unit: String,
+    pub severity: LogSeverity,
+    pub message: String,
+    pub raw: String,
 }
 
 // ── Backups ────────────────────────────────────────────────────────────────
@@ -617,6 +671,7 @@ impl Default for LogSnapshot {
             kernel_errors: Vec::new(),
             auth_failures: Vec::new(),
             error_rate_per_minute: None,
+            patterns: Vec::new(),
         }
     }
 }

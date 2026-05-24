@@ -641,6 +641,86 @@ tr:hover td {
   font-size: 0.9375rem;
 }
 
+.filter-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) repeat(2, minmax(160px, 0.6fr));
+  gap: 12px;
+}
+
+.log-shell {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.95fr) minmax(0, 1.05fr);
+  gap: 16px;
+}
+
+.log-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.log-card {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid rgba(114, 151, 196, 0.12);
+  background: rgba(8, 17, 29, 0.78);
+  cursor: pointer;
+  transition: transform .18s ease, border-color .18s ease, background .18s ease;
+}
+
+.log-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(114, 151, 196, 0.28);
+}
+
+.log-card.active {
+  border-color: rgba(102, 227, 255, 0.52);
+  background: rgba(18, 34, 53, 0.94);
+  box-shadow: 0 0 0 1px rgba(102, 227, 255, 0.14);
+}
+
+.log-top,
+.log-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.log-message {
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.log-context {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.log-line {
+  display: grid;
+  grid-template-columns: 58px 82px minmax(110px, 180px) minmax(0, 1fr);
+  gap: 10px;
+  padding: 11px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(114, 151, 196, 0.12);
+  background: rgba(4, 9, 18, 0.88);
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+}
+
+.log-line.match {
+  border-color: rgba(102, 227, 255, 0.32);
+  background: rgba(13, 28, 44, 0.96);
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
 @media (max-width: 1500px) {
   .hero-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
@@ -648,7 +728,7 @@ tr:hover td {
 @media (max-width: 1120px) {
   #app { height: auto; }
   .workspace { grid-template-columns: 1fr; }
-  .detail-columns, .section-grid { grid-template-columns: 1fr; }
+  .detail-columns, .section-grid, .log-shell, .filter-bar { grid-template-columns: 1fr; }
   .hero-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .signal-strip { margin-left: 0; }
 }
@@ -732,9 +812,9 @@ const tabs = [
   ['containers', 'containers'],
   ['kubernetes', 'kubernetes'],
   ['data', 'data'],
+  ['logs', 'logs'],
   ['network', 'network'],
   ['storage', 'storage'],
-  ['security', 'security'],
   ['fleet', 'fleet'],
 ];
 
@@ -746,6 +826,12 @@ const state = {
   activeTab: 'overview',
   query: '',
   connected: false,
+  selectedLogPatternId: null,
+  logFilters: {
+    unit: '',
+    severity: 'all',
+    range: '1h',
+  },
 };
 
 function connect() {
@@ -784,6 +870,7 @@ function applySnapshot(snapshot) {
   state.snapshot = snapshot;
   state.findings = sortFindings(snapshot.findings || []);
   syncSelectionState();
+  syncLogSelectionState();
   renderAll();
 }
 
@@ -983,13 +1070,16 @@ function renderActiveTab() {
     containers: renderContainers,
     kubernetes: renderKubernetes,
     data: renderData,
+    logs: renderLogs,
     network: renderNetwork,
     storage: renderStorage,
-    security: renderSecurity,
     fleet: renderFleet,
   };
   const render = map[state.activeTab] || renderOverview;
   document.getElementById('tab-body').innerHTML = render();
+  if (state.activeTab === 'logs') {
+    wireLogsTab();
+  }
 }
 
 function renderOverview() {
@@ -1165,6 +1255,46 @@ function renderData() {
   `;
 }
 
+function renderLogs() {
+  const patterns = filteredLogPatterns();
+  const selected = selectedLogPattern(patterns);
+  const totalPatterns = allLogPatterns();
+  return `
+    <div class="stack">
+      <section class="card">
+        <div class="panel-title">Log Filters</div>
+        <div class="filter-bar" style="margin-top:14px">
+          <input id="log-unit-filter" class="search" type="search" value="${esc(state.logFilters.unit)}" placeholder="Filter by unit name">
+          <select id="log-severity-filter" class="search" aria-label="Filter by severity">
+            ${['all', 'warning', 'error', 'critical'].map(level => `<option value="${level}" ${state.logFilters.severity === level ? 'selected' : ''}>${esc(level)}</option>`).join('')}
+          </select>
+          <select id="log-range-filter" class="search" aria-label="Filter by time range">
+            ${[
+              ['15m', 'last 15 minutes'],
+              ['1h', 'last hour'],
+              ['6h', 'last 6 hours'],
+              ['24h', 'last 24 hours'],
+              ['all', 'all collected'],
+            ].map(([value, label]) => `<option value="${value}" ${state.logFilters.range === value ? 'selected' : ''}>${esc(label)}</option>`).join('')}
+          </select>
+        </div>
+      </section>
+      <div class="log-shell">
+        <section class="card">
+          <div class="panel-title">Pattern Queue</div>
+          <div class="panel-meta" style="margin-top:8px">${patterns.length} filtered · ${totalPatterns.length} total</div>
+          <div class="log-list">
+            ${patterns.length ? patterns.map(pattern => logPatternCard(pattern)).join('') : '<div class="empty">No grouped journal patterns match the current filter set.</div>'}
+          </div>
+        </section>
+        <section class="card">
+          ${selected ? logPatternDetail(selected) : '<div class="empty">Select a grouped pattern to inspect raw context lines.</div>'}
+        </section>
+      </div>
+    </div>
+  `;
+}
+
 function renderNetwork() {
   const inv = state.snapshot.inventory || {};
   return `
@@ -1222,10 +1352,6 @@ function renderStorage() {
       ]))}
     </div>
   `;
-}
-
-function renderSecurity() {
-  return `<div class="stack">${renderSecuritySections()}</div>`;
 }
 
 function renderFleet() {
@@ -1388,6 +1514,51 @@ function selectFinding(id, tab = 'overview') {
   renderAll();
 }
 
+function allLogPatterns() {
+  return state.snapshot?.inventory?.logs?.patterns || [];
+}
+
+function filteredLogPatterns() {
+  const patterns = allLogPatterns();
+  const unitQuery = (state.logFilters.unit || '').trim().toLowerCase();
+  const severity = state.logFilters.severity || 'all';
+  const now = Date.now();
+  const rangeMs = {
+    '15m': 15 * 60 * 1000,
+    '1h': 60 * 60 * 1000,
+    '6h': 6 * 60 * 60 * 1000,
+    '24h': 24 * 60 * 60 * 1000,
+    'all': null,
+  }[state.logFilters.range || '1h'];
+  const newIds = new Set(state.snapshot?.newLogPatternIds || []);
+  return patterns
+    .filter(pattern => !unitQuery || (pattern.unit || '').toLowerCase().includes(unitQuery))
+    .filter(pattern => severity === 'all' || pattern.severity === severity)
+    .filter(pattern => rangeMs == null || (pattern.last_seen_unix_ms || 0) >= now - rangeMs)
+    .map(pattern => ({ ...pattern, isNew: newIds.has(pattern.pattern_id) }))
+    .sort((a, b) => {
+      const severityRank = sev => ({ critical: 0, error: 1, warning: 2 }[sev] ?? 3);
+      return severityRank(a.severity) - severityRank(b.severity)
+        || (b.occurrence_count || 0) - (a.occurrence_count || 0)
+        || (b.last_seen_unix_ms || 0) - (a.last_seen_unix_ms || 0);
+    });
+}
+
+function syncLogSelectionState(patterns = filteredLogPatterns()) {
+  if (!patterns.length) {
+    state.selectedLogPatternId = null;
+    return;
+  }
+  if (!patterns.some(pattern => pattern.pattern_id === state.selectedLogPatternId)) {
+    state.selectedLogPatternId = patterns[0].pattern_id;
+  }
+}
+
+function selectedLogPattern(patterns = filteredLogPatterns()) {
+  syncLogSelectionState(patterns);
+  return patterns.find(pattern => pattern.pattern_id === state.selectedLogPatternId) || patterns[0] || null;
+}
+
 function moveQueueFocus(step) {
   const incidents = filteredFindings();
   if (!incidents.length) return;
@@ -1401,6 +1572,92 @@ function moveQueueFocus(step) {
   const row = [...document.querySelectorAll('.incident-row')].find(item => item.dataset.id === state.focusedFindingId);
   row?.focus({ preventScroll: true });
   row?.scrollIntoView({ block: 'nearest' });
+}
+
+function logPatternCard(pattern) {
+  const active = state.selectedLogPatternId === pattern.pattern_id ? ' active' : '';
+  return `
+    <article class="log-card${active}" data-pattern-id="${esc(pattern.pattern_id)}" tabindex="0">
+      <div class="log-top">
+        ${statePill(classifyStatus(pattern.severity), pattern.severity)}
+        <span class="mono">${esc(pattern.unit || 'journal')}</span>
+        <span class="pill">x${esc(String(pattern.occurrence_count || 0))}</span>
+        <span class="pill">${esc(fmtAgoFromUnixMs(pattern.last_seen_unix_ms || 0))}</span>
+        ${pattern.isNew ? '<span class="pill">new this cycle</span>' : ''}
+      </div>
+      <div class="log-message">${esc(pattern.sample_message || pattern.normalized_message || 'pattern')}</div>
+      <div class="log-meta">
+        <span>${esc(pattern.normalized_message || '')}</span>
+      </div>
+    </article>
+  `;
+}
+
+function logPatternDetail(pattern) {
+  const context = pattern.context_lines || [];
+  return `
+    <div class="panel-title">Selected Pattern</div>
+    <h3 style="margin:12px 0 8px">${esc(pattern.unit || 'journal')}</h3>
+    <div class="pill-group">
+      ${statePill(classifyStatus(pattern.severity), pattern.severity)}
+      <span class="pill">occurrences ${esc(String(pattern.occurrence_count || 0))}</span>
+      <span class="pill">first ${esc(fmtAgoFromUnixMs(pattern.first_seen_unix_ms || 0))}</span>
+      <span class="pill">last ${esc(fmtAgoFromUnixMs(pattern.last_seen_unix_ms || 0))}</span>
+      ${pattern.isNew ? '<span class="pill">new in previous cycle comparison</span>' : ''}
+    </div>
+    <p style="margin-top:14px">${esc(pattern.sample_message || pattern.normalized_message || '')}</p>
+    <div class="code" style="margin-top:12px">${esc(pattern.normalized_message || '')}</div>
+    <div class="log-context">
+      ${context.length ? context.map(line => `
+        <div class="log-line${line.offset === 0 ? ' match' : ''}">
+          <div>${esc(line.offset === 0 ? 'match' : (line.offset < 0 ? 'prev' : 'next'))}</div>
+          <div>${esc(line.timestamp || '--:--:--')}</div>
+          <div>${esc(line.unit || 'journal')}</div>
+          <div>${esc(line.raw || line.message || '')}</div>
+        </div>
+      `).join('') : '<div class="empty">No raw context lines were captured for this pattern yet.</div>'}
+    </div>
+  `;
+}
+
+function wireLogsTab() {
+  const unitInput = document.getElementById('log-unit-filter');
+  const severityInput = document.getElementById('log-severity-filter');
+  const rangeInput = document.getElementById('log-range-filter');
+  if (unitInput) {
+    unitInput.addEventListener('input', event => {
+      state.logFilters.unit = event.target.value;
+      state.selectedLogPatternId = null;
+      renderActiveTab();
+    });
+  }
+  if (severityInput) {
+    severityInput.addEventListener('change', event => {
+      state.logFilters.severity = event.target.value;
+      state.selectedLogPatternId = null;
+      renderActiveTab();
+    });
+  }
+  if (rangeInput) {
+    rangeInput.addEventListener('change', event => {
+      state.logFilters.range = event.target.value;
+      state.selectedLogPatternId = null;
+      renderActiveTab();
+    });
+  }
+  document.querySelectorAll('[data-pattern-id]').forEach(node => {
+    node.addEventListener('click', () => {
+      state.selectedLogPatternId = node.dataset.patternId;
+      renderActiveTab();
+    });
+    node.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        state.selectedLogPatternId = node.dataset.patternId;
+        renderActiveTab();
+      }
+    });
+  });
 }
 
 function sortFindings(findings) {
@@ -1498,6 +1755,15 @@ function fmtAgo(value) {
   if (hours) return `${hours}h ago`;
   if (mins) return `${mins}m ago`;
   return 'just now';
+}
+
+function fmtAgoFromUnixMs(value) {
+  if (!value) return 'n/a';
+  const diff = Math.max(0, Date.now() - value);
+  if (diff < 60000) return `${Math.round(diff / 1000)}s ago`;
+  if (diff < 3600000) return `${Math.round(diff / 60000)}m ago`;
+  if (diff < 86400000) return `${Math.round(diff / 3600000)}h ago`;
+  return `${Math.round(diff / 86400000)}d ago`;
 }
 
 function daemonSummary() {

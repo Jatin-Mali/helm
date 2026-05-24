@@ -9,6 +9,7 @@ pub mod detectors;
 pub mod engine;
 pub mod execute;
 pub mod findings;
+pub mod log_analysis;
 pub mod metric_history;
 pub mod pipeline;
 pub mod plan_cache;
@@ -38,6 +39,10 @@ pub use findings::{
     Confidence, EvidenceRef, Finding, FindingId, FindingLifecycle, FindingValidationError,
     MonitorDomain, PlanId, Severity, self_resolved_findings, sort_findings,
 };
+pub use log_analysis::{
+    LogPatternFilter, LogTimeRange, filter_log_patterns, log_pattern_ids_new_since_previous,
+    normalize_log_message,
+};
 pub use metric_history::MetricHistory;
 pub use pipeline::{
     PipelineCollector, PipelineProvider, PipelineSnapshot, PipelineStatus, PipelineWebhookError,
@@ -49,10 +54,11 @@ pub use ring_buffer::RingBuffer;
 pub use snapshot::{
     BackupSnapshot, BackupTool, BlockDevice, CollectorError, ContainerInfo, ContainerRuntime,
     ContainerSnapshot, CronJob, DiskSnapshot, FailedUnit, FilesystemEntry, FirewallSnapshot,
-    HostIdentity, InodeEntry, InterfaceEntry, ListenerEntry, LoadAverage, LoadSnapshot,
-    LogSnapshot, MemoryInfo, MonitorProfile, MountEntry, NetworkSnapshot, PackageSnapshot,
-    PortSnapshot, PressureStall, ProcessInfo, ProcessSnapshot, RouteEntry, ServiceSnapshot,
-    SmartDevice, SnapshotDomains, SystemSnapshot, SystemdTimer, SystemdUnit, TimerSnapshot,
+    HostIdentity, InodeEntry, InterfaceEntry, JournalContextLine, JournalPattern, ListenerEntry,
+    LoadAverage, LoadSnapshot, LogSeverity, LogSnapshot, MemoryInfo, MonitorProfile, MountEntry,
+    NetworkSnapshot, PackageSnapshot, PortSnapshot, PressureStall, ProcessInfo, ProcessSnapshot,
+    RouteEntry, ServiceSnapshot, SmartDevice, SnapshotDomains, SystemSnapshot, SystemdTimer,
+    SystemdUnit, TimerSnapshot,
 };
 pub use thresholds::{
     DetectorThresholdOverride, ThresholdsConfig, ThresholdsLoadOutcome, default_thresholds_path,

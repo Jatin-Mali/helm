@@ -28,9 +28,10 @@ use helm_memory::{
     MemoryStore, TroubleshootingPlanRecord,
 };
 use helm_monitor::{
-    CollectorError, CommandValidator, Finding, FindingSummaryFields, MetricHistory, MonitorProfile,
-    ServiceRegistry, SnapshotDomains, build_narrative_prompt, load_thresholds_config,
-    parse_llm_response,
+    CollectorError, CommandValidator, Finding, FindingSummaryFields, JournalPattern,
+    LogPatternFilter, LogSeverity, LogTimeRange, MetricHistory, MonitorProfile, ServiceRegistry,
+    SnapshotDomains, build_narrative_prompt, filter_log_patterns, load_thresholds_config,
+    log_pattern_ids_new_since_previous, parse_llm_response,
 };
 use helm_providers::ChatRequest;
 use ratatui::{
@@ -940,6 +941,81 @@ impl DashboardFindingStateFilter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DashboardLogSeverityFilter {
+    #[default]
+    All,
+    Warning,
+    Error,
+    Critical,
+}
+
+impl DashboardLogSeverityFilter {
+    fn all() -> &'static [Self] {
+        &[Self::All, Self::Warning, Self::Error, Self::Critical]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all severities",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Critical => "critical",
+        }
+    }
+
+    fn severity(self) -> Option<LogSeverity> {
+        match self {
+            Self::All => None,
+            Self::Warning => Some(LogSeverity::Warning),
+            Self::Error => Some(LogSeverity::Error),
+            Self::Critical => Some(LogSeverity::Critical),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DashboardLogTimeFilter {
+    FifteenMinutes,
+    #[default]
+    OneHour,
+    SixHours,
+    TwentyFourHours,
+    All,
+}
+
+impl DashboardLogTimeFilter {
+    fn all() -> &'static [Self] {
+        &[
+            Self::FifteenMinutes,
+            Self::OneHour,
+            Self::SixHours,
+            Self::TwentyFourHours,
+            Self::All,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FifteenMinutes => "15m",
+            Self::OneHour => "1h",
+            Self::SixHours => "6h",
+            Self::TwentyFourHours => "24h",
+            Self::All => "all",
+        }
+    }
+
+    fn range(self) -> LogTimeRange {
+        match self {
+            Self::FifteenMinutes => LogTimeRange::FifteenMinutes,
+            Self::OneHour => LogTimeRange::OneHour,
+            Self::SixHours => LogTimeRange::SixHours,
+            Self::TwentyFourHours => LogTimeRange::TwentyFourHours,
+            Self::All => LogTimeRange::All,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct DashboardMetrics {
     open: usize,
@@ -1028,6 +1104,8 @@ struct DashboardData {
     consecutive_skips: u64,
     /// Shared history buffer for dashboard trends.
     metric_history: MetricHistory,
+    /// Pattern IDs not seen in the previous snapshot cycle.
+    new_log_pattern_ids: HashSet<String>,
     /// Per-host fleet status for multi-host view.
     fleet_hosts: Vec<FleetHostStatus>,
 }
@@ -1142,6 +1220,10 @@ struct DashboardState {
     detail_scroll: usize,
     beginner_mode: bool,
     finding_state_filter: DashboardFindingStateFilter,
+    log_severity_filter: DashboardLogSeverityFilter,
+    log_time_filter: DashboardLogTimeFilter,
+    log_unit_filter: Option<String>,
+    log_selected_pattern: usize,
     active_plan: Option<DashboardPlan>,
     pending_plan_rx: Option<tokio::sync::oneshot::Receiver<PlanStatus>>,
     error: Option<String>,
@@ -1178,6 +1260,10 @@ impl DashboardState {
             detail_scroll: 0,
             beginner_mode: true,
             finding_state_filter: DashboardFindingStateFilter::default(),
+            log_severity_filter: DashboardLogSeverityFilter::default(),
+            log_time_filter: DashboardLogTimeFilter::default(),
+            log_unit_filter: None,
+            log_selected_pattern: 0,
             active_plan: None,
             pending_plan_rx: None,
             error: None,
@@ -2715,6 +2801,30 @@ impl TuiApp {
                     self.set_dashboard_tab(OpsTab::Changes);
                     return Ok(false);
                 }
+                KeyCode::Char('v')
+                    if self.dashboard.active_tab == OpsTab::Logs && key.modifiers.is_empty() =>
+                {
+                    self.cycle_dashboard_log_severity_filter(1);
+                    return Ok(false);
+                }
+                KeyCode::Char('t')
+                    if self.dashboard.active_tab == OpsTab::Logs && key.modifiers.is_empty() =>
+                {
+                    self.cycle_dashboard_log_time_filter(1);
+                    return Ok(false);
+                }
+                KeyCode::Char('[')
+                    if self.dashboard.active_tab == OpsTab::Logs && key.modifiers.is_empty() =>
+                {
+                    self.cycle_dashboard_log_unit_filter(-1);
+                    return Ok(false);
+                }
+                KeyCode::Char(']')
+                    if self.dashboard.active_tab == OpsTab::Logs && key.modifiers.is_empty() =>
+                {
+                    self.cycle_dashboard_log_unit_filter(1);
+                    return Ok(false);
+                }
                 KeyCode::Char('c')
                     if self.dashboard.active_tab == OpsTab::Resources
                         && key.modifiers.is_empty() =>
@@ -2820,8 +2930,13 @@ impl TuiApp {
                         }
                     }
                     DashboardFocus::Detail => {
-                        self.dashboard.detail_scroll =
-                            self.dashboard.detail_scroll.saturating_sub(1);
+                        if self.dashboard.active_tab == OpsTab::Logs {
+                            self.dashboard.log_selected_pattern =
+                                self.dashboard.log_selected_pattern.saturating_sub(1);
+                        } else {
+                            self.dashboard.detail_scroll =
+                                self.dashboard.detail_scroll.saturating_sub(1);
+                        }
                     }
                 },
                 _ => {
@@ -2841,8 +2956,17 @@ impl TuiApp {
                         }
                     }
                     DashboardFocus::Detail => {
-                        self.dashboard.detail_scroll =
-                            self.dashboard.detail_scroll.saturating_add(1);
+                        if self.dashboard.active_tab == OpsTab::Logs {
+                            let max = self
+                                .filtered_dashboard_log_patterns()
+                                .len()
+                                .saturating_sub(1);
+                            self.dashboard.log_selected_pattern =
+                                (self.dashboard.log_selected_pattern + 1).min(max);
+                        } else {
+                            self.dashboard.detail_scroll =
+                                self.dashboard.detail_scroll.saturating_add(1);
+                        }
                     }
                 },
                 _ => {
@@ -5448,11 +5572,107 @@ Report the exit status and the concise output."
         self.dashboard.detail_scroll = 0;
     }
 
+    fn cycle_dashboard_log_severity_filter(&mut self, delta: isize) {
+        let filters = DashboardLogSeverityFilter::all();
+        let current = filters
+            .iter()
+            .position(|f| *f == self.dashboard.log_severity_filter)
+            .unwrap_or(0);
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(filters.len().saturating_sub(1))
+        };
+        self.dashboard.log_severity_filter = filters[next];
+        self.dashboard.log_selected_pattern = 0;
+        self.dashboard.detail_scroll = 0;
+    }
+
+    fn cycle_dashboard_log_time_filter(&mut self, delta: isize) {
+        let filters = DashboardLogTimeFilter::all();
+        let current = filters
+            .iter()
+            .position(|f| *f == self.dashboard.log_time_filter)
+            .unwrap_or(0);
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(filters.len().saturating_sub(1))
+        };
+        self.dashboard.log_time_filter = filters[next];
+        self.dashboard.log_selected_pattern = 0;
+        self.dashboard.detail_scroll = 0;
+    }
+
+    fn cycle_dashboard_log_unit_filter(&mut self, delta: isize) {
+        let mut units = self.dashboard_available_log_units();
+        units.insert(0, "all units".to_owned());
+        let current_label = self
+            .dashboard
+            .log_unit_filter
+            .clone()
+            .unwrap_or_else(|| "all units".to_owned());
+        let current = units
+            .iter()
+            .position(|unit| *unit == current_label)
+            .unwrap_or(0);
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(units.len().saturating_sub(1))
+        };
+        self.dashboard.log_unit_filter = if units[next] == "all units" {
+            None
+        } else {
+            Some(units[next].clone())
+        };
+        self.dashboard.log_selected_pattern = 0;
+        self.dashboard.detail_scroll = 0;
+    }
+
+    fn dashboard_available_log_units(&self) -> Vec<String> {
+        let mut units = self
+            .dashboard
+            .data
+            .domains
+            .logs
+            .patterns
+            .iter()
+            .map(|pattern| pattern.unit.clone())
+            .collect::<Vec<_>>();
+        units.sort();
+        units.dedup();
+        units
+    }
+
+    fn filtered_dashboard_log_patterns(&self) -> Vec<(JournalPattern, bool)> {
+        let filter = LogPatternFilter {
+            unit_query: self.dashboard.log_unit_filter.as_deref(),
+            severity: self.dashboard.log_severity_filter.severity(),
+            range: self.dashboard.log_time_filter.range(),
+            now_unix_ms: Utc::now().timestamp_millis(),
+        };
+        filter_log_patterns(&self.dashboard.data.domains.logs.patterns, &filter)
+            .into_iter()
+            .map(|pattern| {
+                let is_new = self
+                    .dashboard
+                    .data
+                    .new_log_pattern_ids
+                    .contains(&pattern.pattern_id);
+                (pattern, is_new)
+            })
+            .collect()
+    }
+
     fn set_dashboard_tab(&mut self, tab: OpsTab) {
         self.dashboard.active_tab = tab;
         self.dashboard.detail_scroll = 0;
         if tab != OpsTab::Alerts {
             self.dashboard.view = DashboardView::Overview;
+        }
+        if tab == OpsTab::Logs {
+            self.dashboard.log_selected_pattern = 0;
         }
     }
 
@@ -6056,6 +6276,17 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             .map(|record| (record.fingerprint.clone(), record))
             .collect();
         let snapshot_records = SnapshotStore::list(&conn, 90).unwrap_or_default();
+        let previous_log_patterns = snapshot_records
+            .iter()
+            .filter(|snapshot| snapshot.id != record.id)
+            .max_by_key(|snapshot| snapshot.collected_at)
+            .and_then(|snapshot| {
+                serde_json::from_str::<SnapshotDomains>(&snapshot.domains_json).ok()
+            })
+            .map(|domains| domains.logs.patterns)
+            .unwrap_or_default();
+        let new_log_pattern_ids =
+            log_pattern_ids_new_since_previous(&domains.logs.patterns, &previous_log_patterns);
         let mut aggregates: HashMap<String, AggregateFinding> = HashMap::new();
         for snapshot in &snapshot_records {
             let findings: Vec<Finding> =
@@ -6418,8 +6649,13 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
                 &mut self.dashboard.data.metric_history,
                 MetricHistory::new(self.dashboard.sparkline_history_depth),
             ),
+            new_log_pattern_ids,
             ..Default::default()
         };
+        let log_pattern_count = self.filtered_dashboard_log_patterns().len();
+        if self.dashboard.log_selected_pattern >= log_pattern_count {
+            self.dashboard.log_selected_pattern = 0;
+        }
         self.dashboard.selected_fingerprint = restore_dashboard_selection(
             &self.dashboard.data.findings,
             self.dashboard.finding_state_filter,
@@ -8044,77 +8280,196 @@ fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_ops_logs(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let domains = &app.dashboard.data.domains;
     let w = area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
+    let patterns = app.filtered_dashboard_log_patterns();
+    let selected_idx = app
+        .dashboard
+        .log_selected_pattern
+        .min(patterns.len().saturating_sub(1));
 
     lines.push(Line::from(vec![
         Span::styled(
-            "JOURNAL LOG STREAM",
+            "LOG ANOMALIES",
             Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ", Style::default()),
-        Span::styled("●", Style::default().fg(OPS_GREEN)),
-        Span::styled(" live", Style::default().fg(OPS_GREEN)),
+        Span::styled(
+            format!(
+                "  sev {}  time {}  unit {}",
+                app.dashboard.log_severity_filter.label(),
+                app.dashboard.log_time_filter.label(),
+                app.dashboard
+                    .log_unit_filter
+                    .as_deref()
+                    .unwrap_or("all units")
+            ),
+            Style::default().fg(OPS_DIM),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Keys ", Style::default().fg(OPS_MUTED)),
+        Span::styled(
+            "v",
+            Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" severity  ", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            "t",
+            Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" time  ", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            "[ ]",
+            Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" unit  ", Style::default().fg(OPS_DIM)),
+        Span::styled(
+            "Tab",
+            Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" + Up/Down select pattern", Style::default().fg(OPS_DIM)),
     ]));
     lines.push(Line::from(Span::raw("")));
 
-    // Build unified entry list: (time, level, service, message)
-    let mut entries: Vec<(String, &'static str, String, String)> = Vec::new();
-    for ke in domains.logs.kernel_errors.iter() {
-        let (time, lvl, svc, msg) = parse_log_line(ke);
-        entries.push((time, lvl, svc.to_owned(), msg));
-    }
-    for af in domains.logs.auth_failures.iter() {
-        entries.push((
-            "--:--:--".into(),
-            "WARN",
-            "sshd".into(),
-            af.chars().take(100).collect(),
-        ));
-    }
-
-    if entries.is_empty() {
+    if patterns.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No log signals. System appears quiet.",
+            "No journal anomalies match the current filters.",
             Style::default().fg(OPS_MUTED),
         )));
     } else {
-        let msg_max = w.saturating_sub(35);
-        for (time, lvl, svc, msg) in entries.iter().take(20) {
-            let (lvl_fg, lvl_bg) = match *lvl {
-                "CRIT" => (OPS_RED, Color::Rgb(0x3d, 0x1a, 0x1a)),
-                "ERR" => (OPS_RED, Color::Rgb(0x3d, 0x1a, 0x1a)),
-                "WARN" => (OPS_YELLOW, Color::Rgb(0x2d, 0x20, 0x08)),
-                _ => (OPS_BLUE, Color::Rgb(0x0d, 0x21, 0x37)),
+        lines.push(Line::from(Span::styled(
+            "PATTERN QUEUE",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::raw("")));
+        let msg_max = w.saturating_sub(28).clamp(20, 72);
+        for (idx, (pattern, is_new)) in patterns.iter().enumerate().take(8) {
+            let selected = idx == selected_idx;
+            let bg = if selected { OPS_SURFACE } else { OPS_BG };
+            let sev_fg = log_severity_color(pattern.severity);
+            let sev_bg = match pattern.severity {
+                LogSeverity::Critical | LogSeverity::Error => Color::Rgb(0x3d, 0x1a, 0x1a),
+                LogSeverity::Warning => Color::Rgb(0x2d, 0x20, 0x08),
             };
-            let msg_display = msg.chars().take(msg_max).collect::<String>();
+            let marker = if selected { ">" } else { " " };
+            let sample = pattern
+                .sample_message
+                .chars()
+                .take(msg_max)
+                .collect::<String>();
             lines.push(Line::from(vec![
-                Span::styled(format!("{:<9}", time), Style::default().fg(OPS_DIM)),
+                Span::styled(marker, Style::default().fg(OPS_BLUE).bg(bg)),
                 Span::styled(
-                    format!(" {:<4} ", lvl),
+                    format!(" {:<4} ", log_severity_badge(pattern.severity)),
                     Style::default()
-                        .fg(lvl_fg)
-                        .bg(lvl_bg)
+                        .fg(sev_fg)
+                        .bg(sev_bg)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" {:<8}", svc), Style::default().fg(OPS_MUTED)),
-                Span::styled(msg_display, Style::default().fg(OPS_FG)),
+                Span::styled(
+                    format!(" {:<18}", truncate_cell(&pattern.unit, 18)),
+                    Style::default()
+                        .fg(OPS_FG)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" x{:<3}", pattern.occurrence_count),
+                    Style::default().fg(OPS_BLUE).bg(bg),
+                ),
+                Span::styled(
+                    format!(" {:>6}", format_log_age(pattern.last_seen_unix_ms)),
+                    Style::default().fg(OPS_DIM).bg(bg),
+                ),
+                Span::styled(
+                    if *is_new { " NEW" } else { "" },
+                    Style::default()
+                        .fg(OPS_GREEN)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("   ", Style::default().bg(bg)),
+                Span::styled(sample, Style::default().fg(OPS_MUTED).bg(bg)),
             ]));
         }
         lines.push(Line::from(Span::raw("")));
-        let crit_n = entries.iter().filter(|e| e.1 == "CRIT").count();
-        let err_n = entries.iter().filter(|e| e.1 == "ERR").count();
-        let warn_n = entries.iter().filter(|e| e.1 == "WARN").count();
-        let shown = entries.len().min(20);
+        let selected = &patterns[selected_idx].0;
+        let selected_is_new = patterns[selected_idx].1;
         lines.push(Line::from(vec![
             Span::styled(
-                format!("Showing {} entries · ", shown),
+                "RAW CONTEXT",
+                Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(selected.unit.as_str(), Style::default().fg(OPS_FG)),
+            Span::styled(
+                format!(
+                    "  {}  x{}  last {}",
+                    log_severity_badge(selected.severity),
+                    selected.occurrence_count,
+                    format_log_age(selected.last_seen_unix_ms)
+                ),
                 Style::default().fg(OPS_DIM),
             ),
             Span::styled(
-                format!("{} CRIT · {} ERR · {} WARN", crit_n, err_n, warn_n),
-                Style::default().fg(OPS_RED),
+                if selected_is_new {
+                    "  new in this cycle"
+                } else {
+                    ""
+                },
+                Style::default().fg(OPS_GREEN),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            truncate(&selected.sample_message, w.saturating_sub(2).max(40)),
+            Style::default().fg(OPS_FG),
+        )));
+        lines.push(Line::from(Span::raw("")));
+        for context in &selected.context_lines {
+            let prefix = match context.offset {
+                -1 => "prev",
+                0 => "match",
+                1 => "next",
+                _ => "ctx",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<5}", prefix),
+                    Style::default().fg(if context.offset == 0 {
+                        OPS_BLUE
+                    } else {
+                        OPS_DIM
+                    }),
+                ),
+                Span::styled(
+                    format!("{:<9}", context.timestamp),
+                    Style::default().fg(OPS_DIM),
+                ),
+                Span::styled(
+                    format!("{:<18}", truncate_cell(&context.unit, 18)),
+                    Style::default().fg(OPS_MUTED),
+                ),
+                Span::styled(
+                    truncate(&context.raw, w.saturating_sub(34).max(24)),
+                    Style::default().fg(if context.offset == 0 {
+                        OPS_FG
+                    } else {
+                        OPS_MUTED
+                    }),
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("Showing {} grouped patterns", patterns.len()),
+                Style::default().fg(OPS_DIM),
+            ),
+            Span::styled(
+                " · grouped by unit and normalized message",
+                Style::default().fg(OPS_DIM),
             ),
         ]));
     }
@@ -9176,41 +9531,33 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-fn parse_log_line(line: &str) -> (String, &'static str, &'static str, String) {
-    let lower = line.to_lowercase();
-    let lvl = if lower.contains("crit") || lower.contains("oom") || lower.contains("killed") {
-        "CRIT"
-    } else if lower.contains("error")
-        || lower.contains(" err ")
-        || lower.contains("failed")
-        || lower.contains("denied")
-    {
-        "ERR"
-    } else if lower.contains("warn") {
-        "WARN"
+fn log_severity_badge(severity: LogSeverity) -> &'static str {
+    match severity {
+        LogSeverity::Warning => "WARN",
+        LogSeverity::Error => "ERR",
+        LogSeverity::Critical => "CRIT",
+    }
+}
+
+fn log_severity_color(severity: LogSeverity) -> Color {
+    match severity {
+        LogSeverity::Warning => OPS_YELLOW,
+        LogSeverity::Error | LogSeverity::Critical => OPS_RED,
+    }
+}
+
+fn format_log_age(last_seen_unix_ms: i64) -> String {
+    let age_ms = Utc::now()
+        .timestamp_millis()
+        .saturating_sub(last_seen_unix_ms)
+        .max(0);
+    if age_ms < 60_000 {
+        format!("{}s", age_ms / 1_000)
+    } else if age_ms < 3_600_000 {
+        format!("{}m", age_ms / 60_000)
     } else {
-        "INFO"
-    };
-    let svc = if lower.contains("kernel") || lower.contains("kern") {
-        "kernel"
-    } else if lower.contains("nginx") {
-        "nginx"
-    } else if lower.contains("postgres") {
-        "postgres"
-    } else if lower.contains("ssh") || lower.contains("auth") {
-        "sshd"
-    } else if lower.contains("systemd") {
-        "systemd"
-    } else {
-        "journal"
-    };
-    let time = line
-        .split_whitespace()
-        .find(|part| part.len() == 8 && part.chars().nth(2) == Some(':'))
-        .unwrap_or("--:--:--")
-        .to_owned();
-    let msg = line.chars().take(100).collect::<String>();
-    (time, lvl, svc, msg)
+        format!("{}h", age_ms / 3_600_000)
+    }
 }
 
 fn provider_boundary_label(app: &TuiApp) -> &'static str {
@@ -12122,21 +12469,78 @@ mod tests {
         );
     }
 
+    fn test_log_pattern(
+        id: &str,
+        unit: &str,
+        severity: helm_monitor::LogSeverity,
+        message: &str,
+        count: u64,
+    ) -> helm_monitor::JournalPattern {
+        helm_monitor::JournalPattern {
+            pattern_id: id.into(),
+            unit: unit.into(),
+            severity,
+            normalized_message: message.to_ascii_lowercase(),
+            sample_message: message.into(),
+            occurrence_count: count,
+            first_seen_unix_ms: Utc::now().timestamp_millis() - 60_000,
+            last_seen_unix_ms: Utc::now().timestamp_millis() - 5_000,
+            context_lines: vec![
+                helm_monitor::JournalContextLine {
+                    offset: -1,
+                    timestamp: "12:00:00".into(),
+                    unit: unit.into(),
+                    severity,
+                    message: "previous line".into(),
+                    raw: "12:00:00 previous line".into(),
+                },
+                helm_monitor::JournalContextLine {
+                    offset: 0,
+                    timestamp: "12:00:01".into(),
+                    unit: unit.into(),
+                    severity,
+                    message: message.into(),
+                    raw: format!("12:00:01 {message}"),
+                },
+                helm_monitor::JournalContextLine {
+                    offset: 1,
+                    timestamp: "12:00:02".into(),
+                    unit: unit.into(),
+                    severity,
+                    message: "next line".into(),
+                    raw: "12:00:02 next line".into(),
+                },
+            ],
+        }
+    }
+
     #[test]
     fn dash_logs_tab_generic_view_no_finding_selected() {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         // No finding selected, LOGS tab should show full generic view
         let mut data = test_dash_data();
-        data.domains.logs.kernel_errors = vec![
-            "Out of memory: killed process nginx (PID 1234)".into(),
-            "BUG: soft lockup - CPU#0 stuck".into(),
-        ];
-        data.domains.logs.auth_failures = vec![
-            "Failed password for root from 192.168.1.100".into(),
-            "authentication failure for user admin".into(),
+        data.domains.logs.patterns = vec![
+            test_log_pattern(
+                "log-1",
+                "kernel",
+                helm_monitor::LogSeverity::Critical,
+                "Out of memory: killed process nginx (PID 1234)",
+                3,
+            ),
+            test_log_pattern(
+                "log-2",
+                "sshd.service",
+                helm_monitor::LogSeverity::Warning,
+                "Failed password for root from 192.168.1.100",
+                2,
+            ),
         ];
         app.dashboard.data = data;
+        app.dashboard
+            .data
+            .new_log_pattern_ids
+            .insert("log-1".into());
         app.dashboard.active_tab = OpsTab::Logs;
         // Push selected_fingerprint to nonexistent value so no finding is selected
         app.dashboard.selected_fingerprint = Some("nonexistent".into());
@@ -12145,20 +12549,24 @@ mod tests {
         let rendered = buf_to_string(&buf);
 
         assert!(
-            rendered.contains("Showing 4 entries"),
-            "should show unified log count: got '{rendered}'"
+            rendered.contains("LOG ANOMALIES"),
+            "should show grouped log header: got '{rendered}'"
         );
         assert!(
-            rendered.contains("JOURNAL LOG STREAM"),
-            "should show log stream header: got '{rendered}'"
+            rendered.contains("Showing 2 grouped patterns"),
+            "should show grouped pattern count: got '{rendered}'"
         );
         assert!(
             rendered.contains("out of memory") || rendered.contains("Out of memory"),
             "should contain kernel oom entry"
         );
         assert!(
-            rendered.contains("Failed password") || rendered.contains("authentication failure"),
+            rendered.contains("Failed password"),
             "should contain auth failure"
+        );
+        assert!(
+            rendered.contains("RAW CONTEXT") && rendered.contains("match"),
+            "should show selected pattern context"
         );
     }
 
@@ -12167,30 +12575,43 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         let mut data = test_dash_data();
-        data.domains.logs.kernel_errors = vec![
-            "Out of memory: killed process nginx (PID 1234)".into(),
-            "BUG: soft lockup - CPU#0 stuck for 22s".into(),
-            "kernel: nginx segfault at 0 ip".into(),
-        ];
-        data.domains.logs.auth_failures = vec![
-            "Failed password for root from 192.168.1.100".into(),
-            "authentication failure for user nginx".into(),
+        data.domains.logs.patterns = vec![
+            test_log_pattern(
+                "log-nginx-1",
+                "nginx.service",
+                helm_monitor::LogSeverity::Critical,
+                "Out of memory: killed process nginx (PID 1234)",
+                4,
+            ),
+            test_log_pattern(
+                "log-nginx-2",
+                "nginx.service",
+                helm_monitor::LogSeverity::Error,
+                "kernel: nginx segfault at 0 ip",
+                2,
+            ),
+            test_log_pattern(
+                "log-ssh",
+                "sshd.service",
+                helm_monitor::LogSeverity::Warning,
+                "Failed password for root from 192.168.1.100",
+                1,
+            ),
         ];
         app.dashboard.data = data;
         app.dashboard.active_tab = OpsTab::Logs;
-        // Select finding-002: Nginx service, affected_resource = "nginx"
-        app.dashboard.selected_fingerprint = Some("fp-002".into());
+        app.dashboard.log_unit_filter = Some("nginx.service".into());
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
         render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
         let rendered = buf_to_string(&buf);
 
         assert!(
-            rendered.contains("JOURNAL LOG STREAM"),
-            "should show generic log stream header: got '{rendered}'"
+            rendered.contains("LOG ANOMALIES"),
+            "should show grouped log header: got '{rendered}'"
         );
         assert!(
-            rendered.contains("Showing 5 entries"),
-            "should show unified log count: got '{rendered}'"
+            rendered.contains("unit nginx.service"),
+            "should show unit filter in header: got '{rendered}'"
         );
         assert!(
             rendered.contains("Out of memory") || rendered.contains("out of memory"),
@@ -12205,8 +12626,8 @@ mod tests {
             "should show nginx segfault entry"
         );
         assert!(
-            rendered.contains("authentication failure") || rendered.contains("Failed password"),
-            "should show auth failure entry: got '{rendered}'"
+            !rendered.contains("sshd.service"),
+            "unit filter should hide sshd pattern: got '{rendered}'"
         );
     }
 
@@ -12215,28 +12636,32 @@ mod tests {
         let mut app = app();
         app.mode = AgentMode::Dashboard;
         let mut data = test_dash_data();
-        data.domains.logs.kernel_errors = vec!["BUG: soft lockup - CPU#0 stuck for 22s".into()];
-        data.domains.logs.auth_failures =
-            vec!["Failed password for root from 192.168.1.100".into()];
+        data.domains.logs.patterns = vec![
+            test_log_pattern(
+                "log-1",
+                "kernel",
+                helm_monitor::LogSeverity::Critical,
+                "BUG: soft lockup - CPU#0 stuck for 22s",
+                1,
+            ),
+            test_log_pattern(
+                "log-2",
+                "sshd.service",
+                helm_monitor::LogSeverity::Warning,
+                "Failed password for root from 192.168.1.100",
+                1,
+            ),
+        ];
         app.dashboard.data = data;
         app.dashboard.active_tab = OpsTab::Logs;
-        // Select finding-001: Disk /var, affected_resource = "/var" — no log entry mentions /var
-        app.dashboard.selected_fingerprint = Some("fp-001".into());
+        app.dashboard.log_unit_filter = Some("postgres.service".into());
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 40));
         render_dashboard(&app, Rect::new(0, 0, 100, 40), &mut buf);
         let rendered = buf_to_string(&buf);
 
         assert!(
-            rendered.contains("JOURNAL LOG STREAM"),
-            "should show generic log stream header"
-        );
-        assert!(
-            rendered.contains("BUG: soft lockup") || rendered.contains("Failed password"),
-            "should render available generic log entries: got '{rendered}'"
-        );
-        assert!(
-            rendered.contains("Showing 2 entries"),
-            "should show unified count"
+            rendered.contains("No journal anomalies match the current filters."),
+            "should show empty filter state"
         );
     }
 

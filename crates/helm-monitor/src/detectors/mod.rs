@@ -203,7 +203,9 @@ impl DetectorRegistry {
             &mut reg,
             config,
             "journal-error-burst",
-            Box::new(journal_errors::JournalErrorBurstDetector),
+            Box::new(journal_errors::JournalErrorBurstDetector::from_thresholds(
+                config.detector_override("journal-error-burst"),
+            )),
         );
         register_if_enabled(
             &mut reg,

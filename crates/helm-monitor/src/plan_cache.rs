@@ -44,7 +44,7 @@ impl PlanCache {
 
     pub fn get(&self, fingerprint: &str) -> Option<LlmPlanStatus> {
         let status = self.entries.get(fingerprint).and_then(|entry| {
-            if entry.cached_at.elapsed() <= self.ttl {
+            if entry.cached_at.elapsed() < self.ttl {
                 Some(entry.status.clone())
             } else {
                 None
@@ -170,7 +170,7 @@ mod tests {
             );
 
             let hit = cache.get(&fingerprint).is_some();
-            prop_assert_eq!(hit, age_ms <= ttl_ms);
+            prop_assert_eq!(hit, age_ms < ttl_ms);
             if age_ms > ttl_ms {
                 prop_assert!(!cache.entries.contains_key(&fingerprint));
             }

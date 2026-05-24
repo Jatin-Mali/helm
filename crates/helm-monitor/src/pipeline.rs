@@ -264,6 +264,13 @@ pub fn pipeline_failure_findings(
             let stage = pipeline
                 .last_stage
                 .clone()
+                .map(|value| {
+                    value
+                        .replace('_', " ")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "unknown".to_owned());
             let logs = pipeline
@@ -271,11 +278,12 @@ pub fn pipeline_failure_findings(
                 .clone()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| pipeline.endpoint.clone());
+            let title = pipeline_failure_title(&display_name, &stage);
             Finding::new(
                 snapshot_id,
                 "pipeline-failure",
-                &pipeline.service_id,
-                &format!("Pipeline {} failed in {}", display_name, stage),
+                &display_name,
+                &title,
                 Severity::Critical,
                 Confidence::High,
                 MonitorDomain::Services,
@@ -316,6 +324,24 @@ fn pipeline_display_name(name: &str, service_id: &str) -> String {
     } else {
         cleaned
     }
+}
+
+fn pipeline_failure_title(display_name: &str, stage: &str) -> String {
+    let prefix = "Pipeline ";
+    let middle = " failed in ";
+    let fixed = prefix.len() + middle.len() + stage.chars().count();
+    let name_budget = 80usize.saturating_sub(fixed).max(8);
+    let short_name = if display_name.chars().count() > name_budget {
+        let mut value = display_name
+            .chars()
+            .take(name_budget.saturating_sub(3))
+            .collect::<String>();
+        value.push_str("...");
+        value
+    } else {
+        display_name.to_owned()
+    };
+    format!("{prefix}{short_name}{middle}{stage}")
 }
 
 fn collector_error(message: String) -> CollectorError {

@@ -27,6 +27,7 @@ use helm_monitor::{
         Collector, db_health::DbHealthCollector, db_health::DbInstance,
         web_servers::WebServerCollector, web_servers::WebSite,
     },
+    log_pattern_ids_new_since_previous,
     pipeline::{PipelineSnapshot, record_pipeline_webhook_event},
 };
 use serde::Serialize;
@@ -76,6 +77,7 @@ pub struct LiveSnapshot {
     pub daemon: DaemonSummary,
     pub metric_history: MetricHistoryPayload,
     pub log_entries: Vec<String>,
+    pub new_log_pattern_ids: Vec<String>,
     pub inventory: SnapshotDomains,
     pub databases: Vec<DbInstance>,
     pub websites: Vec<WebSite>,
@@ -473,6 +475,24 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         .count();
 
     let log_entries = log_entries(&snapshot);
+    let new_log_pattern_ids = load_previous_log_patterns(&conn, &snapshot.id)
+        .map(|previous| {
+            let mut ids =
+                log_pattern_ids_new_since_previous(&snapshot.domains.logs.patterns, &previous)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        })
+        .unwrap_or_else(|| {
+            snapshot
+                .domains
+                .logs
+                .patterns
+                .iter()
+                .map(|pattern| pattern.pattern_id.clone())
+                .collect()
+        });
     let collector_health = collector_health(&snapshot);
     let findings = findings
         .iter()
@@ -513,6 +533,7 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         daemon,
         metric_history,
         log_entries,
+        new_log_pattern_ids,
         inventory: snapshot.domains.clone(),
         databases,
         websites,
@@ -669,6 +690,18 @@ fn log_entries(snapshot: &SystemSnapshot) -> Vec<String> {
         lines.push("No recent kernel or auth errors detected.".to_owned());
     }
     lines
+}
+
+fn load_previous_log_patterns(
+    conn: &rusqlite::Connection,
+    current_snapshot_id: &str,
+) -> Option<Vec<helm_monitor::JournalPattern>> {
+    let records = SnapshotStore::list(conn, 2).ok()?;
+    let record = records
+        .into_iter()
+        .find(|record| record.id != current_snapshot_id)?;
+    let domains = serde_json::from_str::<SnapshotDomains>(&record.domains_json).ok()?;
+    Some(domains.logs.patterns)
 }
 
 fn collector_health(snapshot: &SystemSnapshot) -> Vec<CollectorHealth> {
@@ -920,5 +953,6 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("F5"));
         assert!(DASHBOARD_HTML.contains("Alt+G"));
         assert!(DASHBOARD_HTML.contains("1-9"));
+        assert!(DASHBOARD_HTML.contains("renderLogs"));
     }
 }
