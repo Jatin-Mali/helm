@@ -8,6 +8,7 @@ use crate::{
     custom_service::ServiceRegistry,
     detectors::DetectorRegistry,
     findings::{Finding, MonitorDomain, Severity, self_resolved_findings, sort_findings},
+    pipeline::pipeline_failure_findings,
     snapshot::{MonitorProfile, SystemSnapshot},
 };
 
@@ -112,6 +113,18 @@ impl MonitorReporter {
                     }),
             );
         }
+        active_findings.extend(
+            pipeline_failure_findings(
+                &snapshot.domains.pipelines,
+                &snapshot.id,
+                snapshot.collected_at,
+            )
+            .into_iter()
+            .filter(|finding| finding.validate_for_emission().is_ok())
+            .filter(|finding| {
+                domain_filter.is_none_or(|domains| domains.contains(&finding.category))
+            }),
+        );
         sort_findings(&mut active_findings);
         let correlation = engine.correlate(&snapshot, &active_findings);
         let mut findings = correlation.findings;

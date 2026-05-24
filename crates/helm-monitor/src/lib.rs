@@ -10,6 +10,7 @@ pub mod engine;
 pub mod execute;
 pub mod findings;
 pub mod metric_history;
+pub mod pipeline;
 pub mod plan_cache;
 pub mod reporter;
 pub mod ring_buffer;
@@ -38,6 +39,10 @@ pub use findings::{
     MonitorDomain, PlanId, Severity, self_resolved_findings, sort_findings,
 };
 pub use metric_history::MetricHistory;
+pub use pipeline::{
+    PipelineCollector, PipelineProvider, PipelineSnapshot, PipelineStatus, PipelineWebhookError,
+    default_pipeline_history_path, pipeline_failure_findings, record_pipeline_webhook_event,
+};
 pub use plan_cache::{DEFAULT_PLAN_CACHE_TTL_SECS, PlanCache};
 pub use reporter::{MonitorReport, MonitorReporter};
 pub use ring_buffer::RingBuffer;

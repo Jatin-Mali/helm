@@ -1388,6 +1388,8 @@ fn infer_finding_kind(finding: &Finding) -> String {
         ("process", "Process"),
         ("docker", "Container"),
         ("podman", "Container"),
+        ("pipeline", "Pipeline"),
+        ("deploy", "Pipeline"),
         ("backup", "Backup"),
         ("port", "Port"),
         ("timer", "Timer"),
@@ -7758,6 +7760,7 @@ fn render_ops_cpu_memory(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .as_ref()
         .and_then(|pressure| pressure.avg10.or(pressure.avg60).or(pressure.avg300))
         .unwrap_or(0.0);
+    let pipelines = &domains.pipelines;
 
     let trend = |values: &[f64]| -> String {
         let tail = values
@@ -7834,6 +7837,24 @@ fn render_ops_cpu_memory(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         Line::from(vec![
             Span::styled("swap trend ", Style::default().fg(OPS_DIM)),
             Span::styled(trend(&swap_series), Style::default().fg(OPS_YELLOW)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("deploy/day ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                format!("{:.1}", pipelines.deployment_frequency_per_day),
+                Style::default().fg(OPS_GREEN),
+            ),
+            Span::styled("  failure ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                format!("{:.1}%", pipelines.change_failure_rate),
+                Style::default().fg(OPS_YELLOW),
+            ),
+            Span::styled("  running ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                pipelines.running_builds.to_string(),
+                Style::default().fg(OPS_BLUE),
+            ),
         ]),
     ];
 

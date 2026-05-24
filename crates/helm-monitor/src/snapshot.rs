@@ -453,7 +453,8 @@ pub struct SystemSnapshot {
 }
 
 /// All domain sub-snapshots.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct SnapshotDomains {
     pub host: HostIdentity,
     pub load: LoadSnapshot,
@@ -472,6 +473,7 @@ pub struct SnapshotDomains {
     pub libvirt: crate::collectors::libvirt::LibvirtSnapshot,
     pub compose: crate::collectors::compose::ComposeSnapshot,
     pub certs: CertSnapshot,
+    pub pipelines: crate::pipeline::PipelineSnapshot,
 }
 
 /// Non-fatal error from one collector.
@@ -483,7 +485,7 @@ pub struct CollectorError {
 }
 
 impl SnapshotDomains {
-    /// Return the 16 domain names in a stable order matching the struct fields.
+    /// Return the domain names in a stable order matching the struct fields.
     pub fn domain_names() -> Vec<&'static str> {
         vec![
             "host",
@@ -503,6 +505,7 @@ impl SnapshotDomains {
             "libvirt",
             "compose",
             "certs",
+            "pipelines",
         ]
     }
 }
@@ -674,30 +677,6 @@ impl Default for FirewallSnapshot {
             firewalld_active: None,
             iptables_rule_count: None,
             default_accept_input: None,
-        }
-    }
-}
-
-impl Default for SnapshotDomains {
-    fn default() -> Self {
-        Self {
-            host: HostIdentity::default(),
-            load: LoadSnapshot::default(),
-            disks: DiskSnapshot::default(),
-            services: ServiceSnapshot::default(),
-            containers: ContainerSnapshot::default(),
-            ports: PortSnapshot::default(),
-            logs: LogSnapshot::default(),
-            backups: BackupSnapshot::default(),
-            packages: PackageSnapshot::default(),
-            timers: TimerSnapshot::default(),
-            network: NetworkSnapshot::default(),
-            processes: ProcessSnapshot::default(),
-            firewall: FirewallSnapshot::default(),
-            kubernetes: crate::collectors::kubernetes::KubernetesSnapshot::default(),
-            libvirt: crate::collectors::libvirt::LibvirtSnapshot::default(),
-            compose: crate::collectors::compose::ComposeSnapshot::default(),
-            certs: CertSnapshot::default(),
         }
     }
 }

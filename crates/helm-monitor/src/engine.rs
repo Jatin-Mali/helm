@@ -14,6 +14,7 @@ use crate::{
     },
     detectors::DetectorRegistry,
     findings::Finding,
+    pipeline::PipelineCollector,
     snapshot::{CollectorError, MonitorProfile, SnapshotDomains, SystemSnapshot},
 };
 
@@ -87,6 +88,7 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         libvirt_result,
         compose_result,
         certs_result,
+        pipelines_result,
     ) = tokio::join!(
         HostCollector.collect(profile),
         LoadCollector.collect(profile),
@@ -105,6 +107,7 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         LibvirtCollector.collect(profile),
         ComposeCollector.collect(profile),
         CertsCollector.collect(profile),
+        PipelineCollector::collect_default(profile),
     );
 
     let host_identity = unwrap_or_default(host_result, "host", &mut errors);
@@ -124,6 +127,7 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
     let libvirt_out = unwrap_or_default(libvirt_result, "libvirt", &mut errors);
     let compose_out = unwrap_or_default(compose_result, "compose", &mut errors);
     let certs_out = unwrap_or_default(certs_result, "certs", &mut errors);
+    let pipelines_out = unwrap_or_default(pipelines_result, "pipelines", &mut errors);
 
     let domains = SnapshotDomains {
         host: host_identity.clone(),
@@ -143,6 +147,7 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         libvirt: libvirt_out,
         compose: compose_out,
         certs: certs_out,
+        pipelines: pipelines_out,
     };
 
     SystemSnapshot {
@@ -191,10 +196,12 @@ mod tests {
         let _kubernetes = &result.domains.kubernetes;
         let _libvirt = &result.domains.libvirt;
         let _compose = &result.domains.compose;
+        let _pipelines = &result.domains.pipelines;
         let domain_names = crate::snapshot::SnapshotDomains::domain_names();
         assert!(domain_names.contains(&"kubernetes"));
         assert!(domain_names.contains(&"libvirt"));
         assert!(domain_names.contains(&"compose"));
+        assert!(domain_names.contains(&"pipelines"));
     }
 
     struct CaptureSink(Arc<Mutex<Vec<String>>>);

@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{
-        State,
+        Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
@@ -27,6 +27,7 @@ use helm_monitor::{
         Collector, db_health::DbHealthCollector, db_health::DbInstance,
         web_servers::WebServerCollector, web_servers::WebSite,
     },
+    pipeline::{PipelineSnapshot, record_pipeline_webhook_event},
 };
 use serde::Serialize;
 use tokio::sync::broadcast;
@@ -78,6 +79,7 @@ pub struct LiveSnapshot {
     pub inventory: SnapshotDomains,
     pub databases: Vec<DbInstance>,
     pub websites: Vec<WebSite>,
+    pub pipelines: PipelineSnapshot,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -215,6 +217,10 @@ pub async fn serve(
         .route("/api/snapshot", get(api_snapshot))
         .route("/api/refresh", post(api_refresh))
         .route("/api/plan", post(api_generate_plan))
+        .route(
+            "/api/pipelines/webhook/{provider}/{service_id}",
+            post(api_pipeline_webhook),
+        )
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -344,6 +350,28 @@ async fn api_generate_plan(
         None => Json(serde_json::json!({
             "error": "Finding not found. Run a collection first.",
             "plan": null
+        })),
+    }
+}
+
+async fn api_pipeline_webhook(
+    State(state): State<Arc<WebState>>,
+    Path((provider, service_id)): Path<(String, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    match record_pipeline_webhook_event(&provider, &service_id, &payload) {
+        Ok(()) => {
+            let json = collect_live_snapshot(&state.db_path).await;
+            let _ = state.snapshot_tx.send(json);
+            Json(serde_json::json!({
+                "ok": true,
+                "provider": provider,
+                "serviceId": service_id,
+            }))
+        }
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": error.to_string(),
         })),
     }
 }
@@ -488,6 +516,7 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
         inventory: snapshot.domains.clone(),
         databases,
         websites,
+        pipelines: snapshot.domains.pipelines.clone(),
     };
 
     serde_json::to_string(&live).unwrap_or_default()

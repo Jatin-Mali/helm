@@ -114,6 +114,7 @@ mod tests {
                 available: true,
             },
             certs: Default::default(),
+            pipelines: Default::default(),
         };
         SystemSnapshot::new(
             "test-snapshot".to_string(),

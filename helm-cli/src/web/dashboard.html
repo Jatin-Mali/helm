@@ -824,6 +824,10 @@ function renderHero() {
   const upgradable = inv.packages?.upgradable_count ?? 0;
   const pods = inv.kubernetes?.pods?.length || 0;
   const vms = inv.libvirt?.domains?.length || 0;
+  const pipelines = inv.pipelines?.pipelines?.length || 0;
+  const runningBuilds = inv.pipelines?.running_builds || 0;
+  const deploymentRate = inv.pipelines?.deployment_frequency_per_day || 0;
+  const changeFailureRate = inv.pipelines?.change_failure_rate || 0;
   const collectorTotal = (d.collectorHealth || []).length;
   const collectorHealthy = (d.collectorHealth || []).filter(item => item.healthy).length;
   const collectorDegraded = (d.collectorHealth || []).filter(item => !item.healthy).map(item => item.domain);
@@ -858,8 +862,8 @@ function renderHero() {
     {
       label: 'runtime counts',
       value: `${serviceUnits} svc · ${d.totalContainers || 0} ctr`,
-      sub: `${pods} pods · ${vms} vms · ${databases} db · ${sites} sites`,
-      trend: ['failed', `${d.failedServices || 0} services · ${offlineContainers} containers`],
+      sub: `${pods} pods · ${vms} vms · ${databases} db · ${sites} sites · ${pipelines} pipelines`,
+      trend: ['deploy', `${fmt1(deploymentRate)}/day · ${fmt1(changeFailureRate)}% failure · ${runningBuilds} running`],
       spark: d.metricHistory?.memory || [],
     },
     {
@@ -1012,6 +1016,7 @@ function renderOverview() {
             <span class="pill">vms ${esc(String(inv.libvirt?.domains?.length || 0))}</span>
             <span class="pill">databases ${esc(String(d.databases?.length || 0))}</span>
             <span class="pill">sites ${esc(String(d.websites?.length || 0))}</span>
+            <span class="pill">pipelines ${esc(String(inv.pipelines?.pipelines?.length || 0))}</span>
           </div>
         </section>
         <section class="card">
@@ -1053,6 +1058,16 @@ function renderServices() {
         statePill(site.tls ? 'ok' : 'info', site.tls ? 'tls' : 'plain'),
         esc(site.proxy_pass || site.root || 'n/a'),
         esc(site.config_file),
+      ]))}
+      ${tableCard('pipelines', ['name', 'status', 'stage', 'duration', 'failure rate', 'running', 'logs', 'webhook'], (inv.pipelines?.pipelines || []).map(pipeline => [
+        esc(pipeline.name),
+        statePill(classifyStatus(pipeline.last_status), pipeline.last_status),
+        esc(pipeline.last_stage || 'unknown'),
+        esc(pipeline.last_duration_secs != null ? `${pipeline.last_duration_secs}s` : 'n/a'),
+        esc(`${fmt1(pipeline.failure_rate)}%`),
+        esc(String(pipeline.running_builds || 0)),
+        esc(pipeline.log_reference || pipeline.endpoint),
+        esc(pipeline.webhook_path || 'n/a'),
       ]))}
     </div>
   `;
@@ -1118,6 +1133,14 @@ function renderData() {
   const inv = d.inventory || {};
   return `
     <div class="stack">
+      <section class="card">
+        <div class="panel-title">Deployment Metrics</div>
+        <div class="pill-group" style="margin-top:12px">
+          <span class="pill">deploy/day ${esc(fmt1(inv.pipelines?.deployment_frequency_per_day || 0))}</span>
+          <span class="pill">change failure ${esc(`${fmt1(inv.pipelines?.change_failure_rate || 0)}%`)}</span>
+          <span class="pill">running builds ${esc(String(inv.pipelines?.running_builds || 0))}</span>
+        </div>
+      </section>
       ${tableCard('databases', ['type', 'connection', 'reachable', 'version', 'connections', 'error'], (d.databases || []).map(db => [
         esc(db.db_type),
         esc(db.connection),
