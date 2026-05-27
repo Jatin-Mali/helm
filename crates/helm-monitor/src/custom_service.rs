@@ -760,4 +760,54 @@ team = "platform"
         assert_eq!(escalation_severity(5), Some(Severity::Critical));
         assert_eq!(escalation_severity(9), Some(Severity::Critical));
     }
+
+    // ── Property tests ──────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Property 1: Invalid service IDs (empty string) are always rejected.
+            #[test]
+            fn property_empty_id_rejected(_dummy in 0u8..10) {
+                let path = temp_services_path("prop_empty_id");
+                let mut registry = ServiceRegistry::new(&path);
+                let mut svc = sample_service("");
+                svc.id = String::new();
+                let err = registry.add(svc).unwrap_err();
+                prop_assert!(err.to_string().to_lowercase().contains("id"));
+            }
+
+            /// Property 2: Connection strings > 2048 chars are always rejected.
+            #[test]
+            fn property_oversized_connection_string_rejected(extra in 1usize..500) {
+                let path = temp_services_path("prop_connstr");
+                let mut registry = ServiceRegistry::new(&path);
+                let conn = "x".repeat(2048 + extra);
+                let mut svc = sample_service("svc-big");
+                svc.service_type = ServiceType::Database {
+                    kind: DbKind::PostgreSQL,
+                    connection_string: conn,
+                };
+                let err = registry.add(svc).unwrap_err();
+                prop_assert!(err.to_string().contains("2048"));
+            }
+
+            /// Property 3: Escalation severity is monotonically non-decreasing with
+            /// failure count: once Critical is reached, it stays Critical.
+            #[test]
+            fn property_escalation_monotone(n in 5u32..100) {
+                // At and above 5 failures, must be Critical.
+                prop_assert_eq!(escalation_severity(n), Some(Severity::Critical));
+            }
+
+            /// Property 4: Below 3 failures, escalation is always None.
+            #[test]
+            fn property_no_escalation_below_threshold(n in 0u32..3) {
+                prop_assert_eq!(escalation_severity(n), None);
+            }
+        }
+    }
 }

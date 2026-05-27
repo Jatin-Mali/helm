@@ -828,4 +828,70 @@ mod tests {
             );
         }
     }
+
+    // ── Property tests ──────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Property 1: Groups from correlate() can never contain more finding_ids
+            /// than there are input findings.
+            #[test]
+            fn property_group_size_bounded_by_input(n in 0usize..15) {
+                let snap = snapshot_at(1_000);
+                let findings: Vec<Finding> = (0..n)
+                    .map(|i| finding(
+                        &snap.id,
+                        "disk-usage",
+                        &format!("/mnt/{i}"),
+                        &format!("Disk /mnt/{i} near full"),
+                        Severity::Warning,
+                        MonitorDomain::Disks,
+                    ))
+                    .collect();
+                let total_input = findings.len();
+                let mut engine = CorrelationEngine::default();
+                let result = engine.correlate(&snap, &findings);
+                let total_in_groups: usize = result.groups.iter().map(|g| g.finding_ids.len()).sum();
+                prop_assert!(total_in_groups <= total_input);
+            }
+
+            /// Property 2: Every finding_id in every group was in the input set.
+            #[test]
+            fn property_group_members_are_known_findings(n in 1usize..12) {
+                let snap = snapshot_at(2_000);
+                let findings: Vec<Finding> = (0..n)
+                    .map(|i| finding(
+                        &snap.id,
+                        if i % 2 == 0 { "high-load" } else { "oom-kill" },
+                        &format!("proc-{i}"),
+                        &format!("Issue with proc-{i}"),
+                        Severity::Critical,
+                        MonitorDomain::Load,
+                    ))
+                    .collect();
+                let known_ids: std::collections::HashSet<String> =
+                    findings.iter().map(|f| f.id.clone()).collect();
+                let mut engine = CorrelationEngine::new(Duration::from_secs(300));
+                let result = engine.correlate(&snap, &findings);
+                for group in &result.groups {
+                    for fid in &group.finding_ids {
+                        prop_assert!(known_ids.contains(fid), "unknown finding_id in group: {fid}");
+                    }
+                }
+            }
+
+            /// Property 3: Correlating zero findings always yields zero groups.
+            #[test]
+            fn property_empty_input_yields_no_groups(_dummy in 0u8..10) {
+                let snap = snapshot_at(3_000);
+                let mut engine = CorrelationEngine::default();
+                let result = engine.correlate(&snap, &[]);
+                prop_assert_eq!(result.groups.len(), 0);
+            }
+        }
+    }
 }

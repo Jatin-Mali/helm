@@ -863,4 +863,109 @@ threshold = 10
             redaction_version: "test".into(),
         }
     }
+
+    // ── Property tests ──────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Property 1: Rules with invalid severity strings always produce at least
+            /// one validation error with a description containing "invalid severity".
+            #[test]
+            fn property_invalid_severity_always_errors(
+                bad_sev in "[a-z]{6,12}",
+            ) {
+                // Skip any accidentally valid values
+                if matches!(
+                    bad_sev.as_str(),
+                    "info" | "warning" | "critical" | "informational"
+                ) {
+                    return Ok(());
+                }
+                let toml = format!(r#"
+[[rules]]
+id = "test-rule"
+title = "Test Rule"
+severity = "{bad_sev}"
+impact = "test"
+[rules.condition]
+kind = "simple"
+metric_path = "domains.load.load_average.one"
+operator = "gt"
+threshold = 5
+"#);
+                let result = parse_rules_document_partial(&toml);
+                prop_assert!(result.is_err() || {
+                    let (_, errs) = result.unwrap();
+                    !errs.is_empty()
+                }, "expected validation error for severity={bad_sev}");
+            }
+
+            /// Property 2: A rule that fires (metric exceeds threshold) always produces
+            /// findings whose validate_for_emission() passes.
+            #[test]
+            fn property_fired_findings_pass_emission_validation(
+                load in 6.0f64..20.0,
+            ) {
+                let (rules, errors) = parse_rules_document_partial(r#"
+[[rules]]
+id = "load-spike"
+title = "Load spike detected"
+severity = "warning"
+impact = "System under heavy load"
+fix_hint = "Check running processes"
+[rules.condition]
+kind = "simple"
+metric_path = "domains.load.load_average.one"
+operator = "gt"
+threshold = 5
+"#).unwrap();
+                prop_assert!(errors.is_empty());
+                let engine = CustomRulesEngine {
+                    rules,
+                    config_path: None,
+                    last_modified: None,
+                    rate_history: Mutex::new(HashMap::new()),
+                };
+                let snap = snapshot_with_metrics(load, 10, 0);
+                let findings = engine.evaluate(&snap);
+                prop_assert!(!findings.is_empty());
+                for f in &findings {
+                    prop_assert!(f.validate_for_emission().is_ok(), "finding failed emission: {:?}", f);
+                    prop_assert!(f.title_is_readable());
+                }
+            }
+
+            /// Property 3: A rule that does NOT fire produces no findings.
+            #[test]
+            fn property_unfired_rule_produces_no_findings(
+                load in 0.0f64..5.0,
+            ) {
+                let (rules, _) = parse_rules_document_partial(r#"
+[[rules]]
+id = "load-spike"
+title = "Load spike detected"
+severity = "warning"
+impact = "System under heavy load"
+[rules.condition]
+kind = "simple"
+metric_path = "domains.load.load_average.one"
+operator = "gt"
+threshold = 5
+"#).unwrap();
+                let engine = CustomRulesEngine {
+                    rules,
+                    config_path: None,
+                    last_modified: None,
+                    rate_history: Mutex::new(HashMap::new()),
+                };
+                let snap = snapshot_with_metrics(load, 0, 0);
+                let findings = engine.evaluate(&snap);
+                prop_assert!(findings.is_empty(), "expected no findings for load={load}");
+            }
+        }
+    }
 }

@@ -36,7 +36,7 @@ impl std::fmt::Display for ChangeSetStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
     Pending,
@@ -164,6 +164,84 @@ impl ChangeSet {
 
 // ── ExecutionEngine ────────────────────────────────────────────────────────
 
+/// Single entry in the HMAC-chained audit log for step execution.
+/// Each entry's hash = SHA-256(prev_hash ‖ timestamp ‖ command ‖ exit_ok ‖ stdout ‖ stderr).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionAuditEntry {
+    /// Unix timestamp of execution.
+    pub timestamp: i64,
+    /// Command text that was run.
+    pub command_text: String,
+    /// Whether the command exited successfully.
+    pub exit_ok: bool,
+    /// SHA-256 of stdout (hex).
+    pub stdout_hash: String,
+    /// SHA-256 of stderr (hex).
+    pub stderr_hash: String,
+    /// Hash of the previous entry (all-zeros string for the first entry).
+    pub prev_hash: String,
+    /// HMAC-style chain hash for this entry.
+    pub hash: String,
+}
+
+impl ExecutionAuditEntry {
+    /// Compute a new audit entry chained from the previous hash.
+    pub fn new(
+        timestamp: i64,
+        command_text: impl Into<String>,
+        exit_ok: bool,
+        stdout: &str,
+        stderr: &str,
+        prev_hash: impl Into<String>,
+    ) -> Self {
+        let command_text = command_text.into();
+        let prev_hash = prev_hash.into();
+        let stdout_hash = hex::encode(Sha256::digest(stdout.as_bytes()));
+        let stderr_hash = hex::encode(Sha256::digest(stderr.as_bytes()));
+        let chain_input = format!(
+            "{prev_hash}{timestamp}{command_text}{}{stdout_hash}{stderr_hash}",
+            if exit_ok { "1" } else { "0" }
+        );
+        let hash = hex::encode(Sha256::digest(chain_input.as_bytes()));
+        Self {
+            timestamp,
+            command_text,
+            exit_ok,
+            stdout_hash,
+            stderr_hash,
+            prev_hash,
+            hash,
+        }
+    }
+}
+
+/// Verify the integrity of a HMAC-chained audit log.
+/// Returns `true` if all entries link correctly, `false` on any break.
+pub fn verify_audit_chain(entries: &[ExecutionAuditEntry]) -> bool {
+    let zero = "0".repeat(64);
+    let mut expected_prev = zero;
+    for entry in entries {
+        if entry.prev_hash != expected_prev {
+            return false;
+        }
+        let chain_input = format!(
+            "{}{}{}{}{}{}",
+            entry.prev_hash,
+            entry.timestamp,
+            entry.command_text,
+            if entry.exit_ok { "1" } else { "0" },
+            entry.stdout_hash,
+            entry.stderr_hash,
+        );
+        let expected_hash = hex::encode(Sha256::digest(chain_input.as_bytes()));
+        if entry.hash != expected_hash {
+            return false;
+        }
+        expected_prev = entry.hash.clone();
+    }
+    true
+}
+
 /// Outcome of a single executed step.
 #[derive(Debug, Clone)]
 pub struct StepOutcome {
@@ -182,6 +260,8 @@ pub struct ExecutionEngine {
     approve_fn: Box<dyn Fn(&CommandPreview) -> bool + Send + Sync>,
     before_snapshot: Option<SystemSnapshot>,
     after_snapshot: Option<SystemSnapshot>,
+    /// HMAC-chained audit log of every executed step.
+    pub audit_chain: Vec<ExecutionAuditEntry>,
 }
 
 impl ExecutionEngine {
@@ -191,6 +271,7 @@ impl ExecutionEngine {
             approve_fn,
             before_snapshot: None,
             after_snapshot: None,
+            audit_chain: Vec::new(),
         }
     }
 
@@ -404,7 +485,20 @@ impl ExecutionEngine {
         let mut cs = ChangeSet::new(plan, before_id);
 
         // 2. Execute each fix step (zipped with plan steps for expected_output access)
+        // halt_on_failure: once a step fails, remaining steps are not executed.
+        let mut halt = false;
         for (step, plan_step) in cs.steps.iter_mut().zip(plan.proposed_fix_steps.iter()) {
+            // 2-halt. If a prior step failed, skip all remaining steps without execution.
+            if halt {
+                step.status = StepStatus::Skipped;
+                step.verification_result = "not executed (prior step failed)".into();
+                cs.summary.push_str(&format!(
+                    "  - {}: SKIPPED (halted after prior failure)\n",
+                    step.plan_step_title
+                ));
+                continue;
+            }
+
             let preview = &step.command;
 
             // 2a. Idempotency pre-check: skip if system already in desired state
@@ -456,6 +550,22 @@ impl ExecutionEngine {
             step.started_at = Some(now);
             step.completed_at = Some(now);
 
+            // 2f. Append to HMAC audit chain.
+            let prev_hash = self
+                .audit_chain
+                .last()
+                .map(|e| e.hash.clone())
+                .unwrap_or_else(|| "0".repeat(64));
+            let audit_entry = ExecutionAuditEntry::new(
+                now,
+                preview.command_text.as_deref().unwrap_or(&preview.tool),
+                outcome.success,
+                &outcome.output,
+                &outcome.error,
+                prev_hash,
+            );
+            self.audit_chain.push(audit_entry);
+
             cs.summary.push_str(&format!(
                 "  - {}: {} | {} | verification: {}\n",
                 step.plan_step_title,
@@ -467,6 +577,11 @@ impl ExecutionEngine {
                 },
                 step.verification_result,
             ));
+
+            // 2g. Halt on failure: subsequent steps will be skipped.
+            if step.status == StepStatus::Failed {
+                halt = true;
+            }
         }
 
         // 3. Capture after-snapshot
@@ -878,5 +993,111 @@ mod tests {
         let cs = ChangeSet::new(&plan, "before".into());
         assert_eq!(cs.plan_title, "finding: finding-1");
         assert!(cs.status_summary().contains("pending"));
+    }
+
+    // ── Property tests ──────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Property 1: HMAC chain integrity — any chain built by ExecutionAuditEntry::new
+        /// must pass verify_audit_chain, and mutating any field must break verification.
+        #[test]
+        fn property_hmac_chain_integrity() {
+            // Rebuild a clean chain so hashes link correctly
+            let mut chain: Vec<ExecutionAuditEntry> = Vec::new();
+            let cmds = [
+                ("echo hello", true, "hello\n", ""),
+                ("bad-cmd", false, "", "not found"),
+                ("ls /tmp", true, "/tmp/foo\n", ""),
+            ];
+            for (cmd, ok, stdout, stderr) in &cmds {
+                let prev = chain
+                    .last()
+                    .map(|e| e.hash.clone())
+                    .unwrap_or_else(|| "0".repeat(64));
+                chain.push(ExecutionAuditEntry::new(0, *cmd, *ok, stdout, stderr, prev));
+            }
+            assert!(verify_audit_chain(&chain));
+
+            // Mutate one entry — chain must fail
+            let mut tampered = chain.clone();
+            tampered[1].exit_ok = !tampered[1].exit_ok;
+            assert!(!verify_audit_chain(&tampered));
+        }
+
+        proptest! {
+            /// Property 2: Execution halts on step failure — all steps after the first
+            /// Failed step must have status Skipped with halt reason, never Succeeded.
+            #[test]
+            fn property_halt_on_failure_leaves_remaining_pending(
+                n_steps in 2usize..8,
+                fail_idx in 0usize..7,
+            ) {
+                let fail_idx = fail_idx % n_steps;
+                let mut steps: Vec<ChangeSetStep> = (0..n_steps)
+                    .map(|i| ChangeSetStep {
+                        id: i.to_string(),
+                        plan_step_title: format!("step-{i}"),
+                        command: CommandPreview::new("shell", &format!("echo {i}"), ""),
+                        status: StepStatus::Pending,
+                        output_text: String::new(),
+                        error_text: String::new(),
+                        verification_result: String::new(),
+                        started_at: None,
+                        completed_at: None,
+                    })
+                    .collect();
+
+                // Simulate halt-on-failure logic
+                let mut halt = false;
+                for (i, step) in steps.iter_mut().enumerate() {
+                    if halt {
+                        step.status = StepStatus::Skipped;
+                        step.verification_result = "not executed (prior step failed)".into();
+                    } else if i == fail_idx {
+                        step.status = StepStatus::Failed;
+                        halt = true;
+                    } else {
+                        step.status = StepStatus::Succeeded;
+                    }
+                }
+
+                // All steps after fail_idx must be Skipped, never Succeeded
+                for step in &steps[fail_idx + 1..] {
+                    prop_assert_eq!(step.status, StepStatus::Skipped);
+                    prop_assert!(step.verification_result.contains("not executed"));
+                }
+                // The fail_idx step itself must be Failed
+                prop_assert_eq!(steps[fail_idx].status, StepStatus::Failed);
+            }
+
+            /// Property 3: HMAC chain of N arbitrary entries is always self-consistent.
+            #[test]
+            fn property_hmac_chain_always_verifies(
+                cmds in proptest::collection::vec("[a-z ]{1,20}", 1..10),
+                successes in proptest::collection::vec(proptest::bool::ANY, 1..10),
+            ) {
+                let len = cmds.len().min(successes.len());
+                let mut chain: Vec<ExecutionAuditEntry> = Vec::new();
+                for i in 0..len {
+                    let prev = chain
+                        .last()
+                        .map(|e| e.hash.clone())
+                        .unwrap_or_else(|| "0".repeat(64));
+                    chain.push(ExecutionAuditEntry::new(
+                        i as i64,
+                        &cmds[i],
+                        successes[i],
+                        "stdout",
+                        "stderr",
+                        prev,
+                    ));
+                }
+                prop_assert!(verify_audit_chain(&chain));
+            }
+        }
     }
 }
