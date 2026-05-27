@@ -3,6 +3,7 @@
 mod bootstrap;
 mod custom_commands;
 mod keybindings;
+mod ops;
 mod paths;
 mod remote;
 mod sandbox;
@@ -2466,13 +2467,24 @@ async fn render_models(base_url: &str) -> Result<String> {
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     version: String,
+    distribution: DoctorDistributionReport,
     provider: DoctorProviderReport,
     memory: DoctorMemoryReport,
+    audit: DoctorAuditReport,
+    binaries: Vec<DoctorBinaryReport>,
+    collector_prereqs: Vec<DoctorCollectorPrereqReport>,
     tools: Vec<DoctorToolReport>,
     ollama: DoctorOllamaReport,
     other_providers_detected: Vec<DoctorEnvReport>,
     quirks: DoctorQuirksReport,
     secrets: DoctorSecretsReport,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorDistributionReport {
+    id: String,
+    pretty_name: String,
+    package_manager: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2506,6 +2518,13 @@ struct DoctorMemoryReport {
     database: String,
     schema_version: u32,
     episodes: u32,
+    accessible: DoctorCheck,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorAuditReport {
+    chain: DoctorCheck,
+    checked: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -2536,10 +2555,67 @@ struct DoctorEnvReport {
 }
 
 #[derive(Debug, Serialize)]
+struct DoctorBinaryReport {
+    name: String,
+    status: DoctorCheck,
+    package_hint: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorCollectorPrereqReport {
+    collector: String,
+    status: DoctorCheck,
+    package_hint: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum DoctorStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct DoctorCheck {
-    ok: bool,
+    status: DoctorStatus,
     detail: String,
     latency_ms: Option<u128>,
+}
+
+impl DoctorCheck {
+    fn pass(detail: impl Into<String>) -> Self {
+        Self {
+            status: DoctorStatus::Pass,
+            detail: detail.into(),
+            latency_ms: None,
+        }
+    }
+
+    fn warn(detail: impl Into<String>) -> Self {
+        Self {
+            status: DoctorStatus::Warn,
+            detail: detail.into(),
+            latency_ms: None,
+        }
+    }
+
+    fn fail(detail: impl Into<String>) -> Self {
+        Self {
+            status: DoctorStatus::Fail,
+            detail: detail.into(),
+            latency_ms: None,
+        }
+    }
+
+    fn with_latency(mut self, latency_ms: Option<u128>) -> Self {
+        self.latency_ms = latency_ms;
+        self
+    }
+
+    fn ok(&self) -> bool {
+        matches!(self.status, DoctorStatus::Pass)
+    }
 }
 
 async fn run_doctor(
@@ -2548,8 +2624,12 @@ async fn run_doctor(
     memory: &MemoryStore,
     store: &SecretsStore,
 ) -> Result<DoctorReport> {
+    let distribution = detect_distribution();
     let provider_report = run_provider_doctor(settings, store).await;
-    let memory_report = run_memory_doctor(db_path, memory).await?;
+    let memory_report = run_memory_doctor(db_path, memory).await;
+    let audit_report = run_audit_doctor(memory).await;
+    let binaries = run_binary_doctor(&distribution);
+    let collector_prereqs = run_collector_doctor(&distribution);
     let tools = run_tools_doctor();
     let ollama = run_ollama_doctor(
         &settings
@@ -2571,8 +2651,12 @@ async fn run_doctor(
     let secrets = run_secrets_doctor(store);
     Ok(DoctorReport {
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        distribution,
         provider: provider_report,
         memory: memory_report,
+        audit: audit_report,
+        binaries,
+        collector_prereqs,
         tools,
         ollama,
         other_providers_detected: provider_env_reports(),
@@ -2613,6 +2697,140 @@ fn run_secrets_doctor(store: &SecretsStore) -> DoctorSecretsReport {
     }
 }
 
+fn detect_distribution() -> DoctorDistributionReport {
+    let content = fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let mut id = "unknown".to_owned();
+    let mut pretty_name = "Unknown Linux".to_owned();
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("ID=") {
+            id = value.trim_matches('"').to_owned();
+        } else if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
+            pretty_name = value.trim_matches('"').to_owned();
+        }
+    }
+    let package_manager = match id.as_str() {
+        "ubuntu" | "debian" | "linuxmint" | "pop" => "apt",
+        "fedora" | "rhel" | "centos" | "rocky" | "almalinux" => "dnf",
+        "arch" | "manjaro" => "pacman",
+        "opensuse" | "opensuse-tumbleweed" => "zypper",
+        _ => "package-manager",
+    }
+    .to_owned();
+    DoctorDistributionReport {
+        id,
+        pretty_name,
+        package_manager,
+    }
+}
+
+fn run_binary_doctor(distribution: &DoctorDistributionReport) -> Vec<DoctorBinaryReport> {
+    ["systemctl", "journalctl", "df", "ss"]
+        .into_iter()
+        .map(|name| {
+            let found = which::which(name).ok();
+            DoctorBinaryReport {
+                name: name.to_owned(),
+                status: match &found {
+                    Some(path) => DoctorCheck::pass(format!("found at {}", path.display())),
+                    None => DoctorCheck::fail(format!("{name} not found on PATH")),
+                },
+                package_hint: found.is_none().then(|| package_hint(distribution, name)),
+            }
+        })
+        .collect()
+}
+
+fn run_collector_doctor(
+    distribution: &DoctorDistributionReport,
+) -> Vec<DoctorCollectorPrereqReport> {
+    [
+        ("services", &["systemctl"][..]),
+        ("logs", &["journalctl"]),
+        ("disks", &["df", "findmnt", "lsblk"]),
+        ("network", &["ss"]),
+        ("containers", &["docker", "podman"]),
+        ("kubernetes", &["kubectl"]),
+        ("libvirt", &["virsh"]),
+    ]
+    .into_iter()
+    .map(|(collector, bins)| {
+        let found = bins
+            .iter()
+            .find_map(|name| which::which(name).ok().map(|_| *name));
+        let detail = match found {
+            Some(name) => {
+                DoctorCheck::pass(format!("collector prerequisites available via {name}"))
+            }
+            None if collector == "containers"
+                || collector == "kubernetes"
+                || collector == "libvirt" =>
+            {
+                DoctorCheck::warn(format!(
+                    "{collector} collector will stay empty until one of [{}] is installed",
+                    bins.join(", ")
+                ))
+            }
+            None => DoctorCheck::fail(format!("missing prerequisites [{}]", bins.join(", "))),
+        };
+        let package_hint = found.is_none().then(|| package_hint(distribution, bins[0]));
+        DoctorCollectorPrereqReport {
+            collector: collector.to_owned(),
+            status: detail,
+            package_hint,
+        }
+    })
+    .collect()
+}
+
+async fn run_audit_doctor(memory: &MemoryStore) -> DoctorAuditReport {
+    match memory.verify_audit_chain().await {
+        Ok(verification) => DoctorAuditReport {
+            chain: if verification.ok {
+                DoctorCheck::pass(format!("verified {} audit event(s)", verification.checked))
+            } else {
+                DoctorCheck::fail(
+                    verification
+                        .reason
+                        .unwrap_or_else(|| "audit chain verification failed".to_owned()),
+                )
+            },
+            checked: verification.checked,
+        },
+        Err(error) => DoctorAuditReport {
+            chain: DoctorCheck::fail(error.to_string()),
+            checked: 0,
+        },
+    }
+}
+
+fn package_hint(distribution: &DoctorDistributionReport, binary: &str) -> String {
+    let package = match (distribution.package_manager.as_str(), binary) {
+        ("apt", "systemctl") | ("apt", "journalctl") => "systemd",
+        ("apt", "df") => "coreutils",
+        ("apt", "ss") => "iproute2",
+        ("apt", "docker") => "docker.io",
+        ("apt", "podman") => "podman",
+        ("apt", "kubectl") => "kubectl",
+        ("apt", "virsh") => "libvirt-clients",
+        ("dnf", "systemctl") | ("dnf", "journalctl") => "systemd",
+        ("dnf", "df") => "coreutils",
+        ("dnf", "ss") => "iproute",
+        ("dnf", "docker") => "docker",
+        ("dnf", "podman") => "podman",
+        ("dnf", "kubectl") => "kubectl",
+        ("dnf", "virsh") => "libvirt-client",
+        ("pacman", "systemctl") | ("pacman", "journalctl") => "systemd",
+        ("pacman", "df") => "coreutils",
+        ("pacman", "ss") => "iproute2",
+        ("pacman", "docker") => "docker",
+        ("pacman", "podman") => "podman",
+        ("pacman", "kubectl") => "kubectl",
+        ("pacman", "virsh") => "libvirt",
+        _ => binary,
+    };
+    format!("install `{package}` with {}", distribution.package_manager)
+}
+
 async fn run_provider_doctor(
     settings: &ProviderSettings,
     store: &SecretsStore,
@@ -2637,16 +2855,8 @@ async fn run_provider_doctor(
                 .model
                 .clone()
                 .unwrap_or_else(|| default_model_name(settings.choice).to_owned()),
-            reachable: DoctorCheck {
-                ok: false,
-                detail: error.to_string(),
-                latency_ms: None,
-            },
-            tool_calls: DoctorCheck {
-                ok: false,
-                detail: "not probed because provider build failed".to_owned(),
-                latency_ms: None,
-            },
+            reachable: DoctorCheck::warn(error.to_string()),
+            tool_calls: DoctorCheck::warn("not probed because provider build failed"),
         },
     }
 }
@@ -2666,25 +2876,13 @@ async fn probe_provider(provider: &dyn Provider, model: &str) -> (DoctorCheck, D
     let latency_ms = start.elapsed().as_millis();
     match reachable_response {
         Ok(_) => {
-            let reachable = DoctorCheck {
-                ok: true,
-                detail: "yes".to_owned(),
-                latency_ms: Some(latency_ms),
-            };
+            let reachable = DoctorCheck::pass("provider reachable").with_latency(Some(latency_ms));
             let tool_calls = probe_tool_calls(provider, model).await;
             (reachable, tool_calls)
         }
         Err(error) => (
-            DoctorCheck {
-                ok: false,
-                detail: error.to_string(),
-                latency_ms: Some(latency_ms),
-            },
-            DoctorCheck {
-                ok: false,
-                detail: "not probed because reachability failed".to_owned(),
-                latency_ms: None,
-            },
+            DoctorCheck::fail(error.to_string()).with_latency(Some(latency_ms)),
+            DoctorCheck::warn("not probed because reachability failed"),
         ),
     }
 }
@@ -2713,21 +2911,11 @@ async fn probe_tool_calls(provider: &dyn Provider, model: &str) -> DoctorCheck {
         .await;
     let latency_ms = start.elapsed().as_millis();
     match response {
-        Ok(response) if response_has_tool_use(&response) => DoctorCheck {
-            ok: true,
-            detail: "yes".to_owned(),
-            latency_ms: Some(latency_ms),
-        },
-        Ok(_) => DoctorCheck {
-            ok: false,
-            detail: "no - model may not be tool-capable".to_owned(),
-            latency_ms: Some(latency_ms),
-        },
-        Err(error) => DoctorCheck {
-            ok: false,
-            detail: error.to_string(),
-            latency_ms: Some(latency_ms),
-        },
+        Ok(response) if response_has_tool_use(&response) => {
+            DoctorCheck::pass("tool calls supported").with_latency(Some(latency_ms))
+        }
+        Ok(_) => DoctorCheck::warn("model did not emit a tool call").with_latency(Some(latency_ms)),
+        Err(error) => DoctorCheck::fail(error.to_string()).with_latency(Some(latency_ms)),
     }
 }
 
@@ -2739,12 +2927,31 @@ fn response_has_tool_use(response: &ChatResponse) -> bool {
             .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
 }
 
-async fn run_memory_doctor(db_path: &Path, memory: &MemoryStore) -> Result<DoctorMemoryReport> {
-    Ok(DoctorMemoryReport {
-        database: db_path.display().to_string(),
-        schema_version: memory.schema_version().await?,
-        episodes: memory.episode_count().await?,
-    })
+async fn run_memory_doctor(db_path: &Path, memory: &MemoryStore) -> DoctorMemoryReport {
+    let schema_result = memory.schema_version().await;
+    let episode_result = memory.episode_count().await;
+    match (&schema_result, &episode_result) {
+        (Ok(schema_version), Ok(episodes)) => DoctorMemoryReport {
+            database: db_path.display().to_string(),
+            schema_version: *schema_version,
+            episodes: *episodes,
+            accessible: DoctorCheck::pass("database opened and schema queries succeeded"),
+        },
+        _ => {
+            let error = schema_result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .or_else(|| episode_result.as_ref().err().map(ToString::to_string))
+                .unwrap_or_else(|| "unknown error".to_owned());
+            DoctorMemoryReport {
+                database: db_path.display().to_string(),
+                schema_version: schema_result.unwrap_or_default(),
+                episodes: episode_result.unwrap_or_default(),
+                accessible: DoctorCheck::fail(format!("database probe failed: {error}")),
+            }
+        }
+    }
 }
 
 fn run_tools_doctor() -> Vec<DoctorToolReport> {
@@ -2773,22 +2980,14 @@ async fn run_ollama_doctor(base_url: &str) -> DoctorOllamaReport {
                 .map(|model| model.name.clone())
                 .collect();
             DoctorOllamaReport {
-                reachable: DoctorCheck {
-                    ok: true,
-                    detail: "yes".to_owned(),
-                    latency_ms: None,
-                },
+                reachable: DoctorCheck::pass("Ollama API reachable"),
                 base_url: base_url.to_owned(),
                 installed_models,
                 cloud_models,
             }
         }
         Err(error) => DoctorOllamaReport {
-            reachable: DoctorCheck {
-                ok: false,
-                detail: error.to_string(),
-                latency_ms: None,
-            },
+            reachable: DoctorCheck::warn(error.to_string()),
             base_url: base_url.to_owned(),
             installed_models: Vec::new(),
             cloud_models: Vec::new(),
@@ -2837,6 +3036,13 @@ fn provider_env_reports() -> Vec<DoctorEnvReport> {
 fn render_doctor(report: &DoctorReport) -> String {
     let mut output = String::new();
     output.push_str(&format!("HELM v{} - system check\n\n", report.version));
+    output.push_str("[distribution]\n");
+    output.push_str(&format!(
+        "  {} ({}) via {}\n\n",
+        report.distribution.pretty_name,
+        report.distribution.id,
+        report.distribution.package_manager
+    ));
     output.push_str("[provider]\n");
     output.push_str(&format!(
         "  resolved: {} ({})\n",
@@ -2854,10 +3060,44 @@ fn render_doctor(report: &DoctorReport) -> String {
     output.push_str("[memory]\n");
     output.push_str(&format!("  database: {}\n", report.memory.database));
     output.push_str(&format!(
+        "  accessible: {}\n",
+        format_doctor_check(&report.memory.accessible)
+    ));
+    output.push_str(&format!(
         "  schema_version: {}\n",
         report.memory.schema_version
     ));
     output.push_str(&format!("  episodes: {}\n\n", report.memory.episodes));
+    output.push_str("[audit]\n");
+    output.push_str(&format!(
+        "  chain: {}\n  checked: {}\n\n",
+        format_doctor_check(&report.audit.chain),
+        report.audit.checked
+    ));
+    output.push_str("[required binaries]\n");
+    for binary in &report.binaries {
+        output.push_str(&format!(
+            "  {}: {}\n",
+            binary.name,
+            format_doctor_check(&binary.status)
+        ));
+        if let Some(hint) = &binary.package_hint {
+            output.push_str(&format!("    hint: {hint}\n"));
+        }
+    }
+    output.push('\n');
+    output.push_str("[collector prerequisites]\n");
+    for collector in &report.collector_prereqs {
+        output.push_str(&format!(
+            "  {}: {}\n",
+            collector.collector,
+            format_doctor_check(&collector.status)
+        ));
+        if let Some(hint) = &collector.package_hint {
+            output.push_str(&format!("    hint: {hint}\n"));
+        }
+    }
+    output.push('\n');
     output.push_str("[tools]\n");
     for tool in &report.tools {
         output.push_str(&format!("  {}: {}\n", tool.name, tool.status));
@@ -2866,11 +3106,14 @@ fn render_doctor(report: &DoctorReport) -> String {
     output.push_str("[ollama]\n");
     output.push_str(&format!(
         "  reachable: {} ({})\n",
-        yes_no(report.ollama.reachable.ok),
+        format_doctor_check(&report.ollama.reachable),
         report.ollama.base_url
     ));
-    if !report.ollama.reachable.ok {
-        output.push_str(&format!("  error: {}\n", report.ollama.reachable.detail));
+    if !report.ollama.reachable.ok() {
+        output.push_str(&format!(
+            "  error: {}\n",
+            report.ollama.reachable.detail.as_str()
+        ));
     }
     output.push_str(&format!(
         "  installed models: {}\n",
@@ -3213,10 +3456,14 @@ fn render_trust_report(report: &TrustReport) -> String {
 }
 
 fn format_doctor_check(check: &DoctorCheck) -> String {
-    match (check.ok, check.latency_ms) {
-        (true, Some(ms)) => format!("yes ({ms}ms)"),
-        (true, None) => "yes".to_owned(),
-        (false, _) => check.detail.clone(),
+    let status = match check.status {
+        DoctorStatus::Pass => "PASS",
+        DoctorStatus::Warn => "WARN",
+        DoctorStatus::Fail => "FAIL",
+    };
+    match check.latency_ms {
+        Some(ms) => format!("{status} — {} ({ms}ms)", check.detail),
+        None => format!("{status} — {}", check.detail),
     }
 }
 
@@ -3237,10 +3484,6 @@ fn format_list_or_none(values: &[String]) -> String {
     } else {
         values.join(", ")
     }
-}
-
-fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
 }
 
 fn format_models(models: &[OllamaModel]) -> String {
@@ -5400,7 +5643,10 @@ async fn run_troubleshoot_command(args: TroubleshootArgs) -> Result<()> {
     Ok(())
 }
 
-fn reconstruct_snapshot(record: &SnapshotStoreRecord, domains: SnapshotDomains) -> SystemSnapshot {
+pub(crate) fn reconstruct_snapshot(
+    record: &SnapshotStoreRecord,
+    domains: SnapshotDomains,
+) -> SystemSnapshot {
     SystemSnapshot {
         id: record.id.clone(),
         host: HostIdentity {
@@ -6071,73 +6317,7 @@ async fn run_change_set_command(args: ChangeSetArgs) -> Result<()> {
                 }
             }
 
-            // Attempt rollback by reversing steps in reverse order
-            let mut results = Vec::new();
-            for step in full.steps.iter().rev() {
-                if step.status != "succeeded" {
-                    results.push(format!(
-                        "  SKIP {}: step did not succeed, skipping rollback",
-                        step.plan_step_title
-                    ));
-                    continue;
-                }
-                // Try to reverse the command
-                let cmd = step.command_text.as_deref().unwrap_or("");
-                if cmd.is_empty() {
-                    results.push(format!(
-                        "  SKIP {}: no command to reverse",
-                        step.plan_step_title
-                    ));
-                    continue;
-                }
-                // Simple heuristic: for service restarts, start the service back
-                let reverse_cmd = if cmd.contains("systemctl stop") {
-                    Some(cmd.replace("systemctl stop", "systemctl start"))
-                } else if cmd.contains("systemctl disable") {
-                    Some(cmd.replace("systemctl disable", "systemctl enable"))
-                } else if cmd.contains("rm ") {
-                    eprintln!("  WARN: cannot reverse deletion: {cmd}");
-                    None
-                } else {
-                    None
-                };
-                if let Some(reverse) = reverse_cmd {
-                    eprintln!("  Running rollback: {reverse}");
-                    let output = tokio::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(&reverse)
-                        .output()
-                        .await;
-                    match output {
-                        Ok(out) if out.status.success() => {
-                            results.push(format!(
-                                "  OK   {}: rollback succeeded",
-                                step.plan_step_title
-                            ));
-                        }
-                        Ok(out) => {
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            results.push(format!(
-                                "  FAIL {}: rollback failed: {stderr}",
-                                step.plan_step_title
-                            ));
-                        }
-                        Err(e) => {
-                            results.push(format!(
-                                "  FAIL {}: rollback error: {e}",
-                                step.plan_step_title
-                            ));
-                        }
-                    }
-                } else {
-                    results.push(format!(
-                        "  SKIP {}: no rollback available for this step",
-                        step.plan_step_title
-                    ));
-                }
-            }
-
-            let _ = ChangeSetStore::update_status(&conn, &id, "rolled_back");
+            let results = ops::rollback_change_set(&db_path, &id).await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
@@ -6435,12 +6615,13 @@ mod tests {
     }
 
     use super::{
-        DoctorCheck, DoctorEnvReport, DoctorMemoryReport, DoctorOllamaModel, DoctorOllamaReport,
-        DoctorProviderReport, DoctorQuirksReport, DoctorReport, DoctorSecretsReport,
-        DoctorToolReport, ProviderChoice, ProviderSource, classify_exit_code, format_audit_events,
-        format_models, format_permissions, load_config, parse_capability_arg, parse_cli_from,
-        parse_fallback_chain, parse_scope_arg, render_doctor, resolve_provider_choice,
-        resolve_provider_settings_with_env, supports_tools,
+        DoctorAuditReport, DoctorBinaryReport, DoctorCheck, DoctorCollectorPrereqReport,
+        DoctorDistributionReport, DoctorEnvReport, DoctorMemoryReport, DoctorOllamaModel,
+        DoctorOllamaReport, DoctorProviderReport, DoctorQuirksReport, DoctorReport,
+        DoctorSecretsReport, DoctorToolReport, ProviderChoice, ProviderSource, classify_exit_code,
+        format_audit_events, format_models, format_permissions, load_config, parse_capability_arg,
+        parse_cli_from, parse_fallback_chain, parse_scope_arg, render_doctor,
+        resolve_provider_choice, resolve_provider_settings_with_env, supports_tools,
     };
 
     fn empty_env(_name: &str) -> Option<String> {
@@ -6885,26 +7066,38 @@ mod tests {
     fn doctor_human_output_renders_each_section() {
         let report = DoctorReport {
             version: "0.1.2".to_owned(),
+            distribution: DoctorDistributionReport {
+                id: "ubuntu".to_owned(),
+                pretty_name: "Ubuntu 26.04 LTS".to_owned(),
+                package_manager: "apt".to_owned(),
+            },
             provider: DoctorProviderReport {
                 resolved: "groq".to_owned(),
                 source: "from $GROQ_API_KEY".to_owned(),
                 model: "llama-3.1-8b-instant".to_owned(),
-                reachable: DoctorCheck {
-                    ok: true,
-                    detail: "yes".to_owned(),
-                    latency_ms: Some(94),
-                },
-                tool_calls: DoctorCheck {
-                    ok: true,
-                    detail: "yes".to_owned(),
-                    latency_ms: Some(21),
-                },
+                reachable: DoctorCheck::pass("provider reachable").with_latency(Some(94)),
+                tool_calls: DoctorCheck::pass("tool calls supported").with_latency(Some(21)),
             },
             memory: DoctorMemoryReport {
                 database: "/tmp/helm.db".to_owned(),
                 schema_version: 2,
                 episodes: 14,
+                accessible: DoctorCheck::pass("database opened and schema queries succeeded"),
             },
+            audit: DoctorAuditReport {
+                chain: DoctorCheck::pass("verified 12 audit event(s)"),
+                checked: 12,
+            },
+            binaries: vec![DoctorBinaryReport {
+                name: "systemctl".to_owned(),
+                status: DoctorCheck::pass("found at /usr/bin/systemctl"),
+                package_hint: None,
+            }],
+            collector_prereqs: vec![DoctorCollectorPrereqReport {
+                collector: "services".to_owned(),
+                status: DoctorCheck::pass("collector prerequisites available via systemctl"),
+                package_hint: None,
+            }],
             tools: vec![
                 DoctorToolReport {
                     name: "shell".to_owned(),
@@ -6916,11 +7109,7 @@ mod tests {
                 },
             ],
             ollama: DoctorOllamaReport {
-                reachable: DoctorCheck {
-                    ok: true,
-                    detail: "yes".to_owned(),
-                    latency_ms: None,
-                },
+                reachable: DoctorCheck::pass("Ollama API reachable"),
                 base_url: "http://localhost:11434".to_owned(),
                 installed_models: vec![DoctorOllamaModel {
                     name: "qwen3:4b".to_owned(),
@@ -6954,6 +7143,8 @@ mod tests {
         assert!(output.contains("resolved: groq"));
         assert!(output.contains("[memory]"));
         assert!(output.contains("episodes: 14"));
+        assert!(output.contains("[audit]"));
+        assert!(output.contains("[required binaries]"));
         assert!(output.contains("[tools]"));
         assert!(output.contains("[ollama]"));
         assert!(output.contains("[other providers detected via env]"));
@@ -6963,33 +7154,33 @@ mod tests {
     fn doctor_json_output_is_machine_readable() {
         let report = DoctorReport {
             version: "0.1.2".to_owned(),
+            distribution: DoctorDistributionReport {
+                id: "ubuntu".to_owned(),
+                pretty_name: "Ubuntu".to_owned(),
+                package_manager: "apt".to_owned(),
+            },
             provider: DoctorProviderReport {
                 resolved: "ollama".to_owned(),
                 source: "fallback".to_owned(),
                 model: "qwen3:4b".to_owned(),
-                reachable: DoctorCheck {
-                    ok: false,
-                    detail: "offline".to_owned(),
-                    latency_ms: None,
-                },
-                tool_calls: DoctorCheck {
-                    ok: false,
-                    detail: "not probed".to_owned(),
-                    latency_ms: None,
-                },
+                reachable: DoctorCheck::warn("offline"),
+                tool_calls: DoctorCheck::warn("not probed"),
             },
             memory: DoctorMemoryReport {
                 database: "/tmp/helm.db".to_owned(),
                 schema_version: 2,
                 episodes: 0,
+                accessible: DoctorCheck::fail("database probe failed"),
             },
+            audit: DoctorAuditReport {
+                chain: DoctorCheck::fail("tampering detected"),
+                checked: 7,
+            },
+            binaries: Vec::new(),
+            collector_prereqs: Vec::new(),
             tools: Vec::new(),
             ollama: DoctorOllamaReport {
-                reachable: DoctorCheck {
-                    ok: false,
-                    detail: "offline".to_owned(),
-                    latency_ms: None,
-                },
+                reachable: DoctorCheck::warn("offline"),
                 base_url: "http://localhost:11434".to_owned(),
                 installed_models: Vec::new(),
                 cloud_models: Vec::new(),
@@ -7014,6 +7205,7 @@ mod tests {
 
         assert_eq!(value["provider"]["resolved"], "ollama");
         assert_eq!(value["memory"]["schema_version"], 2);
+        assert_eq!(value["audit"]["checked"], 7);
     }
 
     #[test]
@@ -7074,8 +7266,8 @@ mod tests {
 
         let (reachable, tool_calls) = super::probe_provider(&provider, "mock").await;
 
-        assert!(reachable.ok);
-        assert!(tool_calls.ok);
+        assert!(reachable.ok());
+        assert!(tool_calls.ok());
     }
 
     // ── v1.6 integration tests ──

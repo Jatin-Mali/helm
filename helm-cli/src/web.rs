@@ -19,7 +19,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use helm_memory::{FindingStateStore, SnapshotStore};
+use helm_memory::{FindingStateStore, MemoryStore, SnapshotStore};
 use helm_monitor::{
     Finding, HostIdentity, MetricHistory, MonitorProfile, PlanCache, Severity, SnapshotDomains,
     SystemSnapshot,
@@ -33,12 +33,13 @@ use helm_monitor::{
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::{ProviderSettings, llm_provider_usable, secrets::SecretsStore};
+use crate::{ProviderSettings, llm_provider_usable, ops, secrets::SecretsStore};
 
 const DASHBOARD_HTML: &str = include_str!("web/dashboard.html");
 
 struct WebState {
     db_path: PathBuf,
+    memory: Arc<MemoryStore>,
     snapshot_tx: broadcast::Sender<String>,
     plan_cache: PlanCache,
     provider_settings: ProviderSettings,
@@ -83,6 +84,20 @@ pub struct LiveSnapshot {
     pub databases: Vec<DbInstance>,
     pub websites: Vec<WebSite>,
     pub pipelines: PipelineSnapshot,
+    pub change_sets: Vec<ops::ChangeSetView>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceActionRequest {
+    unit: String,
+    action: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangeRollbackRequest {
+    change_set_id: String,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -193,8 +208,14 @@ pub async fn serve(
     secrets: SecretsStore,
 ) -> Result<()> {
     let (tx, _) = broadcast::channel::<String>(32);
+    let memory = Arc::new(
+        MemoryStore::open(&db_path)
+            .await
+            .with_context(|| format!("opening memory store at {}", db_path.display()))?,
+    );
     let state = Arc::new(WebState {
         db_path: db_path.clone(),
+        memory,
         snapshot_tx: tx.clone(),
         plan_cache: PlanCache::default(),
         provider_settings,
@@ -222,6 +243,8 @@ pub async fn serve(
         .route("/api/snapshot", get(api_snapshot))
         .route("/api/refresh", post(api_refresh))
         .route("/api/plan", post(api_generate_plan))
+        .route("/api/service-action", post(api_service_action))
+        .route("/api/change-rollback", post(api_change_rollback))
         .route(
             "/api/pipelines/webhook/{provider}/{service_id}",
             post(api_pipeline_webhook),
@@ -359,6 +382,112 @@ async fn api_generate_plan(
     }
 }
 
+async fn api_service_action(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<ServiceActionRequest>,
+) -> impl IntoResponse {
+    match req.action.as_str() {
+        "journal" => {
+            if state
+                .memory
+                .active_capability_grant(helm_core::Capability::FsRead, true)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "error": "Missing fs.read grant. Run `helmops permissions grant fs.read --scope once` and retry.",
+                }));
+            }
+            Json(serde_json::json!({
+                "ok": true,
+                "unit": req.unit,
+                "lines": ops::read_service_journal_excerpt(&req.unit, 120),
+            }))
+        }
+        "restart" | "stop" => {
+            if state
+                .memory
+                .active_capability_grant(helm_core::Capability::SystemService, true)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "error": "Missing system.service grant. Run `helmops permissions grant system.service --scope once` and retry.",
+                }));
+            }
+            let output = tokio::process::Command::new("systemctl")
+                .arg(&req.action)
+                .arg(&req.unit)
+                .output()
+                .await;
+            match output {
+                Ok(out) => {
+                    let ok = out.status.success();
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                    let json = collect_live_snapshot(state.as_ref()).await;
+                    let _ = state.snapshot_tx.send(json);
+                    Json(serde_json::json!({
+                        "ok": ok,
+                        "unit": req.unit,
+                        "action": req.action,
+                        "stdout": helm_core::redact_secrets(&stdout),
+                        "stderr": helm_core::redact_secrets(&stderr),
+                    }))
+                }
+                Err(error) => Json(serde_json::json!({
+                    "ok": false,
+                    "error": error.to_string(),
+                })),
+            }
+        }
+        _ => Json(serde_json::json!({
+            "ok": false,
+            "error": format!("unsupported service action: {}", req.action),
+        })),
+    }
+}
+
+async fn api_change_rollback(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<ChangeRollbackRequest>,
+) -> impl IntoResponse {
+    if state
+        .memory
+        .active_capability_grant(helm_core::Capability::ShellShell, true)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": "Missing shell.shell grant. Run `helmops permissions grant shell.shell --scope once` and retry rollback.",
+        }));
+    }
+    match ops::rollback_change_set(&state.db_path, &req.change_set_id).await {
+        Ok(results) => {
+            let json = collect_live_snapshot(state.as_ref()).await;
+            let _ = state.snapshot_tx.send(json);
+            Json(serde_json::json!({
+                "ok": true,
+                "changeSetId": req.change_set_id,
+                "results": results,
+            }))
+        }
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": error.to_string(),
+        })),
+    }
+}
+
 async fn api_pipeline_webhook(
     State(state): State<Arc<WebState>>,
     Path((provider, service_id)): Path<(String, String)>,
@@ -436,6 +565,7 @@ async fn collect_live_snapshot(state: &WebState) -> String {
     let daemon = daemon_summary();
     let metric_history = load_metric_history(&conn);
     let (provider, ai_state) = provider_context();
+    let change_sets = ops::load_change_set_views(&conn, 16);
 
     let db_future = DbHealthCollector.collect(snapshot.profile);
     let web_future = WebServerCollector.collect(snapshot.profile);
@@ -542,6 +672,7 @@ async fn collect_live_snapshot(state: &WebState) -> String {
         databases,
         websites,
         pipelines: snapshot.domains.pipelines.clone(),
+        change_sets,
     };
 
     serde_json::to_string(&live).unwrap_or_default()
@@ -983,7 +1114,8 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("new WebSocket"));
         assert!(DASHBOARD_HTML.contains("F5"));
         assert!(DASHBOARD_HTML.contains("Alt+G"));
-        assert!(DASHBOARD_HTML.contains("1-9"));
+        assert!(DASHBOARD_HTML.contains("1-0"));
         assert!(DASHBOARD_HTML.contains("renderLogs"));
+        assert!(DASHBOARD_HTML.contains("renderChanges"));
     }
 }

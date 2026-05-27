@@ -142,6 +142,34 @@ body::before {
   background: rgba(21, 39, 61, 0.9);
 }
 
+.inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.code-block {
+  margin: 12px 0 0;
+  padding: 14px;
+  border-radius: 16px;
+  background: rgba(6, 12, 22, 0.92);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 0.875rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.bullets {
+  margin: 12px 0 0;
+  padding-left: 20px;
+  color: var(--text);
+}
+
+.bullets li + li {
+  margin-top: 6px;
+}
+
 .hero-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -795,7 +823,7 @@ tr:hover td {
 
   <div class="footer">
     <span><strong>tab</strong> focus queue</span>
-    <span><strong>1-9</strong> switch workspace</span>
+    <span><strong>1-0</strong> switch workspace</span>
     <span><strong>enter</strong> open focused incident</span>
     <span><strong>Alt+G</strong> generate plan</span>
     <span><strong>escape</strong> clear selection</span>
@@ -816,6 +844,7 @@ const tabs = [
   ['network', 'network'],
   ['storage', 'storage'],
   ['fleet', 'fleet'],
+  ['changes', 'changes'],
 ];
 
 const state = {
@@ -827,6 +856,10 @@ const state = {
   query: '',
   connected: false,
   selectedLogPatternId: null,
+  selectedServiceUnit: null,
+  serviceJournal: [],
+  serviceJournalError: '',
+  selectedChangeId: null,
   logFilters: {
     unit: '',
     severity: 'all',
@@ -871,6 +904,8 @@ function applySnapshot(snapshot) {
   state.findings = sortFindings(snapshot.findings || []);
   syncSelectionState();
   syncLogSelectionState();
+  syncServiceSelectionState();
+  syncChangeSelectionState();
   renderAll();
 }
 
@@ -1074,11 +1109,18 @@ function renderActiveTab() {
     network: renderNetwork,
     storage: renderStorage,
     fleet: renderFleet,
+    changes: renderChanges,
   };
   const render = map[state.activeTab] || renderOverview;
   document.getElementById('tab-body').innerHTML = render();
+  if (state.activeTab === 'services') {
+    wireServicesTab();
+  }
   if (state.activeTab === 'logs') {
     wireLogsTab();
+  }
+  if (state.activeTab === 'changes') {
+    wireChangesTab();
   }
 }
 
@@ -1124,19 +1166,86 @@ function renderOverview() {
 
 function renderServices() {
   const inv = state.snapshot.inventory || {};
+  const units = [...(inv.services?.units || [])].sort((a, b) => {
+    const af = a.active === 'failed' || a.sub === 'failed' ? 1 : 0;
+    const bf = b.active === 'failed' || b.sub === 'failed' ? 1 : 0;
+    return bf - af || a.name.localeCompare(b.name);
+  });
+  const selectedUnit = units.find(unit => unit.name === state.selectedServiceUnit) || units[0] || null;
+  const timers = inv.services?.timers || [];
+  const relatedTimers = selectedUnit
+    ? timers.filter(timer => timer.activates === selectedUnit.name || timer.unit === selectedUnit.name)
+    : [];
+  const overdue = timers.filter(timer => isTimerOverdue(timer));
   return `
     <div class="stack">
-      ${tableCard('systemd units', ['name', 'active', 'sub', 'description'], (inv.services?.units || []).map(unit => [
-        esc(unit.name),
-        statePill(unit.active, unit.active),
-        esc(unit.sub),
-        esc(unit.description || ''),
-      ]))}
-      ${tableCard('timers', ['name', 'next trigger', 'last trigger', 'activates'], (inv.services?.timers || []).map(timer => [
+      <div class="section-grid">
+        <section class="card">
+          <div class="panel-title">Systemd Units</div>
+          <p class="metric-sub" style="margin-top:8px">${esc(String(overdue.length))} overdue timer(s) across ${(timers || []).length} timer(s)</p>
+          <div class="stack" style="margin-top:14px">
+            ${units.length ? units.map(unit => `
+              <button type="button" class="incident-row${state.selectedServiceUnit === unit.name ? ' active' : ''}" data-service-unit="${escAttr(unit.name)}">
+                <div class="incident-top">
+                  <span class="sev-dot sev-${unit.active === 'failed' || unit.sub === 'failed' ? 'critical' : (unit.active === 'inactive' ? 'warning' : 'info')}" style="background: currentColor"></span>
+                  <div class="incident-title">${esc(unit.name)}</div>
+                </div>
+                <div class="incident-sub">
+                  <span>${esc(unit.active)}</span>
+                  <span>${esc(unit.sub || 'n/a')}</span>
+                  <span>${esc(unit.load || 'loaded')}</span>
+                </div>
+                <div class="incident-times"><span>${esc(unit.description || '')}</span></div>
+              </button>
+            `).join('') : '<div class="empty">No systemd units discovered.</div>'}
+          </div>
+        </section>
+        <section class="card">
+          <div class="panel-title">${selectedUnit ? esc(selectedUnit.name) : 'Service Detail'}</div>
+          ${selectedUnit ? `
+            <div class="pill-group" style="margin-top:12px">
+              <span class="pill">${esc(selectedUnit.active)} / ${esc(selectedUnit.sub || 'n/a')}</span>
+              <span class="pill">${esc(selectedUnit.description || 'no description')}</span>
+            </div>
+            <div class="inline-actions" style="margin-top:16px">
+              <button type="button" class="button" data-service-action="journal" data-service-unit="${escAttr(selectedUnit.name)}">Load Journal</button>
+              <button type="button" class="button" data-service-action="restart" data-service-unit="${escAttr(selectedUnit.name)}">Restart</button>
+              <button type="button" class="button" data-service-action="stop" data-service-unit="${escAttr(selectedUnit.name)}">Stop</button>
+            </div>
+            <div class="stack" style="margin-top:16px">
+              <section class="card" style="padding:16px">
+                <div class="panel-title">Timers</div>
+                ${relatedTimers.length ? relatedTimers.map(timer => `
+                  <div class="incident-row" style="cursor:default">
+                    <div class="incident-top">
+                      <div class="incident-title">${esc(timer.name)}</div>
+                      ${isTimerOverdue(timer) ? '<span class="pill">overdue</span>' : ''}
+                    </div>
+                    <div class="incident-sub">
+                      <span>next ${esc(timer.next_trigger)}</span>
+                      <span>last ${esc(timer.last_trigger)}</span>
+                      <span>${esc(timer.activates)}</span>
+                    </div>
+                  </div>
+                `).join('') : '<div class="empty">No timers activate this unit.</div>'}
+              </section>
+              <section class="card" style="padding:16px">
+                <div class="panel-title">Recent Journal</div>
+                ${state.serviceJournalError ? `<div class="empty">${esc(state.serviceJournalError)}</div>` : ''}
+                ${state.serviceJournal.length
+                  ? `<pre class="code-block">${esc(state.serviceJournal.join('\n'))}</pre>`
+                  : '<div class="empty">Select a unit and load its recent journal output.</div>'}
+              </section>
+            </div>
+          ` : '<div class="empty">Select a unit to inspect timers and journal output.</div>'}
+        </section>
+      </div>
+      ${tableCard('timers', ['name', 'next trigger', 'last trigger', 'activates', 'status'], timers.map(timer => [
         esc(timer.name),
         esc(timer.next_trigger),
         esc(timer.last_trigger),
         esc(timer.activates),
+        isTimerOverdue(timer) ? statePill('warning', 'overdue') : statePill('ok', 'scheduled'),
       ]))}
       ${tableCard('cron jobs', ['path', 'schedule'], (inv.timers?.cron_jobs || []).map(job => [
         esc(job.path),
@@ -1159,6 +1268,78 @@ function renderServices() {
         esc(pipeline.log_reference || pipeline.endpoint),
         esc(pipeline.webhook_path || 'n/a'),
       ]))}
+    </div>
+  `;
+}
+
+function renderChanges() {
+  const changes = state.snapshot.changeSets || [];
+  const selected = changes.find(change => change.id === state.selectedChangeId) || changes[0] || null;
+  return `
+    <div class="section-grid">
+      <section class="card">
+        <div class="panel-title">Changesets</div>
+        <p class="metric-sub" style="margin-top:8px">Chronological execution history with snapshot diffs and rollback context.</p>
+        <div class="stack" style="margin-top:14px">
+          ${changes.length ? changes.map(change => `
+            <button type="button" class="incident-row${state.selectedChangeId === change.id ? ' active' : ''}" data-change-id="${escAttr(change.id)}">
+              <div class="incident-top">
+                <div class="incident-title">${esc(change.planTitle || change.id)}</div>
+                <span class="pill">${esc(change.status)}</span>
+              </div>
+              <div class="incident-sub">
+                <span>${esc(change.createdAt)}</span>
+                <span>${esc((change.affectedResources || []).join(', ') || 'host')}</span>
+              </div>
+              <div class="incident-times">
+                <span>${esc(change.triggerFindingTitle || 'manual / no linked finding')}</span>
+              </div>
+            </button>
+          `).join('') : '<div class="empty">No changesets recorded yet.</div>'}
+        </div>
+      </section>
+      <section class="card">
+        <div class="panel-title">${selected ? esc(selected.planTitle || selected.id) : 'Change Detail'}</div>
+        ${selected ? `
+          <div class="pill-group" style="margin-top:12px">
+            <span class="pill">${esc(selected.status)}</span>
+            <span class="pill">${esc(selected.createdAt)}</span>
+            ${selected.rollbackSupported ? '<span class="pill">rollback available</span>' : ''}
+          </div>
+          <div class="inline-actions" style="margin-top:16px">
+            <button type="button" class="button" data-change-rollback="${escAttr(selected.id)}" ${selected.rollbackSupported ? '' : 'disabled'}>Rollback</button>
+          </div>
+          <section class="card" style="padding:16px; margin-top:16px">
+            <div class="panel-title">Affected Resources</div>
+            <p>${esc((selected.affectedResources || []).join(' · ') || 'host')}</p>
+            <p class="metric-sub">${esc(selected.triggerFindingTitle || 'No triggering finding linked')}</p>
+          </section>
+          <section class="card" style="padding:16px; margin-top:16px">
+            <div class="panel-title">Snapshot Diff</div>
+            ${(selected.diffLines || []).length
+              ? `<ul class="bullets">${selected.diffLines.map(line => `<li>${esc(line)}</li>`).join('')}</ul>`
+              : '<div class="empty">No pre/post snapshot diff captured.</div>'}
+          </section>
+          <section class="card" style="padding:16px; margin-top:16px">
+            <div class="panel-title">Execution Log</div>
+            ${(selected.steps || []).length ? selected.steps.map((step, index) => `
+              <div class="incident-row" style="cursor:default">
+                <div class="incident-top">
+                  <div class="incident-title">${index + 1}. ${esc(step.title)}</div>
+                  <span class="pill">${esc(step.status)}</span>
+                </div>
+                <div class="incident-sub">
+                  <span>${esc(step.tool)}</span>
+                  <span>${esc(step.command)}</span>
+                </div>
+                ${step.stdout ? `<pre class="code-block">${esc(step.stdout)}</pre>` : ''}
+                ${step.stderr ? `<pre class="code-block">${esc(step.stderr)}</pre>` : ''}
+                ${step.verification ? `<div class="metric-sub">verify: ${esc(step.verification)}</div>` : ''}
+              </div>
+            `).join('') : '<div class="empty">No step logs stored for this changeset.</div>'}
+          </section>
+        ` : '<div class="empty">Select a changeset to inspect step logs and rollback data.</div>'}
+      </section>
     </div>
   `;
 }
@@ -1514,6 +1695,42 @@ function selectFinding(id, tab = 'overview') {
   renderAll();
 }
 
+function syncServiceSelectionState() {
+  const units = state.snapshot?.inventory?.services?.units || [];
+  if (!units.length) {
+    state.selectedServiceUnit = null;
+    state.serviceJournal = [];
+    state.serviceJournalError = '';
+    return;
+  }
+  if (!units.some(unit => unit.name === state.selectedServiceUnit)) {
+    const failed = units.find(unit => unit.active === 'failed' || unit.sub === 'failed');
+    state.selectedServiceUnit = (failed || units[0]).name;
+    state.serviceJournal = [];
+    state.serviceJournalError = '';
+  }
+}
+
+function syncChangeSelectionState() {
+  const changes = state.snapshot?.changeSets || [];
+  if (!changes.length) {
+    state.selectedChangeId = null;
+    return;
+  }
+  if (!changes.some(change => change.id === state.selectedChangeId)) {
+    state.selectedChangeId = changes[0].id;
+  }
+}
+
+function isTimerOverdue(timer) {
+  const next = String(timer?.next_trigger || '').trim().toLowerCase();
+  return next === 'n/a' || next === '-' || next.includes('elapsed');
+}
+
+function escAttr(value) {
+  return esc(value).replace(/"/g, '&quot;');
+}
+
 function allLogPatterns() {
   return state.snapshot?.inventory?.logs?.patterns || [];
 }
@@ -1655,6 +1872,75 @@ function wireLogsTab() {
         event.preventDefault();
         state.selectedLogPatternId = node.dataset.patternId;
         renderActiveTab();
+      }
+    });
+  });
+}
+
+function wireServicesTab() {
+  document.querySelectorAll('[data-service-unit]').forEach(node => {
+    node.addEventListener('click', async () => {
+      state.selectedServiceUnit = node.dataset.serviceUnit;
+      state.serviceJournal = [];
+      state.serviceJournalError = '';
+      renderActiveTab();
+    });
+  });
+  document.querySelectorAll('[data-service-action]').forEach(node => {
+    node.addEventListener('click', async () => {
+      const unit = node.dataset.serviceUnit;
+      const action = node.dataset.serviceAction;
+      try {
+        const response = await fetch('/api/service-action', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ unit, action }),
+        });
+        const data = await response.json();
+        if (!data.ok) {
+          state.serviceJournalError = data.error || `Failed to ${action} ${unit}`;
+          if (action !== 'journal') {
+            toast(state.serviceJournalError);
+          }
+        } else if (action === 'journal') {
+          state.serviceJournal = Array.isArray(data.lines) ? data.lines : [];
+          state.serviceJournalError = '';
+        } else {
+          toast(`${action} requested for ${unit}`);
+          state.serviceJournalError = data.stderr || '';
+        }
+      } catch (error) {
+        state.serviceJournalError = error.message;
+      }
+      renderActiveTab();
+    });
+  });
+}
+
+function wireChangesTab() {
+  document.querySelectorAll('[data-change-id]').forEach(node => {
+    node.addEventListener('click', () => {
+      state.selectedChangeId = node.dataset.changeId;
+      renderActiveTab();
+    });
+  });
+  document.querySelectorAll('[data-change-rollback]').forEach(node => {
+    node.addEventListener('click', async () => {
+      const changeSetId = node.dataset.changeRollback;
+      try {
+        const response = await fetch('/api/change-rollback', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ changeSetId }),
+        });
+        const data = await response.json();
+        if (!data.ok) {
+          toast(data.error || `Rollback failed for ${changeSetId}`);
+          return;
+        }
+        toast(`Rollback attempted for ${changeSetId}`);
+      } catch (error) {
+        toast(error.message);
       }
     });
   });
@@ -1920,7 +2206,7 @@ document.addEventListener('keydown', (event) => {
     moveQueueFocus(-1);
     return;
   }
-  const index = Number(event.key);
+  const index = event.key === '0' ? 10 : Number(event.key);
   if (index >= 1 && index <= tabs.length) {
     event.preventDefault();
     state.activeTab = tabs[index - 1][0];

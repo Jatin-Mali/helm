@@ -52,7 +52,7 @@ use crate::{
     ProviderChoice, ProviderSettings, TroubleshootingPlanStore, build_provider, custom_commands,
     default_api_key_env, default_model_name,
     keybindings::KeyMap,
-    provider_choice_name,
+    ops, provider_choice_name,
     remote::RemoteRegistry,
     service_form::{ServiceFormField, ServiceRegistrationDraft},
     wrap_for_remote, write_helm_config,
@@ -1100,6 +1100,7 @@ struct DashboardData {
     domains: SnapshotDomains,
     plans: Vec<TroubleshootingPlanRecord>,
     change_sets: Vec<ChangeSetRecord>,
+    change_set_views: Vec<ops::ChangeSetView>,
     audit_events: Vec<DashboardAuditRow>,
     last_tick_instant: Option<Instant>,
     tick_count: u64,
@@ -1227,6 +1228,10 @@ struct DashboardState {
     log_time_filter: DashboardLogTimeFilter,
     log_unit_filter: Option<String>,
     log_selected_pattern: usize,
+    service_selected_row: usize,
+    service_full_journal: bool,
+    service_journal_cache: HashMap<String, Vec<String>>,
+    change_selected_row: usize,
     active_plan: Option<DashboardPlan>,
     pending_plan_rx: Option<tokio::sync::oneshot::Receiver<PlanStatus>>,
     error: Option<String>,
@@ -1267,6 +1272,10 @@ impl DashboardState {
             log_time_filter: DashboardLogTimeFilter::default(),
             log_unit_filter: None,
             log_selected_pattern: 0,
+            service_selected_row: 0,
+            service_full_journal: false,
+            service_journal_cache: HashMap::new(),
+            change_selected_row: 0,
             active_plan: None,
             pending_plan_rx: None,
             error: None,
@@ -2857,6 +2866,33 @@ impl TuiApp {
                     self.cycle_dashboard_log_unit_filter(1);
                     return Ok(false);
                 }
+                KeyCode::Char('j')
+                    if self.dashboard.active_tab == OpsTab::Services
+                        && key.modifiers.is_empty() =>
+                {
+                    self.run_dashboard_service_action("journal").await?;
+                    return Ok(false);
+                }
+                KeyCode::Char('R')
+                    if self.dashboard.active_tab == OpsTab::Services
+                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    self.run_dashboard_service_action("restart").await?;
+                    return Ok(false);
+                }
+                KeyCode::Char('x')
+                    if self.dashboard.active_tab == OpsTab::Services
+                        && key.modifiers.is_empty() =>
+                {
+                    self.run_dashboard_service_action("stop").await?;
+                    return Ok(false);
+                }
+                KeyCode::Char('b')
+                    if self.dashboard.active_tab == OpsTab::Changes && key.modifiers.is_empty() =>
+                {
+                    self.run_dashboard_change_rollback().await?;
+                    return Ok(false);
+                }
                 KeyCode::Char('c')
                     if self.dashboard.active_tab == OpsTab::Resources
                         && key.modifiers.is_empty() =>
@@ -2957,6 +2993,13 @@ impl TuiApp {
                             } else {
                                 self.dashboard.fleet_selected_row = Some(0);
                             }
+                        } else if self.dashboard.active_tab == OpsTab::Services {
+                            self.dashboard.service_selected_row =
+                                self.dashboard.service_selected_row.saturating_sub(1);
+                            self.dashboard.service_full_journal = false;
+                        } else if self.dashboard.active_tab == OpsTab::Changes {
+                            self.dashboard.change_selected_row =
+                                self.dashboard.change_selected_row.saturating_sub(1);
                         } else {
                             self.move_dashboard_selection(-1)
                         }
@@ -2983,6 +3026,18 @@ impl TuiApp {
                             let row = self.dashboard.fleet_selected_row.unwrap_or(0);
                             let max = self.dashboard.data.fleet_hosts.len().saturating_sub(1);
                             self.dashboard.fleet_selected_row = Some((row + 1).min(max));
+                        } else if self.dashboard.active_tab == OpsTab::Services {
+                            let max = self
+                                .sorted_dashboard_service_units()
+                                .len()
+                                .saturating_sub(1);
+                            self.dashboard.service_selected_row =
+                                (self.dashboard.service_selected_row + 1).min(max);
+                            self.dashboard.service_full_journal = false;
+                        } else if self.dashboard.active_tab == OpsTab::Changes {
+                            let max = self.dashboard.data.change_set_views.len().saturating_sub(1);
+                            self.dashboard.change_selected_row =
+                                (self.dashboard.change_selected_row + 1).min(max);
                         } else {
                             self.move_dashboard_selection(1)
                         }
@@ -5705,7 +5760,197 @@ Report the exit status and the concise output."
         }
         if tab == OpsTab::Logs {
             self.dashboard.log_selected_pattern = 0;
+        } else if tab == OpsTab::Services {
+            self.dashboard.service_selected_row = 0;
+            self.dashboard.service_full_journal = false;
+        } else if tab == OpsTab::Changes {
+            self.dashboard.change_selected_row = 0;
         }
+    }
+
+    fn sorted_dashboard_service_units(&self) -> Vec<&helm_monitor::SystemdUnit> {
+        let mut units = self
+            .dashboard
+            .data
+            .domains
+            .services
+            .units
+            .iter()
+            .filter(|unit| unit.name.ends_with(".service") || unit.name.ends_with(".timer"))
+            .collect::<Vec<_>>();
+        units.sort_by(|left, right| {
+            let left_failed = left.active == "failed" || left.sub == "failed";
+            let right_failed = right.active == "failed" || right.sub == "failed";
+            right_failed
+                .cmp(&left_failed)
+                .then(left.name.cmp(&right.name))
+        });
+        units
+    }
+
+    fn selected_dashboard_service_unit(&self) -> Option<&helm_monitor::SystemdUnit> {
+        let units = self.sorted_dashboard_service_units();
+        units.get(self.dashboard.service_selected_row).copied()
+    }
+
+    fn ensure_dashboard_service_journal(&mut self, unit: &str, full: bool) {
+        let lines = if full { 120 } else { 40 };
+        let cache_key = format!("{unit}:{lines}");
+        if self
+            .dashboard
+            .service_journal_cache
+            .contains_key(&cache_key)
+        {
+            return;
+        }
+        let excerpt = ops::read_service_journal_excerpt(unit, lines);
+        self.dashboard
+            .service_journal_cache
+            .insert(cache_key, excerpt);
+    }
+
+    async fn prompt_or_require_capability(
+        &mut self,
+        capability: Capability,
+        tool_name: &str,
+        detail: String,
+    ) -> Result<bool> {
+        if self
+            .runtime
+            .memory
+            .active_capability_grant(capability, true)
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        self.modal = Some(ModalState::Permission {
+            capability,
+            tool_name: tool_name.to_owned(),
+            taint: "user".to_owned(),
+            detail,
+        });
+        Ok(false)
+    }
+
+    async fn run_dashboard_service_action(&mut self, action: &'static str) -> Result<()> {
+        let Some(unit) = self
+            .selected_dashboard_service_unit()
+            .map(|unit| unit.name.clone())
+        else {
+            self.toast("No service selected");
+            return Ok(());
+        };
+        match action {
+            "journal" => {
+                if !self
+                    .prompt_or_require_capability(
+                        Capability::FsRead,
+                        "journalctl",
+                        format!("Read recent journal output for {unit}."),
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+                self.dashboard.service_full_journal = true;
+                self.ensure_dashboard_service_journal(&unit, true);
+                self.dashboard.pane = DashboardFocus::Detail;
+                self.dashboard.detail_scroll = 0;
+                self.write_dashboard_event(
+                    "journalctl",
+                    Capability::FsRead.as_str(),
+                    "service-journal",
+                    &helm_memory::stable_hash_hex(&unit),
+                    &helm_memory::stable_hash_hex("journal"),
+                )?;
+                self.toast(format!("Loaded full journal for {unit}"));
+            }
+            "restart" | "stop" => {
+                if !self
+                    .prompt_or_require_capability(
+                        Capability::SystemService,
+                        "systemctl",
+                        format!("{action} service {unit}."),
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+                let output = tokio::process::Command::new("systemctl")
+                    .arg(action)
+                    .arg(&unit)
+                    .output()
+                    .await
+                    .with_context(|| format!("failed to run systemctl {action} {unit}"))?;
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                let decision = if output.status.success() {
+                    format!("service-{action}-ok")
+                } else {
+                    format!("service-{action}-failed")
+                };
+                self.write_dashboard_event(
+                    "systemctl",
+                    Capability::SystemService.as_str(),
+                    &decision,
+                    &helm_memory::stable_hash_hex(&format!("{action}:{unit}")),
+                    &helm_memory::stable_hash_hex(&format!("{stdout}\n{stderr}")),
+                )?;
+                if output.status.success() {
+                    self.toast(format!("{action} completed for {unit}"));
+                    self.refresh_dashboard();
+                } else {
+                    self.toast_variant(
+                        format!(
+                            "{action} failed for {unit}: {}",
+                            if stderr.is_empty() {
+                                "unknown error".to_owned()
+                            } else {
+                                stderr
+                            }
+                        ),
+                        ToastVariant::Error,
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn run_dashboard_change_rollback(&mut self) -> Result<()> {
+        let Some(change) = self
+            .dashboard
+            .data
+            .change_set_views
+            .get(self.dashboard.change_selected_row)
+            .cloned()
+        else {
+            self.toast("No change set selected");
+            return Ok(());
+        };
+        if !self
+            .prompt_or_require_capability(
+                Capability::ShellShell,
+                "change-set.rollback",
+                format!("Roll back change set {}.", change.id),
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        let results = crate::ops::rollback_change_set(&self.runtime.db_path, &change.id).await?;
+        self.write_dashboard_event(
+            "change-set.rollback",
+            Capability::ShellShell.as_str(),
+            "rollback",
+            &helm_memory::stable_hash_hex(&change.id),
+            &helm_memory::stable_hash_hex(&results.join("\n")),
+        )?;
+        self.refresh_dashboard();
+        self.toast(format!("Rollback attempted for {}", change.id));
+        Ok(())
     }
 
     async fn handle_dashboard_enter(&mut self, tx: mpsc::UnboundedSender<UiEvent>) -> Result<()> {
@@ -5723,6 +5968,16 @@ Report the exit status and the concise output."
                                 self.toast(format!("Active remote set to {}", host.name));
                             }
                         }
+                    } else if self.dashboard.active_tab == OpsTab::Services {
+                        if let Some(unit) = self.selected_dashboard_service_unit() {
+                            let unit_name = unit.name.clone();
+                            self.ensure_dashboard_service_journal(&unit_name, false);
+                            self.dashboard.pane = DashboardFocus::Detail;
+                            self.dashboard.detail_scroll = 0;
+                        }
+                    } else if self.dashboard.active_tab == OpsTab::Changes {
+                        self.dashboard.pane = DashboardFocus::Detail;
+                        self.dashboard.detail_scroll = 0;
                     } else if self.dashboard.active_tab != OpsTab::Alerts {
                         self.toast("Use 1 for alerts, or switch sections with 1-6.");
                     } else if let Some(idx) = self.dashboard_selected_finding_index() {
@@ -6593,6 +6848,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             .collect();
         let plans = TroubleshootingPlanStore::list(&conn, 12).unwrap_or_default();
         let change_sets = ChangeSetStore::list(&conn, 12).unwrap_or_default();
+        let change_set_views = ops::load_change_set_views(&conn, 12);
         let audit_events = conn
             .prepare(
                 "SELECT timestamp, capability, tool_name, decision
@@ -6676,6 +6932,7 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             domains,
             plans,
             change_sets,
+            change_set_views,
             audit_events,
             metric_history: std::mem::replace(
                 &mut self.dashboard.data.metric_history,
@@ -6687,6 +6944,33 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         let log_pattern_count = self.filtered_dashboard_log_patterns().len();
         if self.dashboard.log_selected_pattern >= log_pattern_count {
             self.dashboard.log_selected_pattern = 0;
+        }
+        if self.dashboard.service_selected_row
+            >= self
+                .dashboard
+                .data
+                .domains
+                .services
+                .units
+                .len()
+                .saturating_sub(0)
+                .max(1)
+        {
+            self.dashboard.service_selected_row = self.dashboard.service_selected_row.min(
+                self.dashboard
+                    .data
+                    .domains
+                    .services
+                    .units
+                    .len()
+                    .saturating_sub(1),
+            );
+        }
+        if self.dashboard.change_selected_row >= self.dashboard.data.change_set_views.len().max(1) {
+            self.dashboard.change_selected_row = self
+                .dashboard
+                .change_selected_row
+                .min(self.dashboard.data.change_set_views.len().saturating_sub(1));
         }
         self.dashboard.selected_fingerprint = restore_dashboard_selection(
             &self.dashboard.data.findings,
@@ -8133,102 +8417,242 @@ fn render_ops_cpu_memory(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_ops_services(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let d = &app.dashboard.data;
-    let domains = &d.domains;
-    let service_units: Vec<&helm_monitor::SystemdUnit> = domains
-        .services
-        .units
-        .iter()
-        .filter(|u| u.name.ends_with(".service") || u.name.ends_with(".timer"))
-        .collect();
-    let failed_units: Vec<&helm_monitor::SystemdUnit> = service_units
-        .iter()
-        .filter(|u| u.active == "failed" || u.sub == "failed")
-        .copied()
-        .collect();
-    let active_count = service_units.len().saturating_sub(failed_units.len());
-    let w = area.width as usize;
-    let mut lines: Vec<Line> = Vec::new();
+    let units = app.sorted_dashboard_service_units();
+    let selected = units.get(app.dashboard.service_selected_row).copied();
+    let layout = if area.width >= 120 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(area)
+    };
 
-    lines.push(Line::from(Span::styled(
-        "SYSTEMD SERVICES",
-        Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::raw("")));
+    let list_block = Block::default()
+        .title(" SYSTEMD SERVICES ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let list_inner = list_block.inner(layout[0]);
+    list_block.render(layout[0], buf);
 
-    if service_units.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No service data. Run a monitor cycle to collect systemd state.",
+    let mut list_lines = vec![
+        Line::from(vec![
+            Span::styled(" failed units first", Style::default().fg(OPS_DIM)),
+            Span::styled(" · ", Style::default().fg(OPS_BORDER)),
+            Span::styled(
+                format!(
+                    "{} failed / {} total",
+                    units
+                        .iter()
+                        .filter(|unit| unit.active == "failed" || unit.sub == "failed")
+                        .count(),
+                    units.len()
+                ),
+                Style::default().fg(OPS_MUTED),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{:<28}", "unit"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:<10}", "active"), Style::default().fg(OPS_DIM)),
+            Span::styled(format!("{:<14}", "sub"), Style::default().fg(OPS_DIM)),
+            Span::styled("description", Style::default().fg(OPS_DIM)),
+        ]),
+        Line::from(Span::styled(
+            "─".repeat(list_inner.width as usize),
+            Style::default().fg(OPS_BORDER),
+        )),
+    ];
+    if units.is_empty() {
+        list_lines.push(Line::from(Span::styled(
+            "No systemd unit data available.",
             Style::default().fg(OPS_MUTED),
         )));
     } else {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:<28}", "service"), Style::default().fg(OPS_DIM)),
-            Span::styled(format!("{:<14}", "status"), Style::default().fg(OPS_DIM)),
-            Span::styled(format!("{:<12}", "uptime"), Style::default().fg(OPS_DIM)),
-            Span::styled(format!("{:>6}", "pid"), Style::default().fg(OPS_DIM)),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "─".repeat(w.min(70)),
-            Style::default().fg(OPS_BORDER),
-        )));
-        for unit in service_units.iter().take(20) {
-            let is_failed = unit.active == "failed" || unit.sub == "failed";
-            let status_color = if is_failed {
+        for (idx, unit) in units.iter().enumerate().take(18) {
+            let selected_row = idx == app.dashboard.service_selected_row;
+            let failed = unit.active == "failed" || unit.sub == "failed";
+            let bg = if selected_row { OPS_SURFACE } else { OPS_BG };
+            let state_color = if failed {
                 OPS_RED
             } else if unit.active == "inactive" {
                 OPS_YELLOW
             } else {
                 OPS_GREEN
             };
-            let name = unit.name.chars().take(27).collect::<String>();
-            let sub_display = if unit.sub.is_empty() || unit.sub == unit.active {
-                "-".to_owned()
-            } else {
-                unit.sub.chars().take(11).collect::<String>()
-            };
-            lines.push(Line::from(vec![
+            list_lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{:<28}", name),
-                    if is_failed {
-                        Style::default().fg(OPS_RED)
-                    } else {
-                        Style::default().fg(OPS_FG)
-                    },
+                    if selected_row { ">" } else { " " },
+                    Style::default().fg(OPS_BLUE).bg(bg),
                 ),
                 Span::styled(
-                    format!("{:<14}", unit.active),
-                    Style::default().fg(status_color),
+                    format!(" {:<27}", truncate_cell(&unit.name, 27)),
+                    Style::default()
+                        .fg(if failed { OPS_RED } else { OPS_FG })
+                        .bg(bg)
+                        .add_modifier(if failed {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
                 ),
                 Span::styled(
-                    format!("{:<12}", sub_display),
-                    Style::default().fg(OPS_MUTED),
+                    format!("{:<10}", truncate_cell(&unit.active, 9)),
+                    Style::default().fg(state_color).bg(bg),
                 ),
-                Span::styled(format!("{:>6}", "-"), Style::default().fg(OPS_DIM)),
+                Span::styled(
+                    format!("{:<14}", truncate_cell(&unit.sub, 13)),
+                    Style::default().fg(OPS_MUTED).bg(bg),
+                ),
+                Span::styled(
+                    truncate(
+                        &unit.description,
+                        list_inner.width.saturating_sub(56).max(20) as usize,
+                    ),
+                    Style::default().fg(OPS_DIM).bg(bg),
+                ),
             ]));
         }
-        lines.push(Line::from(Span::raw("")));
-        let failed_names: Vec<&str> = failed_units.iter().map(|u| u.name.as_str()).collect();
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{} failed · {} active", failed_units.len(), active_count),
-                Style::default().fg(OPS_DIM),
-            ),
-            if !failed_names.is_empty() {
-                Span::styled(
-                    format!(" · {} require attention", failed_names.join(" and ")),
-                    Style::default().fg(OPS_RED),
-                )
-            } else {
-                Span::styled("", Style::default())
-            },
-        ]));
     }
-
-    Paragraph::new(lines)
+    Paragraph::new(list_lines)
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(area, buf);
+        .render(list_inner, buf);
+
+    let detail_block = Block::default()
+        .title(" SERVICE DETAIL ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let detail_inner = detail_block.inner(layout[1]);
+    detail_block.render(layout[1], buf);
+
+    let mut detail_lines = Vec::new();
+    if let Some(unit) = selected {
+        let full = app.dashboard.service_full_journal;
+        let cache_key = format!("{}:{}", unit.name, if full { 120 } else { 40 });
+        let journal = app
+            .dashboard
+            .service_journal_cache
+            .get(&cache_key)
+            .cloned()
+            .unwrap_or_else(|| {
+                ops::read_service_journal_excerpt(&unit.name, if full { 120 } else { 40 })
+            });
+        let matching_timers =
+            ops::timers_for_service(&app.dashboard.data.domains.services.timers, &unit.name);
+        let overdue_timers = app
+            .dashboard
+            .data
+            .domains
+            .services
+            .timers
+            .iter()
+            .filter(|timer| ops::timer_overdue(timer))
+            .count();
+
+        detail_lines.push(Line::from(vec![
+            Span::styled(
+                unit.name.as_str(),
+                Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(unit.description.as_str(), Style::default().fg(OPS_DIM)),
+        ]));
+        detail_lines.push(Line::from(vec![
+            Span::styled("State  ", Style::default().fg(OPS_MUTED)),
+            Span::styled(
+                unit.active.as_str(),
+                Style::default().fg(if unit.active == "failed" {
+                    OPS_RED
+                } else {
+                    OPS_GREEN
+                }),
+            ),
+            Span::styled("   Sub  ", Style::default().fg(OPS_MUTED)),
+            Span::styled(unit.sub.as_str(), Style::default().fg(OPS_FG)),
+            Span::styled("   Load  ", Style::default().fg(OPS_MUTED)),
+            Span::styled(unit.load.as_str(), Style::default().fg(OPS_DIM)),
+        ]));
+        detail_lines.push(Line::from(""));
+        detail_lines.push(Line::from(vec![
+            Span::styled("Actions ", Style::default().fg(OPS_MUTED)),
+            Span::styled(
+                "J",
+                Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" full journal  ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                "Shift+R",
+                Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" restart  ", Style::default().fg(OPS_DIM)),
+            Span::styled(
+                "X",
+                Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" stop", Style::default().fg(OPS_DIM)),
+        ]));
+        detail_lines.push(Line::from(""));
+        detail_lines.push(Line::from(Span::styled(
+            format!(
+                "Timers · {} matched · {} overdue across host",
+                matching_timers.len(),
+                overdue_timers
+            ),
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )));
+        if matching_timers.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "No systemd timers activate this unit.",
+                Style::default().fg(OPS_DIM),
+            )));
+        } else {
+            for timer in matching_timers.into_iter().take(4) {
+                detail_lines.push(Line::from(vec![
+                    Span::styled(
+                        truncate_cell(&timer.name, 26),
+                        Style::default().fg(if ops::timer_overdue(timer) {
+                            OPS_RED
+                        } else {
+                            OPS_FG
+                        }),
+                    ),
+                    Span::styled("  next ", Style::default().fg(OPS_DIM)),
+                    Span::styled(timer.next_trigger.as_str(), Style::default().fg(OPS_MUTED)),
+                    Span::styled("  last ", Style::default().fg(OPS_DIM)),
+                    Span::styled(timer.last_trigger.as_str(), Style::default().fg(OPS_MUTED)),
+                ]));
+            }
+        }
+        detail_lines.push(Line::from(""));
+        detail_lines.push(Line::from(Span::styled(
+            if full {
+                "JOURNAL (full excerpt)"
+            } else {
+                "JOURNAL (recent excerpt)"
+            },
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )));
+        for line in journal.iter().take(if full { 16 } else { 10 }) {
+            detail_lines.push(Line::from(Span::styled(
+                truncate(line, detail_inner.width.saturating_sub(1) as usize),
+                Style::default().fg(OPS_FG),
+            )));
+        }
+    } else {
+        detail_lines.push(Line::from(Span::styled(
+            "Select a service to inspect state, timers, and recent journal output.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    }
+
+    Paragraph::new(detail_lines)
+        .style(Style::default().bg(OPS_BG))
+        .wrap(Wrap { trim: false })
+        .render(detail_inner, buf);
 }
 
 fn render_ops_processes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -9346,133 +9770,314 @@ fn render_ops_security(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_ops_changes(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let d = &app.dashboard.data;
-    let mut lines: Vec<Line> = Vec::new();
-
-    // header
-    lines.push(Line::from(vec![
-        Span::styled(
-            "AUDIT LOG",
-            Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ● ", Style::default().fg(OPS_GREEN)),
-        Span::styled("chain verified", Style::default().fg(OPS_GREEN)),
-    ]));
-    lines.push(Line::from(Span::raw("")));
-
-    if d.audit_events.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No audit events recorded.",
-            Style::default().fg(OPS_MUTED),
-        )));
+    let changes = &app.dashboard.data.change_set_views;
+    let layout = if area.width >= 120 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(area)
     } else {
-        // column header
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<10}", "time"),
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{:<8}", "cap"),
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "command",
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{:>8}", "approved"),
-                Style::default().fg(OPS_DIM).add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        // separator
-        lines.push(Line::from(Span::styled(
-            "─".repeat(80),
-            Style::default().fg(OPS_BORDER),
-        )));
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(area)
+    };
 
-        let mut exec_count = 0usize;
-        let mut read_count = 0usize;
-        let mut plan_count = 0usize;
+    let list_block = Block::default()
+        .title(" AUDIT LOG / CHANGESETS ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let list_inner = list_block.inner(layout[0]);
+    list_block.render(layout[0], buf);
 
-        for event in d.audit_events.iter() {
-            let cap = event.capability.as_str();
-            let cap_color = if cap.contains("shell") || cap == "exec" || cap.contains("write") {
-                exec_count += 1;
-                OPS_YELLOW
-            } else if cap.contains("plan") {
-                plan_count += 1;
-                OPS_BLUE
-            } else {
-                read_count += 1;
-                OPS_GREEN
-            };
-
-            let approved = event.decision.as_str();
-            let approved_color = if approved.contains("user") {
-                OPS_YELLOW
-            } else if approved.contains("plan") {
-                OPS_BLUE
-            } else {
-                OPS_DIM
-            };
-
-            // calculate command column width: total - time(10) - cap(8) - approved(8) - spaces
-            let cmd_width = area.width.saturating_sub(30) as usize;
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:<10}", truncate_cell(&event.time, 9)),
-                    Style::default().fg(OPS_DIM),
-                ),
-                Span::styled(
-                    format!("{:<8}", truncate_cell(cap, 7)),
-                    Style::default().fg(cap_color),
-                ),
-                Span::styled(
-                    format!(
-                        "{:<width$}",
-                        truncate_cell(&event.command, cmd_width.saturating_sub(2)),
-                        width = cmd_width.saturating_sub(2)
-                    ),
-                    Style::default().fg(OPS_FG),
-                ),
-                Span::styled(
-                    format!("{:>8}", truncate_cell(approved, 8)),
-                    Style::default().fg(approved_color),
-                ),
-            ]));
-        }
-
-        lines.push(Line::from(Span::raw("")));
-        lines.push(Line::from(vec![
+    let mut list_lines = vec![
+        Line::from(vec![
+            Span::styled("chain verified", Style::default().fg(OPS_GREEN)),
+            Span::styled(" · ", Style::default().fg(OPS_BORDER)),
             Span::styled(
-                format!("{} events", d.audit_events.len()),
+                format!("{} recorded changes", changes.len()),
                 Style::default().fg(OPS_MUTED),
             ),
             Span::styled(" · ", Style::default().fg(OPS_BORDER)),
             Span::styled(
-                format!("{} exec (user-approved)", exec_count),
-                Style::default().fg(OPS_YELLOW),
+                "B",
+                Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" · ", Style::default().fg(OPS_BORDER)),
+            Span::styled(" rollback selected", Style::default().fg(OPS_DIM)),
+        ]),
+        Line::from(""),
+    ];
+    if changes.is_empty() {
+        list_lines.push(Line::from(Span::styled(
+            "No change sets recorded yet.",
+            Style::default().fg(OPS_MUTED),
+        )));
+    } else {
+        for (idx, change) in changes.iter().enumerate().take(12) {
+            let selected = idx == app.dashboard.change_selected_row;
+            let bg = if selected { OPS_SURFACE } else { OPS_BG };
+            let status_color = match change.status.as_str() {
+                "failed" => OPS_RED,
+                "completed" => OPS_GREEN,
+                "rolled_back" => OPS_YELLOW,
+                _ => OPS_BLUE,
+            };
+            let resources = if change.affected_resources.is_empty() {
+                "host".to_owned()
+            } else {
+                truncate(change.affected_resources.join(", "), 28)
+            };
+            list_lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { ">" } else { " " },
+                    Style::default().fg(OPS_BLUE).bg(bg),
+                ),
+                Span::styled(
+                    format!(" {:<10}", truncate_cell(&change.created_at, 10)),
+                    Style::default().fg(OPS_DIM).bg(bg),
+                ),
+                Span::styled(
+                    format!(" {:<11}", truncate_cell(&change.status, 11)),
+                    Style::default()
+                        .fg(status_color)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    truncate(
+                        &change.plan_title,
+                        list_inner.width.saturating_sub(26) as usize,
+                    ),
+                    Style::default().fg(OPS_FG).bg(bg),
+                ),
+            ]));
+            list_lines.push(Line::from(vec![
+                Span::styled("   ", Style::default().bg(bg)),
+                Span::styled(resources, Style::default().fg(OPS_MUTED).bg(bg)),
+                Span::styled(
+                    change
+                        .trigger_finding_title
+                        .as_ref()
+                        .map(|title| format!(" · triggered by {title}"))
+                        .unwrap_or_default(),
+                    Style::default().fg(OPS_DIM).bg(bg),
+                ),
+            ]));
+        }
+    }
+    Paragraph::new(list_lines)
+        .style(Style::default().bg(OPS_BG))
+        .render(list_inner, buf);
+
+    let detail_block = Block::default()
+        .title(" CHANGE DETAIL ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(OPS_BORDER));
+    let detail_inner = detail_block.inner(layout[1]);
+    detail_block.render(layout[1], buf);
+
+    let mut detail_lines = Vec::new();
+    if let Some(change) = changes.get(app.dashboard.change_selected_row) {
+        detail_lines.push(Line::from(vec![
             Span::styled(
-                format!("{} read (auto)", read_count),
-                Style::default().fg(OPS_GREEN),
+                change.plan_title.as_str(),
+                Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" · ", Style::default().fg(OPS_BORDER)),
-            Span::styled(
-                format!("{} plan", plan_count),
-                Style::default().fg(OPS_BLUE),
-            ),
-            Span::styled(" · ", Style::default().fg(OPS_BORDER)),
-            Span::styled("HMAC chain intact", Style::default().fg(OPS_GREEN)),
+            Span::styled("  ", Style::default()),
+            Span::styled(change.id.as_str(), Style::default().fg(OPS_DIM)),
         ]));
+        detail_lines.push(Line::from(vec![
+            Span::styled("Status  ", Style::default().fg(OPS_MUTED)),
+            Span::styled(
+                change.status.as_str(),
+                Style::default().fg(match change.status.as_str() {
+                    "failed" => OPS_RED,
+                    "completed" => OPS_GREEN,
+                    "rolled_back" => OPS_YELLOW,
+                    _ => OPS_BLUE,
+                }),
+            ),
+            Span::styled("   Created  ", Style::default().fg(OPS_MUTED)),
+            Span::styled(change.created_at.as_str(), Style::default().fg(OPS_FG)),
+        ]));
+        if let Some(title) = &change.trigger_finding_title {
+            detail_lines.push(Line::from(vec![
+                Span::styled("Finding ", Style::default().fg(OPS_MUTED)),
+                Span::styled(title.as_str(), Style::default().fg(OPS_FG)),
+                Span::styled(
+                    change
+                        .trigger_affected_resource
+                        .as_ref()
+                        .map(|value| format!(" · {}", value))
+                        .unwrap_or_default(),
+                    Style::default().fg(OPS_DIM),
+                ),
+            ]));
+        }
+        detail_lines.push(Line::from(vec![
+            Span::styled("Rollback  ", Style::default().fg(OPS_MUTED)),
+            Span::styled(
+                change.rollback_summary.as_str(),
+                Style::default().fg(OPS_DIM),
+            ),
+        ]));
+        if !change.summary.trim().is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                change.summary.as_str(),
+                Style::default().fg(OPS_FG),
+            )));
+        }
+        detail_lines.push(Line::from(""));
+        detail_lines.push(Line::from(Span::styled(
+            "AFFECTED RESOURCES",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )));
+        if change.affected_resources.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "No affected resources were captured.",
+                Style::default().fg(OPS_DIM),
+            )));
+        } else {
+            detail_lines.push(Line::from(Span::styled(
+                change.affected_resources.join(" · "),
+                Style::default().fg(OPS_FG),
+            )));
+        }
+        detail_lines.push(Line::from(""));
+        detail_lines.push(Line::from(Span::styled(
+            "SNAPSHOT DIFF",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )));
+        for line in &change.diff_lines {
+            detail_lines.push(Line::from(Span::styled(
+                line.as_str(),
+                Style::default().fg(OPS_DIM),
+            )));
+        }
+        detail_lines.push(Line::from(""));
+        detail_lines.push(Line::from(Span::styled(
+            "STEP LOG",
+            Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+        )));
+        for (idx, step) in change.steps.iter().enumerate() {
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}. ", idx + 1),
+                    Style::default().fg(OPS_BLUE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    step.title.as_str(),
+                    Style::default().fg(OPS_FG).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" [{}]", step.status),
+                    Style::default().fg(match step.status.as_str() {
+                        "failed" => OPS_RED,
+                        "succeeded" => OPS_GREEN,
+                        _ => OPS_DIM,
+                    }),
+                ),
+            ]));
+            detail_lines.push(Line::from(Span::styled(
+                truncate(
+                    format!("{} · {}", step.tool, step.command),
+                    detail_inner.width.saturating_sub(1) as usize,
+                ),
+                Style::default().fg(OPS_MUTED),
+            )));
+            if !step.stdout.trim().is_empty() {
+                detail_lines.push(Line::from(Span::styled(
+                    format!(
+                        "stdout: {}",
+                        truncate(&step.stdout, detail_inner.width.saturating_sub(9) as usize)
+                    ),
+                    Style::default().fg(OPS_FG),
+                )));
+            }
+            if !step.stderr.trim().is_empty() {
+                detail_lines.push(Line::from(Span::styled(
+                    format!(
+                        "stderr: {}",
+                        truncate(&step.stderr, detail_inner.width.saturating_sub(9) as usize)
+                    ),
+                    Style::default().fg(OPS_RED),
+                )));
+            }
+            if !step.verification.trim().is_empty() {
+                detail_lines.push(Line::from(Span::styled(
+                    format!(
+                        "verify: {}",
+                        truncate(
+                            &step.verification,
+                            detail_inner.width.saturating_sub(9) as usize
+                        )
+                    ),
+                    Style::default().fg(OPS_DIM),
+                )));
+            }
+        }
+        if !change.backups.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "PRE-CHANGE BACKUPS",
+                Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+            )));
+            for backup in &change.backups {
+                detail_lines.push(Line::from(Span::styled(
+                    format!(
+                        "{}{}",
+                        backup.file_path,
+                        if backup.restored { " (restored)" } else { "" }
+                    ),
+                    Style::default().fg(OPS_FG),
+                )));
+            }
+        }
+        if !app.dashboard.data.audit_events.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "RECENT AUDIT EVENTS",
+                Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+            )));
+            for event in app.dashboard.data.audit_events.iter().take(4) {
+                detail_lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} {} {} ({})",
+                        event.time, event.capability, event.command, event.decision
+                    ),
+                    Style::default().fg(OPS_DIM),
+                )));
+            }
+        }
+    } else {
+        detail_lines.push(Line::from(Span::styled(
+            "Select a change set to inspect execution logs, snapshot diffs, and rollback context.",
+            Style::default().fg(OPS_MUTED),
+        )));
+        if !app.dashboard.data.audit_events.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "RECENT AUDIT EVENTS",
+                Style::default().fg(OPS_MUTED).add_modifier(Modifier::BOLD),
+            )));
+            for event in app.dashboard.data.audit_events.iter().take(8) {
+                detail_lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} {} {} ({})",
+                        event.time, event.capability, event.command, event.decision
+                    ),
+                    Style::default().fg(OPS_DIM),
+                )));
+            }
+        }
     }
 
-    Paragraph::new(lines)
+    Paragraph::new(detail_lines)
         .style(Style::default().bg(OPS_BG))
         .scroll((app.dashboard.detail_scroll as u16, 0))
-        .render(area, buf);
+        .wrap(Wrap { trim: false })
+        .render(detail_inner, buf);
 }
 
 fn render_ops_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -9522,7 +10127,7 @@ fn render_ops_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 "Alerts: queue on the left, incident detail on Enter, evidence on Alt+E."
             }
             OpsTab::Services => {
-                "Services: review failed units first, then timers and journal-backed state."
+                "Services: Up/Down selects a unit, Enter opens detail, J loads journal, Shift+R restarts, X stops."
             }
             OpsTab::Resources => {
                 "Resources: use C/D/N/P or Left/Right in detail pane to switch CPU, disk, network, and processes."
@@ -9534,7 +10139,7 @@ fn render_ops_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 "Fleet: Up/Down selects a host, Enter pins that host as the active remote target."
             }
             OpsTab::Changes => {
-                "Changes: audit recent reviewed actions, their outputs, and rollback context."
+                "Changes: review step logs and snapshot diffs, then press B to attempt rollback from stored backups."
             }
         };
         Line::from(vec![

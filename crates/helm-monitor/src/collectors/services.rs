@@ -55,7 +55,7 @@ fn parse_units(s: &str) -> Vec<SystemdUnit> {
             } else {
                 let d = p[..4].iter().map(|x| x.len()).sum::<usize>() + 4;
                 Some(SystemdUnit {
-                    name: p[0].trim_end_matches(".service").into(),
+                    name: p[0].into(),
                     load: p[1].into(),
                     active: p[2].into(),
                     sub: p[3].into(),
@@ -92,7 +92,7 @@ fn parse_timers(s: &str) -> Vec<SystemdTimer> {
                 None
             } else {
                 Some(SystemdTimer {
-                    name: p[5].trim_end_matches(".timer").into(),
+                    name: p[5].into(),
                     next_trigger: format!("{} {}", p[0], p.get(1).unwrap_or(&"")),
                     last_trigger: format!("{} {}", p[2], p.get(3).unwrap_or(&"")),
                     passed: p.get(4).unwrap_or(&"").to_string(),
