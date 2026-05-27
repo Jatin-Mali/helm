@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -43,6 +43,7 @@ struct WebState {
     plan_cache: PlanCache,
     provider_settings: ProviderSettings,
     secrets: SecretsStore,
+    fleet_cache: Mutex<HashMap<uuid::Uuid, FleetHost>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -146,6 +147,7 @@ pub struct FleetHost {
     pub hostname: String,
     pub transport: String,
     pub status: String,
+    pub stale: bool,
     pub findings_count: usize,
     pub critical_count: usize,
     pub warning_count: usize,
@@ -197,18 +199,19 @@ pub async fn serve(
         plan_cache: PlanCache::default(),
         provider_settings,
         secrets,
+        fleet_cache: Mutex::new(HashMap::new()),
     });
     let web_refresh_secs = helm_monitor::load_thresholds_config()
         .refresh_interval_secs
         .clamp(5, 300);
 
-    let bg_db = db_path.clone();
+    let bg_state = Arc::clone(&state);
     let bg_tx = tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(web_refresh_secs));
         loop {
             interval.tick().await;
-            let json = collect_live_snapshot(&bg_db).await;
+            let json = collect_live_snapshot(bg_state.as_ref()).await;
             let _ = bg_tx.send(json);
         }
     });
@@ -251,7 +254,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<WebState>>) ->
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<WebState>) {
     let mut rx = state.snapshot_tx.subscribe();
-    let initial = collect_live_snapshot(&state.db_path).await;
+    let initial = collect_live_snapshot(state.as_ref()).await;
     if socket.send(Message::Text(initial.into())).await.is_err() {
         return;
     }
@@ -269,13 +272,13 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<WebState>) {
 }
 
 async fn api_snapshot(State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    let json = collect_live_snapshot(&state.db_path).await;
+    let json = collect_live_snapshot(state.as_ref()).await;
     Json(serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default())
 }
 
 async fn api_refresh(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     let daemon_requested = crate::request_daemon_refresh().unwrap_or(false);
-    let json = collect_live_snapshot(&state.db_path).await;
+    let json = collect_live_snapshot(state.as_ref()).await;
     let _ = state.snapshot_tx.send(json.clone());
     let snapshot = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
     Json(serde_json::json!({
@@ -363,7 +366,7 @@ async fn api_pipeline_webhook(
 ) -> impl IntoResponse {
     match record_pipeline_webhook_event(&provider, &service_id, &payload) {
         Ok(()) => {
-            let json = collect_live_snapshot(&state.db_path).await;
+            let json = collect_live_snapshot(state.as_ref()).await;
             let _ = state.snapshot_tx.send(json);
             Json(serde_json::json!({
                 "ok": true,
@@ -411,7 +414,8 @@ fn web_plan_summary(record: &helm_memory::TroubleshootingPlanRecord) -> String {
     lines.join("\n")
 }
 
-async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
+async fn collect_live_snapshot(state: &WebState) -> String {
+    let db_path = state.db_path.as_path();
     let conn = match rusqlite::Connection::open(db_path) {
         Ok(c) => c,
         Err(_) => return r#"{"error":"cannot open database"}"#.to_string(),
@@ -435,7 +439,7 @@ async fn collect_live_snapshot(db_path: &std::path::Path) -> String {
 
     let db_future = DbHealthCollector.collect(snapshot.profile);
     let web_future = WebServerCollector.collect(snapshot.profile);
-    let fleet_future = collect_fleet_hosts();
+    let fleet_future = collect_fleet_hosts(state);
     let (db_result, web_result, fleet_hosts) = tokio::join!(db_future, web_future, fleet_future);
 
     let databases = db_result.map(|s| s.instances).unwrap_or_default();
@@ -729,7 +733,142 @@ fn collector_health(snapshot: &SystemSnapshot) -> Vec<CollectorHealth> {
         .collect()
 }
 
-async fn collect_fleet_hosts() -> Vec<FleetHost> {
+fn fleet_host_from_report(transport: String, report: crate::remote::FleetHostReport) -> FleetHost {
+    let critical_count = report
+        .findings
+        .iter()
+        .filter(|finding| matches!(finding.severity, Severity::Critical))
+        .count();
+    let warning_count = report
+        .findings
+        .iter()
+        .filter(|finding| matches!(finding.severity, Severity::Warning))
+        .count();
+    let info_count = report
+        .findings
+        .iter()
+        .filter(|finding| matches!(finding.severity, Severity::Info))
+        .count();
+    let (
+        last_seen,
+        load_1m,
+        cpu_percent,
+        memory_used_pct,
+        failed_services,
+        running_containers,
+        total_containers,
+    ) = match report.snapshot.as_ref() {
+        Some(snapshot) => {
+            let load = &snapshot.domains.load;
+            let cpu = if load.cpu_logical_count > 0 {
+                ((load.load_average.one / load.cpu_logical_count as f64) * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            let mem = if load.memory.total > 0 {
+                (load.memory.used as f64 / load.memory.total as f64) * 100.0
+            } else {
+                0.0
+            };
+            (
+                snapshot.collected_at.to_rfc3339(),
+                Some(load.load_average.one),
+                Some(cpu),
+                Some(mem),
+                Some(
+                    snapshot
+                        .domains
+                        .services
+                        .units
+                        .iter()
+                        .filter(|unit| unit.active == "failed")
+                        .count(),
+                ),
+                Some(
+                    snapshot
+                        .domains
+                        .containers
+                        .containers
+                        .iter()
+                        .filter(|container| container.status == "running")
+                        .count(),
+                ),
+                Some(snapshot.domains.containers.containers.len()),
+            )
+        }
+        None => (String::new(), None, None, None, None, None, None),
+    };
+
+    FleetHost {
+        hostname: report.host_name,
+        transport,
+        status: if critical_count > 0 {
+            "critical".to_owned()
+        } else if warning_count > 0 {
+            "warning".to_owned()
+        } else {
+            "online".to_owned()
+        },
+        stale: false,
+        findings_count: report.findings.len(),
+        critical_count,
+        warning_count,
+        info_count,
+        last_seen,
+        load_1m,
+        cpu_percent,
+        memory_used_pct,
+        failed_services,
+        running_containers,
+        total_containers,
+    }
+}
+
+fn stale_or_offline_fleet_host(
+    cache: &Mutex<HashMap<uuid::Uuid, FleetHost>>,
+    host_id: uuid::Uuid,
+    entry: Option<&crate::remote::RemoteEntry>,
+    default_status: &str,
+) -> FleetHost {
+    if let Ok(cache) = cache.lock()
+        && let Some(previous) = cache.get(&host_id)
+    {
+        let mut stale = previous.clone();
+        stale.hostname = entry
+            .map(|remote| remote.name.clone())
+            .unwrap_or_else(|| host_id.to_string());
+        stale.transport = entry
+            .map(|remote| remote.summary_label())
+            .unwrap_or_else(|| "ssh".to_owned());
+        stale.status = "stale".to_owned();
+        stale.stale = true;
+        return stale;
+    }
+
+    FleetHost {
+        hostname: entry
+            .map(|remote| remote.name.clone())
+            .unwrap_or_else(|| host_id.to_string()),
+        transport: entry
+            .map(|remote| remote.summary_label())
+            .unwrap_or_else(|| "ssh".to_owned()),
+        status: default_status.to_owned(),
+        stale: false,
+        findings_count: 0,
+        critical_count: 0,
+        warning_count: 0,
+        info_count: 0,
+        last_seen: String::new(),
+        load_1m: None,
+        cpu_percent: None,
+        memory_used_pct: None,
+        failed_services: None,
+        running_containers: None,
+        total_containers: None,
+    }
+}
+
+async fn collect_fleet_hosts(state: &WebState) -> Vec<FleetHost> {
     let Ok(registry) = crate::remote::RemoteRegistry::load() else {
         return Vec::new();
     };
@@ -755,137 +894,29 @@ async fn collect_fleet_hosts() -> Vec<FleetHost> {
                         .get(&host_id)
                         .map(|entry| entry.summary_label())
                         .unwrap_or_else(|| "ssh".to_owned());
-                    let critical_count = report
-                        .findings
-                        .iter()
-                        .filter(|finding| matches!(finding.severity, Severity::Critical))
-                        .count();
-                    let warning_count = report
-                        .findings
-                        .iter()
-                        .filter(|finding| matches!(finding.severity, Severity::Warning))
-                        .count();
-                    let info_count = report
-                        .findings
-                        .iter()
-                        .filter(|finding| matches!(finding.severity, Severity::Info))
-                        .count();
-                    let (
-                        last_seen,
-                        load_1m,
-                        cpu_percent,
-                        memory_used_pct,
-                        failed_services,
-                        running_containers,
-                        total_containers,
-                    ) = match report.snapshot.as_ref() {
-                        Some(snapshot) => {
-                            let load = &snapshot.domains.load;
-                            let cpu = if load.cpu_logical_count > 0 {
-                                ((load.load_average.one / load.cpu_logical_count as f64) * 100.0)
-                                    .clamp(0.0, 100.0)
-                            } else {
-                                0.0
-                            };
-                            let mem = if load.memory.total > 0 {
-                                (load.memory.used as f64 / load.memory.total as f64) * 100.0
-                            } else {
-                                0.0
-                            };
-                            (
-                                snapshot.collected_at.to_rfc3339(),
-                                Some(load.load_average.one),
-                                Some(cpu),
-                                Some(mem),
-                                Some(
-                                    snapshot
-                                        .domains
-                                        .services
-                                        .units
-                                        .iter()
-                                        .filter(|unit| unit.active == "failed")
-                                        .count(),
-                                ),
-                                Some(
-                                    snapshot
-                                        .domains
-                                        .containers
-                                        .containers
-                                        .iter()
-                                        .filter(|container| container.status == "running")
-                                        .count(),
-                                ),
-                                Some(snapshot.domains.containers.containers.len()),
-                            )
-                        }
-                        None => (String::new(), None, None, None, None, None, None),
-                    };
-
-                    FleetHost {
-                        hostname: report.host_name,
-                        transport,
-                        status: if critical_count > 0 {
-                            "critical".to_owned()
-                        } else if warning_count > 0 {
-                            "warning".to_owned()
-                        } else {
-                            "online".to_owned()
-                        },
-                        findings_count: report.findings.len(),
-                        critical_count,
-                        warning_count,
-                        info_count,
-                        last_seen,
-                        load_1m,
-                        cpu_percent,
-                        memory_used_pct,
-                        failed_services,
-                        running_containers,
-                        total_containers,
+                    let host = fleet_host_from_report(transport, report);
+                    if let Ok(mut cache) = state.fleet_cache.lock() {
+                        cache.insert(host_id, host.clone());
                     }
+                    host
                 }
-                Err(_) => {
-                    let entry = by_id.get(&host_id);
-                    FleetHost {
-                        hostname: entry
-                            .map(|remote| remote.name.clone())
-                            .unwrap_or_else(|| host_id.to_string()),
-                        transport: entry
-                            .map(|remote| remote.summary_label())
-                            .unwrap_or_else(|| "ssh".to_owned()),
-                        status: "offline".to_owned(),
-                        findings_count: 0,
-                        critical_count: 0,
-                        warning_count: 0,
-                        info_count: 0,
-                        last_seen: String::new(),
-                        load_1m: None,
-                        cpu_percent: None,
-                        memory_used_pct: None,
-                        failed_services: None,
-                        running_containers: None,
-                        total_containers: None,
-                    }
-                }
+                Err(_) => stale_or_offline_fleet_host(
+                    &state.fleet_cache,
+                    host_id,
+                    by_id.get(&host_id),
+                    "offline",
+                ),
             })
             .collect(),
         Err(_) => entries
             .into_iter()
-            .map(|entry| FleetHost {
-                hostname: entry.name.clone(),
-                transport: entry.summary_label(),
-                status: "configured".to_owned(),
-                findings_count: 0,
-                critical_count: 0,
-                warning_count: 0,
-                info_count: 0,
-                last_seen: String::new(),
-                load_1m: None,
-                cpu_percent: None,
-                memory_used_pct: None,
-                failed_services: None,
-                running_containers: None,
-                total_containers: None,
+            .map(|entry| {
+                stale_or_offline_fleet_host(
+                    &state.fleet_cache,
+                    entry.host_id,
+                    Some(&entry),
+                    "configured",
+                )
             })
             .collect(),
     }

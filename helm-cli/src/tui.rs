@@ -46,6 +46,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
+use uuid::Uuid;
 
 use crate::{
     ProviderChoice, ProviderSettings, TroubleshootingPlanStore, build_provider, custom_commands,
@@ -1031,10 +1032,12 @@ struct DashboardMetrics {
 /// Per-host fleet status for multi-host view.
 #[derive(Debug, Clone)]
 struct FleetHostStatus {
+    pub host_id: Uuid,
     pub name: String,
     pub endpoint: String,
     pub transport: String,
     pub reachable: bool,
+    pub stale: bool,
     pub crit: usize,
     pub warn: usize,
     pub info: usize,
@@ -1696,6 +1699,85 @@ fn fleet_detail_from_report(report: &crate::remote::FleetHostReport) -> FleetHos
         vm_domains,
         vm_problem_domains,
         collector_errors,
+    }
+}
+
+fn endpoint_label(remote: &crate::remote::RemoteEntry) -> String {
+    format!(
+        "{}@{}:{}",
+        remote.user.as_deref().unwrap_or("default"),
+        remote.host,
+        remote.port
+    )
+}
+
+fn fresh_fleet_status(
+    remote: &crate::remote::RemoteEntry,
+    report: &crate::remote::FleetHostReport,
+    now: Instant,
+) -> FleetHostStatus {
+    let crit = report
+        .findings
+        .iter()
+        .filter(|f| f.severity.as_str().eq_ignore_ascii_case("critical"))
+        .count();
+    let warn = report
+        .findings
+        .iter()
+        .filter(|f| f.severity.as_str().eq_ignore_ascii_case("warning"))
+        .count();
+    let info = report.findings.len().saturating_sub(crit + warn);
+    FleetHostStatus {
+        host_id: remote.host_id,
+        name: remote.name.clone(),
+        endpoint: endpoint_label(remote),
+        transport: remote.summary_label(),
+        reachable: true,
+        stale: false,
+        crit,
+        warn,
+        info,
+        last_refresh: Some(now),
+        error: None,
+        detail: Some(fleet_detail_from_report(report)),
+    }
+}
+
+fn unavailable_fleet_status(
+    remote: &crate::remote::RemoteEntry,
+    previous: Option<&FleetHostStatus>,
+    error: Option<String>,
+) -> FleetHostStatus {
+    if let Some(previous) = previous {
+        FleetHostStatus {
+            host_id: remote.host_id,
+            name: remote.name.clone(),
+            endpoint: endpoint_label(remote),
+            transport: remote.summary_label(),
+            reachable: false,
+            stale: true,
+            crit: previous.crit,
+            warn: previous.warn,
+            info: previous.info,
+            last_refresh: previous.last_refresh,
+            error,
+            detail: previous.detail.clone(),
+        }
+    } else {
+        FleetHostStatus {
+            host_id: remote.host_id,
+            name: remote.name.clone(),
+            endpoint: endpoint_label(remote),
+            transport: remote.summary_label(),
+            reachable: false,
+            stale: false,
+            crit: 0,
+            warn: 0,
+            info: 0,
+            last_refresh: None,
+            error,
+            detail: None,
+        }
     }
 }
 
@@ -2410,10 +2492,15 @@ impl TuiApp {
                 {
                     self.dashboard.fleet_collection_in_flight = true;
                     let registry = crate::remote::RemoteRegistry::load().unwrap_or_default();
+                    let previous_hosts = self.dashboard.data.fleet_hosts.clone();
                     let (tx_hosts, rx_hosts) =
                         tokio::sync::oneshot::channel::<Vec<FleetHostStatus>>();
                     tokio::spawn(async move {
                         let results = registry.parallel_collect_reports().await;
+                        let previous_by_id = previous_hosts
+                            .into_iter()
+                            .map(|host| (host.host_id, host))
+                            .collect::<HashMap<_, _>>();
                         let mut hosts = Vec::new();
                         for remote in &registry.remotes {
                             let matching = results
@@ -2421,73 +2508,18 @@ impl TuiApp {
                                 .find(|(host_id, _)| *host_id == remote.host_id);
                             let host_status = match matching {
                                 Some((_host_id, Ok(report))) => {
-                                    let crit = report
-                                        .findings
-                                        .iter()
-                                        .filter(|f| {
-                                            f.severity.as_str().eq_ignore_ascii_case("critical")
-                                        })
-                                        .count();
-                                    let warn = report
-                                        .findings
-                                        .iter()
-                                        .filter(|f| {
-                                            f.severity.as_str().eq_ignore_ascii_case("warning")
-                                        })
-                                        .count();
-                                    let info = report.findings.len().saturating_sub(crit + warn);
-                                    FleetHostStatus {
-                                        name: remote.name.clone(),
-                                        endpoint: format!(
-                                            "{}@{}:{}",
-                                            remote.user.as_deref().unwrap_or("default"),
-                                            remote.host,
-                                            remote.port
-                                        ),
-                                        transport: remote.summary_label(),
-                                        reachable: true,
-                                        crit,
-                                        warn,
-                                        info,
-                                        last_refresh: Some(Instant::now()),
-                                        error: None,
-                                        detail: Some(fleet_detail_from_report(report)),
-                                    }
+                                    fresh_fleet_status(remote, report, Instant::now())
                                 }
-                                Some((_host_id, Err(error))) => FleetHostStatus {
-                                    name: remote.name.clone(),
-                                    endpoint: format!(
-                                        "{}@{}:{}",
-                                        remote.user.as_deref().unwrap_or("default"),
-                                        remote.host,
-                                        remote.port
-                                    ),
-                                    transport: remote.summary_label(),
-                                    reachable: false,
-                                    crit: 0,
-                                    warn: 0,
-                                    info: 0,
-                                    last_refresh: Some(Instant::now()),
-                                    error: Some(error.to_string()),
-                                    detail: None,
-                                },
-                                None => FleetHostStatus {
-                                    name: remote.name.clone(),
-                                    endpoint: format!(
-                                        "{}@{}:{}",
-                                        remote.user.as_deref().unwrap_or("default"),
-                                        remote.host,
-                                        remote.port
-                                    ),
-                                    transport: remote.summary_label(),
-                                    reachable: false,
-                                    crit: 0,
-                                    warn: 0,
-                                    info: 0,
-                                    last_refresh: None,
-                                    error: Some("no collection result".to_owned()),
-                                    detail: None,
-                                },
+                                Some((_host_id, Err(error))) => unavailable_fleet_status(
+                                    remote,
+                                    previous_by_id.get(&remote.host_id),
+                                    Some(error.to_string()),
+                                ),
+                                None => unavailable_fleet_status(
+                                    remote,
+                                    previous_by_id.get(&remote.host_id),
+                                    Some("no collection result".to_owned()),
+                                ),
                             };
                             hosts.push(host_status);
                         }
@@ -8774,8 +8806,20 @@ fn render_fleet_tab(
         let is_selected = selected_row == Some(idx);
         let bg = if is_selected { OPS_SURFACE } else { OPS_BG };
 
-        let status_text = if host.reachable { "UP" } else { "DOWN" };
-        let status_color = if host.reachable { OPS_GREEN } else { OPS_RED };
+        let status_text = if host.reachable {
+            "UP"
+        } else if host.stale {
+            "STALE"
+        } else {
+            "DOWN"
+        };
+        let status_color = if host.reachable {
+            OPS_GREEN
+        } else if host.stale {
+            OPS_YELLOW
+        } else {
+            OPS_RED
+        };
 
         let last_str = host
             .last_refresh
@@ -8790,7 +8834,7 @@ fn render_fleet_tab(
                 }
             })
             .unwrap_or_else(|| "N/A".to_owned());
-        let last_cell = if host.reachable {
+        let last_cell = if host.reachable || host.stale {
             last_str
         } else if let Some(error) = &host.error {
             truncate_cell(error, 24)
@@ -8871,10 +8915,32 @@ fn render_fleet_tab(
             Span::styled(host.transport.as_str(), Style::default().fg(OPS_BLUE)),
             Span::styled("   State  ", Style::default().fg(OPS_MUTED)),
             Span::styled(
-                if host.reachable { "up" } else { "down" },
-                Style::default().fg(if host.reachable { OPS_GREEN } else { OPS_RED }),
+                if host.reachable {
+                    "up"
+                } else if host.stale {
+                    "down (stale)"
+                } else {
+                    "down"
+                },
+                Style::default().fg(if host.reachable {
+                    OPS_GREEN
+                } else if host.stale {
+                    OPS_YELLOW
+                } else {
+                    OPS_RED
+                }),
             ),
         ]));
+        lines.push(Line::from(vec![
+            Span::styled("Host ID    ", Style::default().fg(OPS_MUTED)),
+            Span::styled(host.host_id.to_string(), Style::default().fg(OPS_DIM)),
+        ]));
+        if host.stale {
+            lines.push(Line::from(Span::styled(
+                "Remote host is currently unreachable; showing last-known findings.",
+                Style::default().fg(OPS_YELLOW),
+            )));
+        }
 
         if let Some(detail) = &host.detail {
             lines.push(Line::from(vec![
@@ -13865,10 +13931,12 @@ mod tests {
         // Create mock FleetHostStatus entries (3 hosts)
         let fleet_hosts = vec![
             FleetHostStatus {
+                host_id: Uuid::new_v4(),
                 name: "host1".to_string(),
                 endpoint: "ubuntu@host1:22".to_string(),
                 transport: "ssh".to_string(),
                 reachable: true,
+                stale: false,
                 crit: 2,
                 warn: 5,
                 info: 10,
@@ -13877,10 +13945,12 @@ mod tests {
                 detail: None,
             },
             FleetHostStatus {
+                host_id: Uuid::new_v4(),
                 name: "host2".to_string(),
                 endpoint: "ubuntu@host2:22".to_string(),
                 transport: "agent/systemd-user".to_string(),
                 reachable: true,
+                stale: false,
                 crit: 0,
                 warn: 1,
                 info: 3,
@@ -13889,10 +13959,12 @@ mod tests {
                 detail: None,
             },
             FleetHostStatus {
+                host_id: Uuid::new_v4(),
                 name: "host3".to_string(),
                 endpoint: "ubuntu@host3:22".to_string(),
                 transport: "agent/detached".to_string(),
                 reachable: false,
+                stale: false,
                 crit: 0,
                 warn: 0,
                 info: 0,
@@ -14002,10 +14074,12 @@ mod tests {
         // Mock successful results with different severities
         let fleet_hosts = [
             FleetHostStatus {
+                host_id: Uuid::new_v4(),
                 name: "host1".to_string(),
                 endpoint: "ubuntu@host1:22".to_string(),
                 transport: "ssh".to_string(),
                 reachable: true,
+                stale: false,
                 crit: 1,
                 warn: 0,
                 info: 0,
@@ -14014,10 +14088,12 @@ mod tests {
                 detail: None,
             },
             FleetHostStatus {
+                host_id: Uuid::new_v4(),
                 name: "host2".to_string(),
                 endpoint: "ubuntu@host2:22".to_string(),
                 transport: "agent/systemd-user".to_string(),
                 reachable: true,
+                stale: false,
                 crit: 0,
                 warn: 1,
                 info: 0,
@@ -14026,10 +14102,12 @@ mod tests {
                 detail: None,
             },
             FleetHostStatus {
+                host_id: Uuid::new_v4(),
                 name: "host3".to_string(),
                 endpoint: "ubuntu@host3:22".to_string(),
                 transport: "agent/detached".to_string(),
                 reachable: false,
+                stale: false,
                 crit: 0,
                 warn: 0,
                 info: 0,
@@ -14090,10 +14168,12 @@ mod tests {
     fn test_fleet_status_render_display() {
         let fleet_hosts = [
             FleetHostStatus {
+                host_id: Uuid::new_v4(),
                 name: "web1".to_string(),
                 endpoint: "ubuntu@web1:22".to_string(),
                 transport: "ssh".to_string(),
                 reachable: true,
+                stale: false,
                 crit: 0,
                 warn: 0,
                 info: 0,
@@ -14102,10 +14182,12 @@ mod tests {
                 detail: None,
             },
             FleetHostStatus {
+                host_id: Uuid::new_v4(),
                 name: "db1".to_string(),
                 endpoint: "ubuntu@db1:22".to_string(),
                 transport: "agent/systemd-user".to_string(),
                 reachable: true,
+                stale: false,
                 crit: 0,
                 warn: 0,
                 info: 0,
@@ -14126,7 +14208,103 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unreachable_host_reuses_last_known_state() {
+        let remote = crate::remote::RemoteEntry {
+            host_id: Uuid::new_v4(),
+            name: "db1".to_owned(),
+            host: "db1.example.com".to_owned(),
+            port: 22,
+            user: Some("ubuntu".to_owned()),
+            ssh_opts: None,
+            credential: crate::remote::Credential::SshAgent,
+            transport: crate::remote::RemoteTransport::Ssh,
+            agent: None,
+        };
+        let previous = FleetHostStatus {
+            host_id: remote.host_id,
+            name: remote.name.clone(),
+            endpoint: endpoint_label(&remote),
+            transport: remote.summary_label(),
+            reachable: true,
+            stale: false,
+            crit: 2,
+            warn: 1,
+            info: 0,
+            last_refresh: Some(Instant::now()),
+            error: None,
+            detail: Some(FleetHostDetail {
+                snapshot_id: "snap-a".to_owned(),
+                collected_at: "2026-05-27T12:00:00Z".to_owned(),
+                hostname: "db1".to_owned(),
+                findings: Vec::new(),
+                failed_services: 1,
+                total_services: 10,
+                running_containers: 2,
+                total_containers: 2,
+                compose_projects: 0,
+                degraded_compose_projects: 0,
+                kubernetes_pods: 0,
+                kubernetes_problem_pods: 0,
+                vm_domains: 0,
+                vm_problem_domains: 0,
+                collector_errors: Vec::new(),
+            }),
+        };
+
+        let stale = unavailable_fleet_status(&remote, Some(&previous), Some("timeout".to_owned()));
+        assert!(!stale.reachable);
+        assert!(stale.stale);
+        assert_eq!(stale.crit, 2);
+        assert_eq!(stale.warn, 1);
+        assert!(stale.detail.is_some());
+        assert_eq!(stale.error.as_deref(), Some("timeout"));
+    }
+
     proptest! {
+        #[test]
+        fn property_35_unreachable_host_staleness(
+            crit in 0usize..12,
+            warn in 0usize..12,
+            info in 0usize..12,
+            message in "[A-Za-z0-9 .:_/-]{1,40}"
+        ) {
+            let remote = crate::remote::RemoteEntry {
+                host_id: Uuid::new_v4(),
+                name: "fleet-a".to_owned(),
+                host: "fleet-a.example.com".to_owned(),
+                port: 22,
+                user: Some("ubuntu".to_owned()),
+                ssh_opts: None,
+                credential: crate::remote::Credential::SshAgent,
+                transport: crate::remote::RemoteTransport::Ssh,
+                agent: None,
+            };
+            let previous = FleetHostStatus {
+                host_id: remote.host_id,
+                name: remote.name.clone(),
+                endpoint: endpoint_label(&remote),
+                transport: remote.summary_label(),
+                reachable: true,
+                stale: false,
+                crit,
+                warn,
+                info,
+                last_refresh: Some(Instant::now()),
+                error: None,
+                detail: None,
+            };
+
+            let stale = unavailable_fleet_status(&remote, Some(&previous), Some(message.clone()));
+            prop_assert!(!stale.reachable);
+            prop_assert!(stale.stale);
+            prop_assert_eq!(stale.crit, crit);
+            prop_assert_eq!(stale.warn, warn);
+            prop_assert_eq!(stale.info, info);
+            prop_assert_eq!(stale.error.as_deref(), Some(message.as_str()));
+            prop_assert_eq!(stale.last_refresh, previous.last_refresh);
+        }
+
         #[test]
         fn property_29_summary_line_length(
             inputs in prop::collection::vec(("[a-z0-9 ]{1,24}", prop_oneof![Just("critical"), Just("warning"), Just("info")], arb_status()), 0..24)

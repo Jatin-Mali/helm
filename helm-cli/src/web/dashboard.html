@@ -1708,7 +1708,7 @@ function classifyStatus(raw) {
   const status = String(raw || '').toLowerCase();
   if (!status) return 'info';
   if (status.includes('fail') || status.includes('down') || status.includes('dead') || status.includes('exit') || status.includes('oom')) return 'fail';
-  if (status.includes('warn') || status.includes('degraded') || status.includes('pending') || status.includes('inactive') || status.includes('pause')) return 'warn';
+  if (status.includes('warn') || status.includes('degraded') || status.includes('pending') || status.includes('inactive') || status.includes('pause') || status.includes('stale')) return 'warn';
   if (status.includes('run') || status.includes('active') || status.includes('healthy') || status.includes('up') || status.includes('online')) return 'ok';
   return 'info';
 }

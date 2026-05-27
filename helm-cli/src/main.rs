@@ -2586,17 +2586,7 @@ fn run_secrets_doctor(store: &SecretsStore) -> DoctorSecretsReport {
     let store_exists = store.path().exists();
     let keys_stored = store.list_names().unwrap_or_default();
     let store_permissions_ok = if store_exists {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(store.path())
-                .map(|m| m.permissions().mode() & 0o777 == 0o600)
-                .unwrap_or(false)
-        }
-        #[cfg(not(unix))]
-        {
-            true
-        }
+        store.permissions_ok()
     } else {
         true
     };
@@ -2920,9 +2910,9 @@ fn render_doctor(report: &DoctorReport) -> String {
         output.push_str(&format!(
             " ({})\n",
             if report.secrets.store_permissions_ok {
-                "0600"
+                "0600 file, 0700 dir"
             } else {
-                "INSECURE: not 0600"
+                "INSECURE: expected 0600 file, 0700 dir"
             }
         ));
     } else {

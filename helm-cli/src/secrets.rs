@@ -1,4 +1,4 @@
-//! Persistent secrets store: `~/.helm/secrets.toml` with mode 0600.
+//! Persistent secrets store: `$XDG_CONFIG_HOME/helm/secrets.toml` with mode 0600.
 //!
 //! The store is intentionally local and simple for v1.0: flat TOML,
 //! strict Unix permissions, and atomic writes guarded by an advisory lock.
@@ -49,6 +49,8 @@ impl SecretsStore {
             path: dir.clone(),
             source: e,
         })?;
+        #[cfg(unix)]
+        set_mode_700(&dir)?;
         Self::open_at(dir.join("secrets.toml"))
     }
 
@@ -64,6 +66,16 @@ impl SecretsStore {
     /// Returns the backing store path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns whether the store path currently satisfies the required file and parent modes.
+    pub fn permissions_ok(&self) -> bool {
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let parent_ok = check_parent_permissions(dir).is_ok();
+        if !self.path.exists() {
+            return parent_ok;
+        }
+        parent_ok && check_permissions(&self.path).is_ok()
     }
 
     /// Returns the secret for `name`, or `None` if not present.
@@ -145,6 +157,8 @@ impl SecretsStore {
             path: dir.to_owned(),
             source: e,
         })?;
+        #[cfg(unix)]
+        set_mode_700(dir)?;
         check_parent_permissions(dir)
     }
 
@@ -216,7 +230,7 @@ fn check_parent_permissions(path: &Path) -> Result<(), SecretsError> {
         source: e,
     })?;
     let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o002 != 0 {
+    if mode != 0o700 {
         return Err(SecretsError::InsecurePermissions(path.to_owned()));
     }
     Ok(())
@@ -371,6 +385,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn parent_directory_is_forced_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("helm");
+        fs::create_dir_all(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = SecretsStore::open_at(nested.join("secrets.toml")).unwrap();
+        store.set("K", Secret::new("v")).unwrap();
+
+        let meta = std::fs::metadata(store.path().parent().unwrap()).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        assert!(store.permissions_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn world_readable_file_refuses_to_read() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -385,15 +417,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn world_writable_parent_refuses_write() {
+    fn world_writable_parent_is_repaired_before_write() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
         let store = store_in(&dir);
 
-        let error = store.set("K", Secret::new("v")).unwrap_err();
-        assert!(matches!(error, SecretsError::InsecurePermissions(_)));
+        store.set("K", Secret::new("v")).unwrap();
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert!(store.permissions_ok());
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! SSH-reachable remote target registry stored at `~/.helm/remotes.toml`.
+//! SSH-reachable remote target registry stored at
+//! `$XDG_CONFIG_HOME/helm/remotes.toml`.
 
 use std::{
     fs,
@@ -8,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use helm_monitor::{Finding, SystemSnapshot};
+use helm_monitor::{EvidenceRef, Finding, SystemSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -19,11 +20,15 @@ pub struct RemoteRegistry {
     pub remotes: Vec<RemoteEntry>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+const FLEET_COLLECTION_TIMEOUT_SECS: u64 = 2;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub enum Credential {
     #[default]
     SshAgent,
     KeyFile(PathBuf),
+    Password,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,7 +216,20 @@ impl RemoteRegistry {
             if let Some(remote) = task_iter.next() {
                 let remote_clone = remote.clone();
                 joinset.spawn(async move {
-                    (remote_clone.host_id, remote_clone.collect_findings().await)
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(FLEET_COLLECTION_TIMEOUT_SECS),
+                        remote_clone.collect_findings(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "timed out after {}s collecting findings from {}",
+                            FLEET_COLLECTION_TIMEOUT_SECS,
+                            remote_clone.name
+                        )
+                    })
+                    .and_then(|result| result);
+                    (remote_clone.host_id, result)
                 });
             }
         }
@@ -227,7 +245,20 @@ impl RemoteRegistry {
                 if let Some(remote) = task_iter.next() {
                     let remote_clone = remote.clone();
                     joinset.spawn(async move {
-                        (remote_clone.host_id, remote_clone.collect_findings().await)
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(FLEET_COLLECTION_TIMEOUT_SECS),
+                            remote_clone.collect_findings(),
+                        )
+                        .await
+                        .map_err(|_| {
+                            anyhow!(
+                                "timed out after {}s collecting findings from {}",
+                                FLEET_COLLECTION_TIMEOUT_SECS,
+                                remote_clone.name
+                            )
+                        })
+                        .and_then(|result| result);
+                        (remote_clone.host_id, result)
                     });
                 }
             }
@@ -250,7 +281,20 @@ impl RemoteRegistry {
             if let Some(remote) = task_iter.next() {
                 let remote_clone = remote.clone();
                 joinset.spawn(async move {
-                    (remote_clone.host_id, remote_clone.collect_report().await)
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(FLEET_COLLECTION_TIMEOUT_SECS),
+                        remote_clone.collect_report(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "timed out after {}s collecting report from {}",
+                            FLEET_COLLECTION_TIMEOUT_SECS,
+                            remote_clone.name
+                        )
+                    })
+                    .and_then(|result| result);
+                    (remote_clone.host_id, result)
                 });
             }
         }
@@ -265,7 +309,20 @@ impl RemoteRegistry {
             {
                 let remote_clone = remote.clone();
                 joinset.spawn(async move {
-                    (remote_clone.host_id, remote_clone.collect_report().await)
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(FLEET_COLLECTION_TIMEOUT_SECS),
+                        remote_clone.collect_report(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "timed out after {}s collecting report from {}",
+                            FLEET_COLLECTION_TIMEOUT_SECS,
+                            remote_clone.name
+                        )
+                    })
+                    .and_then(|result| result);
+                    (remote_clone.host_id, result)
                 });
             }
         }
@@ -311,7 +368,7 @@ impl RemoteEntry {
         argv.push("-o".to_owned());
         argv.push("BatchMode=yes".to_owned());
         argv.push("-o".to_owned());
-        argv.push("ConnectTimeout=10".to_owned());
+        argv.push(format!("ConnectTimeout={FLEET_COLLECTION_TIMEOUT_SECS}"));
         if let Credential::KeyFile(path) = &self.credential {
             argv.push("-i".to_owned());
             argv.push(path.to_string_lossy().to_string());
@@ -365,10 +422,11 @@ impl RemoteEntry {
     #[allow(dead_code)]
     pub async fn collect_findings(&self) -> Result<Vec<FleetFinding>> {
         let raw_findings = self.collect_raw_findings().await?;
+        let traced_findings = self.annotate_remote_findings(raw_findings);
 
         // Map to FleetFinding, tagging with host_id
         let mut findings = Vec::new();
-        for finding in raw_findings {
+        for finding in traced_findings {
             findings.push(FleetFinding {
                 host_id: self.host_id,
                 host_name: self.name.clone(),
@@ -383,7 +441,7 @@ impl RemoteEntry {
     }
 
     pub async fn collect_report(&self) -> Result<FleetHostReport> {
-        let findings = self.collect_raw_findings().await?;
+        let findings = self.annotate_remote_findings(self.collect_raw_findings().await?);
         let snapshot = self.collect_snapshot().await.ok();
         Ok(FleetHostReport {
             host_id: self.host_id,
@@ -438,11 +496,34 @@ impl RemoteEntry {
 
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
+
+    fn annotate_remote_findings(&self, findings: Vec<Finding>) -> Vec<Finding> {
+        let host_id = self.host_id.to_string();
+        findings
+            .into_iter()
+            .map(|mut finding| {
+                if !finding
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.source == "remote.host_id")
+                {
+                    finding.evidence.push(EvidenceRef {
+                        source: "remote.host_id".to_owned(),
+                        value: host_id.clone(),
+                        note: format!("Collected from remote host {}", self.name),
+                    });
+                }
+                finding
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helm_monitor::{Confidence, MonitorDomain, Severity};
+    use proptest::prelude::*;
     use tempfile::tempdir;
 
     #[test]
@@ -512,7 +593,7 @@ mod tests {
                 "-o",
                 "BatchMode=yes",
                 "-o",
-                "ConnectTimeout=10",
+                "ConnectTimeout=2",
                 "ubuntu@prod.example.com"
             ]
         );
@@ -602,6 +683,27 @@ mod tests {
             }
             _ => panic!("Credential serialization roundtrip failed"),
         }
+    }
+
+    #[test]
+    fn password_credential_serializes_without_secret_material() {
+        let entry = RemoteEntry {
+            host_id: Uuid::new_v4(),
+            name: "prod".to_owned(),
+            host: "prod.example.com".to_owned(),
+            port: 22,
+            user: Some("ubuntu".to_owned()),
+            ssh_opts: None,
+            credential: Credential::Password,
+            transport: RemoteTransport::Ssh,
+            agent: None,
+        };
+
+        let toml_str = toml::to_string(&entry).unwrap();
+        assert!(toml_str.contains("password"));
+        assert!(!toml_str.contains("secret"));
+        let deserialized: RemoteEntry = toml::from_str(&toml_str).unwrap();
+        assert_eq!(deserialized.credential, Credential::Password);
     }
 
     #[test]
@@ -726,15 +828,52 @@ port = 22
             let _ = result; // silence unused warning
         }
 
-        // Assert elapsed time is reasonable (parallel should be much faster than serial)
-        // With 30s timeout per host and max 20 concurrent, worst case is ~30s
-        // If parallel is working, 20 invalid hosts should timeout in ~30s total
-        // not 20 * 30s = 600s
+        // Assert elapsed time is bounded by the fleet timeout budget.
         eprintln!("20-host parallel collection took: {:?}", elapsed);
         assert!(
-            elapsed.as_secs() <= 35,
+            elapsed.as_secs() <= FLEET_COLLECTION_TIMEOUT_SECS + 1,
             "parallel collection took too long: {:?}",
             elapsed
         );
+    }
+
+    proptest! {
+        #[test]
+        fn property_34_remote_findings_include_host_traceability(
+            resource in "[a-z0-9/_-]{1,24}",
+            title in "[A-Za-z0-9 .:_/-]{1,48}"
+        ) {
+            let entry = RemoteEntry {
+                host_id: Uuid::new_v4(),
+                name: "remote-a".to_owned(),
+                host: "remote-a.example.com".to_owned(),
+                port: 22,
+                user: Some("ubuntu".to_owned()),
+                ssh_opts: None,
+                credential: Credential::SshAgent,
+                transport: RemoteTransport::Ssh,
+                agent: None,
+            };
+            let finding = Finding::new(
+                "snap-1",
+                "test-detector",
+                &resource,
+                &title,
+                Severity::Warning,
+                Confidence::Medium,
+                MonitorDomain::Services,
+            )
+            .with_evidence("services.units[0].active", "failed", "service failure");
+            let traced = entry.annotate_remote_findings(vec![finding]);
+            let host_id = entry.host_id.to_string();
+            let all_traced = traced.iter().all(|finding| {
+                finding
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.source == "remote.host_id" && evidence.value == host_id)
+            });
+
+            prop_assert!(all_traced);
+        }
     }
 }
