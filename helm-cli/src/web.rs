@@ -515,8 +515,16 @@ fn web_plan_summary(record: &helm_memory::TroubleshootingPlanRecord) -> String {
     if !record.narrative_summary.trim().is_empty() {
         lines.push(record.narrative_summary.clone());
     }
-    let steps: Vec<serde_json::Value> =
-        serde_json::from_str(&record.proposed_fix_steps_json).unwrap_or_default();
+    let steps = match helm_monitor::decode_plan_steps(&record.proposed_fix_steps_json) {
+        Ok(steps) => steps
+            .into_iter()
+            .map(|step| serde_json::to_value(step).expect("typed plan serializes"))
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            lines.push(format!("Cannot load executable plan: {error}"));
+            return lines.join("\n");
+        }
+    };
     for (index, step) in steps.iter().enumerate() {
         let command = step
             .get("command")

@@ -17,6 +17,16 @@ Baseline audit: workspace tests passed (732 executions); formatting, strict Clip
 
 Verification: reproduced otel compile failure, then cargo check -p helm-cli --features otel PASS; cargo fmt --check PASS; strict workspace all-target Clippy PASS; cargo test -p helm-monitor --lib PASS (198 tests). CI now checks otel.
 
-## Task 2 — in progress
+## Task 2 — complete
 
 Added approval-integrity regressions before changing executor behavior. Root integration target is compiling dependencies; tests will exercise denied shell preflight, shifted approval, and verification mismatch.
+
+Task 2 evidence: three new integration regressions reproduced denied preflight execution, approval shifting and false-positive verification; all three passed after executor repair. TUI regression independently reproduced discarded denial before UI repair.
+Ruling: pull F14 forward from Task 5 because live journal volume caused approval verification to panic — deterministic journal boundary test reproduced overflow at indices 127/128; minimal fix subtracts before narrowing. Remaining Task 5 work is unchanged.
+Ruling: bind step occurrence to the full immutable plan SHA-256 and its ordinal, rather than adding random persisted IDs to every historical step — any plan edit/reordering invalidates all approvals; cost is requiring review again after harmless plan edits. Local approvals bind working directory and boot identity, expire after 15 minutes and are consumed by the executor.
+
+Verification: cargo test --workspace --all-targets PASS (742 passing executions, 2 ignored); strict workspace all-target Clippy PASS. Added changed-review/consumed-approval regression separately PASS after the full run. TUI regression covers deny/approve, deny/approve-remaining, and approve/deny with positive and negative marker assertions. F14 deterministic boundary regression is green in the full run.
+
+## Task 3 — starting
+
+Scope: shared bounded subprocess runner, cancellation, enforce execution modes across CLI/TUI/web/rollback and remote mutation entry points. No production-readiness claim yet.

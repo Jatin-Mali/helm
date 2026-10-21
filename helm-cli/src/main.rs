@@ -41,11 +41,11 @@ use helm_monitor::alerting::{
     default_config_path as default_alerting_config_path,
 };
 use helm_monitor::{
-    CommandPreview, DbKind, ExecutionEngine, Finding, HostIdentity, MetricHistory, MonitorDomain,
-    MonitorProfile, MonitorReport, MonitorReporter, PlanCache, PlanSource, RegisteredService,
-    ServiceRegistry, SnapshotDomains, SystemSnapshot, build_narrative_prompt, collect_snapshot,
-    explain_finding, format_change_set, load_thresholds_config, parse_llm_response,
-    plan_from_finding, plan_from_problem,
+    DbKind, ExecutionEngine, Finding, HostIdentity, MetricHistory, MonitorDomain, MonitorProfile,
+    MonitorReport, MonitorReporter, PlanCache, PlanSource, RegisteredService, ServiceRegistry,
+    SnapshotDomains, SystemSnapshot, build_narrative_prompt, collect_snapshot, explain_finding,
+    format_change_set, load_thresholds_config, parse_llm_response, plan_from_finding,
+    plan_from_problem,
 };
 use helm_providers::{
     AnthropicProvider, ChatRequest, ChatResponse, GeminiProvider, OllamaProvider,
@@ -5381,7 +5381,8 @@ pub(crate) async fn generate_llm_plan_status(
 }
 
 fn llm_plan_steps_json(plan: &helm_monitor::LlmFixPlan) -> String {
-    serde_json::to_string(&plan.steps).unwrap_or_else(|_| "[]".to_owned())
+    helm_monitor::encode_plan_steps(&helm_monitor::llm_fix_steps(&plan.steps))
+        .expect("typed executable plan serializes")
 }
 
 fn verification_steps_for_finding(finding: &Finding) -> Vec<String> {
@@ -5992,6 +5993,42 @@ async fn run_apply_plan_command(args: ApplyPlanArgs) -> Result<()> {
 }
 
 async fn run_apply_plan_command_at_path(db_path: PathBuf, args: ApplyPlanArgs) -> Result<String> {
+    run_approved_plan_command_at_path(db_path, args, None).await
+}
+
+fn executable_plan(
+    plan_record: &helm_memory::TroubleshootingPlanRecord,
+) -> Result<helm_monitor::TroubleshootingPlan> {
+    let source = if let Some(id) = plan_record.source.strip_prefix("finding:") {
+        PlanSource::Finding(id.trim().to_owned())
+    } else {
+        PlanSource::UserQuestion(
+            plan_record
+                .source
+                .trim_start_matches("user:")
+                .trim()
+                .to_owned(),
+        )
+    };
+    Ok(helm_monitor::TroubleshootingPlan {
+        id: plan_record.id.clone(),
+        source,
+        snapshot_id: plan_record.snapshot_id.clone(),
+        hypotheses: serde_json::from_str(&plan_record.hypotheses_json)
+            .context("invalid persisted plan hypotheses")?,
+        read_only_steps: helm_monitor::decode_read_only_steps(&plan_record.read_only_steps_json)
+            .map_err(|e| anyhow!("invalid persisted observation steps: {e}"))?,
+        proposed_fix_steps: helm_monitor::decode_plan_steps(&plan_record.proposed_fix_steps_json)
+            .map_err(|e| anyhow!("invalid persisted executable steps: {e}"))?,
+        approval_required: plan_record.approval_required,
+    })
+}
+
+async fn run_approved_plan_command_at_path(
+    db_path: PathBuf,
+    args: ApplyPlanArgs,
+    supplied_approvals: Option<helm_monitor::PlanApprovals>,
+) -> Result<String> {
     let conn = rusqlite::Connection::open(&db_path)
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
 
@@ -6005,35 +6042,13 @@ async fn run_apply_plan_command_at_path(db_path: PathBuf, args: ApplyPlanArgs) -
             )
         })?;
 
-    // Reconstruct TroubleshootingPlan from stored JSON
-    let source = if plan_record.source.starts_with("finding:") {
-        let id = plan_record.source.trim_start_matches("finding:").trim();
-        PlanSource::Finding(id.to_string())
-    } else {
-        PlanSource::UserQuestion(
-            plan_record
-                .source
-                .trim_start_matches("user:")
-                .trim()
-                .to_string(),
-        )
-    };
-    let hypotheses: Vec<helm_monitor::Hypothesis> =
-        serde_json::from_str(&plan_record.hypotheses_json).unwrap_or_default();
-    let read_only_steps: Vec<helm_monitor::PlanStep> =
-        serde_json::from_str(&plan_record.read_only_steps_json).unwrap_or_default();
-    let proposed_fix_steps: Vec<helm_monitor::PlanStep> =
-        serde_json::from_str(&plan_record.proposed_fix_steps_json).unwrap_or_default();
-
-    let plan = helm_monitor::TroubleshootingPlan {
-        id: plan_record.id.clone(),
-        source,
-        snapshot_id: plan_record.snapshot_id.clone(),
-        hypotheses,
-        read_only_steps,
-        proposed_fix_steps,
-        approval_required: plan_record.approval_required,
-    };
+    let plan = executable_plan(&plan_record)?;
+    if supplied_approvals
+        .as_ref()
+        .is_some_and(|review| !review.matches(&plan))
+    {
+        anyhow::bail!("plan or execution context changed after review; review the plan again");
+    }
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -6061,7 +6076,7 @@ async fn run_apply_plan_command_at_path(db_path: PathBuf, args: ApplyPlanArgs) -
         "plan_shown",
     )?;
 
-    if !plan.approval_required || args.yes {
+    if args.yes && supplied_approvals.is_none() {
         eprintln!("WARNING: auto-approval enabled. Executing all steps...");
     } else {
         eprintln!("\nYou are about to execute the above plan on this system.");
@@ -6070,11 +6085,13 @@ async fn run_apply_plan_command_at_path(db_path: PathBuf, args: ApplyPlanArgs) -
 
     // ── Approval loop: collect per-step decisions upfront ──────────────
     let auto_approve = args.yes;
-    let mut step_decisions: Vec<(String, bool)> = Vec::new();
+    let mut approvals = helm_monitor::PlanApprovals::review(&plan).map_err(|e| anyhow!(e))?;
     let mut global_auto = false;
 
-    for step in &plan.proposed_fix_steps {
-        let approved = if auto_approve || global_auto {
+    for (index, step) in plan.proposed_fix_steps.iter().enumerate() {
+        let approved = if let Some(review) = &supplied_approvals {
+            review.allows(&plan, index)
+        } else if auto_approve || global_auto {
             true
         } else {
             let preview = &step.command;
@@ -6134,23 +6151,11 @@ async fn run_apply_plan_command_at_path(db_path: PathBuf, args: ApplyPlanArgs) -
             if approved { "approved" } else { "denied" },
         )?;
 
-        step_decisions.push((step.title.clone(), approved));
+        approvals.decide(index, approved).map_err(|e| anyhow!(e))?;
     }
 
-    // Build approval callback from decisions
-    let decisions = std::sync::Arc::new(step_decisions);
-    let approve_fn: Box<dyn Fn(&CommandPreview) -> bool + Send + Sync> = {
-        let d = std::sync::Arc::clone(&decisions);
-        // Since we iterate in order, use a counter
-        let pos = std::sync::atomic::AtomicUsize::new(0);
-        Box::new(move |_| {
-            let idx = pos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            d.get(idx).map(|(_, ok)| *ok).unwrap_or(false)
-        })
-    };
-
     // Execute
-    let mut engine = ExecutionEngine::new(approve_fn);
+    let mut engine = ExecutionEngine::with_approvals(approvals);
     let change_set = engine.execute(&plan).await;
 
     // ── Audit: per-step command + output + verification ────────────────

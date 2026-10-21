@@ -399,6 +399,7 @@ enum ModalState {
         step_effects: Vec<String>,
         step_tools: Vec<String>,
         step_risks: Vec<String>,
+        approvals: helm_monitor::PlanApprovals,
         phase: PlanExecPhase,
         result_summary: String,
     },
@@ -3559,65 +3560,47 @@ impl TuiApp {
             },
             Some(ModalState::PlanExecution {
                 ref plan_id,
-                ref step_index,
-                ref step_count,
                 ref phase,
                 ..
             }) if *phase == PlanExecPhase::Approving => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let next = *step_index + 1;
-                    let plan_id_clone = plan_id.clone();
-                    if next >= *step_count {
-                        // All approved — execute
-                        if let Some(ModalState::PlanExecution { ref mut phase, .. }) = self.modal {
-                            *phase = PlanExecPhase::Running;
-                        }
-                        self.push_chat(
-                            MessageRole::System,
-                            "[apply-plan] All steps approved. Executing...",
-                        );
-                        // Audit: approve this step
-                        let _ = self.write_apply_plan_audit(&plan_id_clone, "approved");
-                        self.start_apply_plan_execution(plan_id_clone);
-                    } else {
-                        let _ = self.write_apply_plan_audit(&plan_id_clone, "approved");
-                        // Move to next step
-                        if let Some(ModalState::PlanExecution {
-                            ref mut step_index, ..
-                        }) = self.modal
-                        {
-                            *step_index = next;
-                        }
-                    }
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') => {
-                    let next = *step_index + 1;
+                KeyCode::Char('y' | 'Y' | 'n' | 'N' | '!') => {
                     let plan_id = plan_id.clone();
-                    if next >= *step_count {
-                        self.push_chat(
-                            MessageRole::System,
-                            "[apply-plan] All remaining steps skipped.",
-                        );
-                        self.modal = None;
-                    } else if let Some(ModalState::PlanExecution {
-                        ref mut step_index, ..
-                    }) = self.modal
+                    let approved = !matches!(key.code, KeyCode::Char('n' | 'N'));
+                    let approve_remaining = key.code == KeyCode::Char('!');
+                    let mut completed_review = None;
+                    if let Some(ModalState::PlanExecution {
+                        step_index,
+                        step_count,
+                        approvals,
+                        phase,
+                        ..
+                    }) = self.modal.as_mut()
                     {
-                        *step_index = next;
+                        if approve_remaining {
+                            approvals.approve_remaining(*step_index);
+                            *step_index = *step_count;
+                        } else {
+                            approvals
+                                .decide(*step_index, approved)
+                                .map_err(anyhow::Error::msg)?;
+                            *step_index += 1;
+                        }
+                        if *step_index >= *step_count {
+                            *phase = PlanExecPhase::Running;
+                            completed_review = Some(approvals.clone());
+                        }
                     }
-                    let _ = self.write_apply_plan_audit(&plan_id, "denied");
-                }
-                KeyCode::Char('!') => {
-                    // Approve all remaining
-                    let plan_id = plan_id.clone();
-                    if let Some(ModalState::PlanExecution { ref mut phase, .. }) = self.modal {
-                        *phase = PlanExecPhase::Running;
+                    self.write_apply_plan_audit(
+                        &plan_id,
+                        if approved { "approved" } else { "denied" },
+                    )?;
+                    if let Some(approvals) = completed_review {
+                        self.push_chat(
+                            MessageRole::System,
+                            "[apply-plan] Review complete. Applying approved steps...",
+                        );
+                        self.start_apply_plan_execution(plan_id, approvals);
                     }
-                    self.push_chat(
-                        MessageRole::System,
-                        "[apply-plan] All steps approved. Executing...",
-                    );
-                    self.start_apply_plan_execution(plan_id);
                 }
                 KeyCode::Esc => {
                     self.modal = None;
@@ -5056,9 +5039,25 @@ Report the exit status and the concise output."
             }
         };
 
-        // Parse and display steps
-        let steps: Vec<serde_json::Value> =
-            serde_json::from_str(&record.proposed_fix_steps_json).unwrap_or_default();
+        let plan = match crate::executable_plan(&record) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.push_chat(MessageRole::Error, format!("[apply-plan] {error}"));
+                return;
+            }
+        };
+        let approvals = match helm_monitor::PlanApprovals::review(&plan) {
+            Ok(approvals) => approvals,
+            Err(error) => {
+                self.push_chat(MessageRole::Error, format!("[apply-plan] {error}"));
+                return;
+            }
+        };
+        let steps: Vec<serde_json::Value> = plan
+            .proposed_fix_steps
+            .iter()
+            .map(|step| serde_json::to_value(step).expect("typed plan serializes"))
+            .collect();
         let step_count = steps.len();
         if step_count == 0 {
             self.push_chat(
@@ -5134,12 +5133,17 @@ Report the exit status and the concise output."
             step_effects: effects,
             step_tools: tools,
             step_risks: risks,
+            approvals,
             phase: PlanExecPhase::Approving,
             result_summary: String::new(),
         });
     }
 
-    fn start_apply_plan_execution(&mut self, plan_id: String) {
+    fn start_apply_plan_execution(
+        &mut self,
+        plan_id: String,
+        approvals: helm_monitor::PlanApprovals,
+    ) {
         let db_path = self.runtime.db_path.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
         self.pending_apply_rx = Some(rx);
@@ -5148,12 +5152,13 @@ Report the exit status and the concise output."
             handle.block_on(async move {
                 let args = crate::ApplyPlanArgs {
                     plan_id,
-                    yes: true,
+                    yes: false,
                     json: false,
                 };
-                let result = crate::run_apply_plan_command_at_path(db_path, args)
-                    .await
-                    .map_err(|error| error.to_string());
+                let result =
+                    crate::run_approved_plan_command_at_path(db_path, args, Some(approvals))
+                        .await
+                        .map_err(|error| error.to_string());
                 let _ = tx.send(result);
             });
         });
@@ -5189,31 +5194,22 @@ Report the exit status and the concise output."
     }
 
     fn dashboard_plan_steps_json(steps: &[ValidatedFixStep]) -> String {
-        let payload = steps
+        let generated = steps
             .iter()
-            .enumerate()
-            .map(|(index, step)| {
-                serde_json::json!({
-                    "title": format!("step-{}", index + 1),
-                    "command": {
-                        "tool": "shell",
-                        "input": { "command": step.command },
-                        "command_text": step.command,
-                        "expected_effect": step.expected_effect,
-                        "risk": step.risk,
-                        "blast_radius": step.blast_radius,
-                        "rollback": step.rollback,
-                        "required_capability": step.required_capability,
-                        "verification": []
-                    },
-                    "purpose": step.purpose,
-                    "hypothesis_id": serde_json::Value::Null,
-                    "expected_output": serde_json::Value::Null,
-                    "interpretation_guide": serde_json::Value::Null
-                })
+            .map(|step| helm_monitor::LlmFixStep {
+                command: step.command.clone(),
+                purpose: step.purpose.clone(),
+                expected_effect: step.expected_effect.clone(),
+                risk: serde_json::from_value(serde_json::Value::String(step.risk.clone()))
+                    .unwrap_or(helm_monitor::RiskLevel::High),
+                blast_radius: step.blast_radius.clone(),
+                rollback: step.rollback.clone(),
+                required_capability: step.required_capability.clone(),
+                binary_warnings: step.binary_warnings.clone(),
             })
             .collect::<Vec<_>>();
-        serde_json::to_string(&payload).unwrap_or_else(|_| "[]".to_owned())
+        helm_monitor::encode_plan_steps(&helm_monitor::llm_fix_steps(&generated))
+            .expect("typed executable plan serializes")
     }
 
     fn dashboard_read_only_steps_json(checks: &[String]) -> String {
@@ -5254,6 +5250,7 @@ Report the exit status and the concise output."
                 },
                 fix_steps: fix_steps.clone(),
             },
+            "ready" => PlanStatus::MalformedResponse,
             "timeout" => PlanStatus::Timeout,
             "rate_limited" => PlanStatus::RateLimited {
                 retry_after_secs: record
@@ -5298,84 +5295,19 @@ Report the exit status and the concise output."
         })
     }
 
-    fn validated_steps_from_plan_json(proposed_fix_steps_json: &str) -> Vec<ValidatedFixStep> {
-        let raw_steps: Vec<serde_json::Value> =
-            serde_json::from_str(proposed_fix_steps_json).unwrap_or_default();
-        raw_steps
+    fn validated_steps_from_plan_json(json: &str) -> Vec<ValidatedFixStep> {
+        helm_monitor::decode_plan_steps(json)
+            .unwrap_or_default()
             .into_iter()
-            .filter_map(|step| {
-                let command = step
-                    .get("command")
-                    .and_then(|command| command.get("command_text"))
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| step.get("command").and_then(serde_json::Value::as_str))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_owned();
-                if command.is_empty() {
-                    return None;
-                }
-                let purpose = step
-                    .get("purpose")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| {
-                        step.get("command")
-                            .and_then(|command| command.get("purpose"))
-                            .and_then(serde_json::Value::as_str)
-                    })
-                    .unwrap_or_default()
-                    .to_owned();
-                let expected_effect = step
-                    .get("command")
-                    .and_then(|command| command.get("expected_effect"))
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| {
-                        step.get("expected_effect")
-                            .and_then(serde_json::Value::as_str)
-                    })
-                    .unwrap_or_default()
-                    .to_owned();
-                let risk = step
-                    .get("command")
-                    .and_then(|command| command.get("risk"))
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| step.get("risk").and_then(serde_json::Value::as_str))
-                    .unwrap_or("none")
-                    .to_owned();
-                let rollback = step
-                    .get("command")
-                    .and_then(|command| command.get("rollback"))
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| step.get("rollback").and_then(serde_json::Value::as_str))
-                    .unwrap_or("none")
-                    .to_owned();
-                let blast_radius = step
-                    .get("command")
-                    .and_then(|command| command.get("blast_radius"))
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| step.get("blast_radius").and_then(serde_json::Value::as_str))
-                    .unwrap_or("unknown")
-                    .to_owned();
-                let required_capability = step
-                    .get("command")
-                    .and_then(|command| command.get("required_capability"))
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| {
-                        step.get("required_capability")
-                            .and_then(serde_json::Value::as_str)
-                    })
-                    .unwrap_or("shell.shell")
-                    .to_owned();
-                Some(ValidatedFixStep {
-                    command,
-                    purpose,
-                    expected_effect,
-                    risk,
-                    blast_radius,
-                    rollback,
-                    required_capability,
-                    binary_warnings: Vec::new(),
-                })
+            .map(|step| ValidatedFixStep {
+                command: step.command.command_text.unwrap_or_default(),
+                purpose: step.interpretation_guide.unwrap_or_default(),
+                expected_effect: step.command.expected_effect,
+                risk: step.command.risk.as_str().to_owned(),
+                blast_radius: step.command.blast_radius.to_string(),
+                rollback: step.command.rollback.to_string(),
+                required_capability: "shell.exec".into(),
+                binary_warnings: Vec::new(),
             })
             .collect()
     }
@@ -10884,6 +10816,7 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
             step_risks,
             phase,
             result_summary,
+            ..
         } => {
             let mut lines = Vec::new();
             match phase {
@@ -14016,6 +13949,13 @@ mod tests {
             step_effects: vec!["service returns healthy".into()],
             step_tools: vec!["shell".into()],
             step_risks: vec!["medium".into()],
+            approvals: helm_monitor::PlanApprovals::review(
+                &helm_monitor::TroubleshootingPlan::new(
+                    helm_monitor::PlanSource::UserQuestion("fixture".into()),
+                    "fixture".into(),
+                ),
+            )
+            .unwrap(),
             phase: PlanExecPhase::Running,
             result_summary: String::new(),
         });
@@ -14041,6 +13981,81 @@ mod tests {
             other => panic!("expected completed plan modal, got {other:?}"),
         }
         assert!(app.pending_apply_rx.is_none());
+    }
+
+    #[test]
+    fn earlier_tui_denial_survives_final_approval() {
+        for keys in [['n', 'y'], ['n', '!'], ['y', 'n']] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+            let marker = dir.path().join("first-marker");
+            let second_marker = dir.path().join("second-marker");
+            let make_step = |command: String| helm_monitor::PlanStep {
+                title: "duplicate title".into(),
+                command: helm_monitor::CommandPreview::new(
+                    "shell",
+                    &command,
+                    "isolated approval test",
+                ),
+                hypothesis_id: None,
+                expected_output: None,
+                interpretation_guide: None,
+            };
+            let steps = vec![
+                make_step(format!("printf denied > {}", marker.display())),
+                make_step(format!("printf approved > {}", second_marker.display())),
+            ];
+            let conn = rusqlite::Connection::open(&app.runtime.db_path).unwrap();
+            TroubleshootingPlanStore::insert(
+                &conn,
+                "tui-denial",
+                "user: test",
+                "snapshot",
+                "",
+                "[]",
+                "[]",
+                &serde_json::to_string(&steps).unwrap(),
+                true,
+                "test",
+            )
+            .unwrap();
+            app.execute_apply_plan_inline("tui-denial");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                app.handle_modal_key(
+                    KeyEvent::new(KeyCode::Char(keys[0]), KeyModifiers::NONE),
+                    tx.clone(),
+                )
+                .await
+                .unwrap();
+                app.handle_modal_key(
+                    KeyEvent::new(KeyCode::Char(keys[1]), KeyModifiers::NONE),
+                    tx,
+                )
+                .await
+                .unwrap();
+                let result = app
+                    .pending_apply_rx
+                    .take()
+                    .expect("approved step should execute");
+                tokio::time::timeout(Duration::from_secs(60), result)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            });
+            assert_eq!(marker.exists(), keys[0] == 'y', "first step: {keys:?}");
+            assert_eq!(
+                second_marker.exists(),
+                keys[1] != 'n',
+                "second step: {keys:?}"
+            );
+        }
     }
 
     // ── T04: audit + plan_rejected tag ─────────────────────────────────

@@ -44,10 +44,10 @@ Do not postpone security fixes to make a demo look complete. Each task follows r
 
 **Owns:** `crates/helm-monitor/benches/helmops.rs`, `metric_history.rs`, `ring_buffer.rs`, `helm-cli/src/telemetry.rs`, tracing setup in `main.rs`, `.github/workflows/release.yml`. **Finding:** F29 plus existing fmt/Clippy failures.
 
-- [ ] Record current revision and test results; preserve the existing audit and graph artifacts.
-- [ ] Fix formatting and four known Clippy lints without changing monitoring behavior.
-- [ ] Adapt telemetry exporter and subscriber composition to installed OpenTelemetry APIs. Add CI compilation of `otel`; do not merely suppress compilation of the broken module.
-- [ ] Verify default and optional-feature compilation; commit these bounded build repairs.
+- [x] Record current revision and test results; preserve the existing audit and graph artifacts.
+- [x] Fix formatting and four known Clippy lints without changing monitoring behavior.
+- [x] Adapt telemetry exporter and subscriber composition to installed OpenTelemetry APIs. Add CI compilation of `otel`; do not merely suppress compilation of the broken module.
+- [x] Verify default and optional-feature compilation; commit these bounded build repairs.
 
 ```sh
 rtk cargo fmt --check
@@ -61,11 +61,11 @@ rtk cargo check -p helm-cli --features otel
 
 **Owns:** `crates/helm-monitor/src/{troubleshoot,execute}.rs`, `crates/helm-memory/src/changesets.rs`, `helm-cli/src/{main,tui,web}.rs`, `tests/v20_controlled_execution.rs`; new `tests/approval_integrity.rs`. **Findings:** F01–F03, F13, F18.
 
-- [ ] Convert the two isolated exploit probes into permanent tests. Add TUI decision-state tests for deny-first/approve-last and duplicate titles.
-- [ ] Add a versioned persisted executable-plan representation using existing `PlanStep`/`CommandPreview` models. Give each step a stable ID; approval records bind ID and canonical operation digest, host, cwd and plan revision. Denial is the default. Do not use callback index or title as identity.
-- [ ] Replace unsafe shell-based idempotency inference with literal argv for recognized trusted operations. Authorize before any plan-derived process launch; remove restart-is-active skipping. Checks needing execution have their own policy decision.
-- [ ] Make every producer explicitly convert into this schema and every loader return useful errors. Eliminate silent empty-plan defaults. Preserve TUI decisions through dispatch; reject altered approved plans.
-- [ ] Require successful exit **and** declared output/postconditions for verification. Return failed verification in the change outcome.
+- [x] Convert the two isolated exploit probes into permanent tests. Add TUI decision-state tests for deny-first/approve-last and duplicate titles.
+- [x] Add a versioned persisted executable-plan representation using existing `PlanStep`/`CommandPreview` models. Give each step a stable ID; approval records bind ID and canonical operation digest, host, cwd and plan revision. Denial is the default. Do not use callback index or title as identity.
+- [x] Replace unsafe shell-based idempotency inference with literal argv for recognized trusted operations. Authorize before any plan-derived process launch; remove restart-is-active skipping. Checks needing execution have their own policy decision.
+- [x] Make every producer explicitly convert into this schema and every loader return useful errors. Eliminate silent empty-plan defaults. Preserve TUI decisions through dispatch; reject altered approved plans.
+- [x] Require successful exit **and** declared output/postconditions for verification. Return failed verification in the change outcome.
 
 **Test contracts:** always-denied `systemctl start absent; printf ...` creates no marker; idempotent first step cannot lend approval to denied second step; approval of command A rejects command B; CLI/TUI/web generation round-trips to identical executable steps; invalid legacy JSON reports incompatibility.
 

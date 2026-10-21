@@ -258,6 +258,7 @@ pub struct StepOutcome {
 /// approval gating, change detection, and verification.
 pub struct ExecutionEngine {
     approve_fn: Box<dyn Fn(&CommandPreview) -> bool + Send + Sync>,
+    approvals: Option<crate::PlanApprovals>,
     before_snapshot: Option<SystemSnapshot>,
     after_snapshot: Option<SystemSnapshot>,
     /// HMAC-chained audit log of every executed step.
@@ -269,20 +270,23 @@ impl ExecutionEngine {
     pub fn new(approve_fn: Box<dyn Fn(&CommandPreview) -> bool + Send + Sync>) -> Self {
         Self {
             approve_fn,
+            approvals: None,
             before_snapshot: None,
             after_snapshot: None,
             audit_chain: Vec::new(),
         }
     }
 
+    pub fn with_approvals(approvals: crate::PlanApprovals) -> Self {
+        let mut engine = Self::new(Box::new(|_| false));
+        engine.approvals = Some(approvals);
+        engine
+    }
+
     /// Run a pre-flight idempotency check. Returns Some(reason) if the step
     /// is already satisfied and can be skipped, None if execution is needed.
     async fn check_idempotent(preview: &CommandPreview) -> Option<String> {
         match preview.tool.as_str() {
-            "shell" | "bash" | "sh" | "cmd" => {
-                let cmd = preview.command_text.as_deref().unwrap_or("");
-                Self::check_shell_idempotent(cmd).await
-            }
             "fs_write" | "write" => {
                 let path = preview
                     .input
@@ -307,176 +311,41 @@ impl ExecutionEngine {
         }
     }
 
-    /// Check if a shell command is idempotent by running a pre-flight heuristic.
-    async fn check_shell_idempotent(cmd: &str) -> Option<String> {
-        let cmd = cmd.trim();
-        // systemctl start <service>: skip if already active
-        if let Some(svc) = cmd.strip_prefix("systemctl start ") {
-            let svc = svc.trim();
-            let check = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("systemctl is-active --quiet {svc}"))
-                .output()
-                .await;
-            if let Ok(out) = check {
-                if out.status.success() {
-                    return Some(format!("service {svc} is already active"));
-                }
-            }
-        }
-        // systemctl stop <service>: skip if already inactive
-        if let Some(svc) = cmd.strip_prefix("systemctl stop ") {
-            let svc = svc.trim();
-            let check = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("systemctl is-active --quiet {svc}"))
-                .output()
-                .await;
-            if let Ok(out) = check {
-                if !out.status.success() {
-                    return Some(format!("service {svc} is already inactive"));
-                }
-            }
-        }
-        // systemctl restart <service>: skip if already active (no need to restart healthy services)
-        if let Some(svc) = cmd.strip_prefix("systemctl restart ") {
-            let svc = svc.trim();
-            let check = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("systemctl is-active --quiet {svc}"))
-                .output()
-                .await;
-            if let Ok(out) = check {
-                if out.status.success() {
-                    return Some(format!(
-                        "service {svc} is already active, no restart needed"
-                    ));
-                }
-            }
-        }
-        // systemctl enable <service>: skip if already enabled
-        if let Some(svc) = cmd.strip_prefix("systemctl enable ") {
-            let svc = svc.trim();
-            let check = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("systemctl is-enabled --quiet {svc}"))
-                .output()
-                .await;
-            if let Ok(out) = check {
-                if out.status.success() {
-                    return Some(format!("service {svc} is already enabled"));
-                }
-            }
-        }
-        // systemctl disable <service>: skip if already disabled
-        if let Some(svc) = cmd.strip_prefix("systemctl disable ") {
-            let svc = svc.trim();
-            let check = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("systemctl is-enabled --quiet {svc}"))
-                .output()
-                .await;
-            if let Ok(out) = check {
-                if !out.status.success() {
-                    return Some(format!("service {svc} is already disabled"));
-                }
-            }
-        }
-        // apt install <pkg>: skip if already installed
-        if let Some(pkg) = cmd.strip_prefix("apt install ") {
-            let pkg = pkg.split_whitespace().next().unwrap_or("");
-            if !pkg.is_empty() {
-                let check = tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(format!("dpkg -l {pkg} 2>/dev/null | grep -q '^ii'"))
-                    .output()
-                    .await;
-                if let Ok(out) = check {
-                    if out.status.success() {
-                        return Some(format!("package {pkg} is already installed"));
-                    }
-                }
-            }
-        }
-        // apt remove <pkg>: skip if already removed
-        if let Some(pkg) = cmd.strip_prefix("apt remove ") {
-            let pkg = pkg.split_whitespace().next().unwrap_or("");
-            if !pkg.is_empty() {
-                let check = tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(format!("dpkg -l {pkg} 2>/dev/null | grep -q '^ii'"))
-                    .output()
-                    .await;
-                if let Ok(out) = check {
-                    if !out.status.success() {
-                        return Some(format!("package {pkg} is already removed"));
-                    }
-                }
-            }
-        }
-        // mkdir -p <dir>: skip if directory already exists
-        if let Some(dir) = cmd.strip_prefix("mkdir -p ") {
-            let dir = dir.trim();
-            if std::path::Path::new(dir).exists() {
-                return Some(format!("directory {dir} already exists"));
-            }
-        }
-        // mkdir <dir>: skip if directory already exists
-        if let Some(dir) = cmd.strip_prefix("mkdir ") {
-            let dir = dir.trim();
-            if !dir.starts_with('-') && std::path::Path::new(dir).exists() {
-                return Some(format!("directory {dir} already exists"));
-            }
-        }
-        // touch <file>: skip if file already exists
-        if let Some(file) = cmd.strip_prefix("touch ") {
-            let file = file.trim();
-            if std::path::Path::new(file).exists() {
-                return Some(format!("file {file} already exists"));
-            }
-        }
-        // rm <path>: skip if file does not exist
-        if let Some(target) = cmd.strip_prefix("rm ") {
-            let target = target
-                .trim()
-                .trim_start_matches("-rf ")
-                .trim_start_matches("-r ")
-                .trim_start_matches("-f ");
-            if !std::path::Path::new(target).exists() {
-                return Some(format!("path {target} does not exist, nothing to remove"));
-            }
-        }
-        None
-    }
-
     /// Run verification commands from a preview and compare output against expectations.
     async fn run_verification(
         preview: &CommandPreview,
         expected_output: Option<&str>,
-    ) -> Vec<String> {
+    ) -> (bool, Vec<String>) {
         let mut results = Vec::new();
+        let mut all_passed = true;
         for v in &preview.verification {
             let v_outcome = Self::execute_preview(v).await;
             let output_line = v_outcome.output.lines().next().unwrap_or("").to_string();
             let passed = if let Some(expected) = expected_output {
-                output_line.contains(expected) || v_outcome.success
+                v_outcome.output.contains(expected) && v_outcome.success
             } else {
                 v_outcome.success
             };
+            all_passed &= passed;
             let v_text = if passed {
                 format!("ok: {output_line}")
             } else {
-                format!("failed: {}", v_outcome.error.lines().next().unwrap_or(""))
+                format!(
+                    "failed: expected {:?}; output: {output_line}; {}",
+                    expected_output,
+                    v_outcome.error.lines().next().unwrap_or("")
+                )
             };
             results.push(v_text);
         }
-        results
+        (all_passed, results)
     }
 
     /// Execute a full plan, returning a ChangeSet with execution results.
     /// Takes a before-snapshot, runs each fix step through approval + execution,
     /// takes an after-snapshot, and runs post-change detection.
     pub async fn execute(&mut self, plan: &TroubleshootingPlan) -> ChangeSet {
+        let approvals = self.approvals.take();
         // 1. Capture before-snapshot
         let before = collect_snapshot(MonitorProfile::Quick).await;
         let before_id = before.id.clone();
@@ -487,7 +356,12 @@ impl ExecutionEngine {
         // 2. Execute each fix step (zipped with plan steps for expected_output access)
         // halt_on_failure: once a step fails, remaining steps are not executed.
         let mut halt = false;
-        for (step, plan_step) in cs.steps.iter_mut().zip(plan.proposed_fix_steps.iter()) {
+        for (index, (step, plan_step)) in cs
+            .steps
+            .iter_mut()
+            .zip(plan.proposed_fix_steps.iter())
+            .enumerate()
+        {
             // 2-halt. If a prior step failed, skip all remaining steps without execution.
             if halt {
                 step.status = StepStatus::Skipped;
@@ -501,6 +375,17 @@ impl ExecutionEngine {
 
             let preview = &step.command;
 
+            let approved = match &approvals {
+                Some(approvals) => approvals.allows(plan, index),
+                None => (self.approve_fn)(preview),
+            };
+            if !approved {
+                step.status = StepStatus::Skipped;
+                cs.summary
+                    .push_str(&format!("  - {}: SKIPPED (denied)\n", step.plan_step_title));
+                continue;
+            }
+
             // 2a. Idempotency pre-check: skip if system already in desired state
             let pre_check = Self::check_idempotent(preview).await;
             if let Some(reason) = pre_check {
@@ -510,15 +395,6 @@ impl ExecutionEngine {
                     "  - {}: SKIPPED (idempotent: {reason})\n",
                     step.plan_step_title
                 ));
-                continue;
-            }
-
-            // 2b. Approval gate
-            let approved = (self.approve_fn)(preview);
-            if !approved {
-                step.status = StepStatus::Skipped;
-                cs.summary
-                    .push_str(&format!("  - {}: SKIPPED (denied)\n", step.plan_step_title));
                 continue;
             }
 
@@ -534,7 +410,14 @@ impl ExecutionEngine {
 
             // 2d. Verification: run preview verification commands + expected_output matching
             let expected = plan_step.expected_output.as_deref();
-            let verify_results = Self::run_verification(preview, expected).await;
+            let (verified, verify_results) = if outcome.success {
+                Self::run_verification(preview, expected).await
+            } else {
+                (false, vec!["not verified (action failed)".into()])
+            };
+            if !verified || !outcome.verification_ok {
+                step.status = StepStatus::Failed;
+            }
             step.verification_result = if !verify_results.is_empty() {
                 verify_results.join("; ")
             } else if outcome.verification_ok {
@@ -559,7 +442,7 @@ impl ExecutionEngine {
             let audit_entry = ExecutionAuditEntry::new(
                 now,
                 preview.command_text.as_deref().unwrap_or(&preview.tool),
-                outcome.success,
+                outcome.success && verified,
                 &outcome.output,
                 &outcome.error,
                 prev_hash,

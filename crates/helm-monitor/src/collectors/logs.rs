@@ -252,7 +252,7 @@ fn context_lines_for(
     let mut context = Vec::new();
     for (idx, entry) in entries.iter().enumerate().take(end + 1).skip(start) {
         context.push(JournalContextLine {
-            offset: idx as i8 - latest_index as i8,
+            offset: (idx as isize - latest_index as isize) as i8,
             timestamp: entry.timestamp.clone(),
             unit: entry.unit.clone(),
             severity: entry.severity,
@@ -306,5 +306,34 @@ fn severity_sort_rank(severity: LogSeverity) -> u8 {
         LogSeverity::Critical => 0,
         LogSeverity::Error => 1,
         LogSeverity::Warning => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_context_crosses_signed_byte_boundary() {
+        let entries = (0..260)
+            .map(|index| {
+                parse_journal_line(
+                    &serde_json::json!({
+                        "MESSAGE": format!("entry {index}"), "_SYSTEMD_UNIT": "fixture.service",
+                        "PRIORITY": "3", "__REALTIME_TIMESTAMP": "1000000",
+                    })
+                    .to_string(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for index in [127, 128, 255, 256] {
+            let context = context_lines_for(&entries, index);
+            assert_eq!(
+                context.iter().map(|line| line.offset).collect::<Vec<_>>(),
+                [-1, 0, 1]
+            );
+            assert_eq!(context[1].message, format!("entry {index}"));
+        }
     }
 }

@@ -13,6 +13,7 @@ pub mod log_analysis;
 pub mod metric_history;
 pub mod pipeline;
 pub mod plan_cache;
+pub mod plan_document;
 pub mod reporter;
 pub mod ring_buffer;
 pub mod snapshot;
@@ -49,6 +50,9 @@ pub use pipeline::{
     default_pipeline_history_path, pipeline_failure_findings, record_pipeline_webhook_event,
 };
 pub use plan_cache::{DEFAULT_PLAN_CACHE_TTL_SECS, PlanCache};
+pub use plan_document::{
+    PlanApprovals, decode_plan_steps, decode_read_only_steps, encode_plan_steps, llm_fix_steps,
+};
 pub use reporter::{MonitorReport, MonitorReporter};
 pub use ring_buffer::RingBuffer;
 pub use snapshot::{
