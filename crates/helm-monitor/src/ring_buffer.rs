@@ -135,7 +135,7 @@ mod tests {
                 for i in 0..pushes {
                     buf.push(i as i32);
                 }
-                prop_assert_eq!(buf.is_empty(), buf.len() == 0);
+                prop_assert_eq!(buf.is_empty(), pushes == 0);
             }
         }
     }

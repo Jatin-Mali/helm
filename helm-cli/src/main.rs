@@ -3841,7 +3841,6 @@ fn init_tracing(
 
     #[cfg(feature = "otel")]
     if let Some(tracer) = telemetry::build_otel_tracer(telemetry) {
-        let otel = tracing_opentelemetry::layer().with_tracer(tracer);
         return match log_path {
             Some(path) => {
                 ensure_parent_dir(path)?;
@@ -3850,14 +3849,14 @@ fn init_tracing(
                     .with(fmt::layer().with_writer(LogFileMakeWriter {
                         path: path.to_path_buf(),
                     }))
-                    .with(otel)
+                    .with(tracing_opentelemetry::layer().with_tracer(tracer))
                     .try_init()
                     .map_err(|e| anyhow!("failed to initialize tracing: {e}"))
             }
             None => tracing_subscriber::registry()
                 .with(filter)
                 .with(fmt::layer().with_writer(std::io::stderr))
-                .with(otel)
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .try_init()
                 .map_err(|e| anyhow!("failed to initialize tracing: {e}")),
         };

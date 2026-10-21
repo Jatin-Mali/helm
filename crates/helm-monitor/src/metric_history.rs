@@ -144,61 +144,6 @@ mod tests {
         assert!((swap[1] - 55.0).abs() < 0.000_001);
     }
 
-    // ── Property tests ──────────────────────────────────────────────────────
-
-    #[cfg(test)]
-    mod property_tests {
-        use super::*;
-        use proptest::prelude::*;
-
-        proptest! {
-            /// Property 1: CPU values are always clamped to [0, 100].
-            #[test]
-            fn property_cpu_values_clamped(
-                load_avg in 0.0f64..100.0,
-                cpu_count in 1u32..16,
-            ) {
-                let mut history = MetricHistory::new(10);
-                let mut snap = snapshot_with_usage(0.0, 50.0, 50.0, 0.0);
-                snap.domains.load.cpu_logical_count = cpu_count;
-                snap.domains.load.load_average.one = load_avg;
-                history.push_snapshot(&snap);
-                for v in history.cpu_values() {
-                    prop_assert!(v >= 0.0 && v <= 100.0, "cpu out of range: {v}");
-                }
-            }
-
-            /// Property 2: MetricHistory respects capacity — values count never exceeds it.
-            #[test]
-            fn property_history_bounded_by_capacity(
-                capacity in 1usize..32,
-                pushes in 1usize..64,
-            ) {
-                let mut history = MetricHistory::new(capacity);
-                for _ in 0..pushes {
-                    history.push_snapshot(&snapshot_with_usage(50.0, 50.0, 50.0, 10.0));
-                }
-                prop_assert!(history.cpu_values().len() <= capacity);
-                prop_assert!(history.memory_values().len() <= capacity);
-                prop_assert!(history.disk_values().len() <= capacity);
-            }
-
-            /// Property 3: Memory percent is always in [0, 100].
-            #[test]
-            fn property_memory_values_clamped(used in 0u64..1000, total in 1u64..1000) {
-                let used = used.min(total);
-                let mut snap = snapshot_with_usage(0.0, 0.0, 0.0, 0.0);
-                snap.domains.load.memory.total = total;
-                snap.domains.load.memory.used = used;
-                let mut history = MetricHistory::new(10);
-                history.push_snapshot(&snap);
-                for v in history.memory_values() {
-                    prop_assert!(v >= 0.0 && v <= 100.0, "memory out of range: {v}");
-                }
-            }
-        }
-    }
-
     fn snapshot_with_usage(cpu: f64, memory: f64, disk: f64, swap: f64) -> SystemSnapshot {
         let mut domains = SnapshotDomains::default();
         domains.load.cpu_logical_count = 4;
@@ -233,6 +178,60 @@ mod tests {
             domains,
             collector_errors: Vec::new(),
             redaction_version: "test".into(),
+        }
+    }
+    // ── Property tests ──────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Property 1: CPU values are always clamped to [0, 100].
+            #[test]
+            fn property_cpu_values_clamped(
+                load_avg in 0.0f64..100.0,
+                cpu_count in 1u32..16,
+            ) {
+                let mut history = MetricHistory::new(10);
+                let mut snap = snapshot_with_usage(0.0, 50.0, 50.0, 0.0);
+                snap.domains.load.cpu_logical_count = cpu_count;
+                snap.domains.load.load_average.one = load_avg;
+                history.push_snapshot(&snap);
+                for v in history.cpu_values() {
+                    prop_assert!((0.0..=100.0).contains(&v), "cpu out of range: {v}");
+                }
+            }
+
+            /// Property 2: MetricHistory respects capacity — values count never exceeds it.
+            #[test]
+            fn property_history_bounded_by_capacity(
+                capacity in 1usize..32,
+                pushes in 1usize..64,
+            ) {
+                let mut history = MetricHistory::new(capacity);
+                for _ in 0..pushes {
+                    history.push_snapshot(&snapshot_with_usage(50.0, 50.0, 50.0, 10.0));
+                }
+                prop_assert!(history.cpu_values().len() <= capacity);
+                prop_assert!(history.memory_values().len() <= capacity);
+                prop_assert!(history.disk_values().len() <= capacity);
+            }
+
+            /// Property 3: Memory percent is always in [0, 100].
+            #[test]
+            fn property_memory_values_clamped(used in 0u64..1000, total in 1u64..1000) {
+                let used = used.min(total);
+                let mut snap = snapshot_with_usage(0.0, 0.0, 0.0, 0.0);
+                snap.domains.load.memory.total = total;
+                snap.domains.load.memory.used = used;
+                let mut history = MetricHistory::new(10);
+                history.push_snapshot(&snap);
+                for v in history.memory_values() {
+                    prop_assert!((0.0..=100.0).contains(&v), "memory out of range: {v}");
+                }
+            }
         }
     }
 }

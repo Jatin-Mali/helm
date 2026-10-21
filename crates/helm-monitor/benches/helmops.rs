@@ -1,3 +1,4 @@
+use chrono::{TimeZone, Utc};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use helm_monitor::{
     correlation::CorrelationEngine,
@@ -6,7 +7,6 @@ use helm_monitor::{
     ring_buffer::RingBuffer,
     snapshot::{HostIdentity, MonitorProfile, SnapshotDomains, SystemSnapshot},
 };
-use chrono::{TimeZone, Utc};
 use std::time::Duration;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -84,12 +84,10 @@ fn bench_correlation(c: &mut Criterion) {
             &n_findings,
             |b, &n| {
                 let snap = make_snapshot(1000);
-                let findings: Vec<Finding> =
-                    (0..n).map(|i| make_finding(&snap.id, i)).collect();
+                let findings: Vec<Finding> = (0..n).map(|i| make_finding(&snap.id, i)).collect();
 
                 b.iter(|| {
-                    let mut engine =
-                        CorrelationEngine::new(Duration::from_secs(300));
+                    let mut engine = CorrelationEngine::new(Duration::from_secs(300));
                     engine.correlate(&snap, &findings)
                 });
             },
@@ -101,5 +99,10 @@ fn bench_correlation(c: &mut Criterion) {
 
 // ── harness ───────────────────────────────────────────────────────────────────
 
-criterion_group!(benches, bench_ring_buffer, bench_metric_history, bench_correlation);
+criterion_group!(
+    benches,
+    bench_ring_buffer,
+    bench_metric_history,
+    bench_correlation
+);
 criterion_main!(benches);
