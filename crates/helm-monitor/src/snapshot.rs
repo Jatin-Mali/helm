@@ -510,6 +510,7 @@ pub struct SystemSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SnapshotDomains {
+    pub collection: CollectionCoverage,
     pub host: HostIdentity,
     pub load: LoadSnapshot,
     pub disks: DiskSnapshot,
@@ -528,6 +529,63 @@ pub struct SnapshotDomains {
     pub compose: crate::collectors::compose::ComposeSnapshot,
     pub certs: CertSnapshot,
     pub pipelines: crate::pipeline::PipelineSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationStatus {
+    Successful,
+    Failed,
+    Unsupported,
+    Filtered,
+    Stale,
+    #[default]
+    Unknown,
+}
+
+impl ObservationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Successful => "successful",
+            Self::Failed => "failed",
+            Self::Unsupported => "unsupported",
+            Self::Filtered => "filtered",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CollectionCoverage {
+    pub host_id: Option<String>,
+    pub domains: std::collections::BTreeMap<String, ObservationStatus>,
+}
+
+impl SystemSnapshot {
+    pub fn observation_status(&self, domain: &str) -> ObservationStatus {
+        if self
+            .collector_errors
+            .iter()
+            .any(|error| error.domain == domain)
+        {
+            return ObservationStatus::Failed;
+        }
+        let age = Utc::now()
+            .signed_duration_since(self.collected_at)
+            .num_seconds();
+        // shortcut: five-minute freshness bound, replace when collection intervals become configurable here.
+        if !(0..=300).contains(&age) {
+            return ObservationStatus::Stale;
+        }
+        self.domains
+            .collection
+            .domains
+            .get(domain)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 /// Non-fatal error from one collector.

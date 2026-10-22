@@ -126,3 +126,24 @@ Arbitrary shell commands have no automatic inverse. A mixed change set may
 restore its file edits but still report incomplete restoration because shell
 actions require manual recovery. Legacy records without verified backup data
 also require manual recovery.
+
+## Monitoring reports unknown health or retains an old incident
+
+Coverage is reported separately from findings. `successful` means the collector
+completed its supported probes; `failed`, `unsupported`, `filtered`, `stale` and
+`unknown` do not establish healthy state. Snapshots older than five minutes are
+stale. Older saved snapshots without coverage metadata remain unverified.
+Filtering selects detector domains; a previously observed incident may remain
+visible as last-known evidence until recovery is verified.
+
+Automatic resolution requires fresh successful comparable observations, the same
+host and boot identity, and an enabled detector. After a collection gap, two
+successful observations establish comparison again. Checks without complete
+coverage remain unknown; this currently includes backup, cron, load, firewall
+and pipeline coverage. Custom/configuration checks do not automatically resolve
+without their own observation evidence.
+
+Monitor JSON now returns a versioned object rather than a bare findings array.
+Read `.findings` for the previous array and `.coverage` for domain status; the
+object also includes `schema_version`, snapshot identity, time and collector
+errors. Consumers of the old JSON format must select the `findings` member.

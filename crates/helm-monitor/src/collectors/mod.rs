@@ -34,6 +34,39 @@ use tokio::process::Command;
 use crate::snapshot::CollectorError;
 use crate::snapshot::{MonitorProfile, Seconds};
 
+tokio::task_local! {
+    static PROBE_FAILURES: std::cell::RefCell<Vec<CollectorError>>;
+}
+
+pub(crate) async fn track_failures<T>(
+    work: impl std::future::Future<Output = Result<T, CollectorError>>,
+) -> Result<T, CollectorError> {
+    PROBE_FAILURES
+        .scope(Default::default(), async {
+            let result = work.await;
+            match result {
+                Ok(value) => PROBE_FAILURES.with(|failures| {
+                    let failures = failures.borrow();
+                    if failures.is_empty() {
+                        Ok(value)
+                    } else {
+                        Err(CollectorError {
+                            domain: String::new(),
+                            message: failures
+                                .iter()
+                                .map(|error| error.message.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                            is_timeout: failures.iter().any(|error| error.is_timeout),
+                        })
+                    }
+                }),
+                Err(error) => Err(error),
+            }
+        })
+        .await
+}
+
 /// Common trait for all collectors.
 #[allow(async_fn_in_trait)]
 pub trait Collector: Send + Sync {
@@ -49,6 +82,27 @@ pub trait Collector: Send + Sync {
 
 /// Launch a command with the profile's per-collector timeout.
 async fn run_timed(
+    program: &str,
+    args: &[&str],
+    profile: MonitorProfile,
+) -> Result<Output, CollectorError> {
+    let result = run_timed_inner(program, args, profile).await;
+    if let Err(error) = &result {
+        let _ = PROBE_FAILURES.try_with(|failures| {
+            let mut failures = failures.borrow_mut();
+            if failures.len() < 16 {
+                let mut error = error.clone();
+                error.message = helm_core::redact_secrets(
+                    &error.message.chars().take(8192).collect::<String>(),
+                );
+                failures.push(error);
+            }
+        });
+    }
+    result
+}
+
+async fn run_timed_inner(
     program: &str,
     args: &[&str],
     profile: MonitorProfile,
@@ -137,6 +191,42 @@ fn timeout_err(domain: &str, msg: impl Into<String>) -> CollectorError {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn swallowed_probe_failures_are_isolated_between_collectors() {
+        let (failed, successful) = tokio::join!(
+            super::track_failures(async {
+                let _ = super::run_timed(
+                    "sh",
+                    &["-c", "printf denied >&2; exit 13"],
+                    crate::MonitorProfile::Quick,
+                )
+                .await;
+                Ok(())
+            }),
+            super::track_failures(async {
+                super::run_timed(
+                    "sh",
+                    &["-c", "printf success"],
+                    crate::MonitorProfile::Quick,
+                )
+                .await?;
+                Ok(())
+            })
+        );
+        assert!(failed.unwrap_err().message.contains("denied"));
+        assert!(successful.is_ok());
+        let missing = super::track_failures(async {
+            let _ = super::run_timed(
+                "helm-missing-probe-293057",
+                &[],
+                crate::MonitorProfile::Quick,
+            )
+            .await;
+            Ok(())
+        })
+        .await;
+        assert!(missing.is_err());
+    }
     #[test]
     fn expected_nonzero_statuses_are_narrowly_scoped() {
         assert!(super::accepted_exit(

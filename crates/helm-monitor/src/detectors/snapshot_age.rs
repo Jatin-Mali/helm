@@ -98,6 +98,7 @@ mod tests {
             compose: Default::default(),
             certs: Default::default(),
             pipelines: Default::default(),
+            collection: Default::default(),
         };
         SystemSnapshot::new(
             "test-snapshot".to_string(),

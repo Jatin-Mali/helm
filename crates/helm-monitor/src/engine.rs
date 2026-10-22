@@ -70,7 +70,7 @@ async fn collect_with_deadline<T>(
     timeout: std::time::Duration,
     work: impl std::future::Future<Output = Result<T, CollectorError>>,
 ) -> Result<T, CollectorError> {
-    tokio::time::timeout(timeout, work)
+    tokio::time::timeout(timeout, crate::collectors::track_failures(work))
         .await
         .unwrap_or_else(|_| {
             Err(CollectorError {
@@ -151,6 +151,7 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
     let pipelines_out = unwrap_or_default(pipelines_result, "pipelines", &mut errors);
 
     let domains = SnapshotDomains {
+        collection: Default::default(),
         host: host_identity.clone(),
         load: load_out,
         disks: disks_out,
@@ -171,7 +172,7 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         pipelines: pipelines_out,
     };
 
-    SystemSnapshot {
+    let mut snapshot = SystemSnapshot {
         id,
         host: host_identity,
         collected_at: chrono::Utc::now(),
@@ -179,6 +180,83 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         domains,
         collector_errors: errors,
         redaction_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    record_coverage(&mut snapshot);
+    snapshot
+}
+
+fn record_coverage(snapshot: &mut SystemSnapshot) {
+    use crate::snapshot::ObservationStatus as Status;
+    use sha2::Digest;
+    let identity = std::fs::read_to_string("/etc/machine-id")
+        .ok()
+        .filter(|id| !id.trim().is_empty());
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok();
+    snapshot.domains.collection.host_id = identity.zip(boot).map(|(id, boot)| {
+        hex::encode(sha2::Sha256::digest(format!(
+            "{}:{}:{}",
+            id.trim(),
+            boot.trim(),
+            snapshot.host.hostname
+        )))
+    });
+    for domain in SnapshotDomains::domain_names() {
+        let status = if snapshot
+            .collector_errors
+            .iter()
+            .any(|error| error.domain == domain)
+        {
+            Status::Failed
+        } else {
+            Status::Successful
+        };
+        snapshot
+            .domains
+            .collection
+            .domains
+            .insert(domain.into(), status);
+    }
+    for (domain, unsupported) in [
+        ("containers", snapshot.domains.containers.runtime.is_none()),
+        ("kubernetes", !snapshot.domains.kubernetes.available),
+        ("libvirt", !snapshot.domains.libvirt.available),
+        ("compose", !snapshot.domains.compose.available),
+        (
+            "packages",
+            snapshot.domains.packages.package_manager.is_none(),
+        ),
+        ("certs", !snapshot.domains.certs.openssl_available),
+    ] {
+        if unsupported && snapshot.domains.collection.domains.get(domain) != Some(&Status::Failed) {
+            snapshot
+                .domains
+                .collection
+                .domains
+                .insert(domain.into(), Status::Unsupported);
+        }
+    }
+    if snapshot
+        .domains
+        .certs
+        .certificates
+        .iter()
+        .any(|cert| !cert.error.is_empty())
+    {
+        snapshot
+            .domains
+            .collection
+            .domains
+            .insert("certs".into(), Status::Failed);
+    }
+    // These collectors still omit permission/partial-coverage evidence; never infer recovery from them.
+    for domain in ["backups", "timers", "load", "firewall", "pipelines"] {
+        if snapshot.domains.collection.domains.get(domain) != Some(&Status::Failed) {
+            snapshot
+                .domains
+                .collection
+                .domains
+                .insert(domain.into(), Status::Unknown);
+        }
     }
 }
 

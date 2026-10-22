@@ -2,7 +2,7 @@
 //! Started via `helmops web [--port PORT]`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -154,6 +154,7 @@ pub struct EvidenceEntry {
 pub struct CollectorHealth {
     pub domain: String,
     pub healthy: bool,
+    pub status: helm_monitor::snapshot::ObservationStatus,
     pub error: Option<String>,
 }
 
@@ -879,12 +880,6 @@ fn load_previous_log_patterns(
 }
 
 fn collector_health(snapshot: &SystemSnapshot) -> Vec<CollectorHealth> {
-    let unhealthy: HashSet<String> = snapshot
-        .collector_errors
-        .iter()
-        .map(|error| error.domain.to_lowercase())
-        .collect();
-
     SnapshotDomains::domain_names()
         .iter()
         .map(|domain| {
@@ -896,7 +891,9 @@ fn collector_health(snapshot: &SystemSnapshot) -> Vec<CollectorHealth> {
                 .map(|collector_error| collector_error.message.clone());
             CollectorHealth {
                 domain: name.clone(),
-                healthy: !unhealthy.contains(&name),
+                healthy: snapshot.observation_status(&name)
+                    == helm_monitor::snapshot::ObservationStatus::Successful,
+                status: snapshot.observation_status(&name),
                 error,
             }
         })
@@ -1223,5 +1220,40 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("1-0"));
         assert!(DASHBOARD_HTML.contains("renderLogs"));
         assert!(DASHBOARD_HTML.contains("renderChanges"));
+    }
+
+    #[test]
+    fn collector_health_requires_positive_observation_evidence() {
+        use helm_monitor::snapshot::ObservationStatus;
+        let mut snapshot = SystemSnapshot::new(
+            "coverage".into(),
+            Default::default(),
+            MonitorProfile::Quick,
+            Default::default(),
+        );
+        assert!(
+            collector_health(&snapshot)
+                .iter()
+                .all(|domain| !domain.healthy && domain.status == ObservationStatus::Unknown)
+        );
+        snapshot
+            .domains
+            .collection
+            .domains
+            .insert("services".into(), ObservationStatus::Successful);
+        let domains = collector_health(&snapshot);
+        assert!(
+            domains
+                .iter()
+                .find(|domain| domain.domain == "services")
+                .unwrap()
+                .healthy
+        );
+        snapshot.collected_at -= chrono::Duration::minutes(10);
+        assert!(
+            collector_health(&snapshot)
+                .iter()
+                .all(|domain| !domain.healthy)
+        );
     }
 }

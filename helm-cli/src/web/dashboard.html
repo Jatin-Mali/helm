@@ -13,8 +13,8 @@
   --line: rgba(114, 151, 196, 0.18);
   --line-strong: rgba(114, 151, 196, 0.34);
   --text: #e4ecf7;
-  --muted: #8ea2bb;
-  --dim: #6580a0;
+  --muted: #a8b9ce;
+  --dim: #8fa6c2;
   --accent: #66e3ff;
   --accent-2: #8bff9f;
   --warn: #ffbf66;
@@ -26,6 +26,7 @@
 }
 
 * { box-sizing: border-box; }
+input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -36,6 +37,7 @@ body {
     radial-gradient(circle at top left, rgba(91, 158, 255, 0.18), transparent 32%),
     radial-gradient(circle at 80% 10%, rgba(102, 227, 255, 0.12), transparent 24%),
     linear-gradient(160deg, #08111b 0%, #07111f 45%, #050b14 100%);
+  background-color: var(--bg);
   overflow: auto;
 }
 
@@ -1028,7 +1030,7 @@ function renderQueue() {
   const list = document.getElementById('queue-list');
   if (!incidents.length) {
     list.innerHTML = state.snapshot && !state.findings.length
-      ? `<div class="empty">Healthy state. ${(state.snapshot.collectorHealth || []).filter(item => item.healthy).length}/${(state.snapshot.collectorHealth || []).length || 0} collectors healthy · scan ${esc(fmtAgo(state.snapshot.collectedAt))}.</div>`
+      ? `<div class="empty">${(state.snapshot.collectorHealth || []).length && state.snapshot.collectorHealth.every(item => item.status === 'successful') ? 'No issues detected in observed domains.' : 'Health unknown: incomplete collector coverage.'} ${(state.snapshot.collectorHealth || []).filter(item => item.healthy).length}/${(state.snapshot.collectorHealth || []).length || 0} collectors reporting · scan ${esc(fmtAgo(state.snapshot.collectedAt))}.</div>`
       : '<div class="empty">No incidents match this view.</div>';
     return;
   }
@@ -1135,7 +1137,7 @@ function renderOverview() {
         <section class="card">
           <div class="panel-title">Collector Health</div>
           <div class="pill-group" style="margin-top:12px">
-            ${(d.collectorHealth || []).map(item => `<span class="pill">${esc(item.domain)} · ${item.healthy ? 'healthy' : 'degraded'}</span>`).join('')}
+            ${(d.collectorHealth || []).map(item => `<span class="pill">${esc(item.domain)} · ${esc(item.status || 'unknown')}</span>`).join('')}
           </div>
         </section>
         <section class="card">

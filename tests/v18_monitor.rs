@@ -322,8 +322,10 @@ fn monitor_report_json_is_valid() {
         previous_snapshot_id: None,
     };
     let json = report.render_json();
-    let parsed: Vec<Finding> = serde_json::from_str(&json).unwrap();
-    assert!(!parsed.is_empty());
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(!parsed["findings"].as_array().unwrap().is_empty());
+    assert_eq!(parsed["schema_version"], 1);
+    assert!(parsed["coverage"].is_object());
 }
 
 #[test]

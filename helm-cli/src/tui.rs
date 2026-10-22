@@ -6845,14 +6845,20 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
             .iter()
             .map(|e| format!("{}: {}", e.domain, e.message))
             .collect();
+        let observed = crate::reconstruct_snapshot(&record, domains.clone());
         let collector_health: Vec<(String, bool, Option<String>)> = SnapshotDomains::domain_names()
             .iter()
             .map(|&domain| {
                 let err = collector_errors_raw.iter().find(|e| e.domain == domain);
-                match err {
-                    Some(e) => (domain.to_string(), false, Some(e.message.clone())),
-                    None => (domain.to_string(), true, None),
-                }
+                let status = observed.observation_status(domain);
+                (
+                    domain.to_string(),
+                    status == helm_monitor::snapshot::ObservationStatus::Successful,
+                    err.map(|error| error.message.clone()).or_else(|| {
+                        (status != helm_monitor::snapshot::ObservationStatus::Successful)
+                            .then(|| status.as_str().to_string())
+                    }),
+                )
             })
             .collect();
         let plans = TroubleshootingPlanStore::list(&conn, 12).unwrap_or_default();
@@ -7310,7 +7316,7 @@ fn render_ops_header(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         format!("col ok/{0}", d.collector_health.len())
     } else {
         format!(
-            "col {}/{1} bad",
+            "col {}/{1} unverified",
             unhealthy_collectors,
             d.collector_health.len()
         )
