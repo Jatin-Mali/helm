@@ -104,11 +104,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** `collectors/{mod,logs,db_health,web_servers}.rs`, `engine.rs`, `snapshot.rs`, `reporter.rs`, relevant detectors, CLI/TUI/web rendering, `tests/v18_monitor.rs`; new `tests/monitoring_coverage.rs`. **Findings:** F12, F14.
 
-- [ ] Preserve subprocess exit status/stderr; represent successful, failed, unsupported, filtered and stale observations explicitly per domain.
-- [ ] Gate self-resolution on a fresh successful comparable observation of the same host/domain. Render unknown and coverage in both text and JSON.
-- [ ] Wire DB/web collectors for explicitly configured targets using secret references, bounded safe probes and clear unsupported status. Do not discover credentials or probe arbitrary database endpoints automatically.
-- [ ] Fix journal index arithmetic before narrowing. Review SMART exit bitmasks and container restart parsing with recorded fixtures so meaningful nonzero statuses are interpreted correctly.
-- [ ] Test missing binaries, denied permissions, exit failure, timeout, filtered runs, disconnected collectors and indices crossing 127/128.
+- [x] Preserve subprocess exit status/stderr; represent successful, failed, unsupported, filtered and stale observations explicitly per domain.
+- [x] Gate self-resolution on a fresh successful comparable observation of the same host/domain. Render unknown and coverage in both text and JSON.
+- [x] Wire DB/web collectors for explicitly configured targets using secret references, bounded safe probes and clear unsupported status. Do not discover credentials or probe arbitrary database endpoints automatically.
+- [x] Fix journal index arithmetic before narrowing. Review SMART exit bitmasks and container restart parsing with recorded fixtures so meaningful nonzero statuses are interpreted correctly.
+- [x] Test missing binaries, denied permissions, exit failure, timeout, filtered runs, disconnected collectors and indices crossing 127/128.
 
 **Acceptance:** an unavailable collector cannot produce healthy status or a recovery event; an actually recovered service can. JSON exposes observation health even with zero findings.
 

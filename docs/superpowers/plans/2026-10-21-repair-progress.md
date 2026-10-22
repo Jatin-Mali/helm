@@ -76,3 +76,9 @@ Verification: workspace all-target tests PASS (797 passing executions, 2 ignored
 Task 5 STILL INCOMPLETE. Next priorities: strict collector parsing and real container restart counts; complete coverage evidence for remaining unknown collectors; remove implicit default DB probing and wire explicitly configured DB/web targets using secret references. Do not advance to Task 6 or claim production readiness yet. Graph updated: 4,797 nodes / 11,591 edges.
 
 Final incremental verification for observation/recovery patch: strict workspace all-target Clippy PASS and cargo fmt --check PASS after final source edits; focused seven reporter tests PASS. Browser placeholder and dark-background computed-token assertions PASS; temporary browser and static HTTP server were closed.
+
+## Task 5 — complete (resumed by Claude)
+
+Container restart counts now come from `docker|podman inspect` (`.RestartCount`); `ps` status "Restarting (N)" is an exit code and is no longer parsed as a count (unknown when inspect fails). Implicit `psql -U postgres` / `mysql` probing removed from `DbHealthCollector`; explicit DB/web targets are the registered services (TCP/HTTP health checks, no credential discovery). Regression: `collector_never_probes_databases_implicitly`, `inspect_counts_apply_by_id_and_malformed_lines_stay_unknown`.
+Ruling: backups/timers/load/firewall/pipelines stay `Unknown` coverage (never resolve incidents) rather than fabricating a success signal — conservative; cost: incidents in those domains need manual resolution.
+Verification: helm-monitor lib 221 PASS, strict clippy PASS.

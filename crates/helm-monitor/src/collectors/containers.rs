@@ -37,6 +37,14 @@ impl Collector for ContainersCollector {
             Ok(o) => out.containers = parse_list(&String::from_utf8_lossy(&o.stdout)),
             Err(e) => return Err(err("containers", e.message)),
         }
+        if !out.containers.is_empty() {
+            let mut args = vec!["inspect", "--format", "{{.Id}} {{.RestartCount}}"];
+            args.extend(out.containers.iter().map(|c| c.id.as_str()));
+            // A failed inspect is recorded by run_timed; counts stay unknown rather than zero.
+            if let Ok(o) = run_timed(cmd, &args, profile).await {
+                apply_restart_counts(&mut out.containers, &String::from_utf8_lossy(&o.stdout));
+            }
+        }
         Ok(out)
     }
 }
@@ -76,7 +84,7 @@ fn parse_list(s: &str) -> Vec<ContainerInfo> {
                     .as_deref()
                     .map(split_csv_field)
                     .unwrap_or_default(),
-                restart_count: parse_restart_count(&row.status),
+                restart_count: None,
                 health: parse_health_status(&row.status),
             })
         })
@@ -92,15 +100,23 @@ fn split_csv_field(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_restart_count(status: &str) -> Option<u32> {
-    let marker = "Restarting (";
-    let start = status.find(marker)?;
-    let rest = &status[start + marker.len()..];
-    let digits = rest
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    digits.parse::<u32>().ok()
+/// `docker ps` shows the last exit code in "Restarting (N)", not a restart count;
+/// counts come from `inspect` output lines of "<full id> <count>".
+fn apply_restart_counts(containers: &mut [ContainerInfo], inspect: &str) {
+    for line in inspect.lines() {
+        let Some((id, count)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        let Ok(count) = count.trim().parse::<u32>() else {
+            continue;
+        };
+        if let Some(c) = containers
+            .iter_mut()
+            .find(|c| c.id == id || id.starts_with(c.id.as_str()))
+        {
+            c.restart_count = Some(count);
+        }
+    }
 }
 
 fn parse_health_status(status: &str) -> Option<String> {
@@ -120,12 +136,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_list_extracts_health_and_restarts() {
+    fn parse_list_does_not_confuse_exit_code_with_restart_count() {
         let json = r#"{"ID":"abc","Names":"web","Image":"nginx:latest","Status":"Restarting (7) 12 seconds ago (unhealthy)","Ports":"80/tcp, 443/tcp","Mounts":"/srv/www"}"#;
         let containers = parse_list(json);
         assert_eq!(containers.len(), 1);
         assert_eq!(containers[0].name, "web");
-        assert_eq!(containers[0].restart_count, Some(7));
+        assert_eq!(containers[0].restart_count, None);
         assert_eq!(containers[0].health.as_deref(), Some("unhealthy"));
         assert_eq!(containers[0].ports.len(), 2);
     }
@@ -136,5 +152,15 @@ mod tests {
         let containers = parse_list(json);
         assert_eq!(containers[0].health.as_deref(), Some("healthy"));
         assert_eq!(containers[0].restart_count, None);
+    }
+
+    #[test]
+    fn inspect_counts_apply_by_id_and_malformed_lines_stay_unknown() {
+        let json = r#"{"ID":"abc123","Names":"a","Image":"i","Status":"Up"}
+{"ID":"def456","Names":"b","Image":"i","Status":"Up"}"#;
+        let mut containers = parse_list(json);
+        apply_restart_counts(&mut containers, "abc123ffff 5\ndef456 notanumber\ngarbage\n");
+        assert_eq!(containers[0].restart_count, Some(5));
+        assert_eq!(containers[1].restart_count, None);
     }
 }

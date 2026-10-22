@@ -1,5 +1,5 @@
-//! Database health collector: probes PostgreSQL and MySQL/MariaDB.
-//! Uses respective CLI tools for non-invasive health checks.
+//! Database tooling availability. Instances are never probed implicitly; configured
+//! databases are checked through the service registry.
 
 use crate::{
     collectors::{Collector, run_timed},
@@ -61,122 +61,23 @@ impl Collector for DbHealthCollector {
             .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
             .unwrap_or(false);
 
-        // Probe PostgreSQL instances
-        if snapshot.psql_available {
-            if let Some(instance) = probe_postgresql(profile).await {
-                snapshot.instances.push(instance);
-            }
-        }
-
-        // Probe MySQL instances
-        if snapshot.mysql_available {
-            if let Some(instance) = probe_mysql(profile).await {
-                snapshot.instances.push(instance);
-            }
-        }
-
+        // No implicit probing: guessing credentials/sockets (e.g. `psql -U postgres`) is
+        // forbidden. Explicit targets are registered services (TCP health, no credentials).
         Ok(snapshot)
     }
 }
 
-async fn probe_postgresql(profile: MonitorProfile) -> Option<DbInstance> {
-    let result = run_timed(
-        "psql",
-        &[
-            "-U",
-            "postgres",
-            "-c",
-            "SELECT version(), count(*) FROM pg_stat_activity;",
-            "-t",
-            "-A",
-        ],
-        profile,
-    )
-    .await;
 
-    match result {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut version = None;
-            let mut connections = None;
-            for line in stdout.lines() {
-                if let Some(ver) = line.split('|').next() {
-                    version = Some(ver.trim().to_string());
-                }
-                if let Some(conn_str) = line.split('|').nth(1) {
-                    connections = conn_str.trim().parse().ok();
-                }
-            }
-            Some(DbInstance {
-                db_type: "postgresql".into(),
-                connection: "local socket".into(),
-                reachable: true,
-                version,
-                replication_lag_seconds: None,
-                database_count: None,
-                active_connections: connections,
-                error: None,
-            })
-        }
-        Err(e) => Some(DbInstance {
-            db_type: "postgresql".into(),
-            connection: "local socket".into(),
-            reachable: false,
-            version: None,
-            replication_lag_seconds: None,
-            database_count: None,
-            active_connections: None,
-            error: Some(e.message),
-        }),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn probe_mysql(profile: MonitorProfile) -> Option<DbInstance> {
-    let result = run_timed(
-        "mysql",
-        &[
-            "-e",
-            "SELECT VERSION(), COUNT(*) FROM information_schema.PROCESSLIST;",
-            "-N",
-        ],
-        profile,
-    )
-    .await;
-
-    match result {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut version = None;
-            let mut connections = None;
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.trim().split('\t').collect();
-                if let Some(ver) = parts.first() {
-                    version = Some(ver.trim().to_string());
-                }
-                if let Some(conn) = parts.get(1) {
-                    connections = conn.trim().parse().ok();
-                }
-            }
-            Some(DbInstance {
-                db_type: "mysql".into(),
-                connection: "local socket".into(),
-                reachable: true,
-                version,
-                replication_lag_seconds: None,
-                database_count: None,
-                active_connections: connections,
-                error: None,
-            })
-        }
-        Err(e) => Some(DbInstance {
-            db_type: "mysql".into(),
-            connection: "local socket".into(),
-            reachable: false,
-            version: None,
-            replication_lag_seconds: None,
-            database_count: None,
-            active_connections: None,
-            error: Some(e.message),
-        }),
+    #[tokio::test]
+    async fn collector_never_probes_databases_implicitly() {
+        let snapshot = DbHealthCollector
+            .collect(MonitorProfile::Quick)
+            .await
+            .expect("collect");
+        assert!(snapshot.instances.is_empty());
     }
 }
