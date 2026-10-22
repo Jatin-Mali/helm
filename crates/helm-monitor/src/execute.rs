@@ -259,6 +259,9 @@ pub struct StepOutcome {
 pub struct ExecutionEngine {
     approve_fn: Box<dyn Fn(&CommandPreview) -> bool + Send + Sync>,
     approvals: Option<crate::PlanApprovals>,
+    policy: crate::ExecutionPolicy,
+    limits: crate::process_runner::ProcessLimits,
+    cancellation: crate::process_runner::CancellationToken,
     before_snapshot: Option<SystemSnapshot>,
     after_snapshot: Option<SystemSnapshot>,
     /// HMAC-chained audit log of every executed step.
@@ -271,6 +274,9 @@ impl ExecutionEngine {
         Self {
             approve_fn,
             approvals: None,
+            policy: crate::ExecutionPolicy::default(),
+            limits: crate::process_runner::ProcessLimits::default(),
+            cancellation: crate::process_runner::CancellationToken::default(),
             before_snapshot: None,
             after_snapshot: None,
             audit_chain: Vec::new(),
@@ -281,6 +287,16 @@ impl ExecutionEngine {
         let mut engine = Self::new(Box::new(|_| false));
         engine.approvals = Some(approvals);
         engine
+    }
+
+    pub fn with_policy(mut self, policy: crate::ExecutionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn with_cancellation(mut self, token: crate::process_runner::CancellationToken) -> Self {
+        self.cancellation = token;
+        self
     }
 
     /// Run a pre-flight idempotency check. Returns Some(reason) if the step
@@ -313,13 +329,14 @@ impl ExecutionEngine {
 
     /// Run verification commands from a preview and compare output against expectations.
     async fn run_verification(
+        &self,
         preview: &CommandPreview,
         expected_output: Option<&str>,
     ) -> (bool, Vec<String>) {
         let mut results = Vec::new();
         let mut all_passed = true;
         for v in &preview.verification {
-            let v_outcome = Self::execute_preview(v).await;
+            let v_outcome = self.execute_preview(v).await;
             let output_line = v_outcome.output.lines().next().unwrap_or("").to_string();
             let passed = if let Some(expected) = expected_output {
                 v_outcome.output.contains(expected) && v_outcome.success
@@ -346,6 +363,25 @@ impl ExecutionEngine {
     /// takes an after-snapshot, and runs post-change detection.
     pub async fn execute(&mut self, plan: &TroubleshootingPlan) -> ChangeSet {
         let approvals = self.approvals.take();
+        match self.policy.check_mutation() {
+            Ok(true) => {}
+            disposition => {
+                let mut result = ChangeSet::new(plan, plan.snapshot_id.clone());
+                result.status = if disposition.is_ok() {
+                    ChangeSetStatus::Pending
+                } else {
+                    ChangeSetStatus::Rejected
+                };
+                result.summary = disposition
+                    .err()
+                    .unwrap_or_else(|| "dry run: no operations executed".into());
+                for step in &mut result.steps {
+                    step.status = StepStatus::Skipped;
+                    step.verification_result = result.summary.clone();
+                }
+                return result;
+            }
+        }
         // 1. Capture before-snapshot
         let before = collect_snapshot(MonitorProfile::Quick).await;
         let before_id = before.id.clone();
@@ -374,6 +410,12 @@ impl ExecutionEngine {
             }
 
             let preview = &step.command;
+            if self.cancellation.is_cancelled() {
+                step.status = StepStatus::Skipped;
+                step.verification_result = "cancelled before execution".into();
+                halt = true;
+                continue;
+            }
 
             let approved = match &approvals {
                 Some(approvals) => approvals.allows(plan, index),
@@ -399,7 +441,7 @@ impl ExecutionEngine {
             }
 
             // 2c. Run the step
-            let outcome = Self::execute_preview(preview).await;
+            let outcome = self.execute_preview(preview).await;
             step.status = if outcome.success {
                 StepStatus::Succeeded
             } else {
@@ -411,7 +453,7 @@ impl ExecutionEngine {
             // 2d. Verification: run preview verification commands + expected_output matching
             let expected = plan_step.expected_output.as_deref();
             let (verified, verify_results) = if outcome.success {
-                Self::run_verification(preview, expected).await
+                self.run_verification(preview, expected).await
             } else {
                 (false, vec!["not verified (action failed)".into()])
             };
@@ -487,7 +529,9 @@ impl ExecutionEngine {
                 .push_str("\nNo significant system changes detected.\n");
         }
 
-        cs.status = if cs.steps.iter().any(|s| s.status == StepStatus::Failed) {
+        cs.status = if self.cancellation.is_cancelled()
+            || cs.steps.iter().any(|s| s.status == StepStatus::Failed)
+        {
             ChangeSetStatus::Failed
         } else if cs.steps.iter().all(|s| s.status == StepStatus::Skipped) {
             ChangeSetStatus::Rejected
@@ -501,7 +545,7 @@ impl ExecutionEngine {
 
     /// Execute a single command preview and capture outcome.
     /// This delegates to the real shell/fs tools.
-    async fn execute_preview(preview: &CommandPreview) -> StepOutcome {
+    async fn execute_preview(&self, preview: &CommandPreview) -> StepOutcome {
         match preview.tool.as_str() {
             "shell" | "bash" | "sh" | "cmd" => {
                 let cmd = preview.command_text.as_deref().unwrap_or("");
@@ -517,11 +561,11 @@ impl ExecutionEngine {
                     };
                 }
                 // Use tokio::process::Command to run the shell command
-                let output = tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(cmd)
-                    .output()
-                    .await;
+                let mut command = tokio::process::Command::new("sh");
+                command.args(["-c", cmd]).stdin(std::process::Stdio::null());
+                let output =
+                    crate::process_runner::run_command(command, self.limits, &self.cancellation)
+                        .await;
                 match output {
                     Ok(out) => {
                         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -545,7 +589,7 @@ impl ExecutionEngine {
                     }
                     Err(e) => StepOutcome {
                         success: false,
-                        output: String::new(),
+                        output: e.stdout.clone(),
                         error: format!("execution error: {e}"),
                         changed_files: vec![],
                         verification_ok: false,

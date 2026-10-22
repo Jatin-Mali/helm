@@ -1,7 +1,7 @@
 //! Host identity collector: OS, kernel, hostname, uptime.
 
 use crate::{
-    collectors::{Collector, err, read_proc, timeout_err},
+    collectors::{Collector, read_proc, run_timed, timeout_err},
     snapshot::{HostIdentity, MonitorProfile},
 };
 
@@ -22,41 +22,25 @@ impl Collector for HostCollector {
         let t = profile.per_collector_timeout();
         let mut out = HostIdentity::default();
 
-        let u = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("uname").arg("-n").output()
-        })
-        .await
-        .map_err(|e| err("host", e.to_string()))?;
+        let u = run_timed("uname", &["-n"], profile).await;
         if let Ok(o) = u {
             if o.status.success() {
                 out.hostname = String::from_utf8_lossy(&o.stdout).trim().to_string();
             }
         }
-        let u = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("uname").arg("-s").output()
-        })
-        .await
-        .map_err(|e| err("host", e.to_string()))?;
+        let u = run_timed("uname", &["-s"], profile).await;
         if let Ok(o) = u {
             if o.status.success() {
                 out.kernel_name = String::from_utf8_lossy(&o.stdout).trim().to_string();
             }
         }
-        let u = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("uname").arg("-r").output()
-        })
-        .await
-        .map_err(|e| err("host", e.to_string()))?;
+        let u = run_timed("uname", &["-r"], profile).await;
         if let Ok(o) = u {
             if o.status.success() {
                 out.kernel_release = String::from_utf8_lossy(&o.stdout).trim().to_string();
             }
         }
-        let u = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("uname").arg("-m").output()
-        })
-        .await
-        .map_err(|e| err("host", e.to_string()))?;
+        let u = run_timed("uname", &["-m"], profile).await;
         if let Ok(o) = u {
             if o.status.success() {
                 out.machine = String::from_utf8_lossy(&o.stdout).trim().to_string();

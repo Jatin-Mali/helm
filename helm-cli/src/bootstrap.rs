@@ -151,10 +151,10 @@ async fn run_ssh(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = cmd
-        .output()
-        .await
-        .with_context(|| format!("spawning ssh {target}"))?;
+    let output =
+        helm_monitor::process_runner::run_command(cmd, Default::default(), &Default::default())
+            .await
+            .with_context(|| format!("spawning ssh {target}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
@@ -196,7 +196,10 @@ async fn scp_upload(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = cmd.output().await.context("spawning scp")?;
+    let output =
+        helm_monitor::process_runner::run_command(cmd, Default::default(), &Default::default())
+            .await
+            .context("spawning scp")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(

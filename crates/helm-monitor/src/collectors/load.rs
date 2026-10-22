@@ -1,6 +1,6 @@
 //! Load collector: CPU, memory, swap, PSI from /proc.
 use crate::{
-    collectors::{Collector, read_proc, timeout_err},
+    collectors::{Collector, read_proc, run_timed, timeout_err},
     snapshot::{LoadAverage, LoadSnapshot, MemoryInfo, MonitorProfile, PressureStall},
 };
 
@@ -53,11 +53,7 @@ impl Collector for LoadCollector {
                 used: 0,
                 available: if avail > 0 { Some(avail * 1024) } else { None },
             };
-            if let Ok(o) = tokio::process::Command::new("free")
-                .arg("-b")
-                .output()
-                .await
-            {
+            if let Ok(o) = run_timed("free", &["-b"], profile).await {
                 if o.status.success() {
                     let f = String::from_utf8_lossy(&o.stdout);
                     if let Some(ml) = f.lines().nth(1) {

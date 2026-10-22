@@ -8,12 +8,14 @@ pub mod custom_service;
 pub mod detectors;
 pub mod engine;
 pub mod execute;
+pub mod execution_policy;
 pub mod findings;
 pub mod log_analysis;
 pub mod metric_history;
 pub mod pipeline;
 pub mod plan_cache;
 pub mod plan_document;
+pub mod process_runner;
 pub mod reporter;
 pub mod ring_buffer;
 pub mod snapshot;
@@ -36,6 +38,7 @@ pub use execute::{
     ChangeSet, ChangeSetStatus, ChangeSetStep, ExecutionEngine, PreChangeBackup, StepOutcome,
     StepStatus, format_change_set,
 };
+pub use execution_policy::ExecutionPolicy;
 pub use findings::{
     Confidence, EvidenceRef, Finding, FindingId, FindingLifecycle, FindingValidationError,
     MonitorDomain, PlanId, Severity, self_resolved_findings, sort_findings,

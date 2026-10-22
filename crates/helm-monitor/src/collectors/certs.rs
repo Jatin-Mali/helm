@@ -102,18 +102,11 @@ async fn discover_tls_listeners(profile: MonitorProfile) -> Vec<String> {
 #[allow(clippy::result_large_err, clippy::manual_strip)]
 async fn check_cert(addr: &str, profile: MonitorProfile) -> Result<CertEntry, CertEntry> {
     let servername = addr.split(':').next().unwrap_or("localhost");
-    let shell_cmd = format!(
-        "echo '' | openssl s_client -connect {} -servername {} 2>/dev/null | openssl x509 -noout -dates -subject -issuer -ext subjectAltName 2>/dev/null",
-        addr, servername
-    );
-
+    let shell_cmd = "printf '' | openssl s_client -connect \"$1\" -servername \"$2\" 2>/dev/null | openssl x509 -noout -dates -subject -issuer -ext subjectAltName 2>/dev/null";
     let timeout = profile.per_collector_timeout();
-    let output = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(&shell_cmd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
+    let args = ["-c", shell_cmd, "helm-cert", addr, servername];
+    let output =
+        crate::process_runner::run_program("sh", &args, std::time::Duration::from_secs(timeout));
 
     let output = match tokio::time::timeout(std::time::Duration::from_secs(timeout), output).await {
         Ok(Ok(o)) => o,

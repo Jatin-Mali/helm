@@ -80,11 +80,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** new `crates/helm-monitor/src/{process_runner,execution_policy}.rs`, exports in `lib.rs`, `execute.rs`, `collectors/mod.rs`, CLI `ops.rs`, `sandbox.rs`, `main.rs`, `tui.rs`, `web.rs`; new `tests/execution_policy.rs`. **Findings:** F04, F15.
 
-- [ ] Inventory every child-process launch, including hooks, remote commands and rollback; classify observation versus mutation using trusted operation definitions.
-- [ ] Introduce shared execution policy and bounded process runner using existing types where possible: explicit argv or explicitly approved shell operation, cwd/environment policy, deadline, output limit, cancellation and process-group reaping.
-- [ ] Enforce read-only/dry-run at the execution boundary across all frontends. A dry run returns a preview and creates no action child process. Deny arbitrary shell in read-only mode.
-- [ ] Apply the actual sandbox launch wrapper to supported operations. If unavailable/incompatible, fail requested sandboxed execution before host launch; never print an enabled claim for unused settings.
-- [ ] Migrate subprocess callers; preserve partial stdout/stderr and explicit timeout/cancel/output-limit results. Add total collector deadlines in addition to individual probe limits.
+- [x] Inventory every child-process launch, including hooks, remote commands and rollback; classify observation versus mutation using trusted operation definitions.
+- [x] Introduce shared execution policy and bounded process runner using existing types where possible: explicit argv or explicitly approved shell operation, cwd/environment policy, deadline, output limit, cancellation and process-group reaping.
+- [x] Enforce read-only/dry-run at the execution boundary across all frontends. A dry run returns a preview and creates no action child process. Deny arbitrary shell in read-only mode.
+- [x] Apply the actual sandbox launch wrapper to supported operations. If unavailable/incompatible, fail requested sandboxed execution before host launch; never print an enabled claim for unused settings.
+- [x] Migrate subprocess callers; preserve partial stdout/stderr and explicit timeout/cancel/output-limit results. Add total collector deadlines in addition to individual probe limits.
 
 **Acceptance matrix:** CLI/TUI/web/service/rollback × denied/read-only/dry-run leaves markers absent. Forking child cannot survive cancellation. Large output remains bounded. Hung commands end within deadline plus a bounded kill/reap grace period. Sandbox test verifies the host filesystem boundary, not just a flag value.
 

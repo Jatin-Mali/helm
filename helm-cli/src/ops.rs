@@ -60,13 +60,14 @@ pub struct ChangeSetView {
     pub rollback_summary: String,
 }
 
-pub fn read_service_journal_excerpt(unit: &str, lines: usize) -> Vec<String> {
+pub async fn read_service_journal_excerpt(unit: &str, lines: usize) -> Vec<String> {
     let unit = unit.trim();
     if unit.is_empty() {
         return vec!["No service selected.".to_owned()];
     }
-    let output = std::process::Command::new("journalctl")
-        .args([
+    let output = helm_monitor::process_runner::run_program(
+        "journalctl",
+        &[
             "-u",
             unit,
             "-n",
@@ -74,8 +75,10 @@ pub fn read_service_journal_excerpt(unit: &str, lines: usize) -> Vec<String> {
             "--no-pager",
             "-o",
             "short-iso",
-        ])
-        .output();
+        ],
+        std::time::Duration::from_secs(5),
+    )
+    .await;
     match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -143,7 +146,16 @@ pub fn load_change_set_view(
     Ok(Some(build_change_set_view(conn, &full)))
 }
 
-pub async fn rollback_change_set(db_path: &Path, id: &str) -> Result<Vec<String>> {
+pub async fn rollback_change_set(
+    db_path: &Path,
+    id: &str,
+    policy: helm_monitor::ExecutionPolicy,
+) -> Result<Vec<String>> {
+    if !policy.check_mutation().map_err(anyhow::Error::msg)? {
+        return Ok(vec![format!(
+            "Dry run: would restore change set {id}; no actions executed."
+        )]);
+    }
     let conn = rusqlite::Connection::open(db_path)
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
     let full = ChangeSetStore::get_full(&conn, id)
@@ -184,11 +196,16 @@ pub async fn rollback_change_set(db_path: &Path, id: &str) -> Result<Vec<String>
             continue;
         }
         if let Some(reverse) = reverse_command(cmd) {
-            let output = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&reverse)
-                .output()
-                .await;
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args(["-c", &reverse])
+                .stdin(std::process::Stdio::null());
+            let output = helm_monitor::process_runner::run_command(
+                command,
+                Default::default(),
+                &Default::default(),
+            )
+            .await;
             match output {
                 Ok(out) if out.status.success() => results.push(format!(
                     "  OK   {}: ran rollback command `{reverse}`",
@@ -506,6 +523,35 @@ fn non_empty(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rollback_modes_do_not_open_a_database_or_change_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("never-created.db");
+        let error = rollback_change_set(
+            &db,
+            "fixture",
+            helm_monitor::ExecutionPolicy {
+                read_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("read-only"));
+        let preview = rollback_change_set(
+            &db,
+            "fixture",
+            helm_monitor::ExecutionPolicy {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(preview[0].contains("Dry run"));
+        assert!(!db.exists());
+    }
 
     #[test]
     fn service_timer_matching_handles_unit_and_activates_edges() {

@@ -181,10 +181,19 @@ pub(crate) struct TuiRuntime {
     pub(crate) tui_paste_key_modal: bool,
     pub(crate) auto_approve: bool,
     pub(crate) read_only: bool,
+    pub(crate) dry_run: bool,
     pub(crate) diagnose_mode: bool,
     pub(crate) dashboard_mode: bool,
     pub(crate) sandbox: Option<ResolvedSandbox>,
     pub(crate) remote_target: Option<String>,
+}
+
+struct CancelApplyOnDrop(helm_monitor::process_runner::CancellationToken);
+
+impl Drop for CancelApplyOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 /// Starts the interactive terminal UI.
@@ -2213,6 +2222,7 @@ pub struct TuiApp {
     dashboard: DashboardState,
     audited_transitions: HashSet<String>,
     pending_apply_rx: Option<tokio::sync::oneshot::Receiver<Result<String, String>>>,
+    pending_apply_cancel: Option<CancelApplyOnDrop>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2230,6 +2240,7 @@ struct ToastState {
 }
 
 struct TuiRuntimeInner {
+    policy: helm_monitor::ExecutionPolicy,
     db_path: PathBuf,
     config_path: PathBuf,
     memory: Arc<MemoryStore>,
@@ -2263,6 +2274,11 @@ impl TuiApp {
 
         let mut app = Self {
             runtime: Arc::new(TuiRuntimeInner {
+                policy: helm_monitor::ExecutionPolicy {
+                    read_only: runtime.read_only,
+                    dry_run: runtime.dry_run,
+                    sandbox_requested: runtime.sandbox.is_some(),
+                },
                 db_path: runtime.db_path,
                 config_path,
                 memory: runtime.memory,
@@ -2301,6 +2317,7 @@ impl TuiApp {
             dashboard: DashboardState::new(),
             audited_transitions: HashSet::new(),
             pending_apply_rx: None,
+            pending_apply_cancel: None,
         };
         if mode == AgentMode::Dashboard {
             app.refresh_dashboard();
@@ -2485,6 +2502,7 @@ impl TuiApp {
                             ),
                         }
                         self.pending_apply_rx = None;
+                        self.pending_apply_cancel = None;
                     }
                 }
                 if let Some(rx) = &mut self.dashboard.pending_fleet_rx {
@@ -2607,7 +2625,7 @@ impl TuiApp {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.key_matches(&key, "cancel", KeyCode::Char('c'), KeyModifiers::CONTROL) {
-                if self.running {
+                if self.running || self.pending_apply_cancel.is_some() {
                     self.cancel_running_task();
                     return Ok(false);
                 }
@@ -3242,6 +3260,13 @@ impl TuiApp {
         key: KeyEvent,
         tx: mpsc::UnboundedSender<UiEvent>,
     ) -> Result<bool> {
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.pending_apply_cancel.is_some()
+        {
+            self.cancel_running_task();
+            return Ok(false);
+        }
         match self.modal.clone() {
             Some(ModalState::CommandPalette) => match key.code {
                 KeyCode::Esc => self.modal = None,
@@ -3856,7 +3881,14 @@ Report the exit status and the concise output."
         })
     }
 
+    fn execution_policy(&self) -> helm_monitor::ExecutionPolicy {
+        self.runtime.policy
+    }
+
     fn cancel_running_task(&mut self) {
+        if let Some(cancel) = &self.pending_apply_cancel {
+            cancel.0.cancel();
+        }
         if let Some(task) = self.agent_task.take() {
             task.abort();
         }
@@ -5046,6 +5078,20 @@ Report the exit status and the concise output."
                 return;
             }
         };
+        match self.execution_policy().check_mutation() {
+            Err(error) => {
+                self.push_chat(MessageRole::Error, error);
+                return;
+            }
+            Ok(false) => {
+                self.push_chat(
+                    MessageRole::System,
+                    format!("Dry run: no actions executed.\n{}", plan.render_text()),
+                );
+                return;
+            }
+            Ok(true) => {}
+        }
         let approvals = match helm_monitor::PlanApprovals::review(&plan) {
             Ok(approvals) => approvals,
             Err(error) => {
@@ -5145,6 +5191,9 @@ Report the exit status and the concise output."
         approvals: helm_monitor::PlanApprovals,
     ) {
         let db_path = self.runtime.db_path.clone();
+        let policy = self.execution_policy();
+        let cancellation = helm_monitor::process_runner::CancellationToken::default();
+        self.pending_apply_cancel = Some(CancelApplyOnDrop(cancellation.clone()));
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
         self.pending_apply_rx = Some(rx);
         let handle = tokio::runtime::Handle::current();
@@ -5155,10 +5204,15 @@ Report the exit status and the concise output."
                     yes: false,
                     json: false,
                 };
-                let result =
-                    crate::run_approved_plan_command_at_path(db_path, args, Some(approvals))
-                        .await
-                        .map_err(|error| error.to_string());
+                let result = crate::run_approved_plan_command_at_path(
+                    db_path,
+                    args,
+                    Some(approvals),
+                    policy,
+                    cancellation,
+                )
+                .await
+                .map_err(|error| error.to_string());
                 let _ = tx.send(result);
             });
         });
@@ -5725,7 +5779,7 @@ Report the exit status and the concise output."
         units.get(self.dashboard.service_selected_row).copied()
     }
 
-    fn ensure_dashboard_service_journal(&mut self, unit: &str, full: bool) {
+    async fn ensure_dashboard_service_journal(&mut self, unit: &str, full: bool) {
         let lines = if full { 120 } else { 40 };
         let cache_key = format!("{unit}:{lines}");
         if self
@@ -5735,7 +5789,7 @@ Report the exit status and the concise output."
         {
             return;
         }
-        let excerpt = ops::read_service_journal_excerpt(unit, lines);
+        let excerpt = ops::read_service_journal_excerpt(unit, lines).await;
         self.dashboard
             .service_journal_cache
             .insert(cache_key, excerpt);
@@ -5786,7 +5840,7 @@ Report the exit status and the concise output."
                     return Ok(());
                 }
                 self.dashboard.service_full_journal = true;
-                self.ensure_dashboard_service_journal(&unit, true);
+                self.ensure_dashboard_service_journal(&unit, true).await;
                 self.dashboard.pane = DashboardFocus::Detail;
                 self.dashboard.detail_scroll = 0;
                 self.write_dashboard_event(
@@ -5799,6 +5853,17 @@ Report the exit status and the concise output."
                 self.toast(format!("Loaded full journal for {unit}"));
             }
             "restart" | "stop" => {
+                match self.execution_policy().check_mutation() {
+                    Err(error) => {
+                        self.toast_variant(error, ToastVariant::Error);
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        self.toast(format!("Dry run: would {action} {unit}"));
+                        return Ok(());
+                    }
+                    Ok(true) => {}
+                }
                 if !self
                     .prompt_or_require_capability(
                         Capability::SystemService,
@@ -5809,12 +5874,15 @@ Report the exit status and the concise output."
                 {
                     return Ok(());
                 }
-                let output = tokio::process::Command::new("systemctl")
-                    .arg(action)
-                    .arg(&unit)
-                    .output()
-                    .await
-                    .with_context(|| format!("failed to run systemctl {action} {unit}"))?;
+                let mut command = tokio::process::Command::new("systemctl");
+                command.args([action, "--", &unit]);
+                let output = helm_monitor::process_runner::run_command(
+                    command,
+                    Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .with_context(|| format!("failed to run systemctl {action} {unit}"))?;
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
                 let decision = if output.status.success() {
@@ -5872,7 +5940,12 @@ Report the exit status and the concise output."
         {
             return Ok(());
         }
-        let results = crate::ops::rollback_change_set(&self.runtime.db_path, &change.id).await?;
+        let results = crate::ops::rollback_change_set(
+            &self.runtime.db_path,
+            &change.id,
+            self.execution_policy(),
+        )
+        .await?;
         self.write_dashboard_event(
             "change-set.rollback",
             Capability::ShellShell.as_str(),
@@ -5903,7 +5976,8 @@ Report the exit status and the concise output."
                     } else if self.dashboard.active_tab == OpsTab::Services {
                         if let Some(unit) = self.selected_dashboard_service_unit() {
                             let unit_name = unit.name.clone();
-                            self.ensure_dashboard_service_journal(&unit_name, false);
+                            self.ensure_dashboard_service_journal(&unit_name, false)
+                                .await;
                             self.dashboard.pane = DashboardFocus::Detail;
                             self.dashboard.detail_scroll = 0;
                         }
@@ -8471,7 +8545,7 @@ fn render_ops_services(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             .get(&cache_key)
             .cloned()
             .unwrap_or_else(|| {
-                ops::read_service_journal_excerpt(&unit.name, if full { 120 } else { 40 })
+                vec!["Select the service or open its journal to load entries.".into()]
             });
         let matching_timers =
             ops::timers_for_service(&app.dashboard.data.domains.services.timers, &unit.name);
@@ -11835,6 +11909,7 @@ mod tests {
             tui_paste_key_modal: true,
             auto_approve: false,
             read_only: false,
+            dry_run: false,
             diagnose_mode: false,
             dashboard_mode: false,
             sandbox: None,
@@ -14056,6 +14131,85 @@ mod tests {
                 "second step: {keys:?}"
             );
         }
+    }
+
+    #[test]
+    fn apply_modes_reach_both_cli_dispatch_and_tui_review() {
+        for policy in [
+            helm_monitor::ExecutionPolicy {
+                read_only: true,
+                ..Default::default()
+            },
+            helm_monitor::ExecutionPolicy {
+                dry_run: true,
+                ..Default::default()
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+            Arc::get_mut(&mut app.runtime).unwrap().policy = policy;
+            let marker = dir.path().join("never-written");
+            let mut command =
+                helm_monitor::CommandPreview::new("fs_write", "write fixture", "blocked");
+            command.input = serde_json::json!({"path": marker, "content": "blocked"});
+            let steps = vec![helm_monitor::PlanStep {
+                title: "blocked".into(),
+                command,
+                hypothesis_id: None,
+                expected_output: None,
+                interpretation_guide: None,
+            }];
+            let conn = rusqlite::Connection::open(&app.runtime.db_path).unwrap();
+            TroubleshootingPlanStore::insert(
+                &conn,
+                "mode-fixture",
+                "user: fixture",
+                "snapshot",
+                "",
+                "[]",
+                "[]",
+                &helm_monitor::encode_plan_steps(&steps).unwrap(),
+                true,
+                "fixture",
+            )
+            .unwrap();
+            app.execute_apply_plan_inline("mode-fixture");
+            assert!(app.modal.is_none());
+            assert!(app.pending_apply_rx.is_none());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(crate::run_apply_plan_command_at_path(
+                app.runtime.db_path.clone(),
+                crate::ApplyPlanArgs {
+                    plan_id: "mode-fixture".into(),
+                    yes: true,
+                    json: false,
+                },
+                policy,
+            ));
+            if policy.dry_run {
+                assert!(result.unwrap().contains("Dry run"));
+            } else {
+                assert!(result.unwrap_err().to_string().contains("read-only"));
+            }
+            assert!(!marker.exists());
+            assert!(
+                helm_memory::ChangeSetStore::list(&conn, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_pending_apply_guard_cancels_execution() {
+        let token = helm_monitor::process_runner::CancellationToken::default();
+        let guard = CancelApplyOnDrop(token.clone());
+        assert!(!token.is_cancelled());
+        drop(guard);
+        assert!(token.is_cancelled());
     }
 
     // ── T04: audit + plan_rejected tag ─────────────────────────────────

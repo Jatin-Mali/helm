@@ -38,6 +38,7 @@ use crate::{ProviderSettings, llm_provider_usable, ops, secrets::SecretsStore};
 const DASHBOARD_HTML: &str = include_str!("web/dashboard.html");
 
 struct WebState {
+    policy: helm_monitor::ExecutionPolicy,
     db_path: PathBuf,
     memory: Arc<MemoryStore>,
     snapshot_tx: broadcast::Sender<String>,
@@ -206,6 +207,7 @@ pub async fn serve(
     port: u16,
     provider_settings: ProviderSettings,
     secrets: SecretsStore,
+    policy: helm_monitor::ExecutionPolicy,
 ) -> Result<()> {
     let (tx, _) = broadcast::channel::<String>(32);
     let memory = Arc::new(
@@ -214,6 +216,7 @@ pub async fn serve(
             .with_context(|| format!("opening memory store at {}", db_path.display()))?,
     );
     let state = Arc::new(WebState {
+        policy,
         db_path: db_path.clone(),
         memory,
         snapshot_tx: tx.clone(),
@@ -404,10 +407,19 @@ async fn api_service_action(
             Json(serde_json::json!({
                 "ok": true,
                 "unit": req.unit,
-                "lines": ops::read_service_journal_excerpt(&req.unit, 120),
+                "lines": ops::read_service_journal_excerpt(&req.unit, 120).await,
             }))
         }
         "restart" | "stop" => {
+            match state.policy.check_mutation() {
+                Err(error) => return Json(serde_json::json!({"ok": false, "error": error})),
+                Ok(false) => {
+                    return Json(
+                        serde_json::json!({"ok": true, "dryRun": true, "action": req.action, "unit": req.unit}),
+                    );
+                }
+                Ok(true) => {}
+            }
             if state
                 .memory
                 .active_capability_grant(helm_core::Capability::SystemService, true)
@@ -421,11 +433,14 @@ async fn api_service_action(
                     "error": "Missing system.service grant. Run `helmops permissions grant system.service --scope once` and retry.",
                 }));
             }
-            let output = tokio::process::Command::new("systemctl")
-                .arg(&req.action)
-                .arg(&req.unit)
-                .output()
-                .await;
+            let mut command = tokio::process::Command::new("systemctl");
+            command.args([&req.action, "--", &req.unit]);
+            let output = helm_monitor::process_runner::run_command(
+                command,
+                Default::default(),
+                &Default::default(),
+            )
+            .await;
             match output {
                 Ok(out) => {
                     let ok = out.status.success();
@@ -458,6 +473,15 @@ async fn api_change_rollback(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ChangeRollbackRequest>,
 ) -> impl IntoResponse {
+    match state.policy.check_mutation() {
+        Err(error) => return Json(serde_json::json!({"ok": false, "error": error})),
+        Ok(false) => {
+            return Json(
+                serde_json::json!({"ok": true, "dryRun": true, "changeSetId": req.change_set_id}),
+            );
+        }
+        Ok(true) => {}
+    }
     if state
         .memory
         .active_capability_grant(helm_core::Capability::ShellShell, true)
@@ -471,7 +495,7 @@ async fn api_change_rollback(
             "error": "Missing shell.shell grant. Run `helmops permissions grant shell.shell --scope once` and retry rollback.",
         }));
     }
-    match ops::rollback_change_set(&state.db_path, &req.change_set_id).await {
+    match ops::rollback_change_set(&state.db_path, &req.change_set_id, state.policy).await {
         Ok(results) => {
             let json = collect_live_snapshot(state.as_ref()).await;
             let _ = state.snapshot_tx.send(json);
@@ -1114,7 +1138,74 @@ fn timestamp_to_rfc3339(timestamp: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::DASHBOARD_HTML;
+    use super::*;
+
+    #[tokio::test]
+    async fn web_modes_block_service_and_rollback_before_permission_consumption() {
+        for policy in [
+            helm_monitor::ExecutionPolicy {
+                read_only: true,
+                ..Default::default()
+            },
+            helm_monitor::ExecutionPolicy {
+                dry_run: true,
+                ..Default::default()
+            },
+            helm_monitor::ExecutionPolicy {
+                sandbox_requested: true,
+                ..Default::default()
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("helm.db");
+            let state = Arc::new(WebState {
+                policy,
+                memory: Arc::new(MemoryStore::open(&db_path).await.unwrap()),
+                db_path,
+                snapshot_tx: broadcast::channel(1).0,
+                plan_cache: PlanCache::default(),
+                provider_settings: crate::resolve_provider_settings(
+                    None,
+                    Some(crate::ProviderChoice::Ollama),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+                secrets: SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap(),
+                fleet_cache: Mutex::new(HashMap::new()),
+            });
+            let service = api_service_action(
+                State(state.clone()),
+                Json(ServiceActionRequest {
+                    unit: "helm-test-never-target.service".into(),
+                    action: "stop".into(),
+                }),
+            )
+            .await
+            .into_response();
+            let rollback = api_change_rollback(
+                State(state),
+                Json(ChangeRollbackRequest {
+                    change_set_id: "never-existed".into(),
+                }),
+            )
+            .await
+            .into_response();
+            for response in [service, rollback] {
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if policy.dry_run {
+                    assert_eq!(json["dryRun"], true);
+                } else {
+                    assert_eq!(json["ok"], false);
+                    assert!(!json["error"].as_str().unwrap().contains("grant"));
+                }
+            }
+        }
+    }
 
     #[test]
     fn dashboard_html_exposes_mobile_and_live_console_hooks() {

@@ -390,7 +390,10 @@ impl RemoteEntry {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let output = cmd.output().await.context("spawning ssh shell")?;
+        let output =
+            helm_monitor::process_runner::run_command(cmd, Default::default(), &Default::default())
+                .await
+                .context("spawning ssh shell")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!(
@@ -412,7 +415,16 @@ impl RemoteEntry {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let output = cmd.output().await.context("spawning ssh")?;
+        let output = helm_monitor::process_runner::run_command(
+            cmd,
+            helm_monitor::process_runner::ProcessLimits {
+                timeout: std::time::Duration::from_secs(30),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .await
+        .context("spawning ssh")?;
         Ok(output.status.success())
     }
 
@@ -478,11 +490,16 @@ impl RemoteEntry {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let output_future = cmd.output();
-        let output = tokio::time::timeout(std::time::Duration::from_secs(30), output_future)
-            .await
-            .with_context(|| format!("timeout during {action} from remote host"))?
-            .with_context(|| format!("spawning ssh for {action}"))?;
+        let output = helm_monitor::process_runner::run_command(
+            cmd,
+            helm_monitor::process_runner::ProcessLimits {
+                timeout: std::time::Duration::from_secs(30),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .await
+        .with_context(|| format!("running ssh for {action}"))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

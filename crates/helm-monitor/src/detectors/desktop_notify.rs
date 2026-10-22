@@ -21,18 +21,9 @@ impl Detector for DesktopNotifyDetector {
 
     fn detect(
         &self,
-        snapshot: &SystemSnapshot,
+        _snapshot: &SystemSnapshot,
         _previous: Option<&SystemSnapshot>,
     ) -> Vec<Finding> {
-        // Try to send notifications for critical findings
-        // This is best-effort — failures are silent
-        let _hostname = &snapshot.host.hostname;
-        let _ = std::process::Command::new("which")
-            .arg("notify-send")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
         // Notifications are sent by the engine/router, not here
         // This detector serves as a marker that desktop notifications are configured
         Vec::new()

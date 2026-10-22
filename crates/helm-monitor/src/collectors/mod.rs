@@ -54,25 +54,22 @@ async fn run_timed(
     profile: MonitorProfile,
 ) -> Result<Output, CollectorError> {
     let timeout = profile.per_collector_timeout();
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout),
-        Command::new(program).args(args).output(),
+    let mut command = Command::new(program);
+    command.args(args).stdin(std::process::Stdio::null());
+    crate::process_runner::run_command(
+        command,
+        crate::process_runner::ProcessLimits {
+            timeout: std::time::Duration::from_secs(timeout),
+            ..Default::default()
+        },
+        &Default::default(),
     )
-    .await;
-
-    match output {
-        Ok(Ok(out)) => Ok(out),
-        Ok(Err(e)) => Err(CollectorError {
-            domain: String::new(),
-            message: format!("{program}: {e}"),
-            is_timeout: false,
-        }),
-        Err(_elapsed) => Err(CollectorError {
-            domain: String::new(),
-            message: format!("{program} timed out after {timeout}s"),
-            is_timeout: true,
-        }),
-    }
+    .await
+    .map_err(|error| CollectorError {
+        domain: String::new(),
+        message: format!("{program}: {error}"),
+        is_timeout: error.timed_out,
+    })
 }
 
 /// Read `/proc` file contents, respecting the profile timeout.
@@ -87,11 +84,14 @@ async fn read_proc(path: &str, timeout_secs: Seconds) -> Result<String, std::io:
 
 /// Check if a binary is available on PATH.
 fn bin_exists(name: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(name)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|directory| {
+            std::fs::metadata(directory.join(name)).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+    })
 }
 
 /// Make a CollectorError for a given domain.
@@ -109,5 +109,14 @@ fn timeout_err(domain: &str, msg: impl Into<String>) -> CollectorError {
         domain: domain.to_string(),
         message: msg.into(),
         is_timeout: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn binary_lookup_does_not_need_a_subprocess() {
+        assert!(super::bin_exists("sh"));
+        assert!(!super::bin_exists("helm-binary-that-does-not-exist-293057"));
     }
 }

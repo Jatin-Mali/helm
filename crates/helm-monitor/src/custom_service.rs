@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{net::TcpStream, process::Command, time::timeout};
+use tokio::{net::TcpStream, time::timeout};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -504,14 +504,12 @@ async fn check_service_health(service: &RegisteredService) -> HealthCheckOutcome
         ServiceType::DockerContainer { name_or_label } => {
             let output = timeout(
                 Duration::from_secs(HEALTH_TIMEOUT_SECS),
-                Command::new("docker")
-                    .args([
+                crate::process_runner::run_program("docker", &[
                         "inspect",
                         "--format",
                         "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}",
                         name_or_label,
-                    ])
-                    .output(),
+                    ], Duration::from_secs(HEALTH_TIMEOUT_SECS)),
             )
             .await;
             match output {
@@ -563,10 +561,15 @@ async fn check_service_health(service: &RegisteredService) -> HealthCheckOutcome
         ServiceType::Kubernetes { kubeconfig_path } => {
             let output = timeout(
                 Duration::from_secs(HEALTH_TIMEOUT_SECS),
-                Command::new("kubectl")
-                    .args(["cluster-info", "--kubeconfig"])
-                    .arg(kubeconfig_path)
-                    .output(),
+                crate::process_runner::run_program(
+                    "kubectl",
+                    &[
+                        std::ffi::OsStr::new("cluster-info"),
+                        std::ffi::OsStr::new("--kubeconfig"),
+                        kubeconfig_path.as_os_str(),
+                    ],
+                    Duration::from_secs(HEALTH_TIMEOUT_SECS),
+                ),
             )
             .await;
             match output {

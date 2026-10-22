@@ -65,11 +65,28 @@ impl Default for AlertingEngine {
     }
 }
 
+async fn collect_with_deadline<T>(
+    domain: &str,
+    timeout: std::time::Duration,
+    work: impl std::future::Future<Output = Result<T, CollectorError>>,
+) -> Result<T, CollectorError> {
+    tokio::time::timeout(timeout, work)
+        .await
+        .unwrap_or_else(|_| {
+            Err(CollectorError {
+                domain: domain.into(),
+                message: format!("{domain}: collector deadline exceeded"),
+                is_timeout: true,
+            })
+        })
+}
+
 pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
     let id = Uuid::new_v4().to_string();
     let mut errors: Vec<CollectorError> = Vec::new();
 
-    // Run all collectors concurrently via tokio::join!
+    let deadline = std::time::Duration::from_secs(profile.per_collector_timeout());
+    // Run all collectors concurrently, each with a total deadline.
     let (
         host_result,
         load_result,
@@ -90,24 +107,28 @@ pub async fn collect_snapshot(profile: MonitorProfile) -> SystemSnapshot {
         certs_result,
         pipelines_result,
     ) = tokio::join!(
-        HostCollector.collect(profile),
-        LoadCollector.collect(profile),
-        DisksCollector.collect(profile),
-        ServicesCollector.collect(profile),
-        ContainersCollector.collect(profile),
-        PortsCollector.collect(profile),
-        LogsCollector.collect(profile),
-        BackupsCollector.collect(profile),
-        PackagesCollector.collect(profile),
-        TimersCollector.collect(profile),
-        NetworkCollector.collect(profile),
-        ProcessCollector.collect(profile),
-        FirewallCollector.collect(profile),
-        KubernetesCollector.collect(profile),
-        LibvirtCollector.collect(profile),
-        ComposeCollector.collect(profile),
-        CertsCollector.collect(profile),
-        PipelineCollector::collect_default(profile),
+        collect_with_deadline("host", deadline, HostCollector.collect(profile)),
+        collect_with_deadline("load", deadline, LoadCollector.collect(profile)),
+        collect_with_deadline("disks", deadline, DisksCollector.collect(profile)),
+        collect_with_deadline("services", deadline, ServicesCollector.collect(profile)),
+        collect_with_deadline("containers", deadline, ContainersCollector.collect(profile)),
+        collect_with_deadline("ports", deadline, PortsCollector.collect(profile)),
+        collect_with_deadline("logs", deadline, LogsCollector.collect(profile)),
+        collect_with_deadline("backups", deadline, BackupsCollector.collect(profile)),
+        collect_with_deadline("packages", deadline, PackagesCollector.collect(profile)),
+        collect_with_deadline("timers", deadline, TimersCollector.collect(profile)),
+        collect_with_deadline("network", deadline, NetworkCollector.collect(profile)),
+        collect_with_deadline("processes", deadline, ProcessCollector.collect(profile)),
+        collect_with_deadline("firewall", deadline, FirewallCollector.collect(profile)),
+        collect_with_deadline("kubernetes", deadline, KubernetesCollector.collect(profile)),
+        collect_with_deadline("libvirt", deadline, LibvirtCollector.collect(profile)),
+        collect_with_deadline("compose", deadline, ComposeCollector.collect(profile)),
+        collect_with_deadline("certs", deadline, CertsCollector.collect(profile)),
+        collect_with_deadline(
+            "pipelines",
+            deadline,
+            PipelineCollector::collect_default(profile)
+        ),
     );
 
     let host_identity = unwrap_or_default(host_result, "host", &mut errors);
@@ -181,6 +202,19 @@ fn unwrap_or_default<T: Default>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn total_collector_deadline_is_enforced() {
+        let error = super::collect_with_deadline(
+            "fixture",
+            std::time::Duration::ZERO,
+            std::future::pending::<Result<(), crate::CollectorError>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_timeout);
+        assert_eq!(error.domain, "fixture");
+    }
+
     use super::*;
     use crate::{
         alerting::{AlertConfig, AlertPayload, AlertRouter, AlertSink, SendFuture},

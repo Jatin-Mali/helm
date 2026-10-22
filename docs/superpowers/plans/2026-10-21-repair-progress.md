@@ -27,6 +27,16 @@ Ruling: bind step occurrence to the full immutable plan SHA-256 and its ordinal,
 
 Verification: cargo test --workspace --all-targets PASS (742 passing executions, 2 ignored); strict workspace all-target Clippy PASS. Added changed-review/consumed-approval regression separately PASS after the full run. TUI regression covers deny/approve, deny/approve-remaining, and approve/deny with positive and negative marker assertions. F14 deterministic boundary regression is green in the full run.
 
-## Task 3 — starting
+## Task 3 — complete
 
 Scope: shared bounded subprocess runner, cancellation, enforce execution modes across CLI/TUI/web/rollback and remote mutation entry points. No production-readiness claim yet.
+
+Cancellation regression reproduced a child surviving task abort, then passed after process-group cleanup. Shared runner now handles wall timeout, bounded output, partial diagnostics, cooperative cancellation, aborted futures and SSH/bootstrap/collector callers. CLI Ctrl+C drops active work; TUI pending apply has a cancellation guard. TUI previously discarded runtime policy flags; inner runtime now preserves policy. Rendering no longer launches journalctl. Collector total deadlines added; standalone process wrappers use the bounded runner.
+Ruling: reject requested sandbox execution before launching host work until all operations can honor a real sandbox — follows spec fail-closed requirement; cost is sandbox functionality remains unavailable, rather than falsely claiming containment.
+Limit: process-group cleanup covers ordinary descendants; malicious programs can escape groups. This is lifecycle control, not a substitute for an OS sandbox/cgroup security boundary. Read-only/dry-run guard target operations; application state/logging can still be written.
+
+Verification: workspace all-target tests PASS (760 passing executions, 2 ignored), including policy guards in CLI dispatch/TUI/web/rollback, timeout/output/cancellation tests and journal boundary regression. Standalone CLI integration additionally PASS: restricted bootstrap/agent-install and requested sandbox launch no ssh/scp/bwrap. Strict Clippy and optional otel compile PASS; formatting PASS. A test run initially reproduced a stack overflow from large composed async state; boxing the runner fixed it, with a future-size regression and green full suite. Interactive editor and deliberate daemon launch remain separate lifecycle operations; target mutations use the shared policy.
+
+## Task 4 — starting
+
+Next: durable preparation before mutation, real encrypted backups with original file state, truthful rollback/partial failure, restart recovery and failure-injection tests. Existing rollback remains unsafe until this task is verified; no release readiness claim.

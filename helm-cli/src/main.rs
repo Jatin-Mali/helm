@@ -935,7 +935,11 @@ impl ProviderSettings {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run().await {
+    let result = tokio::select! {
+        result = run() => result,
+        _ = tokio::signal::ctrl_c() => Err(anyhow!("cancelled by user")),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let rendered = format!("{error:#}");
@@ -956,6 +960,11 @@ fn apply_sandbox(
     enabled: bool,
     sandbox_dir: Option<&PathBuf>,
 ) -> Result<Option<sandbox::ResolvedSandbox>> {
+    if enabled {
+        return Err(anyhow!(
+            "sandboxed operations are unavailable; refusing host execution"
+        ));
+    }
     let resolved = sandbox::resolve(enabled, sandbox_dir)?;
     if let Some(policy) = &resolved {
         eprintln!(
@@ -977,6 +986,11 @@ pub(crate) fn wrap_for_remote(task: &str, remote: Option<&String>) -> String {
 
 async fn run() -> Result<()> {
     let cli = parse_cli_from(env::args_os())?;
+    let policy = helm_monitor::ExecutionPolicy {
+        read_only: cli.read_only,
+        dry_run: cli.dry_run,
+        sandbox_requested: cli.sandbox,
+    };
     let sandbox = apply_sandbox(cli.sandbox, cli.sandbox_dir.as_ref())?;
     let tui_log_path = if matches!(cli.command, Some(Command::Tui(_))) || cli.command.is_none() {
         Some(default_log_path()?)
@@ -1143,6 +1157,7 @@ async fn run() -> Result<()> {
                     .unwrap_or(true),
                 auto_approve: cli.yes,
                 read_only: cli.read_only,
+                dry_run: cli.dry_run,
                 diagnose_mode: false,
                 dashboard_mode,
                 sandbox: sandbox.clone(),
@@ -1155,10 +1170,20 @@ async fn run() -> Result<()> {
             run_remote_command(args).await?;
         }
         Command::Agent(args) => {
+            if matches!(&args.command, AgentCommand::Install(_))
+                && !policy.check_mutation().map_err(anyhow::Error::msg)?
+            {
+                println!("Dry run: remote installation would run; no actions executed.");
+                return Ok(());
+            }
             run_agent_command(args).await?;
         }
         // stripped: Command::Serve
         Command::Bootstrap(args) => {
+            if !policy.check_mutation().map_err(anyhow::Error::msg)? {
+                println!("Dry run: remote bootstrap would run; no actions executed.");
+                return Ok(());
+            }
             run_bootstrap_command(args).await?;
         }
         Command::TrustReport(args) => {
@@ -1177,6 +1202,7 @@ async fn run() -> Result<()> {
                 9120,
                 provider_settings.clone(),
                 secrets_store.clone(),
+                policy,
             )
             .await?;
         }
@@ -1190,7 +1216,7 @@ async fn run() -> Result<()> {
             .await?;
         }
         Command::Incident(args) => {
-            run_incident_command(args).await?;
+            run_incident_command(args, policy).await?;
         }
         Command::Snapshot(args) => {
             run_collect_snapshot_command(args).await?;
@@ -1205,10 +1231,10 @@ async fn run() -> Result<()> {
             run_explain_command(args).await?;
         }
         Command::ApplyPlan(args) => {
-            run_apply_plan_command(args).await?;
+            run_apply_plan_command(args, policy).await?;
         }
         Command::ChangeSet(args) => {
-            run_change_set_command(args).await?;
+            run_change_set_command(args, policy).await?;
         }
         Command::Backup(args) => {
             run_backup_command(args).await?;
@@ -1225,6 +1251,7 @@ async fn run() -> Result<()> {
                 args.port,
                 provider_settings.clone(),
                 secrets_store.clone(),
+                policy,
             )
             .await?;
         }
@@ -4648,7 +4675,10 @@ async fn run_single_collection_cycle(
     })
 }
 
-async fn run_incident_command(args: IncidentArgs) -> Result<()> {
+async fn run_incident_command(
+    args: IncidentArgs,
+    policy: helm_monitor::ExecutionPolicy,
+) -> Result<()> {
     match args.command {
         IncidentCommand::Show { id } => {
             run_explain_command(ExplainArgs {
@@ -4722,8 +4752,12 @@ async fn run_incident_command(args: IncidentArgs) -> Result<()> {
                     anyhow!("no persisted plan found for finding '{id_or_plan_id}'")
                 })?
             };
-            let _ = run_apply_plan_command_at_path(db_path, ApplyPlanArgs { plan_id, yes, json })
-                .await?;
+            let _ = run_apply_plan_command_at_path(
+                db_path,
+                ApplyPlanArgs { plan_id, yes, json },
+                policy,
+            )
+            .await?;
             Ok(())
         }
     }
@@ -5986,14 +6020,21 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-async fn run_apply_plan_command(args: ApplyPlanArgs) -> Result<()> {
+async fn run_apply_plan_command(
+    args: ApplyPlanArgs,
+    policy: helm_monitor::ExecutionPolicy,
+) -> Result<()> {
     let db_path = default_db_path()?;
-    let _ = run_apply_plan_command_at_path(db_path, args).await?;
+    let _ = run_apply_plan_command_at_path(db_path, args, policy).await?;
     Ok(())
 }
 
-async fn run_apply_plan_command_at_path(db_path: PathBuf, args: ApplyPlanArgs) -> Result<String> {
-    run_approved_plan_command_at_path(db_path, args, None).await
+async fn run_apply_plan_command_at_path(
+    db_path: PathBuf,
+    args: ApplyPlanArgs,
+    policy: helm_monitor::ExecutionPolicy,
+) -> Result<String> {
+    run_approved_plan_command_at_path(db_path, args, None, policy, Default::default()).await
 }
 
 fn executable_plan(
@@ -6028,6 +6069,8 @@ async fn run_approved_plan_command_at_path(
     db_path: PathBuf,
     args: ApplyPlanArgs,
     supplied_approvals: Option<helm_monitor::PlanApprovals>,
+    policy: helm_monitor::ExecutionPolicy,
+    cancellation: helm_monitor::process_runner::CancellationToken,
 ) -> Result<String> {
     let conn = rusqlite::Connection::open(&db_path)
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
@@ -6043,6 +6086,10 @@ async fn run_approved_plan_command_at_path(
         })?;
 
     let plan = executable_plan(&plan_record)?;
+    if !policy.check_mutation().map_err(anyhow::Error::msg)? {
+        println!("{}", plan.render_text());
+        return Ok("Dry run: no actions executed or change set created.".into());
+    }
     if supplied_approvals
         .as_ref()
         .is_some_and(|review| !review.matches(&plan))
@@ -6155,7 +6202,9 @@ async fn run_approved_plan_command_at_path(
     }
 
     // Execute
-    let mut engine = ExecutionEngine::with_approvals(approvals);
+    let mut engine = ExecutionEngine::with_approvals(approvals)
+        .with_policy(policy)
+        .with_cancellation(cancellation);
     let change_set = engine.execute(&plan).await;
 
     // ── Audit: per-step command + output + verification ────────────────
@@ -6231,7 +6280,10 @@ async fn run_approved_plan_command_at_path(
     ))
 }
 
-async fn run_change_set_command(args: ChangeSetArgs) -> Result<()> {
+async fn run_change_set_command(
+    args: ChangeSetArgs,
+    policy: helm_monitor::ExecutionPolicy,
+) -> Result<()> {
     let db_path = default_db_path()?;
     let conn = rusqlite::Connection::open(&db_path)
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
@@ -6321,7 +6373,7 @@ async fn run_change_set_command(args: ChangeSetArgs) -> Result<()> {
                 }
             }
 
-            let results = ops::rollback_change_set(&db_path, &id).await?;
+            let results = ops::rollback_change_set(&db_path, &id, policy).await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
