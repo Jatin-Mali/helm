@@ -72,13 +72,37 @@ pub struct ChangeSetStep {
 }
 
 /// Pre-change backup of a file before mutation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreChangeBackup {
     pub id: String,
     pub file_path: String,
     pub checksum_before: String,
+    #[serde(skip)]
     pub backup_content: String,
     pub restored: bool,
+}
+
+impl std::fmt::Debug for PreChangeBackup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreChangeBackup")
+            .field("id", &self.id)
+            .field("backup_content", &"[sensitive recovery data]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Persistence adapters must commit preparation before this engine performs a mutation.
+pub trait ExecutionJournal: Send + Sync {
+    fn start(&self, change: &ChangeSet, before: &SystemSnapshot) -> Result<(), String>;
+    fn prepare(
+        &self,
+        change_id: &str,
+        step: &ChangeSetStep,
+        backup: Option<&PreChangeBackup>,
+    ) -> Result<(), String>;
+    fn record_step(&self, step: &ChangeSetStep) -> Result<(), String>;
+    fn finish(&self, change: &ChangeSet, after: &SystemSnapshot) -> Result<(), String>;
 }
 
 /// Complete change set for an approved plan execution.
@@ -262,6 +286,7 @@ pub struct ExecutionEngine {
     policy: crate::ExecutionPolicy,
     limits: crate::process_runner::ProcessLimits,
     cancellation: crate::process_runner::CancellationToken,
+    journal: Option<std::sync::Arc<dyn ExecutionJournal>>,
     before_snapshot: Option<SystemSnapshot>,
     after_snapshot: Option<SystemSnapshot>,
     /// HMAC-chained audit log of every executed step.
@@ -270,6 +295,7 @@ pub struct ExecutionEngine {
 
 impl ExecutionEngine {
     /// Create with an approval callback. Return `true` to proceed, `false` to deny.
+    /// Attach `with_journal` for durable recovery; otherwise evidence exists only in memory.
     pub fn new(approve_fn: Box<dyn Fn(&CommandPreview) -> bool + Send + Sync>) -> Self {
         Self {
             approve_fn,
@@ -277,6 +303,7 @@ impl ExecutionEngine {
             policy: crate::ExecutionPolicy::default(),
             limits: crate::process_runner::ProcessLimits::default(),
             cancellation: crate::process_runner::CancellationToken::default(),
+            journal: None,
             before_snapshot: None,
             after_snapshot: None,
             audit_chain: Vec::new(),
@@ -291,6 +318,11 @@ impl ExecutionEngine {
 
     pub fn with_policy(mut self, policy: crate::ExecutionPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    pub fn with_journal(mut self, journal: std::sync::Arc<dyn ExecutionJournal>) -> Self {
+        self.journal = Some(journal);
         self
     }
 
@@ -336,12 +368,36 @@ impl ExecutionEngine {
         let mut results = Vec::new();
         let mut all_passed = true;
         for v in &preview.verification {
-            let v_outcome = self.execute_preview(v).await;
-            let output_line = v_outcome.output.lines().next().unwrap_or("").to_string();
+            let checked = async {
+                let text = v.command_text.as_deref().ok_or("verification command missing")?;
+                if v.tool != "shell" || text.contains([';', '|', '&', '<', '>', '$', '`', '\n', '\r', '\'', '"', '\\']) {
+                    return Err("verification requires a simple read-only command without shell syntax".to_string());
+                }
+                let args: Vec<_> = text.split_whitespace().collect();
+                let allowed = matches!(args.first().copied(), Some("printf" | "echo" | "test" | "cat" | "stat" | "ls" | "df" | "du" | "head" | "tail" | "grep"))
+                    || (args.first() == Some(&"systemctl") && matches!(args.get(1).copied(), Some("is-active" | "is-enabled" | "status" | "show")));
+                if !allowed || args.iter().any(|arg| helm_core::is_protected_local_path(std::path::Path::new(arg.rsplit('=').next().unwrap_or(arg)))) {
+                    return Err("unsupported or protected verification command; use an explicit reviewed plan step".to_string());
+                }
+                // Verification runs literal argv; it never receives shell mutation authority.
+                let mut command = tokio::process::Command::new(args[0]);
+                command.args(&args[1..]).env("SYSTEMD_PAGER", "").stdin(std::process::Stdio::null());
+                crate::process_runner::run_command(command, self.limits, &self.cancellation)
+                    .await.map_err(|error| error.to_string())
+            }.await;
+            let (success, output, error) = match checked {
+                Ok(out) => (
+                    out.status.success(),
+                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                ),
+                Err(error) => (false, String::new(), error),
+            };
+            let output_line = output.lines().next().unwrap_or("").to_string();
             let passed = if let Some(expected) = expected_output {
-                v_outcome.output.contains(expected) && v_outcome.success
+                output.contains(expected) && success
             } else {
-                v_outcome.success
+                success
             };
             all_passed &= passed;
             let v_text = if passed {
@@ -350,7 +406,7 @@ impl ExecutionEngine {
                 format!(
                     "failed: expected {:?}; output: {output_line}; {}",
                     expected_output,
-                    v_outcome.error.lines().next().unwrap_or("")
+                    error.lines().next().unwrap_or("")
                 )
             };
             results.push(v_text);
@@ -388,6 +444,18 @@ impl ExecutionEngine {
         self.before_snapshot = Some(before);
 
         let mut cs = ChangeSet::new(plan, before_id);
+        if let Some(journal) = &self.journal {
+            if let Err(error) = journal.start(
+                &cs,
+                self.before_snapshot
+                    .as_ref()
+                    .expect("before snapshot captured"),
+            ) {
+                cs.status = ChangeSetStatus::Failed;
+                cs.summary = format!("durable preparation failed; no actions executed: {error}");
+                return cs;
+            }
+        }
 
         // 2. Execute each fix step (zipped with plan steps for expected_output access)
         // halt_on_failure: once a step fails, remaining steps are not executed.
@@ -441,7 +509,26 @@ impl ExecutionEngine {
             }
 
             // 2c. Run the step
-            let outcome = self.execute_preview(preview).await;
+            let backup = match crate::file_change::prepare_file_change(preview) {
+                Ok(backup) => backup,
+                Err(error) => {
+                    step.status = StepStatus::Failed;
+                    step.error_text = error;
+                    halt = true;
+                    continue;
+                }
+            };
+            step.started_at = Some(chrono::Utc::now().timestamp());
+            step.status = StepStatus::Running;
+            if let Some(journal) = &self.journal {
+                if let Err(error) = journal.prepare(&cs.id, step, backup.as_ref()) {
+                    step.status = StepStatus::Failed;
+                    step.error_text = format!("durable step preparation failed: {error}");
+                    halt = true;
+                    continue;
+                }
+            }
+            let outcome = self.execute_preview(preview, backup.as_ref()).await;
             step.status = if outcome.success {
                 StepStatus::Succeeded
             } else {
@@ -469,11 +556,17 @@ impl ExecutionEngine {
             };
 
             // 2e. Collect backups from step outcome
-            cs.backups.extend(outcome.backups);
+            cs.backups.extend(backup);
 
             let now = chrono::Utc::now().timestamp();
-            step.started_at = Some(now);
             step.completed_at = Some(now);
+            if let Some(journal) = &self.journal {
+                if let Err(error) = journal.record_step(step) {
+                    step.status = StepStatus::Failed;
+                    step.error_text
+                        .push_str(&format!("; cannot persist outcome: {error}"));
+                }
+            }
 
             // 2f. Append to HMAC audit chain.
             let prev_hash = self
@@ -539,13 +632,31 @@ impl ExecutionEngine {
             ChangeSetStatus::Completed
         };
         cs.completed_at = Some(chrono::Utc::now().timestamp());
+        if let Some(journal) = &self.journal {
+            if let Err(error) = journal.finish(
+                &cs,
+                self.after_snapshot
+                    .as_ref()
+                    .expect("after snapshot captured"),
+            ) {
+                cs.status = ChangeSetStatus::Failed;
+                cs.summary.push_str(&format!(
+                    "\nCannot persist final outcome; inspect change {} before retrying: {error}",
+                    cs.id
+                ));
+            }
+        }
 
         cs
     }
 
     /// Execute a single command preview and capture outcome.
     /// This delegates to the real shell/fs tools.
-    async fn execute_preview(&self, preview: &CommandPreview) -> StepOutcome {
+    async fn execute_preview(
+        &self,
+        preview: &CommandPreview,
+        backup: Option<&PreChangeBackup>,
+    ) -> StepOutcome {
         match preview.tool.as_str() {
             "shell" | "bash" | "sh" | "cmd" => {
                 let cmd = preview.command_text.as_deref().unwrap_or("");
@@ -599,63 +710,36 @@ impl ExecutionEngine {
                 }
             }
             "fs_write" | "write" => {
-                // File write: backup before if it exists
-                let path = preview
-                    .input
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let content = preview
-                    .input
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if path.is_empty() {
-                    return StepOutcome {
-                        success: false,
-                        output: String::new(),
-                        error: "No path in preview input".into(),
-                        changed_files: vec![],
-                        verification_ok: false,
-                        verification_output: "no path specified".into(),
-                        backups: vec![],
-                    };
-                }
-                if std::path::Path::new(path).exists() {
-                    if let Ok(orig) = std::fs::read_to_string(path) {
-                        let _checksum = hex::encode(Sha256::digest(orig.as_bytes()));
-                        let backup_path = format!(
-                            "/tmp/helm-backup-{}-{}",
-                            path.replace('/', "_"),
-                            Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
-                        );
-                        let _ = std::fs::write(&backup_path, &orig);
+                let result: Result<&PreChangeBackup, String> = (|| {
+                    let backup = backup.ok_or("file writes require prepared recovery data")?;
+                    if self.cancellation.is_cancelled() {
+                        return Err("cancelled before file mutation".into());
                     }
-                }
-                // Write new content
-                match std::fs::write(path, content) {
-                    Ok(()) => StepOutcome {
+                    let content = preview
+                        .input
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .ok_or("file content required")?;
+                    crate::file_change::apply_file_change(backup, content)?;
+                    Ok(backup)
+                })();
+                match result {
+                    Ok(backup) => StepOutcome {
                         success: true,
-                        output: format!("wrote {} bytes to {}", content.len(), path),
+                        output: format!("wrote {}", backup.file_path),
                         error: String::new(),
-                        changed_files: vec![path.to_string()],
+                        changed_files: vec![backup.file_path.clone()],
                         verification_ok: true,
-                        verification_output: format!("file {} written", path),
-                        backups: vec![PreChangeBackup {
-                            id: Uuid::new_v4().to_string(),
-                            file_path: path.to_string(),
-                            checksum_before: String::new(),
-                            backup_content: String::new(),
-                            restored: false,
-                        }],
+                        verification_output: "file written atomically".into(),
+                        backups: vec![backup.clone()],
                     },
-                    Err(e) => StepOutcome {
+                    Err(error) => StepOutcome {
                         success: false,
                         output: String::new(),
-                        error: format!("write error: {e}"),
+                        error: error.clone(),
                         changed_files: vec![],
                         verification_ok: false,
-                        verification_output: format!("write error: {e}"),
+                        verification_output: error,
                         backups: vec![],
                     },
                 }

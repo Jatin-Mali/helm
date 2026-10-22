@@ -9,6 +9,7 @@ pub mod detectors;
 pub mod engine;
 pub mod execute;
 pub mod execution_policy;
+pub mod file_change;
 pub mod findings;
 pub mod log_analysis;
 pub mod metric_history;

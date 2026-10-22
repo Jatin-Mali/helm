@@ -495,7 +495,14 @@ async fn api_change_rollback(
             "error": "Missing shell.shell grant. Run `helmops permissions grant shell.shell --scope once` and retry rollback.",
         }));
     }
-    match ops::rollback_change_set(&state.db_path, &req.change_set_id, state.policy).await {
+    match ops::rollback_change_set(
+        &state.db_path,
+        &req.change_set_id,
+        state.policy,
+        &state.secrets,
+    )
+    .await
+    {
         Ok(results) => {
             let json = collect_live_snapshot(state.as_ref()).await;
             let _ = state.snapshot_tx.send(json);

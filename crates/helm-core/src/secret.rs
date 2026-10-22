@@ -2,6 +2,42 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Protected HELM state, including canonical aliases, must not be read or overwritten by tools.
+pub fn is_protected_local_path(path: &std::path::Path) -> bool {
+    use std::path::PathBuf;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("helm");
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"))
+        .join("helm");
+    let resolve = |value: &std::path::Path| {
+        value.canonicalize().unwrap_or_else(|_| {
+            let parent = value.parent().unwrap_or(std::path::Path::new("."));
+            let parent = parent
+                .canonicalize()
+                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(parent));
+            parent.join(value.file_name().unwrap_or_default())
+        })
+    };
+    let candidate = resolve(path);
+    [
+        config.join("secrets.toml"),
+        config.join(".secrets.toml.lock"),
+        data.join("helm.db"),
+        data.join("helm.db-wal"),
+        data.join("helm.db-shm"),
+    ]
+    .iter()
+    .any(|protected| candidate == resolve(protected))
+        || candidate.starts_with(resolve(&data.join("logs")))
+}
+
 /// Secrets rotation policy configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotationPolicy {

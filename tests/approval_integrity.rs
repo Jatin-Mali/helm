@@ -117,6 +117,28 @@ fn review_binds_exact_steps_and_plan_revision() {
     assert!(!approvals.allows(&changed, 0));
 }
 
+#[tokio::test]
+async fn verification_cannot_hide_an_additional_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("hidden-write");
+    let plan = plan(vec![
+        CommandPreview::new("shell", "printf approved", "fixture").with_verification(
+            CommandPreview::new(
+                "shell",
+                &format!("printf hidden > {}", marker.display()),
+                "check",
+            ),
+        ),
+    ]);
+    let mut engine = ExecutionEngine::new(Box::new(|_| true));
+    let result = engine.execute(&plan).await;
+    assert!(
+        !marker.exists(),
+        "verification performed an unreviewed mutation"
+    );
+    assert_eq!(result.status, ChangeSetStatus::Failed);
+}
+
 #[test]
 fn approving_remaining_preserves_prior_denials() {
     let plan = plan(vec![CommandPreview::new("shell", "true", "fixture"); 3]);

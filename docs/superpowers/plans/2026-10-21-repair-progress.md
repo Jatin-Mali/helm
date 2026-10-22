@@ -37,6 +37,22 @@ Limit: process-group cleanup covers ordinary descendants; malicious programs can
 
 Verification: workspace all-target tests PASS (760 passing executions, 2 ignored), including policy guards in CLI dispatch/TUI/web/rollback, timeout/output/cancellation tests and journal boundary regression. Standalone CLI integration additionally PASS: restricted bootstrap/agent-install and requested sandbox launch no ssh/scp/bwrap. Strict Clippy and optional otel compile PASS; formatting PASS. A test run initially reproduced a stack overflow from large composed async state; boxing the runner fixed it, with a future-size regression and green full suite. Interactive editor and deliberate daemon launch remain separate lifecycle operations; target mutations use the shared policy.
 
-## Task 4 — starting
+## Task 4 — complete
 
 Next: durable preparation before mutation, real encrypted backups with original file state, truthful rollback/partial failure, restart recovery and failure-injection tests. Existing rollback remains unsafe until this task is verified; no release readiness claim.
+
+DurableJournal now commits pending steps and pre-change snapshot before execution, then encrypted file recovery material plus running status before mutation. Production CLI/TUI execution always attaches the journal. Database preparation failure prevents mutation; outcome failures retain recoverable interrupted evidence. A per-database process lock prevents concurrent executors. Existing free-text status columns and backup body support this additively without a SQL migration; the encrypted envelope is versioned.
+
+Recovery preserves binary bytes, owner/group, mode and prior existence; uses sibling temporary files, atomic rename and fsync. AES-256-GCM backups bind change/step/backup/path/checksum metadata; the key is created atomically only in the designated secrets store. Missing keys and authentication failures stop restoration. Link targets, special files, extended attributes/ACLs, set-id files and files over 8 MiB are rejected rather than silently losing metadata. Active database and secret-store paths are protected.
+
+Rollback restores only supported persisted file operations in reverse order, verifies results and reports partial failures. Arbitrary shell reversal was removed; unbacked operations require manual recovery. Already-restored backups are skipped on retry. Restart reconciliation marks unfinished work interrupted and never replays it automatically. Low-level library callers without a journal have memory-only evidence, explicitly documented; production entry points attach it.
+
+An additional regression reproduced hidden mutation through verification commands. Verification now accepts bounded literal argv for a small read-only command set and rejects shell syntax/unsupported commands. General command previews default to unsupported rollback.
+
+Verification: workspace all-target tests PASS (785 passing executions, 2 ignored); strict workspace all-target Clippy PASS after a type-alias lint repair; formatting PASS; optional otel build PASS. Failure-injection tests cover initial DB and backup persistence failure, final execution-status failure followed by restart restoration, final rollback-status failure followed by safe retry, tampered backup, missing key, newer user edits, repeated writes to one file, newly created files, binary contents, permissions and mixed shell/file partial rollback. Concurrent key creation returns one consistent key. Tests use temporary stores and harmless commands; real process-kill/power-loss and VM testing remain Task 14.
+
+Limit: file comparison and rename do not provide a filesystem transaction against concurrent external writers or hostile directory replacement. Do not claim universal rollback or sandbox containment. Fork-identity grep found only the existing verification command quoted in PRD/TRD/ROADMAP.
+
+## Task 5 — starting
+
+Next: preserve collector failure/coverage and prevent false incident self-resolution. Database/web configured collector coverage remains to implement.

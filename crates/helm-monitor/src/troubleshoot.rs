@@ -113,7 +113,7 @@ impl CommandPreview {
             expected_effect: expected_effect.into(),
             risk: RiskLevel::Low,
             blast_radius: BlastRadius::Unknown,
-            rollback: RollbackStatus::NotNeeded,
+            rollback: RollbackStatus::Unsupported,
             verification: Vec::new(),
         }
     }

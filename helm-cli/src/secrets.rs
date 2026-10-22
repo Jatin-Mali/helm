@@ -93,6 +93,18 @@ impl SecretsStore {
         self.save_atomic(&file)
     }
 
+    pub fn get_or_insert(&self, name: &str, candidate: Secret) -> Result<Secret, SecretsError> {
+        self.ensure_parent_secure()?;
+        let _lock = self.lock_exclusive()?;
+        let mut data = self.load()?;
+        if let Some(value) = data.get(name) {
+            return Ok(Secret::new(value.clone()));
+        }
+        data.insert(name.to_owned(), candidate.expose().to_owned());
+        self.save_atomic(&data)?;
+        Ok(candidate)
+    }
+
     /// Removes `name` from the store and returns whether a value was deleted.
     pub fn delete(&self, name: &str) -> Result<bool, SecretsError> {
         self.ensure_parent_secure()?;
@@ -143,11 +155,21 @@ impl SecretsStore {
             path: tmp.path().to_owned(),
             source: e,
         })?;
+        file.sync_all().map_err(|e| SecretsError::Io {
+            path: tmp.path().to_owned(),
+            source: e,
+        })?;
 
         tmp.persist(&self.path).map_err(|e| SecretsError::Io {
             path: self.path.clone(),
             source: e.error,
         })?;
+        File::open(dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| SecretsError::Io {
+                path: dir.to_owned(),
+                source: e,
+            })?;
         Ok(())
     }
 
@@ -330,6 +352,38 @@ mod tests {
 
     fn store_in(dir: &TempDir) -> SecretsStore {
         SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap()
+    }
+
+    #[test]
+    fn get_or_insert_is_atomic_across_concurrent_creators() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(store_in(&dir));
+        let values = std::thread::scope(|scope| {
+            let tasks = (0..8)
+                .map(|index| {
+                    let store = store.clone();
+                    scope.spawn(move || {
+                        store
+                            .get_or_insert(
+                                "RECOVERY_TEST_KEY",
+                                Secret::new(format!("candidate-{index}")),
+                            )
+                            .unwrap()
+                            .expose()
+                            .to_owned()
+                    })
+                })
+                .collect::<Vec<_>>();
+            tasks
+                .into_iter()
+                .map(|task| task.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(values.iter().all(|value| value == &values[0]));
+        assert_eq!(
+            store.get("RECOVERY_TEST_KEY").unwrap().unwrap().expose(),
+            values[0]
+        );
     }
 
     #[test]

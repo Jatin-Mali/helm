@@ -5192,6 +5192,7 @@ Report the exit status and the concise output."
     ) {
         let db_path = self.runtime.db_path.clone();
         let policy = self.execution_policy();
+        let secrets = self.runtime.secrets.clone();
         let cancellation = helm_monitor::process_runner::CancellationToken::default();
         self.pending_apply_cancel = Some(CancelApplyOnDrop(cancellation.clone()));
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
@@ -5210,6 +5211,7 @@ Report the exit status and the concise output."
                     Some(approvals),
                     policy,
                     cancellation,
+                    secrets,
                 )
                 .await
                 .map_err(|error| error.to_string());
@@ -5944,6 +5946,7 @@ Report the exit status and the concise output."
             &self.runtime.db_path,
             &change.id,
             self.execution_policy(),
+            &self.runtime.secrets,
         )
         .await?;
         self.write_dashboard_event(
@@ -14188,6 +14191,7 @@ mod tests {
                     json: false,
                 },
                 policy,
+                app.runtime.secrets.clone(),
             ));
             if policy.dry_run {
                 assert!(result.unwrap().contains("Dry run"));
@@ -14210,6 +14214,53 @@ mod tests {
         assert!(!token.is_cancelled());
         drop(guard);
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn recovery_database_failure_prevents_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+        let marker = dir.path().join("must-not-exist");
+        let mut command = helm_monitor::CommandPreview::new("fs_write", "write fixture", "blocked");
+        command.input = serde_json::json!({"path": marker, "content": "blocked"});
+        let steps = vec![helm_monitor::PlanStep {
+            title: "blocked".into(),
+            command,
+            hypothesis_id: None,
+            expected_output: None,
+            interpretation_guide: None,
+        }];
+        let conn = rusqlite::Connection::open(&app.runtime.db_path).unwrap();
+        TroubleshootingPlanStore::insert(
+            &conn,
+            "journal-failure",
+            "user: fixture",
+            "snapshot",
+            "",
+            "[]",
+            "[]",
+            &helm_monitor::encode_plan_steps(&steps).unwrap(),
+            true,
+            "fixture",
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_change_journal BEFORE INSERT ON change_sets BEGIN SELECT RAISE(FAIL, 'injected journal failure'); END;").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(crate::run_apply_plan_command_at_path(
+            app.runtime.db_path.clone(),
+            crate::ApplyPlanArgs {
+                plan_id: "journal-failure".into(),
+                yes: true,
+                json: false,
+            },
+            Default::default(),
+            app.runtime.secrets.clone(),
+        ));
+        assert!(result.is_err(), "journal failure was ignored");
+        assert!(!marker.exists(), "mutation ran before durable preparation");
     }
 
     // ── T04: audit + plan_rejected tag ─────────────────────────────────

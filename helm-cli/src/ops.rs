@@ -1,10 +1,6 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, path::Path};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use helm_memory::{
     ChangeSetStepRecord, ChangeSetStore, FullChangeSet, SnapshotStore, TroubleshootingPlanRecord,
@@ -150,108 +146,93 @@ pub async fn rollback_change_set(
     db_path: &Path,
     id: &str,
     policy: helm_monitor::ExecutionPolicy,
+    secrets: &crate::secrets::SecretsStore,
 ) -> Result<Vec<String>> {
     if !policy.check_mutation().map_err(anyhow::Error::msg)? {
         return Ok(vec![format!(
             "Dry run: would restore change set {id}; no actions executed."
         )]);
     }
-    let conn = rusqlite::Connection::open(db_path)
-        .with_context(|| format!("failed to open db at {}", db_path.display()))?;
-    let full = ChangeSetStore::get_full(&conn, id)
-        .map_err(|e| anyhow!("{e}"))?
-        .ok_or_else(|| anyhow!("Change set '{}' not found.", id))?;
-
-    let mut results = Vec::new();
-    for backup in &full.backups {
-        let path = PathBuf::from(&backup.file_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(&path, &backup.backup_content)
-            .with_context(|| format!("failed to restore {}", path.display()))?;
-        conn.execute(
-            "UPDATE change_set_backups SET restored = 1 WHERE id = ?1",
-            rusqlite::params![backup.id],
-        )
-        .map_err(|e| anyhow!(e.to_string()))?;
-        results.push(format!("  OK   restored {}", path.display()));
+    let _lock = crate::execution_journal::lock_database(db_path)?;
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+    let full =
+        ChangeSetStore::get_full(&conn, id)?.ok_or_else(|| anyhow!("change set not found"))?;
+    if full.record.status == "rolled_back" {
+        return Ok(vec!["Already rolled back; no actions executed.".into()]);
     }
-
+    let mut results = Vec::new();
+    let mut failures = Vec::new();
+    let mut recoveries = Vec::new();
     for step in full.steps.iter().rev() {
-        if step.status != "succeeded" {
-            results.push(format!(
-                "  SKIP {}: step did not succeed, skipping command reversal",
-                step.plan_step_title
-            ));
-            continue;
-        }
-        let cmd = step.command_text.as_deref().unwrap_or("").trim();
-        if cmd.is_empty() {
-            results.push(format!(
-                "  SKIP {}: no command to reverse",
-                step.plan_step_title
-            ));
-            continue;
-        }
-        if let Some(reverse) = reverse_command(cmd) {
-            let mut command = tokio::process::Command::new("sh");
-            command
-                .args(["-c", &reverse])
-                .stdin(std::process::Stdio::null());
-            let output = helm_monitor::process_runner::run_command(
-                command,
-                Default::default(),
-                &Default::default(),
+        let backups = full
+            .backups
+            .iter()
+            .filter(|backup| backup.step_id == step.id)
+            .collect::<Vec<_>>();
+        if backups.is_empty()
+            && matches!(
+                step.status.as_str(),
+                "succeeded" | "running" | "interrupted" | "failed"
             )
-            .await;
-            match output {
-                Ok(out) if out.status.success() => results.push(format!(
-                    "  OK   {}: ran rollback command `{reverse}`",
-                    step.plan_step_title
-                )),
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-                    results.push(format!(
-                        "  FAIL {}: rollback command `{reverse}` failed: {}",
-                        step.plan_step_title,
-                        if stderr.is_empty() {
-                            "unknown error".to_owned()
-                        } else {
-                            stderr
-                        }
+        {
+            failures.push(format!(
+                "{}: no verified inverse or backup; manual recovery required",
+                step.plan_step_title
+            ));
+        }
+        for backup in backups {
+            if backup.restored {
+                continue;
+            }
+            match crate::execution_journal::open_backup(secrets, backup) {
+                Ok(body) => recoveries.push((backup, body)),
+                Err(error) => {
+                    ChangeSetStore::update_status(&conn, id, "rollback_failed")?;
+                    return Err(error.context(
+                        "recovery material could not be authenticated; no files restored",
                     ));
                 }
-                Err(error) => results.push(format!(
-                    "  FAIL {}: rollback command `{reverse}` errored: {error}",
-                    step.plan_step_title
-                )),
             }
-        } else {
-            results.push(format!(
-                "  SKIP {}: no automatic command rollback available",
-                step.plan_step_title
-            ));
         }
     }
-
-    let rollback_snapshot =
-        helm_monitor::engine::collect_snapshot(helm_monitor::MonitorProfile::Quick).await;
-    let rollback_findings_json = "[]";
-    let snapshot_json = serde_json::to_string(&rollback_snapshot)?;
-    SnapshotStore::insert(&conn, &snapshot_json, rollback_findings_json)
-        .map_err(|e| anyhow!(e.to_string()))?;
-    conn.execute(
-        "UPDATE change_sets
-         SET status = 'rolled_back',
-             rolled_back_at = ?2,
-             rollback_snapshot_id = ?3
-         WHERE id = ?1",
-        rusqlite::params![id, Utc::now().timestamp(), rollback_snapshot.id.as_str()],
-    )
-    .map_err(|e| anyhow!(e.to_string()))?;
-
+    if recoveries.is_empty() && (full.backups.is_empty() || !failures.is_empty()) {
+        ChangeSetStore::update_status(&conn, id, "rollback_failed")?;
+        return Err(anyhow!(
+            "no verified file recovery data; {}",
+            failures.join("; ")
+        ));
+    }
+    ChangeSetStore::update_status(&conn, id, "rolling_back")?;
+    for (backup, body) in recoveries {
+        match helm_monitor::file_change::restore_file_change(
+            &backup.file_path,
+            &backup.checksum_before,
+            &body,
+        ) {
+            Ok(()) => {
+                conn.execute(
+                    "UPDATE change_set_backups SET restored=1 WHERE id=?1",
+                    rusqlite::params![backup.id],
+                )?;
+                results.push(format!("restored and verified {}", backup.file_path));
+            }
+            Err(error) => failures.push(format!("{}: {error}", backup.file_path)),
+        }
+    }
+    if !failures.is_empty() {
+        ChangeSetStore::update_status(&conn, id, "rollback_failed")?;
+        return Err(anyhow!(
+            "restoration incomplete: {}\n{}",
+            failures.join("; "),
+            results.join("\n")
+        ));
+    }
+    let snapshot = helm_monitor::collect_snapshot(helm_monitor::MonitorProfile::Quick).await;
+    let encoded = helm_core::redact_secrets(&serde_json::to_string(&snapshot)?);
+    SnapshotStore::insert(&conn, &encoded, "[]")?;
+    conn.execute("UPDATE change_sets SET status='rolled_back', rolled_back_at=?2, rollback_snapshot_id=?3 WHERE id=?1",
+        rusqlite::params![id, Utc::now().timestamp(), snapshot.id])?;
     Ok(results)
 }
 
@@ -282,17 +263,14 @@ fn build_change_set_view(conn: &rusqlite::Connection, full: &FullChangeSet) -> C
         .iter()
         .map(step_view_from_record)
         .collect::<Vec<_>>();
-    let rollback_supported = !full.backups.is_empty()
-        || full
-            .steps
-            .iter()
-            .any(|step| reverse_command(step.command_text.as_deref().unwrap_or("")).is_some());
-    let rollback_summary = if !full.backups.is_empty() {
-        format!("{} stored backup(s) can be restored.", full.backups.len())
-    } else if rollback_supported {
-        "Automatic service command reversal is available for part of this change set.".to_owned()
+    let rollback_supported = full
+        .backups
+        .iter()
+        .any(crate::execution_journal::has_verified_backup);
+    let rollback_summary = if rollback_supported {
+        "Encrypted file restoration requires the recovery key and matching applied state. Unbacked commands require manual recovery.".to_owned()
     } else {
-        "No automatic rollback path is stored for this change set.".to_owned()
+        "No verified automatic recovery data is stored for this change set.".to_owned()
     };
 
     ChangeSetView {
@@ -494,17 +472,6 @@ fn collect_step_resources(step: &ChangeSetStepRecord, resources: &mut BTreeSet<S
     }
 }
 
-fn reverse_command(command: &str) -> Option<String> {
-    let command = command.trim();
-    if command.contains("systemctl stop") {
-        Some(command.replace("systemctl stop", "systemctl start"))
-    } else if command.contains("systemctl disable") {
-        Some(command.replace("systemctl disable", "systemctl enable"))
-    } else {
-        None
-    }
-}
-
 fn format_timestamp(timestamp: i64) -> String {
     DateTime::<Utc>::from_timestamp(timestamp, 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
@@ -525,6 +492,57 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn recovery_refuses_unbacked_shell_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("helm.db");
+        let _store = helm_memory::MemoryStore::open(&db).await.unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        ChangeSetStore::insert(
+            &conn,
+            "unbacked",
+            "plan",
+            "fixture",
+            "snapshot",
+            "before",
+            "completed",
+            1,
+            "",
+        )
+        .unwrap();
+        ChangeSetStore::insert_step(
+            &conn,
+            "step",
+            "unbacked",
+            "unbacked shell",
+            "shell",
+            "{}",
+            Some("printf harmless"),
+            "fixture",
+            "low",
+            "succeeded",
+        )
+        .unwrap();
+        let result = rollback_change_set(
+            &db,
+            "unbacked",
+            Default::default(),
+            &crate::secrets::SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "unsupported shell reversal was reported as successful"
+        );
+        assert_ne!(
+            ChangeSetStore::get(&conn, "unbacked")
+                .unwrap()
+                .unwrap()
+                .status,
+            "rolled_back"
+        );
+    }
+
+    #[tokio::test]
     async fn rollback_modes_do_not_open_a_database_or_change_files() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("never-created.db");
@@ -535,6 +553,7 @@ mod tests {
                 read_only: true,
                 ..Default::default()
             },
+            &crate::secrets::SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap(),
         )
         .await
         .unwrap_err();
@@ -546,6 +565,7 @@ mod tests {
                 dry_run: true,
                 ..Default::default()
             },
+            &crate::secrets::SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap(),
         )
         .await
         .unwrap();
@@ -577,18 +597,5 @@ mod tests {
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].name, "apt-daily.timer");
         assert!(timer_overdue(matched[0]));
-    }
-
-    #[test]
-    fn reverse_command_supports_stop_and_disable_only() {
-        assert_eq!(
-            reverse_command("systemctl stop nginx.service").as_deref(),
-            Some("systemctl start nginx.service")
-        );
-        assert_eq!(
-            reverse_command("systemctl disable redis.service").as_deref(),
-            Some("systemctl enable redis.service")
-        );
-        assert!(reverse_command("systemctl restart nginx.service").is_none());
     }
 }

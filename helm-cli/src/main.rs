@@ -2,6 +2,7 @@
 
 mod bootstrap;
 mod custom_commands;
+mod execution_journal;
 mod keybindings;
 mod ops;
 mod paths;
@@ -1216,7 +1217,7 @@ async fn run() -> Result<()> {
             .await?;
         }
         Command::Incident(args) => {
-            run_incident_command(args, policy).await?;
+            run_incident_command(args, policy, secrets_store.clone()).await?;
         }
         Command::Snapshot(args) => {
             run_collect_snapshot_command(args).await?;
@@ -1231,10 +1232,10 @@ async fn run() -> Result<()> {
             run_explain_command(args).await?;
         }
         Command::ApplyPlan(args) => {
-            run_apply_plan_command(args, policy).await?;
+            run_apply_plan_command(args, policy, secrets_store.clone()).await?;
         }
         Command::ChangeSet(args) => {
-            run_change_set_command(args, policy).await?;
+            run_change_set_command(args, policy, secrets_store.clone()).await?;
         }
         Command::Backup(args) => {
             run_backup_command(args).await?;
@@ -4678,6 +4679,7 @@ async fn run_single_collection_cycle(
 async fn run_incident_command(
     args: IncidentArgs,
     policy: helm_monitor::ExecutionPolicy,
+    secrets: SecretsStore,
 ) -> Result<()> {
     match args.command {
         IncidentCommand::Show { id } => {
@@ -4756,6 +4758,7 @@ async fn run_incident_command(
                 db_path,
                 ApplyPlanArgs { plan_id, yes, json },
                 policy,
+                secrets,
             )
             .await?;
             Ok(())
@@ -6023,9 +6026,10 @@ fn human_bytes(bytes: u64) -> String {
 async fn run_apply_plan_command(
     args: ApplyPlanArgs,
     policy: helm_monitor::ExecutionPolicy,
+    secrets: SecretsStore,
 ) -> Result<()> {
     let db_path = default_db_path()?;
-    let _ = run_apply_plan_command_at_path(db_path, args, policy).await?;
+    let _ = run_apply_plan_command_at_path(db_path, args, policy, secrets).await?;
     Ok(())
 }
 
@@ -6033,8 +6037,10 @@ async fn run_apply_plan_command_at_path(
     db_path: PathBuf,
     args: ApplyPlanArgs,
     policy: helm_monitor::ExecutionPolicy,
+    secrets: SecretsStore,
 ) -> Result<String> {
-    run_approved_plan_command_at_path(db_path, args, None, policy, Default::default()).await
+    run_approved_plan_command_at_path(db_path, args, None, policy, Default::default(), secrets)
+        .await
 }
 
 fn executable_plan(
@@ -6071,6 +6077,7 @@ async fn run_approved_plan_command_at_path(
     supplied_approvals: Option<helm_monitor::PlanApprovals>,
     policy: helm_monitor::ExecutionPolicy,
     cancellation: helm_monitor::process_runner::CancellationToken,
+    secrets: SecretsStore,
 ) -> Result<String> {
     let conn = rusqlite::Connection::open(&db_path)
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
@@ -6202,9 +6209,11 @@ async fn run_approved_plan_command_at_path(
     }
 
     // Execute
+    let journal = std::sync::Arc::new(execution_journal::DurableJournal::new(&db_path, secrets)?);
     let mut engine = ExecutionEngine::with_approvals(approvals)
         .with_policy(policy)
-        .with_cancellation(cancellation);
+        .with_cancellation(cancellation)
+        .with_journal(journal);
     let change_set = engine.execute(&plan).await;
 
     // ── Audit: per-step command + output + verification ────────────────
@@ -6225,47 +6234,10 @@ async fn run_approved_plan_command_at_path(
         )?;
     }
 
-    // Persist change set
     let cs = &change_set;
-    let _ = ChangeSetStore::insert(
-        &conn,
-        &cs.id,
-        &cs.plan_id,
-        &cs.plan_title,
-        &cs.snapshot_id,
-        &cs.before_snapshot_id,
-        &cs.status.to_string(),
-        cs.created_at,
-        &helm_core::redact_secrets(&cs.summary),
-    );
-    for step in &cs.steps {
-        let _ = ChangeSetStore::insert_step(
-            &conn,
-            &step.id,
-            &cs.id,
-            &step.plan_step_title,
-            &step.command.tool,
-            &helm_core::redact_secrets(
-                &serde_json::to_string(&step.command.input).unwrap_or_default(),
-            ),
-            step.command.command_text.as_deref(),
-            &step.command.expected_effect,
-            step.command.risk.as_str(),
-            &step.status.to_string(),
-        );
-        let _ = ChangeSetStore::update_step_outcome(
-            &conn,
-            &step.id,
-            &step.status.to_string(),
-            &helm_core::redact_secrets(&step.output_text),
-            &helm_core::redact_secrets(&step.error_text),
-            &helm_core::redact_secrets(&step.verification_result),
-        );
+    if ChangeSetStore::get(&conn, &cs.id)?.is_none() {
+        return Err(anyhow!("{}", helm_core::redact_secrets(&cs.summary)));
     }
-    if let Some(after_id) = &cs.after_snapshot_id {
-        let _ = ChangeSetStore::update_after_snapshot(&conn, &cs.id, after_id);
-    }
-
     let redacted = helm_core::redact_secrets(&format_change_set(&change_set));
     if args.json {
         println!("{}", serde_json::to_string_pretty(&change_set)?);
@@ -6274,6 +6246,12 @@ async fn run_approved_plan_command_at_path(
     }
 
     eprintln!("\nChange set saved as: {}", cs.id);
+    if cs.status == helm_monitor::ChangeSetStatus::Failed {
+        return Err(anyhow!(
+            "change set {} failed; inspect its evidence before retrying",
+            cs.id
+        ));
+    }
     Ok(format!(
         "Plan executed. Change set: {} ({})",
         cs.id, cs.status
@@ -6283,6 +6261,7 @@ async fn run_approved_plan_command_at_path(
 async fn run_change_set_command(
     args: ChangeSetArgs,
     policy: helm_monitor::ExecutionPolicy,
+    secrets: SecretsStore,
 ) -> Result<()> {
     let db_path = default_db_path()?;
     let conn = rusqlite::Connection::open(&db_path)
@@ -6373,7 +6352,7 @@ async fn run_change_set_command(
                 }
             }
 
-            let results = ops::rollback_change_set(&db_path, &id, policy).await?;
+            let results = ops::rollback_change_set(&db_path, &id, policy, &secrets).await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&results)?);

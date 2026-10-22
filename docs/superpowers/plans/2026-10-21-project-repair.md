@@ -92,11 +92,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** `execute.rs`, `helm-cli/src/ops.rs`, apply handlers in `main.rs`/`web.rs`, memory `changesets.rs`/`snapshots.rs`, new additive migration and `tests/change_recovery.rs`. **Findings:** F06, F07, F16.
 
-- [ ] Create secure backups before mutation; persist bytes or durable artifact reference, checksum, original mode and whether the file existed. Fail closed if backup or pending-record persistence fails.
-- [ ] Persist pending/running/applied/verified/failed/interrupted states, step results and snapshot references. Use transactions for related DB writes; propagate errors instead of printing saved unconditionally.
-- [ ] Replace substring reversal of arbitrary shell with explicit supported inverse operations. Require confirmation for irreversible or unbacked actions; never invent a rollback command.
-- [ ] Restore from persisted backups after process restart; verify content, mode and existence. Mark partial rollback honestly and return API failure when any required restoration fails.
-- [ ] Add startup reconciliation for interrupted changes and ensure retry does not duplicate an already completed mutation without a new decision.
+- [x] Create secure backups before mutation; persist bytes or durable artifact reference, checksum, original mode and whether the file existed. Fail closed if backup or pending-record persistence fails.
+- [x] Persist pending/running/applied/verified/failed/interrupted states, step results and snapshot references. Use transactions for related DB writes; propagate errors instead of printing saved unconditionally.
+- [x] Replace substring reversal of arbitrary shell with explicit supported inverse operations. Require confirmation for irreversible or unbacked actions; never invent a rollback command.
+- [x] Restore from persisted backups after process restart; verify content, mode and existence. Mark partial rollback honestly and return API failure when any required restoration fails.
+- [x] Add startup reconciliation for interrupted changes and ensure retry does not duplicate an already completed mutation without a new decision.
 
 **Tests:** edit existing file, create new file, permission change, missing/corrupt backup, unwritable DB, terminated worker between stages, and mixed successful/failed rollback. Original state returns exactly for supported operations; every failure stays visible.
 
