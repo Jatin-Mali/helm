@@ -96,3 +96,33 @@ Grant only the capability needed:
 helm permissions grant shell.shell --scope once
 helm permissions list
 ```
+
+## An apply operation was interrupted or restoration failed
+
+Inspect the saved change set before approving another attempt:
+
+```sh
+helm change-set show <change-set-id>
+helm change-set rollback <change-set-id>
+```
+
+Apply records its steps and pre-change snapshot before executing actions. An
+unfinished execution is marked interrupted when the next executor opens that
+database; HELM does not automatically replay it.
+
+Automatic restoration supports regular-file edits with one link, up to 8 MiB.
+It preserves bytes, owner/group, permissions and whether the file existed.
+Symlink targets, special files, set-id files and extended attributes or ACLs
+require manual handling. Concurrent external writes are outside this guarantee;
+restoration refuses content or metadata that differs from the applied change.
+
+Recovery material is encrypted in the database. Its `HELM_BACKUP_KEY` is stored
+in the configured secrets store (`$XDG_CONFIG_HOME/helm/secrets.toml`, normally
+`~/.config/helm/secrets.toml`). Keep the matching database and key together when
+backing up HELM. Deleting or changing that key makes older backups unusable;
+HELM refuses restoration if the key is missing or the backup fails authentication.
+
+Arbitrary shell commands have no automatic inverse. A mixed change set may
+restore its file edits but still report incomplete restoration because shell
+actions require manual recovery. Legacy records without verified backup data
+also require manual recovery.

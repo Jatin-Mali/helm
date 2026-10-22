@@ -41,15 +41,11 @@ impl Collector for DisksCollector {
         if out.smart_available && profile.deep_probes() {
             for d in out.block_devices.iter().map(|d| format!("/dev/{}", d.name)) {
                 if let Ok(o) = run_timed("smartctl", &["-H", &d], profile).await {
-                    if o.status.success() {
-                        let s = String::from_utf8_lossy(&o.stdout);
-                        let h = if s.contains("PASSED") || s.contains("OK") {
-                            Some("PASSED".into())
-                        } else if s.contains("FAIL") {
-                            Some("FAIL".into())
-                        } else {
-                            Some("UNKNOWN".into())
-                        };
+                    {
+                        let h = Some(smart_health(
+                            o.status.code().unwrap_or(1),
+                            &String::from_utf8_lossy(&o.stdout),
+                        ));
                         out.smart_devices.push(SmartDevice {
                             device: d,
                             model: None,
@@ -63,6 +59,18 @@ impl Collector for DisksCollector {
         Ok(out)
     }
 }
+fn smart_health(code: i32, text: &str) -> String {
+    if code & 0b11000 != 0 || text.contains("FAIL") {
+        "FAIL".into()
+    } else if code & 0b11100000 != 0 {
+        format!("WARN: SMART history or error log flags ({code})")
+    } else if text.contains("PASSED") || text.contains("OK") {
+        "PASSED".into()
+    } else {
+        "UNKNOWN".into()
+    }
+}
+
 fn parse_df(s: &str) -> Vec<FilesystemEntry> {
     s.lines()
         .skip(1)
@@ -154,4 +162,22 @@ fn parse_hsize(s: &str) -> Option<u64> {
         (s.trim(), 1)
     };
     n.parse::<f64>().ok().map(|v| (v * m as f64) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn smart_nonzero_health_bits_remain_visible() {
+        assert_eq!(
+            super::smart_health(
+                8,
+                "SMART overall-health self-assessment test result: FAILED!"
+            ),
+            "FAIL"
+        );
+        assert_eq!(super::smart_health(16, "PASSED"), "FAIL");
+        assert!(super::smart_health(64, "PASSED").starts_with("WARN:"));
+        assert_eq!(super::smart_health(0, "PASSED"), "PASSED");
+        assert_eq!(super::smart_health(0, "unrecognized result"), "UNKNOWN");
+    }
 }

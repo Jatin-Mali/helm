@@ -6,7 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    collectors::{Collector, run_timed},
+    collectors::{Collector, err, run_timed},
     log_analysis::normalize_log_message,
     snapshot::{JournalContextLine, JournalPattern, LogSeverity, LogSnapshot, MonitorProfile},
 };
@@ -49,7 +49,7 @@ impl Collector for LogsCollector {
         profile: MonitorProfile,
     ) -> Result<Self::Output, crate::snapshot::CollectorError> {
         let mut out = LogSnapshot::default();
-        let Ok(output) = run_timed(
+        let output = run_timed(
             "journalctl",
             &[
                 "-p",
@@ -64,10 +64,19 @@ impl Collector for LogsCollector {
             ],
             profile,
         )
-        .await
-        else {
-            return Ok(out);
-        };
+        .await?;
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        if diagnostics.contains("not seeing messages")
+            || diagnostics.contains("Permission denied")
+            || diagnostics.contains("No journal files")
+        {
+            return Err(err(
+                "logs",
+                helm_core::redact_secrets(&format!(
+                    "journal coverage unavailable or incomplete: {diagnostics}"
+                )),
+            ));
+        }
 
         let mut entries = parse_journal_entries(&output.stdout);
         if entries.is_empty() {

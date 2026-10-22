@@ -1,6 +1,6 @@
 //! Services collector: systemd units, failed, timers.
 use crate::{
-    collectors::{Collector, err, run_timed},
+    collectors::{Collector, run_timed},
     snapshot::{FailedUnit, MonitorProfile, ServiceSnapshot, SystemdTimer, SystemdUnit},
 };
 #[derive(Default)]
@@ -15,34 +15,27 @@ impl Collector for ServicesCollector {
         profile: MonitorProfile,
     ) -> Result<Self::Output, crate::snapshot::CollectorError> {
         let mut out = ServiceSnapshot::default();
-        match run_timed(
+        let o = run_timed(
             "systemctl",
             &["list-units", "--all", "--no-legend", "--no-pager"],
             profile,
         )
-        .await
-        {
-            Ok(o) => out.units = parse_units(&String::from_utf8_lossy(&o.stdout)),
-            Err(e) => return Err(err("services", e.message)),
-        }
-        if let Ok(o) = run_timed(
+        .await?;
+        out.units = parse_units(&String::from_utf8_lossy(&o.stdout));
+        let o = run_timed(
             "systemctl",
             &["--failed", "--no-legend", "--no-pager"],
             profile,
         )
-        .await
-        {
-            out.failed_units = parse_failed(&String::from_utf8_lossy(&o.stdout));
-        }
-        if let Ok(o) = run_timed(
+        .await?;
+        out.failed_units = parse_failed(&String::from_utf8_lossy(&o.stdout));
+        let o = run_timed(
             "systemctl",
             &["list-timers", "--all", "--no-legend", "--no-pager"],
             profile,
         )
-        .await
-        {
-            out.timers = parse_timers(&String::from_utf8_lossy(&o.stdout));
-        }
+        .await?;
+        out.timers = parse_timers(&String::from_utf8_lossy(&o.stdout));
         Ok(out)
     }
 }

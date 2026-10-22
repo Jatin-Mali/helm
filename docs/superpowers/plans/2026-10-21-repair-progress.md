@@ -56,3 +56,11 @@ Limit: file comparison and rename do not provide a filesystem transaction agains
 ## Task 5 — starting
 
 Next: preserve collector failure/coverage and prevent false incident self-resolution. Database/web configured collector coverage remains to implement.
+
+Task 5 first verified patch: reproduced nonzero collector exit being accepted as an empty healthy result. Shared runner now rejects unexpected exit statuses with redacted stderr/stdout diagnostics, preserving only documented SMART health flags, DNF check-update 100 and checkupdates 2. Service sub-probe and journal failures propagate; incomplete journal-permission/no-files diagnostics are errors. SMART failing-health and history/error bits now survive nonzero exits and emit critical/warning findings respectively. Recovery limits and key requirements are documented in troubleshooting.
+
+Verification: workspace all-target tests PASS (789 passing executions, 2 ignored); strict workspace all-target Clippy PASS; formatting PASS. Graph refreshed (4,769 nodes / 11,491 edges). Tests cover original exit regression, scoped accepted statuses, SMART recorded output and finding severities. No additional live provider/VM calls.
+
+Task 5 remains INCOMPLETE: explicit per-domain observation states; filtering/staleness and host-comparable evidence before self-resolution; failures still swallowed by other collectors; configured DB/web probes; actual container restart counts. Address these before checking off Task 5 or proceeding to Task 6. Existing self-resolution behavior remains a known risk until that repair.
+
+External command semantics checked against primary sources: [smartctl source](https://www.smartmontools.org/static/doxygen/smartctl_8h_source.html), [DNF command reference](https://dnf.readthedocs.io/en/stable/command_ref.html), [Arch checkupdates manual](https://man.archlinux.org/man/checkupdates.8.en). Project behavior was verified through source and regressions.

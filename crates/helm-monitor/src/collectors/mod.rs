@@ -56,7 +56,7 @@ async fn run_timed(
     let timeout = profile.per_collector_timeout();
     let mut command = Command::new(program);
     command.args(args).stdin(std::process::Stdio::null());
-    crate::process_runner::run_command(
+    let output = crate::process_runner::run_command(
         command,
         crate::process_runner::ProcessLimits {
             timeout: std::time::Duration::from_secs(timeout),
@@ -69,7 +69,30 @@ async fn run_timed(
         domain: String::new(),
         message: format!("{program}: {error}"),
         is_timeout: error.timed_out,
-    })
+    })?;
+    if !accepted_exit(program, args, output.status.code()) {
+        return Err(err(
+            "",
+            helm_core::redact_secrets(&format!(
+                "{program}: exited with {}; stderr: {}; stdout: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            )),
+        ));
+    }
+    Ok(output)
+}
+
+fn accepted_exit(program: &str, args: &[&str], code: Option<i32>) -> bool {
+    match (program, code) {
+        (_, Some(0)) => true,
+        // SMART bits 3–7 report disk health; bits 0–2 mean the probe failed.
+        ("smartctl", Some(code)) => (0..=255).contains(&code) && code & 7 == 0,
+        ("dnf", Some(100)) => args.first() == Some(&"check-update"),
+        ("checkupdates", Some(2)) => true,
+        _ => false,
+    }
 }
 
 /// Read `/proc` file contents, respecting the profile timeout.
@@ -114,6 +137,38 @@ fn timeout_err(domain: &str, msg: impl Into<String>) -> CollectorError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expected_nonzero_statuses_are_narrowly_scoped() {
+        assert!(super::accepted_exit(
+            "smartctl",
+            &["-H", "/dev/fixture"],
+            Some(8)
+        ));
+        assert!(!super::accepted_exit("smartctl", &[], Some(9)));
+        assert!(super::accepted_exit(
+            "dnf",
+            &["check-update", "-q"],
+            Some(100)
+        ));
+        assert!(!super::accepted_exit("dnf", &["updateinfo"], Some(100)));
+        assert!(super::accepted_exit("checkupdates", &[], Some(2)));
+        assert!(!super::accepted_exit("systemctl", &[], Some(1)));
+        assert!(!super::accepted_exit("sh", &[], None));
+    }
+    #[tokio::test]
+    async fn nonzero_exit_is_a_collector_failure_with_diagnostics() {
+        let result = super::run_timed(
+            "sh",
+            &["-c", "printf fixture-error >&2; exit 7"],
+            crate::MonitorProfile::Quick,
+        )
+        .await;
+        let error =
+            result.expect_err("nonzero collector exit cannot become a healthy empty result");
+        assert!(error.message.contains("7"));
+        assert!(error.message.contains("fixture-error"));
+    }
+
     #[test]
     fn binary_lookup_does_not_need_a_subprocess() {
         assert!(super::bin_exists("sh"));
