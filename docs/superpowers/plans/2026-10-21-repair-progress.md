@@ -112,3 +112,14 @@ NOT done (still required by Task 8): dashboard pairing/session authentication fo
 
 ## Remaining tasks (not started)
 9 planning/TUI; 10 agent runtime; 11 agent tools/permissions; 12 sessions/workflows; 13 distribution/installer/CI/docs; 14 real demonstrations (needs real provider, browser, two SSH hosts, VM). Real-provider keys exist in the environment (GROQ/GEMINI/OPENROUTER/DEEPSEEK) but were not used.
+
+
+## Task 8 — complete (Codex continuation)
+
+Dashboard remains loopback-only. A 256-bit terminal pairing code creates one HttpOnly/SameSite=Strict process-local session; both pairing and session expire after 15 minutes. Restart invalidates all sessions. Anonymous API/snapshot/WebSocket requests are rejected. Exact Host and same-origin validation cover requests; mutations require Origin and session-bound CSRF; WebSockets require Origin and terminate at session expiry. Responses disable caching/framing and external script loading. Anonymous HTML contains no credential or host observation.
+
+Service stop/restart now prepare a review, then consume a single-use, session/operation/host/cwd-bound PlanApprovals review through ExecutionEngine + DurableJournal. Rollback reviews bind the full persisted change-set digest and use the existing authenticated backup restoration. Changed, cross-session, expired and consumed reviews fail. Global grants no longer authorize web mutations. UI masks and clears pairing input, authenticates before streaming, and confirms exact prepared operations.
+
+Verification: full workspace all-target suite PASS (852 passed, 0 failed, 2 ignored); strict workspace all-target clippy PASS; fmt PASS. Expanded HTTP regression separately PASS after the suite: fake systemctl marker remains absent before approval and on changed/replayed approval, appears only for the approved exact operation, and produces durable change evidence. Auth/review unit tests cover expiry, CSRF, cross-session and tampered review. Real Chromium via Playwright: anonymous pairing form; wrong code rejected; correct code closes login and connects WebSocket; authenticated session 200; missing-CSRF POST 403; authorized read-only mutation returns explicit denial. No real service was changed. Browser/server used isolated /tmp state. Graph updated (4969 nodes / 11995 edges); SQL extraction still unavailable (tree_sitter_sql missing), source graph remains partial for SQL.
+
+Ruling: one terminal pairing per process, restart to pair again after expiry — the smallest explicit local-client authentication flow; costs restarting the console every 15 minutes. Webhook authentication remains separate from browser sessions. Real disposable-VM operations/fleet demonstrations remain Task 14; this is not a production-readiness claim.

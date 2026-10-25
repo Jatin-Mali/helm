@@ -780,6 +780,16 @@ tr:hover td {
 </style>
 </head>
 <body>
+<dialog id="login-dialog" aria-labelledby="login-title">
+  <form id="login-form">
+    <h2 id="login-title">Pair this browser</h2>
+    <p>Enter the single-use pairing code printed by helm web. Sessions expire after 15 minutes.</p>
+    <label for="pairing-code">Pairing code</label>
+    <input id="pairing-code" type="password" autocomplete="off" required>
+    <button type="submit" class="button">Sign in</button>
+    <p id="login-error" role="alert"></p>
+  </form>
+</dialog>
 <div id="app">
   <div class="topbar">
     <div class="brand-block">
@@ -869,6 +879,49 @@ const state = {
   },
 };
 
+let csrfToken = '';
+const nativeFetch = window.fetch.bind(window);
+async function authenticatedFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if ((options.method || 'GET') !== 'GET') headers.set('x-helm-csrf', csrfToken);
+  const response = await nativeFetch(url, {...options, headers});
+  if (response.status === 401) showLogin();
+  return response;
+}
+async function reviewedAction(url, payload) {
+  const send = async body => {
+    const response = await authenticatedFetch(url, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body)});
+    return response.json();
+  };
+  const prepared = await send(payload);
+  if (!prepared.approvalId) return prepared;
+  if (!window.confirm(prepared.review)) return {ok: false, error: 'Action denied; nothing executed'};
+  return send({...payload, approvalId: prepared.approvalId});
+}
+function showLogin() {
+  const dialog = document.getElementById('login-dialog');
+  if (!dialog.open) dialog.showModal();
+}
+async function authenticate() {
+  const response = await nativeFetch('/api/session');
+  if (!response.ok) { showLogin(); return; }
+  csrfToken = (await response.json()).csrf;
+  connect();
+}
+document.getElementById('login-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const input = document.getElementById('pairing-code');
+  const code = input.value;
+  input.value = '';
+  try {
+    const response = await nativeFetch('/api/login', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({code})});
+    if (!response.ok) throw new Error('Pairing failed. Check the terminal code or restart helm web for a new code.');
+    csrfToken = (await response.json()).csrf;
+    document.getElementById('login-dialog').close();
+    connect();
+  } catch (error) { document.getElementById('login-error').textContent = error.message; }
+});
+
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/ws`);
@@ -895,7 +948,7 @@ function connect() {
   ws.onclose = () => {
     state.connected = false;
     renderConnection();
-    setTimeout(connect, 2500);
+    setTimeout(authenticate, 2500);
   };
 
   ws.onerror = () => ws.close();
@@ -1893,12 +1946,7 @@ function wireServicesTab() {
       const unit = node.dataset.serviceUnit;
       const action = node.dataset.serviceAction;
       try {
-        const response = await fetch('/api/service-action', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ unit, action }),
-        });
-        const data = await response.json();
+        const data = await reviewedAction('/api/service-action', {unit, action});
         if (!data.ok) {
           state.serviceJournalError = data.error || `Failed to ${action} ${unit}`;
           if (action !== 'journal') {
@@ -1930,12 +1978,7 @@ function wireChangesTab() {
     node.addEventListener('click', async () => {
       const changeSetId = node.dataset.changeRollback;
       try {
-        const response = await fetch('/api/change-rollback', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ changeSetId }),
-        });
-        const data = await response.json();
+        const data = await reviewedAction('/api/change-rollback', {changeSetId});
         if (!data.ok) {
           toast(data.error || `Rollback failed for ${changeSetId}`);
           return;
@@ -2122,7 +2165,7 @@ function renderSecuritySections() {
 }
 
 async function refreshSnapshot() {
-  const response = await fetch('/api/refresh', { method: 'POST' });
+  const response = await authenticatedFetch('/api/refresh', { method: 'POST' });
   const data = await response.json();
   if (data.snapshot) {
     applySnapshot(data.snapshot);
@@ -2136,7 +2179,7 @@ async function requestPlan() {
     toast('Select an incident first');
     return;
   }
-  const response = await fetch('/api/plan', {
+  const response = await authenticatedFetch('/api/plan', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ findingId: finding.id }),
@@ -2221,7 +2264,7 @@ setInterval(() => {
   document.getElementById('chip-clock').textContent = new Date().toISOString().slice(11, 19);
 }, 1000);
 
-connect();
+authenticate();
 </script>
 </body>
 </html>

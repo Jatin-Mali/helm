@@ -14,6 +14,7 @@ mod service_form;
 mod telemetry;
 mod tui;
 mod web;
+mod web_auth;
 
 use std::{
     env,

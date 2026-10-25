@@ -1,4 +1,4 @@
-//! HELMOPS web dashboard — production HTTP/WebSocket server.
+//! HELMOPS loopback web dashboard.
 //! Started via `helmops web [--port PORT]`.
 
 use std::{
@@ -11,11 +11,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
+    extract::Request,
     extract::{
         Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::StatusCode,
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -38,6 +41,8 @@ use crate::{ProviderSettings, llm_provider_usable, ops, secrets::SecretsStore};
 const DASHBOARD_HTML: &str = include_str!("web/dashboard.html");
 
 struct WebState {
+    auth: crate::web_auth::Auth,
+    pending: Mutex<HashMap<String, PendingAction>>,
     policy: helm_monitor::ExecutionPolicy,
     db_path: PathBuf,
     memory: Arc<MemoryStore>,
@@ -93,12 +98,94 @@ pub struct LiveSnapshot {
 struct ServiceActionRequest {
     unit: String,
     action: String,
+    approval_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChangeRollbackRequest {
     change_set_id: String,
+    approval_id: Option<String>,
+}
+
+struct PendingAction {
+    session: String,
+    target: String,
+    plan: helm_monitor::TroubleshootingPlan,
+    review: helm_monitor::PlanApprovals,
+}
+
+enum ActionReview {
+    Prepared(String),
+    Approved(
+        Box<(
+            helm_monitor::TroubleshootingPlan,
+            helm_monitor::PlanApprovals,
+        )>,
+    ),
+}
+
+// The browser reviews an immutable operation; execution consumes it even on failure.
+fn action_review(
+    state: &WebState,
+    session: &crate::web_auth::Session,
+    target: String,
+    plan: helm_monitor::TroubleshootingPlan,
+    id: Option<&str>,
+) -> Result<ActionReview, String> {
+    let mut pending = state.pending.lock().map_err(|_| "approval lock poisoned")?;
+    pending.retain(|_, a| a.review.matches(&a.plan));
+    if let Some(id) = id {
+        let action = pending
+            .get(id)
+            .ok_or("Approval expired or already consumed")?;
+        if action.session != session.id || action.target != target {
+            return Err("Approval belongs to another session or operation".into());
+        }
+        let mut action = pending.remove(id).unwrap();
+        action.review.decide(0, true)?;
+        if !action.review.allows(&action.plan, 0) {
+            return Err("Approval context changed".into());
+        }
+        Ok(ActionReview::Approved(Box::new((
+            action.plan,
+            action.review,
+        ))))
+    } else {
+        if pending.len() >= 64 {
+            return Err("Too many pending reviews; wait for expiry".into());
+        }
+        let review = helm_monitor::PlanApprovals::review(&plan)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        pending.insert(
+            id.clone(),
+            PendingAction {
+                session: session.id.clone(),
+                target,
+                plan,
+                review,
+            },
+        );
+        Ok(ActionReview::Prepared(id))
+    }
+}
+
+fn action_plan(
+    title: &str,
+    command: helm_monitor::CommandPreview,
+) -> helm_monitor::TroubleshootingPlan {
+    let mut plan = helm_monitor::TroubleshootingPlan::new(
+        helm_monitor::PlanSource::UserQuestion(title.into()),
+        "web-action".into(),
+    );
+    plan.proposed_fix_steps.push(helm_monitor::PlanStep {
+        title: title.into(),
+        command,
+        hypothesis_id: None,
+        expected_output: None,
+        interpretation_guide: None,
+    });
+    plan
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -210,6 +297,12 @@ pub async fn serve(
     secrets: SecretsStore,
     policy: helm_monitor::ExecutionPolicy,
 ) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port)))
+        .await
+        .context("binding web server address")?;
+    let port = listener.local_addr()?.port();
+    let (auth, pairing) = crate::web_auth::Auth::new(port);
+    eprintln!("Dashboard pairing code (single use, expires in 15 minutes): {pairing}");
     let (tx, _) = broadcast::channel::<String>(32);
     let memory = Arc::new(
         MemoryStore::open(&db_path)
@@ -217,6 +310,8 @@ pub async fn serve(
             .with_context(|| format!("opening memory store at {}", db_path.display()))?,
     );
     let state = Arc::new(WebState {
+        auth,
+        pending: Mutex::new(HashMap::new()),
         policy,
         db_path: db_path.clone(),
         memory,
@@ -243,6 +338,8 @@ pub async fn serve(
 
     let app = Router::new()
         .route("/", get(serve_dashboard))
+        .route("/api/login", post(api_login))
+        .route("/api/session", get(api_session))
         .route("/ws", get(ws_handler))
         .route("/api/snapshot", get(api_snapshot))
         .route("/api/refresh", post(api_refresh))
@@ -253,6 +350,10 @@ pub async fn serve(
             "/api/pipelines/webhook/{provider}/{service_id}",
             post(api_pipeline_webhook),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            dashboard_guard,
+        ))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -264,19 +365,77 @@ pub async fn serve(
     println!("║   API        → http://{addr}/api/snapshot ║");
     println!("╚══════════════════════════════════════════════╝");
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .context("binding web server address")?;
     axum::serve(listener, app).await.context("web server")?;
     Ok(())
+}
+
+async fn dashboard_guard(
+    State(state): State<Arc<WebState>>,
+    mut request: Request,
+    next: Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    let ingress = path.starts_with("/api/pipelines/webhook/");
+    let mutation =
+        request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD;
+    if let Err(status) = state
+        .auth
+        .check_host_origin(request.headers(), !ingress && (mutation || path == "/ws"))
+    {
+        return crate::web_auth::denied(status);
+    }
+    if !ingress && path != "/" && path != "/api/login" {
+        match state.auth.authorize(request.headers(), request.method()) {
+            Ok(session) => {
+                request.extensions_mut().insert(session);
+            }
+            Err(status) => return crate::web_auth::denied(status),
+        }
+    }
+    crate::web_auth::harden(next.run(request).await)
+}
+
+#[derive(serde::Deserialize)]
+struct LoginRequest {
+    code: String,
+}
+async fn api_login(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<LoginRequest>,
+) -> axum::response::Response {
+    match state.auth.login(&req.code) {
+        Some(session) => {
+            let mut response = Json(serde_json::json!({"csrf": session.csrf})).into_response();
+            response.headers_mut().insert(
+                "set-cookie",
+                format!(
+                    "helm_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=900",
+                    session.id
+                )
+                .parse()
+                .unwrap(),
+            );
+            response
+        }
+        None => crate::web_auth::denied(StatusCode::UNAUTHORIZED),
+    }
+}
+async fn api_session(Extension(session): Extension<crate::web_auth::Session>) -> impl IntoResponse {
+    Json(serde_json::json!({"csrf": session.csrf}))
 }
 
 async fn serve_dashboard() -> impl IntoResponse {
     axum::response::Html(DASHBOARD_HTML)
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<WebState>>,
+    Extension(session): Extension<crate::web_auth::Session>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        let _ = tokio::time::timeout_at(session.expires.into(), handle_ws(socket, state)).await;
+    })
 }
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<WebState>) {
@@ -388,6 +547,7 @@ async fn api_generate_plan(
 
 async fn api_service_action(
     State(state): State<Arc<WebState>>,
+    Extension(session): Extension<crate::web_auth::Session>,
     Json(req): Json<ServiceActionRequest>,
 ) -> impl IntoResponse {
     match req.action.as_str() {
@@ -421,46 +581,52 @@ async fn api_service_action(
                 }
                 Ok(true) => {}
             }
-            if state
-                .memory
-                .active_capability_grant(helm_core::Capability::SystemService, true)
-                .await
-                .ok()
-                .flatten()
-                .is_none()
+            if req.unit.is_empty()
+                || req.unit.len() > 256
+                || req.unit.starts_with('-')
+                || !req
+                    .unit
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.@:-".contains(&b))
             {
-                return Json(serde_json::json!({
-                    "ok": false,
-                    "error": "Missing system.service grant. Run `helmops permissions grant system.service --scope once` and retry.",
-                }));
+                return Json(serde_json::json!({"ok": false, "error": "Invalid service unit"}));
             }
-            let mut command = tokio::process::Command::new("systemctl");
-            command.args([&req.action, "--", &req.unit]);
-            let output = helm_monitor::process_runner::run_command(
-                command,
-                Default::default(),
-                &Default::default(),
-            )
-            .await;
-            match output {
-                Ok(out) => {
-                    let ok = out.status.success();
-                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-                    let json = collect_live_snapshot(state.as_ref()).await;
-                    let _ = state.snapshot_tx.send(json);
-                    Json(serde_json::json!({
-                        "ok": ok,
-                        "unit": req.unit,
-                        "action": req.action,
-                        "stdout": helm_core::redact_secrets(&stdout),
-                        "stderr": helm_core::redact_secrets(&stderr),
-                    }))
+            let command = format!("systemctl {} -- {}", req.action, req.unit);
+            let plan = action_plan(
+                &format!("{} {} (service rollback unsupported)", req.action, req.unit),
+                helm_monitor::CommandPreview::new(
+                    "shell",
+                    &command,
+                    "Change the requested service state; rollback unsupported",
+                ),
+            );
+            let target = format!("service:{}:{}", req.action, req.unit);
+            match action_review(&state, &session, target, plan, req.approval_id.as_deref()) {
+                Ok(ActionReview::Approved(approved)) => {
+                    let (plan, approvals) = *approved;
+                    let journal = match crate::execution_journal::DurableJournal::new(
+                        &state.db_path,
+                        state.secrets.clone(),
+                    ) {
+                        Ok(journal) => Arc::new(journal),
+                        Err(error) => {
+                            return Json(
+                                serde_json::json!({"ok": false, "error": helm_core::redact_secrets(&error.to_string())}),
+                            );
+                        }
+                    };
+                    let mut engine = helm_monitor::ExecutionEngine::with_approvals(approvals)
+                        .with_policy(state.policy)
+                        .with_journal(journal);
+                    let change = engine.execute(&plan).await;
+                    Json(
+                        serde_json::json!({"ok": change.status == helm_monitor::ChangeSetStatus::Completed, "changeSetId": change.id, "summary": helm_core::redact_secrets(&change.summary)}),
+                    )
                 }
-                Err(error) => Json(serde_json::json!({
-                    "ok": false,
-                    "error": error.to_string(),
-                })),
+                Ok(ActionReview::Prepared(id)) => Json(
+                    serde_json::json!({"ok": false, "approvalId": id, "review": format!("{command}\nHost: local; cwd: {}\nRollback unsupported. Approve this exact action?", std::env::current_dir().unwrap_or_default().display())}),
+                ),
+                Err(error) => Json(serde_json::json!({"ok": false, "error": error})),
             }
         }
         _ => Json(serde_json::json!({
@@ -472,6 +638,7 @@ async fn api_service_action(
 
 async fn api_change_rollback(
     State(state): State<Arc<WebState>>,
+    Extension(session): Extension<crate::web_auth::Session>,
     Json(req): Json<ChangeRollbackRequest>,
 ) -> impl IntoResponse {
     match state.policy.check_mutation() {
@@ -483,18 +650,39 @@ async fn api_change_rollback(
         }
         Ok(true) => {}
     }
-    if state
-        .memory
-        .active_capability_grant(helm_core::Capability::ShellShell, true)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return Json(serde_json::json!({
-            "ok": false,
-            "error": "Missing shell.shell grant. Run `helmops permissions grant shell.shell --scope once` and retry rollback.",
-        }));
+    let review = (|| -> Result<(String, helm_monitor::TroubleshootingPlan)> {
+        let conn = rusqlite::Connection::open(&state.db_path)?;
+        let record = helm_memory::ChangeSetStore::get_full(&conn, &req.change_set_id)?
+            .context("Change set not found")?;
+        let encoded = serde_json::to_vec(&record)?;
+        let digest = hex::encode(ring::digest::digest(&ring::digest::SHA256, &encoded));
+        let target = format!("rollback:{}:{digest}", req.change_set_id);
+        let plan = action_plan(
+            &format!("Restore change set {}", req.change_set_id),
+            helm_monitor::CommandPreview::new(
+                "rollback",
+                &target,
+                "Restore encrypted file backups; unsupported operations require manual recovery",
+            ),
+        );
+        Ok((target, plan))
+    })();
+    let (target, plan) = match review {
+        Ok(review) => review,
+        Err(error) => {
+            return Json(
+                serde_json::json!({"ok": false, "error": helm_core::redact_secrets(&error.to_string())}),
+            );
+        }
+    };
+    match action_review(&state, &session, target, plan, req.approval_id.as_deref()) {
+        Ok(ActionReview::Approved(_)) => {}
+        Ok(ActionReview::Prepared(id)) => {
+            return Json(
+                serde_json::json!({"ok": false, "approvalId": id, "review": format!("Restore change set {} on the local host? Only supported file backups can be restored; newer edits prevent restoration.", req.change_set_id)}),
+            );
+        }
+        Err(error) => return Json(serde_json::json!({"ok": false, "error": error})),
     }
     match ops::rollback_change_set(
         &state.db_path,
@@ -1192,6 +1380,105 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn web_action_review_is_exact_session_bound_and_single_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("helm.db");
+        let state = WebState {
+            auth: crate::web_auth::Auth::new(9000).0,
+            pending: Mutex::new(HashMap::new()),
+            policy: Default::default(),
+            memory: Arc::new(MemoryStore::open(&db_path).await.unwrap()),
+            db_path,
+            snapshot_tx: broadcast::channel(1).0,
+            plan_cache: PlanCache::default(),
+            provider_settings: crate::resolve_provider_settings(
+                None,
+                Some(crate::ProviderChoice::Ollama),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            secrets: SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap(),
+            fleet_cache: Mutex::new(HashMap::new()),
+        };
+        let session = crate::web_auth::Session {
+            id: "client-a".into(),
+            csrf: "csrf".into(),
+            expires: std::time::Instant::now() + Duration::from_secs(60),
+        };
+        let other = crate::web_auth::Session {
+            id: "client-b".into(),
+            ..session.clone()
+        };
+        let plan = action_plan(
+            "test action",
+            helm_monitor::CommandPreview::new("shell", "printf harmless", "test"),
+        );
+        let ActionReview::Prepared(id) =
+            action_review(&state, &session, "exact-action".into(), plan.clone(), None).unwrap()
+        else {
+            panic!("must prepare before execution")
+        };
+        assert!(
+            action_review(
+                &state,
+                &other,
+                "exact-action".into(),
+                plan.clone(),
+                Some(&id)
+            )
+            .is_err()
+        );
+        assert!(
+            action_review(
+                &state,
+                &session,
+                "changed-action".into(),
+                plan.clone(),
+                Some(&id)
+            )
+            .is_err()
+        );
+        let ActionReview::Approved(approved) = action_review(
+            &state,
+            &session,
+            "exact-action".into(),
+            plan.clone(),
+            Some(&id),
+        )
+        .unwrap() else {
+            panic!("approval missing")
+        };
+        assert!(approved.1.allows(&approved.0, 0));
+        assert!(
+            action_review(
+                &state,
+                &session,
+                "exact-action".into(),
+                plan.clone(),
+                Some(&id)
+            )
+            .is_err()
+        );
+        let ActionReview::Prepared(id) =
+            action_review(&state, &session, "exact-action".into(), plan.clone(), None).unwrap()
+        else {
+            panic!("expected review")
+        };
+        state
+            .pending
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .plan
+            .proposed_fix_steps[0]
+            .title = "tampered".into();
+        assert!(action_review(&state, &session, "exact-action".into(), plan, Some(&id)).is_err());
+    }
+
+    #[tokio::test]
     async fn web_modes_block_service_and_rollback_before_permission_consumption() {
         for policy in [
             helm_monitor::ExecutionPolicy {
@@ -1210,6 +1497,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("helm.db");
             let state = Arc::new(WebState {
+                auth: crate::web_auth::Auth::new(9000).0,
+                pending: Mutex::new(HashMap::new()),
                 policy,
                 memory: Arc::new(MemoryStore::open(&db_path).await.unwrap()),
                 db_path,
@@ -1228,17 +1517,29 @@ mod tests {
             });
             let service = api_service_action(
                 State(state.clone()),
+                Extension(crate::web_auth::Session {
+                    id: "test".into(),
+                    csrf: "test".into(),
+                    expires: std::time::Instant::now() + Duration::from_secs(60),
+                }),
                 Json(ServiceActionRequest {
                     unit: "helm-test-never-target.service".into(),
                     action: "stop".into(),
+                    approval_id: None,
                 }),
             )
             .await
             .into_response();
             let rollback = api_change_rollback(
                 State(state),
+                Extension(crate::web_auth::Session {
+                    id: "test".into(),
+                    csrf: "test".into(),
+                    expires: std::time::Instant::now() + Duration::from_secs(60),
+                }),
                 Json(ChangeRollbackRequest {
                     change_set_id: "never-existed".into(),
+                    approval_id: None,
                 }),
             )
             .await

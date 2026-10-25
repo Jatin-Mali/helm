@@ -138,11 +138,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** `helm-cli/src/web.rs`, `web/dashboard.html`, `crates/helm-monitor/src/pipeline.rs`, secrets integration; new `tests/web_security.rs` and pipeline tests. **Findings:** F05, F23.
 
-- [ ] Add explicit local-client pairing/session authentication; protect snapshots, WebSockets and actions. Do not place reusable credentials in URLs, logs or HTML served to anonymous clients.
-- [ ] Validate Host and Origin, enforce session-bound mutation authorization and CSRF protection where cookie sessions are used. Reject unauthorized WebSocket handshakes before streaming.
-- [ ] Route service actions and rollback through Tasks 2–4. Existing global grants do not identify a web client.
-- [ ] Verify webhook signatures against raw request bytes with stored secret references; enforce provider-specific freshness/deduplication. Unsupported providers remain disabled until their verification is implemented.
-- [ ] Serialize pipeline updates with a shared transactional store or locked atomic writer; test concurrent pull/webhook events.
+- [x] Add explicit local-client pairing/session authentication; protect snapshots, WebSockets and actions. Do not place reusable credentials in URLs, logs or HTML served to anonymous clients.
+- [x] Validate Host and Origin, enforce session-bound mutation authorization and CSRF protection where cookie sessions are used. Reject unauthorized WebSocket handshakes before streaming.
+- [x] Route service actions and rollback through Tasks 2–4. Existing global grants do not identify a web client.
+- [x] Verify webhook signatures against raw request bytes with stored secret references; enforce provider-specific freshness/deduplication. Unsupported providers remain disabled until their verification is implemented.
+- [x] Serialize pipeline updates with a shared transactional store or locked atomic writer; test concurrent pull/webhook events.
 
 **Acceptance:** anonymous reads/actions fail, wrong-origin clients cannot connect or mutate, expired sessions fail, tampered/replayed webhooks fail, and authorized exact actions still work. Use a real browser for the dashboard positive/negative checks.
 

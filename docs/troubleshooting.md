@@ -147,3 +147,24 @@ Monitor JSON now returns a versioned object rather than a bare findings array.
 Read `.findings` for the previous array and `.coverage` for domain status; the
 object also includes `schema_version`, snapshot identity, time and collector
 errors. Consumers of the old JSON format must select the `findings` member.
+
+## Pairing the web console
+
+`helm web --port 8765` listens only on loopback. Open the exact printed
+`http://127.0.0.1:8765` address and enter the single-use pairing code from the
+terminal. The code and browser session expire after 15 minutes; restart
+`helm web` to issue a new code. Restarting also invalidates existing sessions.
+The code is never included in a URL or in anonymous HTML. Cookies are
+HttpOnly and SameSite=Strict; this HTTP console must stay on loopback.
+
+API reads and WebSockets require the paired session. POST requests also need
+the session's CSRF token and a matching Origin. Service stop/restart and file
+rollback first return an exact review; confirming consumes that review once,
+bound to this browser session, host, working directory and operation. Global
+CLI grants do not authorize web mutations. Service operations use the durable
+execution journal but cannot be automatically reversed. File rollback retains
+the documented encrypted-backup and newer-edit checks. Read-only, dry-run and
+unsupported sandbox restrictions apply to web actions too.
+
+Webhook ingress uses separate per-service signature verification rather than
+browser cookies; missing webhook secrets disable ingestion.
