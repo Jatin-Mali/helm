@@ -91,7 +91,7 @@ fn command(state: &Path, workspace: &Path, server: &Mock, args: &[&str]) -> Comm
     command
 }
 fn sessions(state: &Path) -> Vec<Value> {
-    let dir = state.join("data/helm/agent-sessions");
+    let dir = state.join("agent-sessions");
     let mut found: Vec<Value> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -138,7 +138,7 @@ fn read_task_completes_with_evidence_and_a_redacted_private_session() {
         );
     }
     use std::os::unix::fs::PermissionsExt;
-    let file = std::fs::read_dir(state.path().join("data/helm/agent-sessions"))
+    let file = std::fs::read_dir(state.path().join("agent-sessions"))
         .unwrap()
         .next()
         .unwrap()
@@ -304,4 +304,18 @@ fn both_binaries_accept_the_run_command() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn run_refuses_a_remote_target_instead_of_acting_locally() {
+    let state = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_helm"))
+        .env("XDG_CONFIG_HOME", state.path().join("config"))
+        .env("XDG_DATA_HOME", state.path().join("data"))
+        .env("XDG_CACHE_HOME", state.path().join("cache"))
+        .args(["--remote", "prod", "run", "do something"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("this machine only"));
 }

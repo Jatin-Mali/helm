@@ -302,10 +302,9 @@ impl AgentRuntime {
             if matches!(
                 quirks.expected_format,
                 helm_providers::ExpectedFormat::Native
-            ) {
-                if let Some(addendum) = quirks.system_prompt_addendum {
-                    system.push_str(&addendum);
-                }
+            ) && let Some(addendum) = quirks.system_prompt_addendum
+            {
+                system.push_str(&addendum);
             }
             let overhead = serde_json::to_vec(&schemas)
                 .map(|b| b.len())

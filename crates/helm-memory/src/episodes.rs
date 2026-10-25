@@ -632,8 +632,8 @@ impl MemoryStore {
                 .map_err(sqlite_error)?;
 
             // Mirror to per-host shard DB when a target is set.
-            if let Some(shard_conn) = shard {
-                if let Ok(sg) = shard_conn.lock() {
+            if let Some(shard_conn) = shard
+                && let Ok(sg) = shard_conn.lock() {
                     let _ = sg.execute(
                         insert_sql,
                         params![
@@ -652,7 +652,6 @@ impl MemoryStore {
                         ],
                     );
                 }
-            }
 
             Ok::<String, MemoryError>(event_hash)
         })

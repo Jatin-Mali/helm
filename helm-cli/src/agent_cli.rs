@@ -64,7 +64,23 @@ pub(crate) enum Output {
     Quiet,
 }
 
+/// Model- and file-derived text must not drive the terminal: control characters (ESC, CR, BEL…)
+/// and bidirectional/zero-width format characters could redraw or reorder an approval prompt.
+pub(crate) fn sanitize_for_terminal(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let hidden = matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+            if (c.is_control() && c != '\n') || hidden {
+                format!("\\u{{{:04x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 fn brief(text: &str, limit: usize) -> String {
+    let text = sanitize_for_terminal(text);
     let line = text.lines().next().unwrap_or("").trim();
     if line.chars().count() > limit {
         format!("{}…", line.chars().take(limit).collect::<String>())
@@ -76,10 +92,8 @@ fn brief(text: &str, limit: usize) -> String {
 pub(crate) fn observe(event: &AgentEvent, observed: &Mutex<Observed>, output: Output) {
     let json = output == Output::Json;
     let human = output == Output::Human;
-    if json {
-        if let Ok(line) = serde_json::to_string(event) {
-            println!("{line}");
-        }
+    if json && let Ok(line) = serde_json::to_string(event) {
+        println!("{line}");
     }
     let Ok(mut observed) = observed.lock() else {
         return;
@@ -116,7 +130,10 @@ pub(crate) fn observe(event: &AgentEvent, observed: &Mutex<Observed>, output: Ou
 }
 
 fn ask(description: &str) -> bool {
-    eprintln!("\nApproval required:\n{description}");
+    eprintln!(
+        "\nApproval required:\n{}",
+        sanitize_for_terminal(description)
+    );
     eprint!("Approve this exact action once? [y/N] ");
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
@@ -175,7 +192,7 @@ pub(crate) fn setup(
         db_path.to_path_buf(),
         crate::paths::default_secrets_path(),
         crate::paths::default_config_path(),
-        agent_session::sessions_dir(),
+        agent_session::sessions_dir(db_path),
     ] {
         tools.protect_path(path).map_err(|e| anyhow!(e))?;
     }
@@ -199,7 +216,7 @@ pub(crate) async fn run_command(
     policy: ExecutionPolicy,
 ) -> Result<()> {
     if args.sessions {
-        for s in agent_session::list() {
+        for s in agent_session::list(db_path) {
             println!(
                 "{}  {:<18} {} step(s)  {}",
                 s.id,
@@ -211,7 +228,7 @@ pub(crate) async fn run_command(
         return Ok(());
     }
     let mut record = match &args.resume {
-        Some(id) => agent_session::load(id)?,
+        Some(id) => agent_session::load(db_path, id)?,
         None => {
             let goal = args.task.as_deref().filter(|t| !t.trim().is_empty());
             let goal = goal.ok_or_else(|| anyhow!("provide a task, or --resume <session>"))?;
@@ -308,7 +325,7 @@ pub(crate) async fn run_command(
     OWNS_INTERRUPT.store(false, Ordering::SeqCst);
 
     conclude(&mut record, &run, &observed);
-    agent_session::save(&mut record)?;
+    agent_session::save(db_path, &mut record)?;
     if args.json {
         println!("{}", serde_json::to_string(&record)?);
     } else {
@@ -357,5 +374,23 @@ pub(crate) fn conclude(record: &mut SessionRecord, run: &AgentRun, observed: &Mu
                 decision: "pending".into(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_for_terminal;
+
+    #[test]
+    fn terminal_control_and_bidi_characters_are_escaped_but_newlines_survive() {
+        let hostile = "ls\u{1b}[2K\r\u{7}Approved: nothing\u{202e}\nsecond line";
+        let clean = sanitize_for_terminal(hostile);
+        assert!(
+            !clean
+                .chars()
+                .any(|c| (c.is_control() && c != '\n') || c == '\u{202e}')
+        );
+        assert!(clean.contains("\\u{001b}") && clean.contains("\\u{202e}"));
+        assert_eq!(clean.lines().count(), 2);
     }
 }

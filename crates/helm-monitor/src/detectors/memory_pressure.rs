@@ -69,28 +69,27 @@ impl Detector for MemoryPressureDetector {
             );
         }
 
-        if let Some(psi) = &snapshot.domains.load.memory_pressure {
-            if let Some(avg60) = psi.avg60 {
-                if avg60 > 10.0 {
-                    findings.push(
-                        Finding::new(
-                            &snapshot.id,
-                            self.id(),
-                            "system",
-                            &format!("Memory pressure stall is high (avg60={avg60:.1})"),
-                            Severity::Warning,
-                            Confidence::High,
-                            MonitorDomain::Load,
-                        )
-                        .with_evidence(
-                            "load.memory_pressure.avg60",
-                            &format!("{avg60:.1}"),
-                            "PSI memory pressure indicates processes waiting for memory",
-                        )
-                        .with_impact("Applications are stalling due to memory contention"),
-                    );
-                }
-            }
+        if let Some(psi) = &snapshot.domains.load.memory_pressure
+            && let Some(avg60) = psi.avg60
+            && avg60 > 10.0
+        {
+            findings.push(
+                Finding::new(
+                    &snapshot.id,
+                    self.id(),
+                    "system",
+                    &format!("Memory pressure stall is high (avg60={avg60:.1})"),
+                    Severity::Warning,
+                    Confidence::High,
+                    MonitorDomain::Load,
+                )
+                .with_evidence(
+                    "load.memory_pressure.avg60",
+                    &format!("{avg60:.1}"),
+                    "PSI memory pressure indicates processes waiting for memory",
+                )
+                .with_impact("Applications are stalling due to memory contention"),
+            );
         }
 
         findings

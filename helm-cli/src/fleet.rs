@@ -83,10 +83,10 @@ pub fn apply_results(
             Some((_, Ok(report))) => {
                 let mut fresh = summarize(entry, report);
                 let mut warning = None;
-                if let Some(id) = fresh.identity.clone() {
-                    if let Some(other) = seen_identity.insert(id, entry.name.clone()) {
-                        warning = Some(format!("same machine identity as '{other}'"));
-                    }
+                if let Some(id) = fresh.identity.clone()
+                    && let Some(other) = seen_identity.insert(id, entry.name.clone())
+                {
+                    warning = Some(format!("same machine identity as '{other}'"));
                 }
                 if warning.is_some() {
                     // Identical identities mean two registrations reach one machine; do not

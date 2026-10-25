@@ -184,15 +184,15 @@ impl SecretStore {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        if let Some(entry) = data.get_mut(key) {
-            if let Some(obj) = entry.as_object_mut() {
-                let rotated_at = obj.get("rotated_at").cloned();
-                if let Some(hist) = obj.get_mut("history").and_then(|h| h.as_array_mut()) {
-                    hist.push(serde_json::json!({ "rotated_at": rotated_at }));
-                }
-                obj["value"] = serde_json::Value::String(new_value.to_string());
-                obj["rotated_at"] = serde_json::Value::Number(now.into());
+        if let Some(entry) = data.get_mut(key)
+            && let Some(obj) = entry.as_object_mut()
+        {
+            let rotated_at = obj.get("rotated_at").cloned();
+            if let Some(hist) = obj.get_mut("history").and_then(|h| h.as_array_mut()) {
+                hist.push(serde_json::json!({ "rotated_at": rotated_at }));
             }
+            obj["value"] = serde_json::Value::String(new_value.to_string());
+            obj["rotated_at"] = serde_json::Value::Number(now.into());
         }
 
         self.save_data(&data)?;
@@ -229,10 +229,10 @@ impl SecretStore {
 
         let mut needs_rotation = Vec::new();
         for (key, entry) in data.iter() {
-            if let Some(rotated_at) = entry.get("rotated_at").and_then(|v| v.as_i64()) {
-                if now - rotated_at > threshold_secs {
-                    needs_rotation.push(key.clone());
-                }
+            if let Some(rotated_at) = entry.get("rotated_at").and_then(|v| v.as_i64())
+                && now - rotated_at > threshold_secs
+            {
+                needs_rotation.push(key.clone());
             }
         }
         Ok(needs_rotation)

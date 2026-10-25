@@ -35,19 +35,19 @@ impl Collector for FirewallCollector {
         }
 
         // ufw status
-        if bin_exists("ufw") {
-            if let Ok(o) = run_timed("ufw", &["status"], profile).await {
-                let s = String::from_utf8_lossy(&o.stdout);
-                out.ufw_active = Some(s.contains("active"));
-            }
+        if bin_exists("ufw")
+            && let Ok(o) = run_timed("ufw", &["status"], profile).await
+        {
+            let s = String::from_utf8_lossy(&o.stdout);
+            out.ufw_active = Some(s.contains("active"));
         }
 
         // firewalld status
-        if bin_exists("firewall-cmd") {
-            if let Ok(o) = run_timed("firewall-cmd", &["--state"], profile).await {
-                let s = String::from_utf8_lossy(&o.stdout);
-                out.firewalld_active = Some(s.trim() == "running");
-            }
+        if bin_exists("firewall-cmd")
+            && let Ok(o) = run_timed("firewall-cmd", &["--state"], profile).await
+        {
+            let s = String::from_utf8_lossy(&o.stdout);
+            out.firewalld_active = Some(s.trim() == "running");
         }
 
         Ok(out)

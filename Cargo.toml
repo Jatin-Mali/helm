@@ -20,7 +20,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/Jatin-Mali/helm"
 
@@ -35,7 +35,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 crossterm = "0.28"
 dashmap = "6"
-ratatui = "0.29"
+ratatui = "0.30"
 mockito = "1"
 pretty_assertions = "1"
 proptest = "1"

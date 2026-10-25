@@ -326,20 +326,20 @@ pub fn resolve_secret(
     cli_override: Option<&Secret>,
     store: &SecretsStore,
 ) -> Result<Option<Secret>, SecretsError> {
-    if let Some(v) = cli_override {
-        if !v.is_empty() {
-            return Ok(Some(v.clone()));
-        }
+    if let Some(v) = cli_override
+        && !v.is_empty()
+    {
+        return Ok(Some(v.clone()));
     }
-    if let Some(s) = store.get(name)? {
-        if !s.is_empty() {
-            return Ok(Some(s));
-        }
+    if let Some(s) = store.get(name)?
+        && !s.is_empty()
+    {
+        return Ok(Some(s));
     }
-    if let Ok(v) = env::var(name) {
-        if !v.is_empty() {
-            return Ok(Some(Secret::new(v)));
-        }
+    if let Ok(v) = env::var(name)
+        && !v.is_empty()
+    {
+        return Ok(Some(Secret::new(v)));
     }
     Ok(None)
 }

@@ -23,28 +23,28 @@ impl Collector for HostCollector {
         let mut out = HostIdentity::default();
 
         let u = run_timed("uname", &["-n"], profile).await;
-        if let Ok(o) = u {
-            if o.status.success() {
-                out.hostname = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            }
+        if let Ok(o) = u
+            && o.status.success()
+        {
+            out.hostname = String::from_utf8_lossy(&o.stdout).trim().to_string();
         }
         let u = run_timed("uname", &["-s"], profile).await;
-        if let Ok(o) = u {
-            if o.status.success() {
-                out.kernel_name = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            }
+        if let Ok(o) = u
+            && o.status.success()
+        {
+            out.kernel_name = String::from_utf8_lossy(&o.stdout).trim().to_string();
         }
         let u = run_timed("uname", &["-r"], profile).await;
-        if let Ok(o) = u {
-            if o.status.success() {
-                out.kernel_release = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            }
+        if let Ok(o) = u
+            && o.status.success()
+        {
+            out.kernel_release = String::from_utf8_lossy(&o.stdout).trim().to_string();
         }
         let u = run_timed("uname", &["-m"], profile).await;
-        if let Ok(o) = u {
-            if o.status.success() {
-                out.machine = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            }
+        if let Ok(o) = u
+            && o.status.success()
+        {
+            out.machine = String::from_utf8_lossy(&o.stdout).trim().to_string();
         }
 
         if let Ok(content) = std::fs::read_to_string("/etc/os-release") {

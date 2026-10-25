@@ -53,15 +53,15 @@ impl Collector for LoadCollector {
                 used: 0,
                 available: if avail > 0 { Some(avail * 1024) } else { None },
             };
-            if let Ok(o) = run_timed("free", &["-b"], profile).await {
-                if o.status.success() {
-                    let f = String::from_utf8_lossy(&o.stdout);
-                    if let Some(ml) = f.lines().nth(1) {
-                        let cols: Vec<&str> = ml.split_whitespace().collect();
-                        if cols.len() >= 3 {
-                            out.memory.total = cols[1].parse().unwrap_or(out.memory.total);
-                            out.memory.used = cols[2].parse().unwrap_or(0);
-                        }
+            if let Ok(o) = run_timed("free", &["-b"], profile).await
+                && o.status.success()
+            {
+                let f = String::from_utf8_lossy(&o.stdout);
+                if let Some(ml) = f.lines().nth(1) {
+                    let cols: Vec<&str> = ml.split_whitespace().collect();
+                    if cols.len() >= 3 {
+                        out.memory.total = cols[1].parse().unwrap_or(out.memory.total);
+                        out.memory.used = cols[2].parse().unwrap_or(0);
                     }
                 }
             }

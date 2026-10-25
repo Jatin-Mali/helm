@@ -1487,14 +1487,13 @@ fn restore_dashboard_selection(
     if visible.is_empty() {
         return None;
     }
-    if let Some(preferred) = preferred_fingerprint {
-        if let Some(found) = visible
+    if let Some(preferred) = preferred_fingerprint
+        && let Some(found) = visible
             .iter()
             .find(|finding| finding.fingerprint == preferred)
             .map(|finding| finding.fingerprint.clone())
-        {
-            return Some(found);
-        }
+    {
+        return Some(found);
     }
     let index = fallback_visible_pos
         .unwrap_or(0)
@@ -2337,14 +2336,12 @@ impl TuiApp {
 
         // Allow env-only sessions without silently importing keys into the
         // persistent secrets store.
-        if active_settings.api_key.is_none() {
-            if let Some(env_name) = default_api_key_env(active_settings.choice) {
-                let in_store = runtime.secrets.get(env_name).ok().flatten().is_some();
-                if !in_store {
-                    if let Ok(key) = std::env::var(env_name) {
-                        active_settings.api_key = Some(key);
-                    }
-                }
+        if active_settings.api_key.is_none()
+            && let Some(env_name) = default_api_key_env(active_settings.choice)
+        {
+            let in_store = runtime.secrets.get(env_name).ok().flatten().is_some();
+            if !in_store && let Ok(key) = std::env::var(env_name) {
+                active_settings.api_key = Some(key);
             }
         }
 
@@ -2483,43 +2480,43 @@ impl TuiApp {
                 {
                     self.toast = None;
                 }
-                if let Some(rx) = &mut self.dashboard.pending_plan_rx {
-                    if let Ok((finding, plan_id, status)) = rx.try_recv() {
-                        self.dashboard.pending_plan_rx = None;
-                        self.dashboard.pending_plan_task = None;
-                        if let PlanStatus::DangerousCommand {
-                            pattern,
-                            command_text,
-                        } = &status
-                        {
-                            let _ = self.write_dashboard_audit(command_text, pattern);
-                            if let Some(idx) = self
-                                .dashboard
-                                .data
-                                .findings
-                                .iter()
-                                .position(|f| f.id == finding.id)
-                            {
-                                self.tag_finding_rejected(idx);
-                            }
-                        }
-                        if let Ok(conn) = rusqlite::Connection::open(&self.runtime.db_path) {
-                            self.persist_dashboard_plan_status(&conn, &finding, &plan_id, &status);
-                        }
-                        if let Some(plan) = self
+                if let Some(rx) = &mut self.dashboard.pending_plan_rx
+                    && let Ok((finding, plan_id, status)) = rx.try_recv()
+                {
+                    self.dashboard.pending_plan_rx = None;
+                    self.dashboard.pending_plan_task = None;
+                    if let PlanStatus::DangerousCommand {
+                        pattern,
+                        command_text,
+                    } = &status
+                    {
+                        let _ = self.write_dashboard_audit(command_text, pattern);
+                        if let Some(idx) = self
                             .dashboard
-                            .active_plan
-                            .as_mut()
-                            .filter(|p| p.plan_id == plan_id)
+                            .data
+                            .findings
+                            .iter()
+                            .position(|f| f.id == finding.id)
                         {
-                            plan.rate_limit_retry_at = match &status {
-                                PlanStatus::RateLimited { retry_after_secs } => {
-                                    Some(Instant::now() + Duration::from_secs(*retry_after_secs))
-                                }
-                                _ => None,
-                            };
-                            plan.status = status;
+                            self.tag_finding_rejected(idx);
                         }
+                    }
+                    if let Ok(conn) = rusqlite::Connection::open(&self.runtime.db_path) {
+                        self.persist_dashboard_plan_status(&conn, &finding, &plan_id, &status);
+                    }
+                    if let Some(plan) = self
+                        .dashboard
+                        .active_plan
+                        .as_mut()
+                        .filter(|p| p.plan_id == plan_id)
+                    {
+                        plan.rate_limit_retry_at = match &status {
+                            PlanStatus::RateLimited { retry_after_secs } => {
+                                Some(Instant::now() + Duration::from_secs(*retry_after_secs))
+                            }
+                            _ => None,
+                        };
+                        plan.status = status;
                     }
                 }
                 let retry = self.dashboard.active_plan.as_ref().is_some_and(|plan| {
@@ -2531,38 +2528,39 @@ impl TuiApp {
                 if retry && self.dashboard.pending_plan_rx.is_none() {
                     self.generate_dashboard_plan().await?;
                 }
-                if let Some(rx) = &mut self.pending_apply_rx {
-                    if let Ok(result) = rx.try_recv() {
-                        if let Some(ModalState::PlanExecution {
-                            ref mut phase,
-                            ref mut result_summary,
-                            ..
-                        }) = self.modal
-                        {
-                            *phase = PlanExecPhase::Done;
-                            *result_summary = match &result {
-                                Ok(summary) => summary.clone(),
-                                Err(error) => format!("Execution failed: {error}"),
-                            };
-                        }
-                        match result {
-                            Ok(summary) => self
-                                .push_chat(MessageRole::System, format!("[apply-plan] {summary}")),
-                            Err(error) => self.push_chat(
-                                MessageRole::Error,
-                                format!("[apply-plan] Execution failed: {error}"),
-                            ),
-                        }
-                        self.pending_apply_rx = None;
-                        self.pending_apply_cancel = None;
+                if let Some(rx) = &mut self.pending_apply_rx
+                    && let Ok(result) = rx.try_recv()
+                {
+                    if let Some(ModalState::PlanExecution {
+                        ref mut phase,
+                        ref mut result_summary,
+                        ..
+                    }) = self.modal
+                    {
+                        *phase = PlanExecPhase::Done;
+                        *result_summary = match &result {
+                            Ok(summary) => summary.clone(),
+                            Err(error) => format!("Execution failed: {error}"),
+                        };
                     }
+                    match result {
+                        Ok(summary) => {
+                            self.push_chat(MessageRole::System, format!("[apply-plan] {summary}"))
+                        }
+                        Err(error) => self.push_chat(
+                            MessageRole::Error,
+                            format!("[apply-plan] Execution failed: {error}"),
+                        ),
+                    }
+                    self.pending_apply_rx = None;
+                    self.pending_apply_cancel = None;
                 }
-                if let Some(rx) = &mut self.dashboard.pending_fleet_rx {
-                    if let Ok(hosts) = rx.try_recv() {
-                        self.dashboard.data.fleet_hosts = hosts;
-                        self.dashboard.fleet_collection_in_flight = false;
-                        self.dashboard.pending_fleet_rx = None;
-                    }
+                if let Some(rx) = &mut self.dashboard.pending_fleet_rx
+                    && let Ok(hosts) = rx.try_recv()
+                {
+                    self.dashboard.data.fleet_hosts = hosts;
+                    self.dashboard.fleet_collection_in_flight = false;
+                    self.dashboard.pending_fleet_rx = None;
                 }
                 // Spawn real fleet collection from registered remotes when fleet view is active.
                 if self.mode == AgentMode::Dashboard
@@ -2741,12 +2739,12 @@ impl TuiApp {
                 }
                 KeyCode::Tab => {
                     let filtered = self.slash_filtered();
-                    if let Some(sel) = self.slash_popup {
-                        if let Some(cmd) = filtered.get(sel) {
-                            self.input.text = format!("/{}", cmd.slug());
-                            self.input.cursor = self.input.text.chars().count();
-                            self.update_slash_popup();
-                        }
+                    if let Some(sel) = self.slash_popup
+                        && let Some(cmd) = filtered.get(sel)
+                    {
+                        self.input.text = format!("/{}", cmd.slug());
+                        self.input.cursor = self.input.text.chars().count();
+                        self.update_slash_popup();
                     }
                     return Ok(false);
                 }
@@ -4011,6 +4009,7 @@ Report the exit status and the concise output."
         observed: Arc<Mutex<crate::agent_cli::Observed>>,
     ) {
         let run_id = self.active_run_id;
+        let db_path = self.runtime.db_path.clone();
         let cancel = helm_monitor::process_runner::CancellationToken::default();
         self.agent_cancel = Some(cancel.clone());
         // A previous task is detached, never aborted: it cancels through its own token and saves.
@@ -4034,7 +4033,7 @@ Report the exit status and the concise output."
             };
             let approval = observed.lock().ok().and_then(|o| o.approval.clone());
             crate::agent_cli::conclude(&mut record, &run, &observed);
-            if let Err(error) = crate::agent_session::save(&mut record) {
+            if let Err(error) = crate::agent_session::save(&db_path, &mut record) {
                 tracing::warn!(%error, "failed to persist agent session");
             }
             let _ = tx.send(UiEvent::AgentDone {
@@ -4711,19 +4710,17 @@ Report the exit status and the concise output."
     }
 
     fn apply_provider_with_key(&mut self, choice: ProviderChoice, key: String, persist_key: bool) {
-        if persist_key {
-            if let Some(env_name) = default_api_key_env(choice) {
-                if let Err(error) = self
-                    .runtime
-                    .secrets
-                    .set(env_name, helm_core::Secret::new(key.clone()))
-                {
-                    self.push_chat(
-                        MessageRole::Error,
-                        format!("failed to save key to secrets store: {error}"),
-                    );
-                }
-            }
+        if persist_key
+            && let Some(env_name) = default_api_key_env(choice)
+            && let Err(error) = self
+                .runtime
+                .secrets
+                .set(env_name, helm_core::Secret::new(key.clone()))
+        {
+            self.push_chat(
+                MessageRole::Error,
+                format!("failed to save key to secrets store: {error}"),
+            );
         }
         let mut s = self.active_settings.with_choice(choice);
         s.api_key_env = default_api_key_env(choice).map(str::to_owned);
@@ -4870,16 +4867,14 @@ Report the exit status and the concise output."
 
     async fn execute_slash_from_popup(&mut self, tx: mpsc::UnboundedSender<UiEvent>) -> Result<()> {
         let filtered = self.slash_filtered();
-        if let Some(sel) = self.slash_popup {
-            if let Some(cmd) = filtered.get(sel).cloned() {
-                self.input.clear();
-                self.slash_popup = None;
-                match cmd {
-                    SlashItem::BuiltIn(command) => self.execute_command(command),
-                    SlashItem::Custom(command) => {
-                        self.execute_custom_command(command, "", tx).await?
-                    }
-                }
+        if let Some(sel) = self.slash_popup
+            && let Some(cmd) = filtered.get(sel).cloned()
+        {
+            self.input.clear();
+            self.slash_popup = None;
+            match cmd {
+                SlashItem::BuiltIn(command) => self.execute_command(command),
+                SlashItem::Custom(command) => self.execute_custom_command(command, "", tx).await?,
             }
         }
         Ok(())
@@ -5820,16 +5815,15 @@ Report the exit status and the concise output."
 
     /// Resolve selected_fingerprint to an absolute index in data.findings (via visible list).
     fn dashboard_selected_finding_index(&self) -> Option<usize> {
-        if let Some(fp) = self.workspace_fingerprint() {
-            if let Some(idx) = self
+        if let Some(fp) = self.workspace_fingerprint()
+            && let Some(idx) = self
                 .dashboard
                 .data
                 .findings
                 .iter()
                 .position(|finding| finding.fingerprint == fp)
-            {
-                return Some(idx);
-            }
+        {
+            return Some(idx);
         }
         if let DashboardView::FindingDetail(idx)
         | DashboardView::EvidenceView(idx)
@@ -5927,10 +5921,10 @@ Report the exit status and the concise output."
                 .map(|f| f.fingerprint.clone());
         }
         // Keep scroll in bounds.
-        if let Some(vpos) = self.selected_visible_index() {
-            if vpos < self.dashboard.table_scroll {
-                self.dashboard.table_scroll = vpos;
-            }
+        if let Some(vpos) = self.selected_visible_index()
+            && vpos < self.dashboard.table_scroll
+        {
+            self.dashboard.table_scroll = vpos;
         }
         if !matches!(self.dashboard.view, DashboardView::Overview) {
             self.persist_pinned_incident_from_current();
@@ -5948,10 +5942,10 @@ Report the exit status and the concise output."
         let next_vpos = ((current_vpos as isize) + delta)
             .clamp(0, visible.len().saturating_sub(1) as isize) as usize;
         self.set_selected_from_visible_index(next_vpos);
-        if let Some(vpos) = self.selected_visible_index() {
-            if vpos < self.dashboard.table_scroll {
-                self.dashboard.table_scroll = vpos;
-            }
+        if let Some(vpos) = self.selected_visible_index()
+            && vpos < self.dashboard.table_scroll
+        {
+            self.dashboard.table_scroll = vpos;
         }
     }
 
@@ -6322,11 +6316,11 @@ Report the exit status and the concise output."
                 DashboardFocus::Table | DashboardFocus::Detail => {
                     // Fleet tab has special Enter behavior: switch active_remote
                     if self.dashboard.active_tab == OpsTab::Fleet {
-                        if let Some(row) = self.dashboard.fleet_selected_row {
-                            if let Some(host) = self.dashboard.data.fleet_hosts.get(row) {
-                                self.active_remote = Some(host.name.clone());
-                                self.toast(format!("Active remote set to {}", host.name));
-                            }
+                        if let Some(row) = self.dashboard.fleet_selected_row
+                            && let Some(host) = self.dashboard.data.fleet_hosts.get(row)
+                        {
+                            self.active_remote = Some(host.name.clone());
+                            self.toast(format!("Active remote set to {}", host.name));
                         }
                     } else if self.dashboard.active_tab == OpsTab::Services {
                         if let Some(unit) = self.selected_dashboard_service_unit() {
@@ -11039,9 +11033,12 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
             description,
         } => {
             let text = vec![
-                modal_kv("tool", tool_name),
+                modal_kv("tool", &crate::agent_cli::sanitize_for_terminal(tool_name)),
                 Line::from(""),
-                Line::styled(description.as_str(), Style::default().fg(MODAL_FG)),
+                Line::styled(
+                    crate::agent_cli::sanitize_for_terminal(description),
+                    Style::default().fg(MODAL_FG),
+                ),
                 Line::from(""),
                 Line::from(vec![
                     key_span("[Y] Approve this exact action once"),
@@ -12602,8 +12599,16 @@ mod tests {
             )
             .await
             .unwrap();
+            // Dashboard refreshes also call systemctl for read-only listings; only mutations count.
+            let mutations = || {
+                std::fs::read_to_string(&marker)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| l.starts_with("restart"))
+                    .count()
+            };
             assert!(
-                app.modal.is_none() && !marker.exists(),
+                app.modal.is_none() && mutations() == 0,
                 "ran without confirmation"
             );
             app.modal = Some(review());

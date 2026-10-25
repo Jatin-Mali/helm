@@ -196,11 +196,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** `install.sh`, `.github/workflows/release.yml`, new installer tests/CI checks, user docs and current navigation index. **Finding:** F25; completes additional feature gaps.
 
-- [ ] Check OS/architecture, download and validate the checksum, stage safely, and leave the old binary intact on mismatch/failure. Publish only supported targets; retain clear source-build fallback.
-- [ ] Add mock endpoint alert tests for Slack/PagerDuty/webhook success, rejection, rate limits, deduplication and recovery. Exercise daemon startup/stop/restart and stale heartbeat handling.
-- [ ] Add optional-feature builds and integration regressions to CI. Run a dependency-advisory scan with current data and triage actual affected dependencies rather than claiming cleanliness from compilation.
-- [ ] Update install/setup/security/agent/rollback docs from tested commands. Correct the stale crate/command index while preserving unrelated local edits. List unsupported operations and required external binaries plainly.
-- [ ] Verify required release assets and `contents: write`; do not publish a release as part of writing or implementing this plan without the release gate.
+- [x] Check OS/architecture, download and validate the checksum, stage safely, and leave the old binary intact on mismatch/failure. Publish only supported targets; retain clear source-build fallback.
+- [x] Add mock endpoint alert tests for Slack/PagerDuty/webhook success, rejection, rate limits, deduplication and recovery. Exercise daemon startup/stop/restart and stale heartbeat handling.
+- [x] Add optional-feature builds and integration regressions to CI. Run a dependency-advisory scan with current data and triage actual affected dependencies rather than claiming cleanliness from compilation.
+- [x] Update install/setup/security/agent/rollback docs from tested commands. Correct the stale crate/command index while preserving unrelated local edits. List unsupported operations and required external binaries plainly.
+- [x] Verify required release assets and `contents: write`; do not publish a release as part of writing or implementing this plan without the release gate.
 
 ### Task 14 — Fresh-machine acceptance and demo package
 

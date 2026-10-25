@@ -246,26 +246,26 @@ impl RemoteRegistry {
             }
 
             // Spawn one more task if available and we're below the max
-            if joinset.len() < MAX_CONCURRENT {
-                if let Some(remote) = task_iter.next() {
-                    let remote_clone = remote.clone();
-                    joinset.spawn(async move {
-                        let result = tokio::time::timeout(
-                            std::time::Duration::from_secs(FLEET_COLLECTION_TIMEOUT_SECS),
-                            remote_clone.collect_findings(),
+            if joinset.len() < MAX_CONCURRENT
+                && let Some(remote) = task_iter.next()
+            {
+                let remote_clone = remote.clone();
+                joinset.spawn(async move {
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(FLEET_COLLECTION_TIMEOUT_SECS),
+                        remote_clone.collect_findings(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "timed out after {}s collecting findings from {}",
+                            FLEET_COLLECTION_TIMEOUT_SECS,
+                            remote_clone.name
                         )
-                        .await
-                        .map_err(|_| {
-                            anyhow!(
-                                "timed out after {}s collecting findings from {}",
-                                FLEET_COLLECTION_TIMEOUT_SECS,
-                                remote_clone.name
-                            )
-                        })
-                        .and_then(|result| result);
-                        (remote_clone.host_id, result)
-                    });
-                }
+                    })
+                    .and_then(|result| result);
+                    (remote_clone.host_id, result)
+                });
             }
         }
 

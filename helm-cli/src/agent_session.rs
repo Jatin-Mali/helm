@@ -8,7 +8,7 @@ use helm_agent::AgentOutcome;
 use helm_core::{ContentBlock, Message, Role, redact_secrets};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const VERSION: u32 = 1;
 
@@ -161,11 +161,15 @@ pub(crate) fn redact_message(message: &Message) -> Message {
     }
 }
 
-pub(crate) fn sessions_dir() -> PathBuf {
-    crate::paths::data_dir().join("agent-sessions")
+/// Sessions live beside the database, so `--db-path` (and every test) isolates them too.
+pub(crate) fn sessions_dir(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("agent-sessions")
 }
 
-fn session_path(id: &str) -> Result<PathBuf> {
+fn session_path(dir: &Path, id: &str) -> Result<PathBuf> {
     let valid = !id.is_empty()
         && id.len() <= 64
         && id
@@ -174,22 +178,22 @@ fn session_path(id: &str) -> Result<PathBuf> {
     if !valid {
         bail!("invalid session id");
     }
-    Ok(sessions_dir().join(format!("{id}.json")))
+    Ok(dir.join(format!("{id}.json")))
 }
 
-pub(crate) fn save(record: &mut SessionRecord) -> Result<()> {
+pub(crate) fn save(db_path: &Path, record: &mut SessionRecord) -> Result<()> {
     record.updated_at = chrono::Utc::now().timestamp();
     record.messages = record.messages.iter().map(redact_message).collect();
     record.summary = redact_secrets(&record.summary);
-    let dir = sessions_dir();
+    let dir = sessions_dir(db_path);
     helm_core::private_fs::create_private_dir(&dir)?;
     let bytes = serde_json::to_vec_pretty(record)?;
-    crate::paths::write_atomic(&session_path(&record.id)?, &bytes, 0o600)?;
+    crate::paths::write_atomic(&session_path(&dir, &record.id)?, &bytes, 0o600)?;
     Ok(())
 }
 
-pub(crate) fn load(id: &str) -> Result<SessionRecord> {
-    let path = session_path(id)?;
+pub(crate) fn load(db_path: &Path, id: &str) -> Result<SessionRecord> {
+    let path = session_path(&sessions_dir(db_path), id)?;
     let text = std::fs::read_to_string(&path).map_err(|e| anyhow!("session {id}: {e}"))?;
     let record: SessionRecord =
         serde_json::from_str(&text).map_err(|e| anyhow!("session {id} is unreadable: {e}"))?;
@@ -199,14 +203,14 @@ pub(crate) fn load(id: &str) -> Result<SessionRecord> {
     Ok(record)
 }
 
-pub(crate) fn list() -> Vec<SessionRecord> {
-    let mut sessions: Vec<SessionRecord> = std::fs::read_dir(sessions_dir())
+pub(crate) fn list(db_path: &Path) -> Vec<SessionRecord> {
+    let mut sessions: Vec<SessionRecord> = std::fs::read_dir(sessions_dir(db_path))
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
-            load(name.strip_suffix(".json")?).ok()
+            load(db_path, name.strip_suffix(".json")?).ok()
         })
         .collect();
     sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
@@ -261,8 +265,8 @@ mod tests {
     #[test]
     fn session_ids_cannot_escape_the_directory() {
         for id in ["", "../x", "a/b", "a.b", &"x".repeat(65)] {
-            assert!(session_path(id).is_err(), "{id}");
+            assert!(session_path(Path::new("/d"), id).is_err(), "{id}");
         }
-        assert!(session_path("sess-1-ab").is_ok());
+        assert!(session_path(Path::new("/d"), "sess-1-ab").is_ok());
     }
 }

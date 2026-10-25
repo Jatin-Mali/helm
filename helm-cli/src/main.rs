@@ -121,7 +121,7 @@ struct Cli {
     /// Use this directory as the Bubblewrap sandbox root instead of the current directory.
     #[arg(long, value_name = "PATH", global = true)]
     sandbox_dir: Option<PathBuf>,
-    /// Execute shell-style tool calls on the named remote host (registered via `helm remote add`).
+    /// Select a registered remote (`helm remote add`) for the dashboard; agent tasks stay local.
     #[arg(long, value_name = "NAME", global = true)]
     remote: Option<String>,
     #[command(subcommand)]
@@ -1054,6 +1054,11 @@ async fn run() -> Result<()> {
     };
     match command {
         Command::Run(args) => {
+            if let Some(remote) = &cli.remote {
+                anyhow::bail!(
+                    "agent tasks run on this machine only; --remote {remote} is not supported by `run` (use `helm monitor --fleet` or `helm remote` for remote observation)"
+                );
+            }
             agent_cli::run_command(args, &provider_settings, &secrets_store, &db_path, policy)
                 .await?;
         }
@@ -1392,15 +1397,15 @@ fn run_secrets_command(args: SecretsArgs, store: &SecretsStore) -> Result<()> {
             ];
             let mut imported = 0usize;
             for var in env_vars {
-                if let Ok(v) = env::var(var) {
-                    if !v.is_empty() {
-                        if store.get(var).map_err(|e| anyhow!("{e}"))?.is_some() {
-                            eprintln!("warning: overwriting stored {var}");
-                        }
-                        store.set(var, Secret::new(v)).map_err(|e| anyhow!("{e}"))?;
-                        println!("imported {var}");
-                        imported += 1;
+                if let Ok(v) = env::var(var)
+                    && !v.is_empty()
+                {
+                    if store.get(var).map_err(|e| anyhow!("{e}"))?.is_some() {
+                        eprintln!("warning: overwriting stored {var}");
                     }
+                    store.set(var, Secret::new(v)).map_err(|e| anyhow!("{e}"))?;
+                    println!("imported {var}");
+                    imported += 1;
                 }
             }
             println!("imported {imported} secret(s)");
@@ -4527,10 +4532,10 @@ async fn run_daemon_command(
 
 /// Core daemon start — returns status message, does NOT print (TUI-safe).
 pub(crate) async fn daemon_start_core(args: DaemonStartArgs, db_path: &Path) -> Result<String> {
-    if let Some(pid) = read_daemon_state().and_then(|state| state.pid) {
-        if process_alive(pid) {
-            return Ok(format!("helm daemon already running (pid {pid})"));
-        }
+    if let Some(pid) = read_daemon_state().and_then(|state| state.pid)
+        && process_alive(pid)
+    {
+        return Ok(format!("helm daemon already running (pid {pid})"));
     }
 
     let refresh_interval_secs = configured_refresh_interval(args.interval);
@@ -5777,30 +5782,29 @@ async fn run_troubleshoot_command(args: TroubleshootArgs) -> Result<()> {
     }
 
     // Persist the plan to DB for later apply-plan lookup
-    if let Ok(db_path) = default_db_path() {
-        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-            let source = match &plan.source {
-                PlanSource::UserQuestion(q) => format!("user: {q}"),
-                PlanSource::Finding(id) => format!("finding: {id}"),
-            };
-            let hypotheses_json = serde_json::to_string(&plan.hypotheses).unwrap_or_default();
-            let read_only_steps_json =
-                serde_json::to_string(&plan.read_only_steps).unwrap_or_default();
-            let proposed_fix_steps_json =
-                serde_json::to_string(&plan.proposed_fix_steps).unwrap_or_default();
-            let _ = TroubleshootingPlanStore::insert(
-                &conn,
-                &plan.id,
-                &source,
-                &plan.snapshot_id,
-                "",
-                &helm_core::redact_secrets(&hypotheses_json),
-                &helm_core::redact_secrets(&read_only_steps_json),
-                &helm_core::redact_secrets(&proposed_fix_steps_json),
-                plan.approval_required,
-                &helm_core::redact_secrets(&plan.render_text()),
-            );
-        }
+    if let Ok(db_path) = default_db_path()
+        && let Ok(conn) = rusqlite::Connection::open(&db_path)
+    {
+        let source = match &plan.source {
+            PlanSource::UserQuestion(q) => format!("user: {q}"),
+            PlanSource::Finding(id) => format!("finding: {id}"),
+        };
+        let hypotheses_json = serde_json::to_string(&plan.hypotheses).unwrap_or_default();
+        let read_only_steps_json = serde_json::to_string(&plan.read_only_steps).unwrap_or_default();
+        let proposed_fix_steps_json =
+            serde_json::to_string(&plan.proposed_fix_steps).unwrap_or_default();
+        let _ = TroubleshootingPlanStore::insert(
+            &conn,
+            &plan.id,
+            &source,
+            &plan.snapshot_id,
+            "",
+            &helm_core::redact_secrets(&hypotheses_json),
+            &helm_core::redact_secrets(&read_only_steps_json),
+            &helm_core::redact_secrets(&proposed_fix_steps_json),
+            plan.approval_required,
+            &helm_core::redact_secrets(&plan.render_text()),
+        );
     }
     Ok(())
 }
@@ -5827,10 +5831,10 @@ pub(crate) fn reconstruct_snapshot(
 pub(crate) fn find_finding_by_id(conn: &rusqlite::Connection, finding_id: &str) -> Option<Finding> {
     let records = SnapshotStore::list(conn, 100).ok()?;
     for record in &records {
-        if let Ok(findings) = serde_json::from_str::<Vec<Finding>>(&record.findings_json) {
-            if let Some(f) = findings.into_iter().find(|f| f.id == finding_id) {
-                return Some(f);
-            }
+        if let Ok(findings) = serde_json::from_str::<Vec<Finding>>(&record.findings_json)
+            && let Some(f) = findings.into_iter().find(|f| f.id == finding_id)
+        {
+            return Some(f);
         }
     }
     None

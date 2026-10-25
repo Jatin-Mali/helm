@@ -135,26 +135,26 @@ impl Detector for JournalErrorBurstDetector {
             );
         }
 
-        if let Some(rate) = snapshot.domains.logs.error_rate_per_minute {
-            if rate >= 10.0 {
-                findings.push(
-                    Finding::new(
-                        &snapshot.id,
-                        self.id(),
-                        "system",
-                        &format!("Error rate: {rate:.1}/min — sustained error burst"),
-                        Severity::Warning,
-                        Confidence::High,
-                        MonitorDomain::Logs,
-                    )
-                    .with_evidence(
-                        "logs.error_rate_per_minute",
-                        &format!("{rate:.1}"),
-                        "Error rate per minute exceeds safe threshold",
-                    )
-                    .with_impact("Sustained error rate indicates active failure mode"),
-                );
-            }
+        if let Some(rate) = snapshot.domains.logs.error_rate_per_minute
+            && rate >= 10.0
+        {
+            findings.push(
+                Finding::new(
+                    &snapshot.id,
+                    self.id(),
+                    "system",
+                    &format!("Error rate: {rate:.1}/min — sustained error burst"),
+                    Severity::Warning,
+                    Confidence::High,
+                    MonitorDomain::Logs,
+                )
+                .with_evidence(
+                    "logs.error_rate_per_minute",
+                    &format!("{rate:.1}"),
+                    "Error rate per minute exceeds safe threshold",
+                )
+                .with_impact("Sustained error rate indicates active failure mode"),
+            );
         }
 
         if !snapshot.domains.logs.auth_failures.is_empty() {

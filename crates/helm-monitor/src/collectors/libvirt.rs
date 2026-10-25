@@ -131,12 +131,12 @@ fn parse_virsh_snapshots(s: &str) -> HashMap<String, SnapshotInfo> {
 
         // Check for domain name (heuristic: lines with "Domain:" prefix)
         if trimmed.starts_with("Domain:") {
-            if let Some(prev_domain) = current_domain.take() {
-                if !snapshots_in_domain.is_empty() {
-                    let count = snapshots_in_domain.len() as u32;
-                    let age_days = calculate_age_days(&snapshots_in_domain);
-                    result.insert(prev_domain, SnapshotInfo { count, age_days });
-                }
+            if let Some(prev_domain) = current_domain.take()
+                && !snapshots_in_domain.is_empty()
+            {
+                let count = snapshots_in_domain.len() as u32;
+                let age_days = calculate_age_days(&snapshots_in_domain);
+                result.insert(prev_domain, SnapshotInfo { count, age_days });
             }
             current_domain = Some(
                 trimmed
@@ -156,12 +156,12 @@ fn parse_virsh_snapshots(s: &str) -> HashMap<String, SnapshotInfo> {
     }
 
     // Don't forget the last domain
-    if let Some(domain) = current_domain {
-        if !snapshots_in_domain.is_empty() {
-            let count = snapshots_in_domain.len() as u32;
-            let age_days = calculate_age_days(&snapshots_in_domain);
-            result.insert(domain, SnapshotInfo { count, age_days });
-        }
+    if let Some(domain) = current_domain
+        && !snapshots_in_domain.is_empty()
+    {
+        let count = snapshots_in_domain.len() as u32;
+        let age_days = calculate_age_days(&snapshots_in_domain);
+        result.insert(domain, SnapshotInfo { count, age_days });
     }
 
     result

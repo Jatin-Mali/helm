@@ -497,11 +497,11 @@ fn findings_persisted_in_snapshot_can_be_retrieved_by_id() {
     // Search for f1 from first snapshot
     let mut found_f1 = None;
     for record in &records {
-        if let Ok(parsed) = serde_json::from_str::<Vec<Finding>>(&record.findings_json) {
-            if let Some(f) = parsed.into_iter().find(|f| f.id == f1.id) {
-                found_f1 = Some(f);
-                break;
-            }
+        if let Ok(parsed) = serde_json::from_str::<Vec<Finding>>(&record.findings_json)
+            && let Some(f) = parsed.into_iter().find(|f| f.id == f1.id)
+        {
+            found_f1 = Some(f);
+            break;
         }
     }
     assert!(
@@ -513,11 +513,11 @@ fn findings_persisted_in_snapshot_can_be_retrieved_by_id() {
     // Search for f2 from second snapshot (same logic, different snapshot)
     let mut found_f2 = None;
     for record in &records {
-        if let Ok(parsed) = serde_json::from_str::<Vec<Finding>>(&record.findings_json) {
-            if let Some(f) = parsed.into_iter().find(|f| f.id == f2.id) {
-                found_f2 = Some(f);
-                break;
-            }
+        if let Ok(parsed) = serde_json::from_str::<Vec<Finding>>(&record.findings_json)
+            && let Some(f) = parsed.into_iter().find(|f| f.id == f2.id)
+        {
+            found_f2 = Some(f);
+            break;
         }
     }
     assert!(
@@ -581,11 +581,11 @@ fn explain_finding_works_across_multiple_snapshots() {
 
     let mut found = None;
     for record in &records {
-        if let Ok(parsed) = serde_json::from_str::<Vec<Finding>>(&record.findings_json) {
-            if let Some(f) = parsed.into_iter().find(|f| f.id == old_finding.id) {
-                found = Some(f);
-                break;
-            }
+        if let Ok(parsed) = serde_json::from_str::<Vec<Finding>>(&record.findings_json)
+            && let Some(f) = parsed.into_iter().find(|f| f.id == old_finding.id)
+        {
+            found = Some(f);
+            break;
         }
     }
     assert!(

@@ -219,13 +219,13 @@ impl CommandValidator {
         let path_var = std::env::var_os("PATH")?;
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join(binary);
-            if let Ok(meta) = std::fs::metadata(&candidate) {
-                if meta.is_file() {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = meta.permissions().mode();
-                    if mode & 0o111 != 0 {
-                        return Some(candidate);
-                    }
+            if let Ok(meta) = std::fs::metadata(&candidate)
+                && meta.is_file()
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode();
+                if mode & 0o111 != 0 {
+                    return Some(candidate);
                 }
             }
         }

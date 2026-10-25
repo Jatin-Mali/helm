@@ -346,12 +346,12 @@ impl ExecutionEngine {
                     .get("content")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if !path.is_empty() && std::path::Path::new(path).exists() {
-                    if let Ok(existing) = std::fs::read_to_string(path) {
-                        if existing == content {
-                            return Some(format!("file {} already has the desired content", path));
-                        }
-                    }
+                if !path.is_empty()
+                    && std::path::Path::new(path).exists()
+                    && let Ok(existing) = std::fs::read_to_string(path)
+                    && existing == content
+                {
+                    return Some(format!("file {} already has the desired content", path));
                 }
                 None
             }
@@ -444,17 +444,17 @@ impl ExecutionEngine {
         self.before_snapshot = Some(before);
 
         let mut cs = ChangeSet::new(plan, before_id);
-        if let Some(journal) = &self.journal {
-            if let Err(error) = journal.start(
+        if let Some(journal) = &self.journal
+            && let Err(error) = journal.start(
                 &cs,
                 self.before_snapshot
                     .as_ref()
                     .expect("before snapshot captured"),
-            ) {
-                cs.status = ChangeSetStatus::Failed;
-                cs.summary = format!("durable preparation failed; no actions executed: {error}");
-                return cs;
-            }
+            )
+        {
+            cs.status = ChangeSetStatus::Failed;
+            cs.summary = format!("durable preparation failed; no actions executed: {error}");
+            return cs;
         }
 
         // 2. Execute each fix step (zipped with plan steps for expected_output access)
@@ -520,13 +520,13 @@ impl ExecutionEngine {
             };
             step.started_at = Some(chrono::Utc::now().timestamp());
             step.status = StepStatus::Running;
-            if let Some(journal) = &self.journal {
-                if let Err(error) = journal.prepare(&cs.id, step, backup.as_ref()) {
-                    step.status = StepStatus::Failed;
-                    step.error_text = format!("durable step preparation failed: {error}");
-                    halt = true;
-                    continue;
-                }
+            if let Some(journal) = &self.journal
+                && let Err(error) = journal.prepare(&cs.id, step, backup.as_ref())
+            {
+                step.status = StepStatus::Failed;
+                step.error_text = format!("durable step preparation failed: {error}");
+                halt = true;
+                continue;
             }
             let outcome = self.execute_preview(preview, backup.as_ref()).await;
             step.status = if outcome.success {
@@ -560,12 +560,12 @@ impl ExecutionEngine {
 
             let now = chrono::Utc::now().timestamp();
             step.completed_at = Some(now);
-            if let Some(journal) = &self.journal {
-                if let Err(error) = journal.record_step(step) {
-                    step.status = StepStatus::Failed;
-                    step.error_text
-                        .push_str(&format!("; cannot persist outcome: {error}"));
-                }
+            if let Some(journal) = &self.journal
+                && let Err(error) = journal.record_step(step)
+            {
+                step.status = StepStatus::Failed;
+                step.error_text
+                    .push_str(&format!("; cannot persist outcome: {error}"));
             }
 
             // 2f. Append to HMAC audit chain.
@@ -632,19 +632,19 @@ impl ExecutionEngine {
             ChangeSetStatus::Completed
         };
         cs.completed_at = Some(chrono::Utc::now().timestamp());
-        if let Some(journal) = &self.journal {
-            if let Err(error) = journal.finish(
+        if let Some(journal) = &self.journal
+            && let Err(error) = journal.finish(
                 &cs,
                 self.after_snapshot
                     .as_ref()
                     .expect("after snapshot captured"),
-            ) {
-                cs.status = ChangeSetStatus::Failed;
-                cs.summary.push_str(&format!(
-                    "\nCannot persist final outcome; inspect change {} before retrying: {error}",
-                    cs.id
-                ));
-            }
+            )
+        {
+            cs.status = ChangeSetStatus::Failed;
+            cs.summary.push_str(&format!(
+                "\nCannot persist final outcome; inspect change {} before retrying: {error}",
+                cs.id
+            ));
         }
 
         cs
@@ -767,25 +767,25 @@ impl ExecutionEngine {
             let before_disks = &before.domains.disks;
             let after_disks = &after.domains.disks;
             for (i, bd) in before_disks.filesystems.iter().enumerate() {
-                if let Some(ad) = after_disks.filesystems.get(i) {
-                    if bd.mount_point == ad.mount_point {
-                        let b_pct = if bd.total_bytes > 0 {
-                            bd.used_bytes as f64 / bd.total_bytes as f64 * 100.0
-                        } else {
-                            0.0
-                        };
-                        let a_pct = if ad.total_bytes > 0 {
-                            ad.used_bytes as f64 / ad.total_bytes as f64 * 100.0
-                        } else {
-                            0.0
-                        };
-                        let diff = (a_pct - b_pct).abs();
-                        if diff > 5.0 {
-                            changes.push(format!(
-                                "filesystem {} usage changed: {:.1}% -> {:.1}%",
-                                bd.mount_point, b_pct, a_pct
-                            ));
-                        }
+                if let Some(ad) = after_disks.filesystems.get(i)
+                    && bd.mount_point == ad.mount_point
+                {
+                    let b_pct = if bd.total_bytes > 0 {
+                        bd.used_bytes as f64 / bd.total_bytes as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    let a_pct = if ad.total_bytes > 0 {
+                        ad.used_bytes as f64 / ad.total_bytes as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    let diff = (a_pct - b_pct).abs();
+                    if diff > 5.0 {
+                        changes.push(format!(
+                            "filesystem {} usage changed: {:.1}% -> {:.1}%",
+                            bd.mount_point, b_pct, a_pct
+                        ));
                     }
                 }
             }

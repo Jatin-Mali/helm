@@ -1,111 +1,30 @@
 # HELMOPS
 
-> A web-first Linux, DevOps, and fleet monitoring console.
+> A Linux operations console and a general AI agent, with local evidence, exact approvals and recoverable changes.
 
-HELMOPS is a read-only-first ops console. It collects system context, surfaces
-findings that operators miss, shows the evidence, and guides reviewed fixes.
-It changes nothing unless you explicitly approve a plan step.
+HELMOPS observes Linux hosts (services, disks, containers, logs, certificates,
+backups, databases you register), explains findings with evidence, and turns
+them into reviewed plans. It changes nothing unless you approve the exact
+operation. The same binary also runs a general agent (`helmops run`) that can
+read, search, edit files and run commands inside a workspace, one approved
+action at a time.
 
-`helmops` with no arguments opens the web dashboard. `helm` remains as a compatibility alias.
-
-## What HELM Is Now
-
-Current default product surface:
-
-- web console: `helmops`
-- terminal dashboard: `helmops tui`
-- typed system snapshots: `helmops snapshot`
-- local monitoring reports: `helmops monitor`
-- finding-driven troubleshooting: `helmops troubleshoot`
-- reviewed execution only after approval: `helmops apply-plan`
-
-Current shipped core:
-
-- morning-triage dashboard with briefing cards, sidebar filters, finding queue,
-  detail pane, and deep host/service/disk/log/backup drill-down
-- finding lifecycle states: open, new, recurring, suppressed, resolved,
-  self-resolved
-- read-only monitor and diagnose flows
-- structured evidence with risk, rollback, and exact command previews
-- troubleshooting plans with expected output and interpretation guidance
-- approved execution with audit trail and change-set history
-- local Ollama and API providers
-- remote SSH targets with per-target audit
-- sessions, snapshots, stored findings, and audit verification
-
-## First Run
-
-```sh
-# Configure provider/model once
-helmops init
-
-# Open the web dashboard
-helmops
-
-# Open the terminal dashboard
-helmops tui
-```
-
-Web console shortcuts:
-
-- `1-9` switch workspaces
-- `Enter` open the selected incident
-- `Escape` clear the selection
-- `Alt+G` load plan guidance for the selected incident
-- `F5` reload the page
-
-### Web Dashboard
-
-```sh
-# Start the live web dashboard
-helmops web
-
-# Custom port
-helmops web --port 8080
-```
-
-Open http://localhost:9120 in your browser. The web dashboard provides:
-
-- **Incident-first layout**: a larger queue, richer evidence panel, and guided remediation context
-- **Infrastructure coverage**: services, containers, compose, Kubernetes, databases, websites, network, storage, certificates, and fleet
-- **Live operator cards**: daemon status, update pressure, storage risk, runtime counts, and collector health
-- **Keyboard shortcuts**: `1-9` tabs, `Enter` select, `Escape` clear, `Alt+G` plan, `F5` refresh
-- **Single-file frontend**: no JS framework, no build step, live updates over WebSocket
-
-The web dashboard connects via WebSocket to the helm daemon for real-time data.
-Start the daemon first for continuous data: `helmops daemon start`
-
-## Safe CLI Flows
-
-```sh
-# Collect a typed system snapshot
-helmops snapshot --profile standard
-
-# Produce findings without allowing mutation
-helmops monitor --domain disk,services,containers,ports,load,logs,backups
-
-# Explain one stored finding in detail
-helmops explain <finding-id>
-
-# Build a guided troubleshooting plan
-helmops troubleshoot --from-finding <finding-id>
-
-# Verify trust boundaries and active permissions
-helmops trust-report
-```
+`helmops` and `helm` are the same program. With no arguments it opens the web
+dashboard.
 
 ## Install
 
-### Release binary
+### Release binary (Linux x86-64 only)
 
 ```sh
 curl -fsSL https://github.com/Jatin-Mali/helm/releases/latest/download/install.sh | sh
 helmops init
-helmops
 ```
 
-If your architecture does not have a published release asset yet, the installer
-fails with clear source-build instructions.
+The installer downloads one asset, verifies its SHA-256 checksum, and replaces
+the existing binary only after verification. On any other OS or architecture,
+or if verification fails, it stops and prints the source-build steps. It never
+modifies an existing install on failure.
 
 ### Build from source
 
@@ -115,25 +34,15 @@ cd helm
 cargo build --release -p helm-cli
 ./target/release/helmops init
 ./target/release/helmops doctor
-./target/release/helmops
 ```
 
-Minimum supported Rust version: `1.85`.
+Requires Rust 1.89 or newer.
 
-## First Run Setup
+## First run
 
-`helmops init` asks for:
-
-1. provider
-2. model
-3. API key if the provider needs one
-4. optional crash-report consent
-
-Keys go into `$XDG_CONFIG_HOME/helm/secrets.toml` (or
-`~/.config/helm/secrets.toml`) with mode `0600`. `config.toml` stores provider
-and model settings, not the raw key.
-
-HELM follows XDG paths:
+`helmops init` asks for a provider, model and (if needed) an API key. Keys are
+stored in `$XDG_CONFIG_HOME/helm/secrets.toml` (mode `0600`); `config.toml`
+holds provider and model only. Environment variables work without being saved.
 
 | Type | Path |
 |------|------|
@@ -141,103 +50,99 @@ HELM follows XDG paths:
 | Data | `$XDG_DATA_HOME/helm/` or `~/.local/share/helm/` |
 | Cache | `$XDG_CACHE_HOME/helm/` or `~/.cache/helm/` |
 
-## Provider Examples
+Providers: Ollama (local), Groq, OpenRouter, Gemini, Anthropic, NVIDIA NIM and
+any OpenAI-compatible endpoint. See `docs/providers.md`. API providers mean
+prompts (redacted) leave your machine; Ollama keeps inference local.
 
-### OpenRouter
-
-```sh
-export OPENROUTER_API_KEY='sk-or-...'
-./target/release/helmops init --force --provider openrouter
-./target/release/helmops doctor
-./target/release/helmops
-```
-
-### Gemini
+## Operations
 
 ```sh
-export GOOGLE_API_KEY='...'
-# GEMINI_API_KEY is also accepted
-./target/release/helmops init --force --provider gemini --model gemini-2.5-flash
-./target/release/helmops doctor
-./target/release/helmops
+helmops snapshot --profile standard           # typed system snapshot
+helmops monitor --domain disks,services       # findings with coverage (what was and was not observed)
+helmops monitor --fleet                       # every registered SSH host; unreachable hosts are UNKNOWN, never healthy
+helmops explain <finding-id>
+helmops troubleshoot --from-finding <id>      # reviewed plan
+helmops apply-plan <plan-id>                  # approve step by step; changes are journaled
+helmops change-set list
+helmops audit verify                          # hash chain check, prints head hashes
 ```
 
-### Ollama (local, no API key needed)
+Monitoring reports state what each domain's collector observed. A failed,
+filtered, stale or unsupported collector is reported as unknown and never
+resolves an incident. `monitor --format json` emits a versioned object; read
+findings from `.findings`.
+
+Changes: every approved step is recorded before it runs. File edits keep
+encrypted backups and can be restored with `helmops change-set rollback <id>` where
+the operation is supported; other operations are labeled "manual recovery".
+Details and limits: `docs/troubleshooting.md`.
+
+## Web dashboard
 
 ```sh
-ollama pull qwen3:4b
-./target/release/helmops init --force --provider ollama --model qwen3:4b
-./target/release/helmops doctor
-./target/release/helmops
+helmops web                # http://127.0.0.1:9120
 ```
 
-## Core Commands
+The dashboard binds to loopback only. On start, the terminal prints a
+single-use pairing code (valid 15 minutes); entering it creates an HttpOnly,
+SameSite session. Without a session every data route and WebSocket is refused;
+the Host and Origin must match, and every action needs the session's CSRF
+token. Service stop/restart and rollback are two-step: the dashboard shows the
+exact operation, and approving executes only that operation once.
+
+Do not expose it through a proxy or tunnel: there is no multi-user model or
+TLS. Restart `helmops web` to pair again.
+
+Webhooks (`/api/pipelines/webhook/{provider}/{service_id}`) use a per-service secret from the
+secrets store (`HELM_WEBHOOK_SECRET_<SERVICE_ID>`); GitHub (HMAC-SHA256),
+GitLab (token) and generic timestamped HMAC deliveries are verified over the
+raw body, and replays are rejected.
+
+Terminal dashboard: `helmops tui`. Background collection: `helmops daemon start`
+(status reports a stale heartbeat as stale).
+
+## General agent
 
 ```sh
-helmops                               # open the web dashboard
-helmops tui                           # open the terminal dashboard
-helmops snapshot --profile standard   # typed system snapshot
-helmops monitor                       # findings report from latest snapshot
-helmops explain <finding-id>          # show evidence and likely impact
-helmops troubleshoot "<problem>"      # build a guided plan
-helmops troubleshoot --from-finding <id>
-helmops apply-plan <plan-id>          # reviewed execution
-helmops change-set list               # recent approved changes
-helmops trust-report                  # verify trust boundaries
-helmops init                          # configure provider/model/key
-helmops doctor                        # verify provider, DB, tools, secrets
-helmops models                        # list models for the active provider
-helmops audit verify                  # verify audit chain integrity
-helmops permissions list              # current capability grants
-helmops secrets list                  # stored provider keys
-helmops remote list                   # registered SSH targets
-helmops bootstrap user@host --register-as prod-1
-helmops web --port 9120               # explicit web launch
-helmops daemon start                  # background collector loop
-helmops completion bash               # shell completion
+helmops run "find the failing test in this project and fix it" --workspace ./myproject
+helmops run --sessions
+helmops run --resume <session-id> "continue"
 ```
 
-## Security Notes
+Tools: read, search, write (approval), shell (approval), HTTP GET (approval), a
+static browser reader (approval). Every write, command and request needs your
+approval of that exact call; without a terminal the run stops and executes
+nothing. File and shell content is untrusted data and cannot grant itself
+authority. Sessions are saved redacted and are resumable; resuming never
+replays an unfinished action. Details: `docs/agent.md`.
 
-- Stored provider keys live in `$XDG_CONFIG_HOME/helm/secrets.toml` (mode
-  `0600`). Environment variables stay ephemeral unless you explicitly save them.
-- The TUI does not auto-import env keys into the secrets store.
-- Dashboard, monitor, snapshot, and diagnose flows are read-only by default.
-- Read-only diagnose mode blocks all write tools and mutating sub-actions.
-- Dangerous tools require explicit capability grants.
-- HELM keeps local config, audit, session, and episode state under XDG helm
-  directories. Treat those directories as sensitive local state.
-- API models mean prompts leave your machine. Local Ollama models mean local
-  inference. The trust-report and dashboard status bar make this boundary clear.
+Agent tasks act on the local machine only.
 
-## Remote Mode
+## Remote hosts
 
-Remote targets use SSH for read-only inspection and, when explicitly approved,
-execution. The local client starts the remote `helmops` binary and replays
-`AgentEvent` results into the local CLI or TUI. See `docs/agent-on-remote.md`.
+`helmops remote add`, `helmops bootstrap user@host --register-as prod-1`,
+`helmops agent install|register|list|test|remove`, `helmops monitor --fleet`.
+Remote support is SSH-based observation. See `docs/agent-on-remote.md`.
 
-## Use HELM If
+## Security notes
 
-| Use HELM if... | Use something else if... |
-|---|---|
-| You want read-only system inspection with evidence | You want a cloud-hosted managed agent |
-| You need typed disk, service, log, and process tools | You need team collaboration and SaaS workflows |
-| You want local audit, session history, and rollback data | You do not want any local state at all |
-| You prefer a terminal-first interface | You want a browser-only product |
-| You want to review every command before it runs | You want unsupervised repair |
+- Provider keys: `secrets.toml` (0600). The TUI never copies env keys into it.
+- Anything persisted or sent to a provider passes through `redact_secrets`; it
+  is pattern-based and cannot recognize arbitrary secrets (`docs/data-boundary.md`).
+- The audit log is a SHA-256 hash chain, not a MAC: a same-user attacker can
+  rewrite it. Record `audit verify` head hashes off-host if you need that
+  guarantee.
+- `--read-only` and `--dry-run` apply to every execution path. `--sandbox` is
+  not available; HELM refuses host execution rather than pretend.
+- Unsupported: non-Linux hosts, `helmops run --remote`, JavaScript-driven web
+  pages in the agent browser, Jenkins webhooks.
 
 ## Docs
 
-- `docs/providers.md`
-- `docs/agent-on-remote.md`
-- `docs/threat-model.md`
-- `docs/trust-ladder.md`
-- `docs/data-boundary.md`
-- `docs/detector-review-checklist.md`
-- `docs/helmops-gap-closure-checklist.md`
-- `docs/troubleshooting.md`
-- `docs/release-notes-v1.0.md`
-- `CONTRIBUTING.md`
+`docs/providers.md` · `docs/agent.md` · `docs/agent-on-remote.md` ·
+`docs/threat-model.md` · `docs/trust-ladder.md` · `docs/data-boundary.md` ·
+`docs/troubleshooting.md` · `docs/detector-review-checklist.md` ·
+`docs/release-notes-v1.0.md` · `CONTRIBUTING.md`
 
 ## License
 
