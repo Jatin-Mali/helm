@@ -902,8 +902,8 @@ pub fn format_change_set(cs: &ChangeSet) -> String {
     }
     out.push_str("\nSteps:\n");
     for s in &cs.steps {
-        let output_short = if s.output_text.len() > 120 {
-            format!("{}…", &s.output_text[..120])
+        let output_short = if s.output_text.chars().count() > 120 {
+            format!("{}…", s.output_text.chars().take(120).collect::<String>())
         } else {
             s.output_text.clone()
         };

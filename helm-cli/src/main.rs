@@ -3882,6 +3882,32 @@ fn lookup_provider_key(
 }
 
 #[cfg(test)]
+mod planning_regressions {
+    use super::*;
+    #[test]
+    fn multibyte_snapshot_values_truncate_safely() {
+        let value = serde_json::json!("é😀".repeat(100));
+        assert!(truncate_val(&value).ends_with("..."));
+    }
+    #[test]
+    fn stored_custom_key_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap();
+        store
+            .set(
+                "HELM_TEST_CUSTOM_PROVIDER",
+                Secret::new("fixture".to_owned()),
+            )
+            .unwrap();
+        let mut settings =
+            resolve_provider_settings(None, Some(ProviderChoice::Groq), None, None, None).unwrap();
+        settings.api_key = None;
+        settings.api_key_env = Some("HELM_TEST_CUSTOM_PROVIDER".into());
+        assert!(llm_provider_usable(&settings, &store));
+    }
+}
+
+#[cfg(test)]
 fn resolve_provider_choice(choice: ProviderChoice) -> ProviderChoice {
     choice
 }
@@ -4471,12 +4497,13 @@ async fn run_daemon_command(
             Ok(())
         }
         DaemonCommand::Run(args) => {
-            let plan_runtime =
-                llm_provider_usable(&provider_settings).then(|| PlanGenerationRuntime {
+            let plan_runtime = llm_provider_usable(&provider_settings, &secrets_store).then(|| {
+                PlanGenerationRuntime {
                     provider_settings,
                     secrets: secrets_store,
                     cache: PlanCache::default(),
-                });
+                }
+            });
             run_daemon_loop(
                 configured_refresh_interval(args.interval),
                 db_path.to_path_buf(),
@@ -4592,6 +4619,21 @@ pub(crate) async fn daemon_stop_core() -> Result<String> {
     Ok(format!("helm daemon {}", state.status))
 }
 
+/// A "running" daemon whose heartbeat stopped advancing (hung, or its state file outlived it)
+/// is reported stale instead of healthy. Allows three missed intervals, minimum 30s.
+fn effective_daemon_status(state: &DaemonState) -> &str {
+    if state.status != "running" {
+        return &state.status;
+    }
+    let allowed = (state.refresh_interval_secs.saturating_mul(3)).max(30) as i64;
+    let fresh = state
+        .last_heartbeat
+        .as_deref()
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .is_some_and(|ts| (Utc::now() - ts.with_timezone(&Utc)).num_seconds() <= allowed);
+    if fresh { "running" } else { "stale" }
+}
+
 /// Core daemon status — returns status message, does NOT print (TUI-safe).
 pub(crate) fn daemon_status_core() -> Result<String> {
     let Some(state) = read_daemon_state() else {
@@ -4608,7 +4650,7 @@ pub(crate) fn daemon_status_core() -> Result<String> {
         })
         .unwrap_or_else(|| "no pid".to_owned());
     let mut lines = vec![
-        format!("helm daemon {}", state.status),
+        format!("helm daemon {}", effective_daemon_status(&state)),
         format!("  {pid_note}"),
         format!("  interval: {}s", state.refresh_interval_secs),
         format!("  db: {}", state.db_path),
@@ -5019,8 +5061,8 @@ fn diff_recursive(
 
 fn truncate_val(v: &serde_json::Value) -> String {
     let s = v.to_string();
-    if s.len() > 80 {
-        format!("{}...", &s[..77])
+    if s.chars().count() > 80 {
+        format!("{}...", s.chars().take(77).collect::<String>())
     } else {
         s
     }
@@ -5366,15 +5408,27 @@ pub(crate) struct PlanGenerationRuntime {
     pub(crate) cache: PlanCache,
 }
 
-pub(crate) fn llm_provider_usable(settings: &ProviderSettings) -> bool {
-    matches!(settings.choice, ProviderChoice::Ollama)
-        || settings
-            .api_key
-            .as_ref()
-            .is_some_and(|key| !key.trim().is_empty())
-        || default_api_key_env(settings.choice)
-            .and_then(|name| std::env::var(name).ok())
-            .is_some_and(|key| !key.trim().is_empty())
+pub(crate) fn llm_provider_usable(settings: &ProviderSettings, store: &SecretsStore) -> bool {
+    build_provider(settings, store).is_ok()
+}
+
+// Scope generated plans to their actual evidence, host boot and provider configuration.
+pub(crate) fn plan_context_key(settings: &ProviderSettings, finding: &Finding) -> String {
+    let prompt = build_narrative_prompt(&helm_monitor::FindingSummaryFields::from(finding));
+    let context = format!(
+        "{:?}|{:?}|{:?}|{:?}|{}|{}|{}",
+        settings.choice,
+        settings.model,
+        settings.base_url,
+        settings.api_key_env,
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
+        finding.fingerprint,
+        prompt
+    );
+    hex::encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        context.as_bytes(),
+    ))
 }
 
 pub(crate) async fn generate_llm_plan_status(
@@ -5567,13 +5621,15 @@ pub(crate) fn persist_llm_plan_status(
 fn has_fresh_persisted_plan(
     conn: &rusqlite::Connection,
     finding_fingerprint: &str,
+    context: &str,
     ttl_secs: u64,
 ) -> bool {
     TroubleshootingPlanStore::latest_for_fingerprint(conn, finding_fingerprint)
         .ok()
         .flatten()
         .is_some_and(|record| {
-            record.dashboard_plan_status == "ready"
+            record.id.starts_with(&format!("plan-{context}-"))
+                && record.dashboard_plan_status == "ready"
                 && (Utc::now().timestamp() - record.updated_at) <= ttl_secs as i64
         })
 }
@@ -5586,11 +5642,12 @@ pub(crate) fn queue_background_plan_generation(
     let conn = rusqlite::Connection::open(db_path)
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
     let ttl_secs = runtime.cache.ttl().as_secs().max(1);
-    if has_fresh_persisted_plan(&conn, &finding.fingerprint, ttl_secs) {
+    let context = plan_context_key(&runtime.provider_settings, finding);
+    if has_fresh_persisted_plan(&conn, &finding.fingerprint, &context, ttl_secs) {
         return Ok(());
     }
 
-    let plan_id = format!("plan-{}", uuid::Uuid::new_v4());
+    let plan_id = format!("plan-{context}-{}", uuid::Uuid::new_v4());
     let source = format!("finding:{}", finding.id);
     let read_only_steps_json =
         serde_json::to_string(&finding.read_only_checks).unwrap_or_else(|_| "[]".to_owned());
@@ -5601,37 +5658,34 @@ pub(crate) fn queue_background_plan_generation(
     let plan_id_clone = plan_id.clone();
     let source_clone = source.clone();
     let read_only_steps_json_clone = read_only_steps_json.clone();
-    if !runtime
-        .cache
-        .ensure_plan(finding.fingerprint.clone(), move || async move {
-            if let Ok(conn) = rusqlite::Connection::open(&plan_db_path) {
-                let _ = TroubleshootingPlanStore::insert(
-                    &conn,
-                    &plan_id_clone,
-                    &source_clone,
-                    &finding_clone.snapshot_id,
-                    &finding_clone.fingerprint,
-                    "[]",
-                    &read_only_steps_json_clone,
-                    "[]",
-                    false,
-                    "",
-                );
-                persist_llm_plan_status(
-                    &conn,
-                    &finding_clone,
-                    &plan_id_clone,
-                    &helm_monitor::LlmPlanStatus::Loading,
-                );
-            }
-            let status =
-                generate_llm_plan_status(&finding_clone, settings.clone(), secrets.clone()).await;
-            if let Ok(conn) = rusqlite::Connection::open(&plan_db_path) {
-                persist_llm_plan_status(&conn, &finding_clone, &plan_id_clone, &status);
-            }
-            status
-        })
-    {
+    if !runtime.cache.ensure_plan(context, move || async move {
+        if let Ok(conn) = rusqlite::Connection::open(&plan_db_path) {
+            let _ = TroubleshootingPlanStore::insert(
+                &conn,
+                &plan_id_clone,
+                &source_clone,
+                &finding_clone.snapshot_id,
+                &finding_clone.fingerprint,
+                "[]",
+                &read_only_steps_json_clone,
+                "[]",
+                false,
+                "",
+            );
+            persist_llm_plan_status(
+                &conn,
+                &finding_clone,
+                &plan_id_clone,
+                &helm_monitor::LlmPlanStatus::Loading,
+            );
+        }
+        let status =
+            generate_llm_plan_status(&finding_clone, settings.clone(), secrets.clone()).await;
+        if let Ok(conn) = rusqlite::Connection::open(&plan_db_path) {
+            persist_llm_plan_status(&conn, &finding_clone, &plan_id_clone, &status);
+        }
+        status
+    }) {
         return Ok(());
     }
     Ok(())

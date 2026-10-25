@@ -81,6 +81,22 @@ fn regular_file_bytes(path: &Path) -> Result<Option<FileBytesAndMetadata>, Strin
 }
 
 pub fn prepare_file_change(preview: &CommandPreview) -> Result<Option<PreChangeBackup>, String> {
+    prepare_file_change_inner(preview, None)
+}
+
+/// Trusted workspace callers hold the validated parent descriptor through preparation and apply.
+/// Recovery records retain the original absolute path; backup reads use only this descriptor.
+pub fn prepare_file_change_in_parent(
+    preview: &CommandPreview,
+    parent: &File,
+) -> Result<Option<PreChangeBackup>, String> {
+    prepare_file_change_inner(preview, Some(parent))
+}
+
+fn prepare_file_change_inner(
+    preview: &CommandPreview,
+    pinned_parent: Option<&File>,
+) -> Result<Option<PreChangeBackup>, String> {
     if !matches!(preview.tool.as_str(), "fs_write" | "write") {
         return Ok(None);
     }
@@ -106,10 +122,18 @@ pub fn prepare_file_change(preview: &CommandPreview) -> Result<Option<PreChangeB
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let target = parent
-        .canonicalize()
-        .map_err(|e| e.to_string())?
-        .join(input.file_name().ok_or("file name required")?);
+    let target = if let Some(parent) = pinned_parent {
+        if !input.is_absolute() {
+            return Err("anchored writes require an absolute recovery path".into());
+        }
+        PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+            .join(input.file_name().ok_or("file name required")?)
+    } else {
+        parent
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .join(input.file_name().ok_or("file name required")?)
+    };
     let original = regular_file_bytes(&target)?;
     let (existed, original_bytes, mode, uid, gid) = match original {
         Some((bytes, mode, uid, gid)) => (true, bytes, mode, uid, gid),
@@ -132,10 +156,14 @@ pub fn prepare_file_change(preview: &CommandPreview) -> Result<Option<PreChangeB
     };
     Ok(Some(PreChangeBackup {
         id: uuid::Uuid::new_v4().to_string(),
-        file_path: target
-            .to_str()
-            .ok_or("non-UTF-8 file paths are unsupported")?
-            .to_owned(),
+        file_path: if pinned_parent.is_some() {
+            input
+        } else {
+            &target
+        }
+        .to_str()
+        .ok_or("non-UTF-8 file paths are unsupported")?
+        .to_owned(),
         checksum_before: checksum(&original_bytes),
         backup_content: serde_json::to_string(&state).map_err(|e| e.to_string())?,
         restored: false,

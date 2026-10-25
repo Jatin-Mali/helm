@@ -45,7 +45,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Cell, Clear, ListItem, Paragraph, Row, Table, Wrap},
 };
 use serde::Deserialize;
-use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
+use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::{
@@ -224,6 +224,21 @@ enum UiEvent {
     Input(Event),
     Tick,
     DashboardRefresh,
+    AssistantResult {
+        run_id: u64,
+        result: Result<helm_providers::ChatResponse, String>,
+    },
+    CatalogResult {
+        choice: ProviderChoice,
+        entries: Vec<ModelCatalogEntry>,
+    },
+    KeyValidated {
+        run_id: u64,
+        key: helm_core::Secret,
+        provider_name: String,
+        env_name: String,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1243,15 +1258,14 @@ struct DashboardState {
     service_journal_cache: HashMap<String, Vec<String>>,
     change_selected_row: usize,
     active_plan: Option<DashboardPlan>,
-    pending_plan_rx: Option<tokio::sync::oneshot::Receiver<PlanStatus>>,
+    pending_plan_task: Option<JoinHandle<()>>,
+    pending_plan_rx: Option<tokio::sync::oneshot::Receiver<(FindingSummary, String, PlanStatus)>>,
     error: Option<String>,
     overlap_guard: Option<Arc<AtomicBool>>,
     /// Max history points for sparklines (loaded from thresholds.toml, default 60).
     sparkline_history_depth: usize,
     /// Selected row in Fleet tab for multi-host view.
     fleet_selected_row: Option<usize>,
-    /// Fingerprint-keyed plan cache: survives re-selection of the same finding.
-    plan_cache: HashMap<String, PlanStatus>,
     /// Set to true when a fingerprint change requires background plan generation.
     needs_plan_generation: bool,
     /// Flag to prevent double-spawning of fleet collection tasks.
@@ -1288,11 +1302,11 @@ impl DashboardState {
             change_selected_row: 0,
             active_plan: None,
             pending_plan_rx: None,
+            pending_plan_task: None,
             error: None,
             overlap_guard: None,
             sparkline_history_depth: thresholds.sparkline_history_depth,
             fleet_selected_row: None,
-            plan_cache: HashMap::new(),
             needs_plan_generation: false,
             fleet_collection_in_flight: false,
             pending_fleet_rx: None,
@@ -2207,11 +2221,13 @@ pub struct TuiApp {
     active_remote: Option<String>,
     status_note: String,
     catalog_cache: HashMap<ProviderChoice, CachedModelCatalog>,
+    catalog_tasks: HashMap<ProviderChoice, JoinHandle<()>>,
     pending_tool_summaries: HashMap<String, String>,
     active_tool_cells: HashMap<String, usize>,
     toast: Option<ToastState>,
     last_chat_height: StdCell<u16>,
     active_run_id: u64,
+    ui_tx: Option<mpsc::UnboundedSender<UiEvent>>,
     agent_task: Option<JoinHandle<()>>,
     pending_auth_retry: Option<String>,
     task_started: Option<Instant>,
@@ -2223,6 +2239,20 @@ pub struct TuiApp {
     audited_transitions: HashSet<String>,
     pending_apply_rx: Option<tokio::sync::oneshot::Receiver<Result<String, String>>>,
     pending_apply_cancel: Option<CancelApplyOnDrop>,
+}
+
+impl Drop for TuiApp {
+    fn drop(&mut self) {
+        if let Some(task) = self.agent_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.dashboard.pending_plan_task.take() {
+            task.abort();
+        }
+        for (_, task) in self.catalog_tasks.drain() {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2303,11 +2333,13 @@ impl TuiApp {
             active_remote: runtime.remote_target,
             status_note: "ready".to_owned(),
             catalog_cache: HashMap::new(),
+            catalog_tasks: HashMap::new(),
             pending_tool_summaries: HashMap::new(),
             active_tool_cells: HashMap::new(),
             toast: None,
             last_chat_height: StdCell::new(10),
             active_run_id: 0,
+            ui_tx: None,
             agent_task: None,
             pending_auth_retry: None,
             task_started: None,
@@ -2361,6 +2393,7 @@ impl TuiApp {
         event: UiEvent,
         tx: mpsc::UnboundedSender<UiEvent>,
     ) -> Result<bool> {
+        self.ui_tx = Some(tx.clone());
         match event {
             UiEvent::Input(Event::Key(key)) if key.kind == event::KeyEventKind::Press => {
                 self.handle_key(key, tx).await
@@ -2392,92 +2425,53 @@ impl TuiApp {
                 {
                     self.toast = None;
                 }
-                // Poll the oneshot receiver for a completed LLM plan.
                 if let Some(rx) = &mut self.dashboard.pending_plan_rx {
-                    if let Ok(status) = rx.try_recv() {
-                        // If the LLM produced a dangerous command, write an
-                        // audit entry and tag the finding before updating the
-                        // plan status.
+                    if let Ok((finding, plan_id, status)) = rx.try_recv() {
+                        self.dashboard.pending_plan_rx = None;
+                        self.dashboard.pending_plan_task = None;
                         if let PlanStatus::DangerousCommand {
                             pattern,
                             command_text,
                         } = &status
                         {
                             let _ = self.write_dashboard_audit(command_text, pattern);
-                            if let Some(idx) = self.dashboard_selected_finding_index() {
-                                self.tag_finding_rejected(idx);
-                            }
-                        }
-                        if let Some(ref mut plan) = self.dashboard.active_plan {
-                            match &status {
-                                PlanStatus::RateLimited { retry_after_secs } => {
-                                    let secs = *retry_after_secs;
-                                    plan.status = status.clone();
-                                    plan.rate_limit_retry_at =
-                                        Some(Instant::now() + Duration::from_secs(secs));
-                                }
-                                _ => {
-                                    plan.status = status.clone();
-                                }
-                            }
-                        }
-                        // Cache the resolved plan by fingerprint so re-selection is instant.
-                        if let Some(fp) = self
-                            .dashboard
-                            .pinned_incident
-                            .as_ref()
-                            .map(|p| p.fingerprint.clone())
-                        {
-                            self.dashboard.plan_cache.insert(fp, status.clone());
-                        }
-                        let active_plan_ctx = self
-                            .dashboard
-                            .active_plan
-                            .as_ref()
-                            .map(|plan| (plan.plan_id.clone(), plan.finding_id.clone()));
-                        if let Some((plan_id, finding_id)) = active_plan_ctx {
-                            if let Some(finding) = self
+                            if let Some(idx) = self
                                 .dashboard
                                 .data
                                 .findings
                                 .iter()
-                                .find(|finding| finding.id == finding_id)
-                                .cloned()
+                                .position(|f| f.id == finding.id)
                             {
-                                if let Ok(conn) = rusqlite::Connection::open(&self.runtime.db_path)
-                                {
-                                    self.persist_dashboard_plan_status(
-                                        &conn, &finding, &plan_id, &status,
-                                    );
-                                    self.restore_active_dashboard_plan(
-                                        &conn,
-                                        &finding.id,
-                                        &finding.fingerprint,
-                                        Some(&plan_id),
-                                    );
-                                }
+                                self.tag_finding_rejected(idx);
                             }
                         }
-                        self.dashboard.pending_plan_rx = None;
+                        if let Ok(conn) = rusqlite::Connection::open(&self.runtime.db_path) {
+                            self.persist_dashboard_plan_status(&conn, &finding, &plan_id, &status);
+                        }
+                        if let Some(plan) = self
+                            .dashboard
+                            .active_plan
+                            .as_mut()
+                            .filter(|p| p.plan_id == plan_id)
+                        {
+                            plan.rate_limit_retry_at = match &status {
+                                PlanStatus::RateLimited { retry_after_secs } => {
+                                    Some(Instant::now() + Duration::from_secs(*retry_after_secs))
+                                }
+                                _ => None,
+                            };
+                            plan.status = status;
+                        }
                     }
                 }
-                // Plan generation: requires explicit Alt+G.
-                // Handle rate-limited auto-retry countdown.
-                if let Some(ref mut plan) = self.dashboard.active_plan {
-                    if plan.rate_limit_retry_pending {
-                        plan.rate_limit_retry_pending = false;
-                        // We'd re-call generate but cannot borrow self here.
-                        // Instead, the next Alt+G or the auto-countdown logic handles it.
-                    }
-                    if let Some(retry_at) = plan.rate_limit_retry_at {
-                        if let PlanStatus::RateLimited { .. } = &plan.status {
-                            if Instant::now() >= retry_at {
-                                // Auto-retry: set a flag for the next event loop cycle.
-                                plan.rate_limit_retry_pending = true;
-                                plan.rate_limit_retry_at = None;
-                            }
-                        }
-                    }
+                let retry = self.dashboard.active_plan.as_ref().is_some_and(|plan| {
+                    matches!(plan.status, PlanStatus::RateLimited { .. })
+                        && plan
+                            .rate_limit_retry_at
+                            .is_some_and(|at| Instant::now() >= at)
+                });
+                if retry && self.dashboard.pending_plan_rx.is_none() {
+                    self.generate_dashboard_plan().await?;
                 }
                 if let Some(rx) = &mut self.pending_apply_rx {
                     if let Ok(result) = rx.try_recv() {
@@ -2554,6 +2548,73 @@ impl TuiApp {
                         let _ = tx_hosts.send(hosts);
                     });
                     self.dashboard.pending_fleet_rx = Some(rx_hosts);
+                }
+                Ok(false)
+            }
+            UiEvent::AssistantResult { run_id, result } => {
+                if run_id == self.active_run_id {
+                    self.agent_task = None;
+                    self.finish_assistant_response(result);
+                }
+                Ok(false)
+            }
+            UiEvent::CatalogResult { choice, entries } => {
+                self.catalog_tasks.remove(&choice);
+                self.catalog_cache.insert(
+                    choice,
+                    CachedModelCatalog {
+                        fetched_at: Instant::now(),
+                        entries,
+                    },
+                );
+                if let Some(ModalState::ModelSelector { entries, .. }) = &mut self.modal {
+                    *entries = self
+                        .catalog_cache
+                        .values()
+                        .flat_map(|cache| cache.entries.clone())
+                        .collect();
+                    entries
+                        .sort_by(|a, b| a.group.cmp(&b.group).then_with(|| a.label.cmp(&b.label)));
+                }
+                Ok(false)
+            }
+            UiEvent::KeyValidated {
+                run_id,
+                key,
+                provider_name,
+                env_name,
+                result,
+            } => {
+                if run_id != self.active_run_id
+                    || !matches!(&self.modal, Some(ModalState::AuthRequired {env_name: current, ..}) if *current == env_name)
+                {
+                    return Ok(false);
+                }
+                self.agent_task = None;
+                self.running = false;
+                let result = result.and_then(|()| {
+                    self.runtime
+                        .secrets
+                        .set(&env_name, key.clone())
+                        .map_err(|e| format!("Failed to save key: {e}"))
+                });
+                match result {
+                    Ok(()) => {
+                        self.active_settings.api_key = Some(key.expose().to_owned());
+                        self.push_chat(
+                            MessageRole::System,
+                            format!("API key saved for {provider_name}. Retrying the task."),
+                        );
+                        self.modal = None;
+                        if let Some(task) = self.pending_auth_retry.take() {
+                            self.start_task(task, tx, false).await?;
+                        }
+                    }
+                    Err(error_text) => {
+                        if let Some(ModalState::AuthRequired { error, .. }) = &mut self.modal {
+                            *error = Some(error_text);
+                        }
+                    }
                 }
                 Ok(false)
             }
@@ -3458,6 +3519,7 @@ impl TuiApp {
             Some(ModalState::AuthRequired { .. }) => match key.code {
                 KeyCode::Esc => {
                     self.pending_auth_retry = None;
+                    self.cancel_running_task();
                     self.modal = None;
                 }
                 KeyCode::Enter => {
@@ -3481,37 +3543,25 @@ impl TuiApp {
                             }
                         } else {
                             self.status_note = "validating key".to_owned();
-                            match self.validate_key(&key_val).await {
-                                Ok(()) => {
-                                    let secret = helm_core::Secret::new(key_val.clone());
-                                    if let Err(e) = self.runtime.secrets.set(&env_name, secret) {
-                                        if let Some(ModalState::AuthRequired { error, .. }) =
-                                            &mut self.modal
-                                        {
-                                            *error = Some(format!("Failed to save key: {e}"));
-                                        }
-                                    } else {
-                                        self.active_settings.api_key = Some(key_val);
-                                        self.push_chat(
-                                            MessageRole::System,
-                                            format!(
-                                                "API key saved for {provider_name}. Retrying the task."
-                                            ),
-                                        );
-                                        self.modal = None;
-                                        if let Some(task) = self.pending_auth_retry.take() {
-                                            self.start_task(task, tx, false).await?;
-                                        }
-                                    }
-                                }
-                                Err(error_text) => {
-                                    if let Some(ModalState::AuthRequired { error, .. }) =
-                                        &mut self.modal
-                                    {
-                                        *error = Some(error_text);
-                                    }
-                                }
+                            if let Some(previous) = self.agent_task.take() {
+                                previous.abort();
                             }
+                            self.active_run_id = self.active_run_id.saturating_add(1);
+                            let run_id = self.active_run_id;
+                            let mut settings = self.active_settings.clone();
+                            settings.api_key = Some(key_val.clone());
+                            let secrets = self.runtime.secrets.clone();
+                            self.running = true;
+                            self.agent_task = Some(tokio::spawn(async move {
+                                let result = Self::validate_provider_key(settings, secrets).await;
+                                let _ = tx.send(UiEvent::KeyValidated {
+                                    run_id,
+                                    key: helm_core::Secret::new(key_val),
+                                    provider_name,
+                                    env_name,
+                                    result,
+                                });
+                            }));
                         }
                     }
                 }
@@ -3792,7 +3842,7 @@ Report the exit status and the concise output."
     async fn start_task_internal_with_mode(
         &mut self,
         task: String,
-        _tx: mpsc::UnboundedSender<UiEvent>,
+        tx: mpsc::UnboundedSender<UiEvent>,
         _mode: AgentMode,
     ) -> Result<()> {
         self.record_tool_event("queued", "assistant", "request submitted");
@@ -3804,24 +3854,42 @@ Report the exit status and the concise output."
         let effective_task = wrap_for_remote(&task, self.active_remote.as_ref());
         let settings = self.active_settings.clone();
 
-        let response = match build_provider(&settings, &self.runtime.secrets) {
-            Ok((provider, model)) => {
-                let request = ChatRequest {
-                    model,
-                    system: None,
-                    messages: vec![Message::user(&effective_task)],
-                    tools: vec![],
-                    max_tokens: 2048,
-                    temperature: 0.2,
-                };
-                provider
-                    .chat(request)
-                    .await
-                    .map_err(|error| error.to_string())
-            }
-            Err(error) => Err(error.to_string()),
-        };
+        if let Some(previous) = self.agent_task.take() {
+            previous.abort();
+        }
+        let secrets = self.runtime.secrets.clone();
+        let run_id = self.active_run_id;
+        self.agent_task = Some(tokio::spawn(async move {
+            let response = match build_provider(&settings, &secrets) {
+                Ok((provider, model)) => {
+                    let request = ChatRequest {
+                        model,
+                        system: None,
+                        messages: vec![Message::user(&effective_task)],
+                        tools: vec![],
+                        max_tokens: 2048,
+                        temperature: 0.2,
+                    };
+                    tokio::time::timeout(Duration::from_secs(30), provider.chat(request))
+                        .await
+                        .map_err(|_| "Provider timed out after 30s".to_owned())
+                        .and_then(|reply| reply.map_err(|error| error.to_string()))
+                }
+                Err(error) => Err(error.to_string()),
+            };
 
+            let _ = tx.send(UiEvent::AssistantResult {
+                run_id,
+                result: response,
+            });
+        }));
+        Ok(())
+    }
+
+    fn finish_assistant_response(
+        &mut self,
+        response: Result<helm_providers::ChatResponse, String>,
+    ) {
         match response {
             Ok(reply) => {
                 let text = reply
@@ -3855,14 +3923,14 @@ Report the exit status and the concise output."
 
         self.running = false;
         self.task_started = None;
-        Ok(())
     }
 
-    async fn validate_key(&self, key: &str) -> Result<(), String> {
-        let mut settings = self.active_settings.clone();
-        settings.api_key = Some(key.to_owned());
+    async fn validate_provider_key(
+        settings: ProviderSettings,
+        secrets: SecretsStore,
+    ) -> Result<(), String> {
         let (provider, model) =
-            build_provider(&settings, &self.runtime.secrets).map_err(|error| error.to_string())?;
+            build_provider(&settings, &secrets).map_err(|error| error.to_string())?;
         let request = ChatRequest {
             model,
             system: None,
@@ -3871,14 +3939,18 @@ Report the exit status and the concise output."
             max_tokens: 1,
             temperature: 0.0,
         };
-        provider.chat(request).await.map(|_| ()).map_err(|error| {
-            let text = error.to_string();
-            if is_auth_error(&text) {
-                "Validation failed: invalid API key.".to_owned()
-            } else {
-                format!("Validation failed: {}", truncate(text, 180))
-            }
-        })
+        tokio::time::timeout(Duration::from_secs(30), provider.chat(request))
+            .await
+            .map_err(|_| "Key validation timed out".to_owned())?
+            .map(|_| ())
+            .map_err(|error| {
+                let text = error.to_string();
+                if is_auth_error(&text) {
+                    "Validation failed: invalid API key.".to_owned()
+                } else {
+                    format!("Validation failed: {}", truncate(text, 180))
+                }
+            })
     }
 
     fn execution_policy(&self) -> helm_monitor::ExecutionPolicy {
@@ -3886,6 +3958,13 @@ Report the exit status and the concise output."
     }
 
     fn cancel_running_task(&mut self) {
+        if let Some(task) = self.dashboard.pending_plan_task.take() {
+            task.abort();
+        }
+        self.dashboard.pending_plan_rx = None;
+        for (_, task) in self.catalog_tasks.drain() {
+            task.abort();
+        }
         if let Some(cancel) = &self.pending_apply_cancel {
             cancel.0.cancel();
         }
@@ -4013,14 +4092,7 @@ Report the exit status and the concise output."
     /// Returns true when there is a usable LLM provider — either Ollama (local)
     /// or a cloud provider with an API key available.
     fn is_llm_provider_configured(&self) -> bool {
-        if self.active_settings.choice == ProviderChoice::Ollama {
-            // Ollama is local; always considered configured.
-            true
-        } else {
-            // Cloud providers (Groq, Anthropic, Gemini, OpenRouter, NvidiaNim,
-            // OpenaiCompat, Auto) need an API key.
-            self.active_settings.api_key.is_some()
-        }
+        crate::llm_provider_usable(&self.active_settings, &self.runtime.secrets)
     }
 
     /// Write a hash-chained audit event when the blocklist catches a dangerous
@@ -4272,45 +4344,50 @@ Report the exit status and the concise output."
     }
 
     fn model_catalog_entries(&mut self) -> Vec<ModelCatalogEntry> {
-        let now = Instant::now();
         let mut all = Vec::new();
         for (choice, _) in provider_selector_list() {
-            let entries = if let Some(cached) = self.catalog_cache.get(&choice) {
-                if now.duration_since(cached.fetched_at) <= Duration::from_secs(5 * 60) {
-                    cached.entries.clone()
-                } else {
-                    self.refresh_catalog_for(choice)
-                }
-            } else {
-                self.refresh_catalog_for(choice)
-            };
-            all.extend(entries);
-        }
-        all.sort_by(|left, right| {
-            left.group
-                .cmp(&right.group)
-                .then_with(|| left.label.cmp(&right.label))
-        });
-        all
-    }
-
-    fn refresh_catalog_for(&mut self, choice: ProviderChoice) -> Vec<ModelCatalogEntry> {
-        let entries = tokio::task::block_in_place(|| {
-            Handle::current().block_on(fetch_model_catalog_for_provider(
+            let cached = self
+                .catalog_cache
+                .get(&choice)
+                .filter(|c| c.fetched_at.elapsed() <= Duration::from_secs(300));
+            if let Some(cached) = cached {
+                all.extend(cached.entries.clone());
+                continue;
+            }
+            let entries = static_model_catalog_for(choice);
+            self.catalog_cache.insert(
                 choice,
-                &self.active_settings,
-                self.resolved_provider_key(choice),
-            ))
-        })
-        .unwrap_or_else(|_| static_model_catalog_for(choice));
-        self.catalog_cache.insert(
-            choice,
-            CachedModelCatalog {
-                fetched_at: Instant::now(),
-                entries: entries.clone(),
-            },
-        );
-        entries
+                CachedModelCatalog {
+                    fetched_at: Instant::now(),
+                    entries: entries.clone(),
+                },
+            );
+            all.extend(entries);
+            if self.catalog_tasks.contains_key(&choice) {
+                continue;
+            }
+            let settings = self.active_settings.clone();
+            let key = self.resolved_provider_key(choice);
+            let Some(tx) = self.ui_tx.clone() else {
+                continue;
+            };
+            self.catalog_tasks.insert(
+                choice,
+                tokio::spawn(async move {
+                    let entries = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        fetch_model_catalog_for_provider(choice, &settings, key),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_else(|| static_model_catalog_for(choice));
+                    let _ = tx.send(UiEvent::CatalogResult { choice, entries });
+                }),
+            );
+        }
+        all.sort_by(|a, b| a.group.cmp(&b.group).then_with(|| a.label.cmp(&b.label)));
+        all
     }
 
     fn apply_provider_choice(&mut self, choice: ProviderChoice) {
@@ -5496,17 +5573,7 @@ Report the exit status and the concise output."
             self.persist_pinned_incident_from_current();
         }
         if changed {
-            if let Some(ref fingerprint) = fp {
-                if let Some(cached_status) = self.dashboard.plan_cache.get(fingerprint).cloned() {
-                    // Cache hit: restore plan state instantly without spawning a new task.
-                    if let Some(ref mut plan) = self.dashboard.active_plan {
-                        plan.status = cached_status;
-                    }
-                } else {
-                    // Cache miss: queue auto-generation on next tick.
-                    self.dashboard.needs_plan_generation = true;
-                }
-            }
+            self.dashboard.needs_plan_generation = true;
         }
     }
 
@@ -6108,6 +6175,10 @@ Report the exit status and the concise output."
     }
 
     async fn generate_dashboard_plan(&mut self) -> Result<()> {
+        if self.dashboard.pending_plan_rx.is_some() {
+            self.toast("Plan generation is already running");
+            return Ok(());
+        }
         if !self.is_llm_provider_configured() {
             self.toast(
                 "No LLM provider configured. Run `helmops init --provider ollama` to enable AI-powered troubleshooting.",
@@ -6137,7 +6208,11 @@ Report the exit status and the concise output."
         let summary_fields = FindingSummaryFields::from(&finding);
         let prompt = build_narrative_prompt(&summary_fields);
 
-        let plan_id = format!("plan-{}", uuid::Uuid::new_v4());
+        let plan_id = format!(
+            "plan-{}-{}",
+            crate::plan_context_key(&self.active_settings, &finding),
+            uuid::Uuid::new_v4()
+        );
         let started_at = Utc::now().timestamp();
 
         // Set the plan to Loading and switch the detail pane.
@@ -6184,9 +6259,10 @@ Report the exit status and the concise output."
         let finding_id = finding.id.clone();
         let snapshot_id = finding.snapshot_id.clone();
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<PlanStatus>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<(FindingSummary, String, PlanStatus)>();
+        let result_plan_id = plan_id.clone();
 
-        tokio::spawn(async move {
+        self.dashboard.pending_plan_task = Some(tokio::spawn(async move {
             let status = Self::call_llm_for_plan(
                 active_settings,
                 secrets,
@@ -6196,8 +6272,8 @@ Report the exit status and the concise output."
                 snapshot_id,
             )
             .await;
-            let _ = tx.send(status);
-        });
+            let _ = tx.send((summary, result_plan_id, status));
+        }));
 
         self.dashboard.pending_plan_rx = Some(rx);
         Ok(())
@@ -11893,6 +11969,48 @@ mod tests {
         })
     }
 
+    #[test]
+    fn provider_call_does_not_block_input_or_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in_dir(&dir, crate::ProviderChoice::OpenaiCompat);
+        app.active_settings.api_key_env = None;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        app.active_settings.base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                if let Ok((_stream, _)) = listener.accept() {
+                    std::thread::sleep(Duration::from_millis(300));
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (tx, _) = mpsc::unbounded_channel();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    app.start_task_internal_with_mode(
+                        "hello".into(),
+                        tx.clone(),
+                        AgentMode::Dashboard
+                    )
+                )
+                .await
+                .is_ok()
+            );
+            assert!(app.running);
+            app.handle_ui_event(UiEvent::Tick, tx).await.unwrap();
+            app.cancel_running_task();
+            assert!(!app.running);
+            assert!(app.agent_task.is_none());
+        });
+        server.join().unwrap();
+    }
+
     fn app() -> TuiApp {
         let dir = tempfile::tempdir().unwrap();
         app_in_dir(&dir, crate::ProviderChoice::Ollama)
@@ -12092,7 +12210,7 @@ mod tests {
 
         app.submit_service_registration();
 
-        match app.modal {
+        match app.modal.take() {
             Some(ModalState::ServiceRegistration {
                 draft,
                 error: Some(_),
@@ -13487,8 +13605,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Use Groq (cloud provider) WITHOUT an API key to trigger the guard.
         let mut app = app_in_dir(&dir, ProviderChoice::Groq);
-        // Explicitly clear the API key in case env var leaked in.
+        // Point at an unset env var so the host's real provider keys cannot leak in.
         app.active_settings.api_key = None;
+        app.active_settings.api_key_env = Some("HELM_TEST_ABSENT_KEY".to_owned());
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
         app.dashboard.selected_fingerprint = Some("fp-001".into());
@@ -13521,8 +13640,9 @@ mod tests {
     fn dash_no_provider_guard_blocks_assist_submit() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in_dir(&dir, ProviderChoice::Groq);
-        // Explicitly clear the API key in case env var leaked in.
+        // Point at an unset env var so the host's real provider keys cannot leak in.
         app.active_settings.api_key = None;
+        app.active_settings.api_key_env = Some("HELM_TEST_ABSENT_KEY".to_owned());
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
         app.dashboard.selected_fingerprint = Some("fp-001".into());
@@ -13969,7 +14089,7 @@ mod tests {
         app.mode = AgentMode::Dashboard;
         app.dashboard.data = test_dash_data();
         app.dashboard.selected_fingerprint = Some("fp-001".into());
-        let (_tx, rx) = tokio::sync::oneshot::channel::<PlanStatus>();
+        let (_tx, rx) = tokio::sync::oneshot::channel::<(FindingSummary, String, PlanStatus)>();
         app.dashboard.pending_plan_rx = Some(rx);
         // Switch tab while LLM is pending — should not panic or hang.
         app.dashboard.active_tab = OpsTab::Services;
@@ -14020,7 +14140,7 @@ mod tests {
             .block_on(app.handle_ui_event(UiEvent::Tick, tx))
             .unwrap();
 
-        match app.modal {
+        match app.modal.take() {
             Some(ModalState::PlanExecution {
                 phase,
                 result_summary,

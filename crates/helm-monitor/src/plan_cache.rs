@@ -51,7 +51,9 @@ impl PlanCache {
             }
         });
         if status.is_none() {
-            self.entries.remove(fingerprint);
+            self.entries.remove_if(fingerprint, |_, entry| {
+                entry.cached_at.elapsed() >= self.ttl
+            });
         }
         status
     }
@@ -83,17 +85,38 @@ impl PlanCache {
         Fut: Future<Output = LlmPlanStatus> + Send + 'static,
     {
         self.evict_expired();
-        if self.get(&fingerprint).is_some() || self.in_flight.contains_key(&fingerprint) {
+        // Entry ownership is atomic across callers; status lookup alone is not a lock.
+        let dashmap::mapref::entry::Entry::Vacant(owner) =
+            self.in_flight.entry(fingerprint.clone())
+        else {
             return false;
+        };
+        if let Some(status) = self.get(&fingerprint) {
+            let reusable = matches!(status, LlmPlanStatus::Ready(_) | LlmPlanStatus::Loading)
+                || matches!(status, LlmPlanStatus::RateLimited(seconds) if self.entries.get(&fingerprint).is_some_and(|e| e.cached_at.elapsed() < Duration::from_secs(seconds)));
+            if reusable {
+                return false;
+            }
         }
-
+        owner.insert(());
         self.insert(fingerprint.clone(), LlmPlanStatus::Loading);
-        self.in_flight.insert(fingerprint.clone(), ());
         let cache = self.clone();
         tokio::spawn(async move {
-            let status = generator().await;
-            cache.insert(fingerprint.clone(), status);
-            cache.in_flight.remove(&fingerprint);
+            struct Release(PlanCache, String);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    // Cancellation/panic must not strand a permanent loading record.
+                    if matches!(self.0.get(&self.1), Some(LlmPlanStatus::Loading)) {
+                        self.0.insert(self.1.clone(), LlmPlanStatus::Timeout);
+                    }
+                    self.0.in_flight.remove(&self.1);
+                }
+            }
+            let _owner = Release(cache.clone(), fingerprint.clone());
+            let status = tokio::time::timeout(Duration::from_secs(35), generator())
+                .await
+                .unwrap_or(LlmPlanStatus::Timeout);
+            cache.insert(fingerprint, status);
         });
         true
     }
@@ -151,6 +174,38 @@ mod tests {
             cache.get("finding-a"),
             Some(LlmPlanStatus::Ready(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_generation_can_retry() {
+        let cache = PlanCache::default();
+        cache.insert("failed", LlmPlanStatus::Timeout);
+        assert!(cache.ensure_plan("failed".into(), || async { ready_status() }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(cache.get("failed"), Some(LlmPlanStatus::Ready(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_generation_has_one_owner() {
+        let cache = PlanCache::default();
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let mut jobs = Vec::new();
+        for _ in 0..16 {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            jobs.push(tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                cache.ensure_plan("same".into(), || async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    ready_status()
+                }) as usize
+            }));
+        }
+        let mut owners = 0;
+        for job in jobs {
+            owners += job.await.unwrap();
+        }
+        assert_eq!(owners, 1);
     }
 
     proptest! {

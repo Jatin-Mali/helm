@@ -488,7 +488,14 @@ async fn api_generate_plan(
             if let Ok(Some(record)) = helm_memory::TroubleshootingPlanStore::latest_for_fingerprint(
                 &conn,
                 &finding.fingerprint,
-            ) {
+            ) && record.dashboard_plan_status == "ready"
+                && record.id.starts_with(&format!(
+                    "plan-{}-",
+                    crate::plan_context_key(&state.provider_settings, &finding)
+                ))
+                && chrono::Utc::now().timestamp() - record.updated_at
+                    < state.plan_cache.ttl().as_secs() as i64
+            {
                 return Json(serde_json::json!({
                     "finding_id": req.finding_id,
                     "title": finding.title,
@@ -501,7 +508,7 @@ async fn api_generate_plan(
                 }));
             }
 
-            if llm_provider_usable(&state.provider_settings) {
+            if llm_provider_usable(&state.provider_settings, &state.secrets) {
                 let runtime = crate::PlanGenerationRuntime {
                     provider_settings: state.provider_settings.clone(),
                     secrets: state.secrets.clone(),
