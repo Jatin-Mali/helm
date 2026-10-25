@@ -58,8 +58,18 @@ pub fn default_config_path() -> PathBuf {
     config_file("config.toml")
 }
 
+static DB_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Records the global `--db-path` once so every subcommand resolves the same database.
+pub fn set_db_override(path: PathBuf) {
+    let _ = DB_OVERRIDE.set(path);
+}
+
 pub fn default_db_path() -> PathBuf {
-    data_file("helm.db")
+    DB_OVERRIDE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| data_file("helm.db"))
 }
 
 pub fn default_log_path() -> PathBuf {

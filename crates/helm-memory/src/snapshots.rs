@@ -155,6 +155,60 @@ impl SnapshotStore {
         Ok(result)
     }
 
+    /// Delete snapshots older than `max_age_secs` and any beyond the newest `max_rows`, never
+    /// touching the newest `MIN_KEPT`, or rows still referenced by changes (including their
+    /// before/after/rollback evidence), troubleshooting plans or unresolved finding states.
+    /// Returns the number of rows removed.
+    pub fn prune(
+        conn: &Connection,
+        max_age_secs: i64,
+        max_rows: u32,
+    ) -> Result<usize, MemoryError> {
+        const MIN_KEPT: u32 = 2;
+        let table_exists = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                params![name],
+                |_| Ok(()),
+            )
+            .is_ok()
+        };
+        let mut protected = Vec::new();
+        for (table, column, filter) in [
+            ("change_sets", "snapshot_id", ""),
+            ("change_sets", "before_snapshot_id", ""),
+            ("change_sets", "after_snapshot_id", ""),
+            ("change_sets", "rollback_snapshot_id", ""),
+            ("troubleshooting_plans", "snapshot_id", ""),
+            (
+                "finding_states",
+                "snapshot_id",
+                " AND status NOT IN ('resolved','closed')",
+            ),
+        ] {
+            if table_exists(table) {
+                // NULLs would make NOT IN match nothing.
+                protected.push(format!(
+                    "SELECT {column} FROM {table} WHERE {column} IS NOT NULL{filter}"
+                ));
+            }
+        }
+        let protected = if protected.is_empty() {
+            "SELECT ''".to_owned()
+        } else {
+            protected.join(" UNION ")
+        };
+        let cutoff = chrono::Utc::now().timestamp() - max_age_secs;
+        let sql = format!(
+            "DELETE FROM snapshots WHERE id NOT IN ({protected})
+               AND id NOT IN (SELECT id FROM snapshots ORDER BY collected_at DESC LIMIT {MIN_KEPT})
+               AND (collected_at < ?1
+                    OR id NOT IN (SELECT id FROM snapshots ORDER BY collected_at DESC LIMIT ?2))"
+        );
+        conn.execute(&sql, params![cutoff, max_rows])
+            .map_err(|e| MemoryError::Other(e.to_string()))
+    }
+
     /// Delete a snapshot by ID.
     pub fn delete(conn: &Connection, id: &str) -> Result<(), MemoryError> {
         conn.execute("DELETE FROM snapshots WHERE id = ?1", params![id])
@@ -265,5 +319,80 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].host_id, "uuid-2"); // newest first
         assert_eq!(list[1].host_id, "uuid-1");
+    }
+
+    fn prune_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (id TEXT PRIMARY KEY, host_hostname TEXT, host_id TEXT,
+                collected_at INTEGER NOT NULL, profile TEXT, domains_json TEXT,
+                collector_errors_json TEXT, findings_json TEXT);
+             CREATE TABLE change_sets (id TEXT, snapshot_id TEXT, before_snapshot_id TEXT,
+                after_snapshot_id TEXT, rollback_snapshot_id TEXT);
+             CREATE TABLE finding_states (fingerprint TEXT, status TEXT, snapshot_id TEXT);",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        for n in 0..10i64 {
+            // s0 is the oldest; each is one day apart.
+            conn.execute(
+                "INSERT INTO snapshots VALUES (?1,'h','i',?2,'quick','{}','[]','[]')",
+                params![format!("s{n}"), now - (10 - n) * 86_400],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn ids(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM snapshots ORDER BY collected_at")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn prune_removes_old_rows_but_protects_change_and_open_incident_evidence() {
+        let conn = prune_fixture();
+        conn.execute(
+            "INSERT INTO change_sets VALUES ('c','s0','s1','s2',NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO finding_states VALUES ('f','open','s3')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO finding_states VALUES ('g','resolved','s4')",
+            [],
+        )
+        .unwrap();
+        let removed = SnapshotStore::prune(&conn, 5 * 86_400 + 3_600, 1_000).unwrap();
+        // Older than ~5 days: s0..s4. s0-s3 protected; s4 (resolved) goes.
+        assert_eq!(removed, 1);
+        assert_eq!(ids(&conn).len(), 9);
+        assert!(!ids(&conn).contains(&"s4".to_owned()));
+    }
+
+    #[test]
+    fn prune_enforces_row_cap_and_always_keeps_the_newest() {
+        let conn = prune_fixture();
+        SnapshotStore::prune(&conn, i64::MAX / 2, 3).unwrap();
+        assert_eq!(ids(&conn), ["s7", "s8", "s9"]);
+        SnapshotStore::prune(&conn, 0, 0).unwrap();
+        assert_eq!(ids(&conn), ["s8", "s9"]);
+    }
+
+    #[test]
+    fn prune_on_a_database_without_optional_tables_still_works() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (id TEXT PRIMARY KEY, collected_at INTEGER NOT NULL);
+             INSERT INTO snapshots VALUES ('a',1),('b',2),('c',3);",
+        )
+        .unwrap();
+        assert_eq!(SnapshotStore::prune(&conn, 0, 10).unwrap(), 1);
     }
 }

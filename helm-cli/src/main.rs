@@ -3,6 +3,7 @@
 mod bootstrap;
 mod custom_commands;
 mod execution_journal;
+mod fleet;
 mod keybindings;
 mod ops;
 mod paths;
@@ -1025,10 +1026,10 @@ async fn run() -> Result<()> {
         cli.model,
         cli.api_key,
     )?;
-    let db_path = match cli.db_path.clone() {
-        Some(p) => p,
-        None => default_db_path()?,
-    };
+    if let Some(path) = cli.db_path.clone() {
+        paths::set_db_override(path);
+    }
+    let db_path = default_db_path()?;
     ensure_parent_dir(&db_path)?;
     let secrets_store =
         SecretsStore::open_default().map_err(|e| anyhow!("failed to open secrets store: {e}"))?;
@@ -4648,7 +4649,7 @@ async fn run_single_collection_cycle(
         &conn,
         &report.snapshot,
         &serde_json::to_string(&report.findings).unwrap_or_default(),
-    );
+    )?;
     if let Some(runtime) = plan_runtime {
         for finding in &report.findings {
             if let Err(error) = queue_background_plan_generation(runtime, db_path, finding) {
@@ -4774,10 +4775,7 @@ async fn run_collect_snapshot_command(args: SnapshotArgs) -> Result<()> {
     let db_path = default_db_path()?;
     let conn = rusqlite::Connection::open(&db_path)
         .with_context(|| format!("failed to open db at {}", db_path.display()))?;
-    let raw_json = serde_json::to_string(&snapshot)?;
-    let redacted_json = helm_core::redact_secrets(&raw_json);
-    SnapshotStore::insert(&conn, &redacted_json, "[]")
-        .with_context(|| "failed to persist snapshot")?;
+    persist_monitor_snapshot(&conn, &snapshot, "[]")?;
 
     if args.diff {
         match SnapshotStore::latest_except(&conn, &snapshot.id) {
@@ -5157,54 +5155,9 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
             .collect()
     });
 
-    // Fleet mode: run on all configured remotes
+    // Fleet mode: real SSH observations only; --domain/--profile apply to the local host.
     if args.fleet {
-        let registry = crate::remote::RemoteRegistry::load()?;
-        if registry.remotes.is_empty() {
-            eprintln!("No remote hosts configured. Use `helm remote add <name> <host>` first.");
-            return Ok(());
-        }
-        println!("Fleet Monitor — {} host(s)", registry.remotes.len());
-        println!("{}", "─".repeat(60));
-        let mut total_findings = 0usize;
-        for remote in &registry.remotes {
-            println!("\\n>>> {} ({})", remote.name, remote.host);
-            // Run local snapshot for now (future: SSH to remote)
-            let report = run_monitor_cycle(profile, domain_filter.as_deref(), None).await;
-            if !report.findings.is_empty() {
-                let crits: Vec<_> = report
-                    .findings
-                    .iter()
-                    .filter(|f| f.severity >= helm_monitor::Severity::Critical)
-                    .collect();
-                let warns: Vec<_> = report
-                    .findings
-                    .iter()
-                    .filter(|f| f.severity == helm_monitor::Severity::Warning)
-                    .collect();
-                println!(
-                    "  Findings: {} critical, {} warning, {} info (total: {})",
-                    crits.len(),
-                    warns.len(),
-                    report
-                        .findings
-                        .len()
-                        .saturating_sub(crits.len() + warns.len()),
-                    report.findings.len()
-                );
-                total_findings += report.findings.len();
-            } else {
-                println!("  ✅ No findings");
-            }
-        }
-        println!();
-        println!("{}", "─".repeat(60));
-        println!(
-            "Fleet summary: {} total findings across {} host(s)",
-            total_findings,
-            registry.remotes.len()
-        );
-        return Ok(());
+        return fleet::run(resolve_format(&args) == "json").await;
     }
 
     let db_path = default_db_path()?;
@@ -5226,7 +5179,7 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
                 &conn,
                 &report.snapshot,
                 &serde_json::to_string(&report.findings).unwrap_or_default(),
-            );
+            )?;
             let fmt = resolve_format(&args);
             let output = format_report(&report, &fmt);
             let redacted = helm_core::redact_secrets(&output);
@@ -5241,7 +5194,7 @@ async fn run_monitor_command(args: MonitorArgs) -> Result<()> {
             &conn,
             &report.snapshot,
             &serde_json::to_string(&report.findings).unwrap_or_default(),
-        );
+        )?;
         let fmt = resolve_format(&args);
         let output = format_report(&report, &fmt);
         let redacted = helm_core::redact_secrets(&output);
@@ -5268,16 +5221,25 @@ fn resolve_format(args: &MonitorArgs) -> String {
     }
 }
 
-/// Persist the monitor snapshot so the next run can use it as baseline.
+/// Retention: a quick/standard snapshot measures ~135 KB, so 1000 rows is ~135 MB.
+const SNAPSHOT_RETENTION_SECS: i64 = 7 * 86_400;
+const SNAPSHOT_MAX_ROWS: u32 = 1000;
+
+/// Persist the monitor snapshot so the next run can use it as baseline, then enforce retention.
+/// A failed insert is an error; a failed prune is only logged so collection keeps running.
 pub(crate) fn persist_monitor_snapshot(
     conn: &rusqlite::Connection,
     snapshot: &SystemSnapshot,
     findings_json: &str,
-) {
-    if let Ok(raw_json) = serde_json::to_string(snapshot) {
-        let redacted = helm_core::redact_secrets(&raw_json);
-        let _ = SnapshotStore::insert(conn, &redacted, findings_json);
+) -> Result<()> {
+    let raw_json = serde_json::to_string(snapshot)?;
+    let redacted = helm_core::redact_secrets(&raw_json);
+    SnapshotStore::insert(conn, &redacted, findings_json)
+        .map_err(|error| anyhow!("failed to persist snapshot {}: {error}", snapshot.id))?;
+    if let Err(error) = SnapshotStore::prune(conn, SNAPSHOT_RETENTION_SECS, SNAPSHOT_MAX_ROWS) {
+        tracing::warn!(%error, "snapshot retention cleanup failed");
     }
+    Ok(())
 }
 
 pub(crate) fn load_previous_snapshot(conn: &rusqlite::Connection) -> Option<SystemSnapshot> {

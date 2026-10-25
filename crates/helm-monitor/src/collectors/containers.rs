@@ -159,7 +159,10 @@ mod tests {
         let json = r#"{"ID":"abc123","Names":"a","Image":"i","Status":"Up"}
 {"ID":"def456","Names":"b","Image":"i","Status":"Up"}"#;
         let mut containers = parse_list(json);
-        apply_restart_counts(&mut containers, "abc123ffff 5\ndef456 notanumber\ngarbage\n");
+        apply_restart_counts(
+            &mut containers,
+            "abc123ffff 5\ndef456 notanumber\ngarbage\n",
+        );
         assert_eq!(containers[0].restart_count, Some(5));
         assert_eq!(containers[1].restart_count, None);
     }

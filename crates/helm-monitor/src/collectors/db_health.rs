@@ -67,7 +67,6 @@ impl Collector for DbHealthCollector {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

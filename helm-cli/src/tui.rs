@@ -6042,7 +6042,7 @@ Report the exit status and the concise output."
         let prev = crate::load_previous_snapshot(&conn);
         let report = crate::run_monitor_cycle(MonitorProfile::Standard, None, prev).await;
         let findings_json = serde_json::to_string(&report.findings).unwrap_or_default();
-        crate::persist_monitor_snapshot(&conn, &report.snapshot, &findings_json);
+        crate::persist_monitor_snapshot(&conn, &report.snapshot, &findings_json)?;
         self.refresh_dashboard();
         self.toast(format!(
             "Dashboard refreshed locally: {} finding(s) on {}",

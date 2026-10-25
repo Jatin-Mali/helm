@@ -116,11 +116,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** CLI `paths.rs`, `main.rs`, `remote.rs`, `bootstrap.rs`, memory snapshot/change stores, daemon/watch loops; new `tests/runtime_paths.rs` and SSH fixtures. **Findings:** F11, F22, F26, F27.
 
-- [ ] Resolve config/data/cache/database paths once and pass them through commands/services. An alternate DB must never cause default-DB writes.
-- [ ] Reuse actual SSH collection for `monitor --fleet`; persist target host identity and observation timestamps. An unreachable host returns unknown with last-known data labeled stale.
-- [ ] Send scripts over stdin to a fixed remote shell or quote the remote command exactly once. Test spaces, quotes and metacharacters using a shell fixture before two-VM SSH testing.
-- [ ] Add bounded snapshot retention with protected references for active incidents and change restoration. Measure representative growth, choose documented defaults, then test cleanup and cleanup failures.
-- [ ] Verify two remote hosts differ from each other and the local machine; interruption cannot silently substitute local results.
+- [x] Resolve config/data/cache/database paths once and pass them through commands/services. An alternate DB must never cause default-DB writes.
+- [x] Reuse actual SSH collection for `monitor --fleet`; persist target host identity and observation timestamps. An unreachable host returns unknown with last-known data labeled stale.
+- [x] Send scripts over stdin to a fixed remote shell or quote the remote command exactly once. Test spaces, quotes and metacharacters using a shell fixture before two-VM SSH testing.
+- [x] Add bounded snapshot retention with protected references for active incidents and change restoration. Measure representative growth, choose documented defaults, then test cleanup and cleanup failures.
+- [x] Verify two remote hosts differ from each other and the local machine; interruption cannot silently substitute local results.
 
 ### Task 7 — Privacy, configuration and verifiable audit
 

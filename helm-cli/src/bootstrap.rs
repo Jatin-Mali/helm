@@ -143,9 +143,7 @@ async fn run_ssh(
     argv.extend_from_slice(port_args);
     argv.extend_from_slice(common);
     argv.push(target.to_owned());
-    for arg in remote_argv {
-        argv.push((*arg).to_owned());
-    }
+    argv.push(crate::remote::remote_command(remote_argv));
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())

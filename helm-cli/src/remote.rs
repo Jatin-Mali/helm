@@ -20,7 +20,9 @@ pub struct RemoteRegistry {
     pub remotes: Vec<RemoteEntry>,
 }
 
-const FLEET_COLLECTION_TIMEOUT_SECS: u64 = 2;
+/// Whole-host budget: SSH connect plus a quick-profile monitor and snapshot on the remote.
+const FLEET_COLLECTION_TIMEOUT_SECS: u64 = 60;
+const FLEET_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -122,6 +124,9 @@ pub struct FleetHostReport {
     pub host_name: String,
     pub findings: Vec<Finding>,
     pub snapshot: Option<SystemSnapshot>,
+    /// Local clock time at which this host answered; the snapshot's own time is the remote's.
+    #[serde(default = "Utc::now")]
+    pub observed_at: chrono::DateTime<Utc>,
 }
 
 fn default_port() -> u16 {
@@ -331,6 +336,33 @@ impl RemoteRegistry {
     }
 }
 
+/// Accepts the versioned report object (`{"findings": [...]}`) and the legacy bare array.
+fn parse_findings_json(raw: &str) -> serde_json::Result<Vec<Finding>> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    match value {
+        serde_json::Value::Object(mut report) => {
+            serde_json::from_value(report.remove("findings").unwrap_or_default())
+        }
+        other => serde_json::from_value(other),
+    }
+}
+
+/// ssh joins its trailing arguments with spaces and hands the result to the remote shell, so
+/// quote every argument exactly once. A leading `$HOME/` is the only expansion allowed.
+pub fn remote_command(argv: &[&str]) -> String {
+    fn quote(arg: &str) -> String {
+        let single = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        match arg.strip_prefix("$HOME/") {
+            Some(rest) => format!("\"$HOME\"/{}", single(rest)),
+            None => single(arg),
+        }
+    }
+    argv.iter()
+        .map(|arg| quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl RemoteEntry {
     fn remote_helm_command(&self) -> String {
         self.agent
@@ -368,7 +400,7 @@ impl RemoteEntry {
         argv.push("-o".to_owned());
         argv.push("BatchMode=yes".to_owned());
         argv.push("-o".to_owned());
-        argv.push(format!("ConnectTimeout={FLEET_COLLECTION_TIMEOUT_SECS}"));
+        argv.push(format!("ConnectTimeout={FLEET_CONNECT_TIMEOUT_SECS}"));
         if let Credential::KeyFile(path) = &self.credential {
             argv.push("-i".to_owned());
             argv.push(path.to_string_lossy().to_string());
@@ -382,9 +414,7 @@ impl RemoteEntry {
 
     pub async fn run_shell(&self, script: &str) -> Result<String> {
         let mut argv = self.ssh_argv();
-        argv.push("sh".to_owned());
-        argv.push("-lc".to_owned());
-        argv.push(script.to_owned());
+        argv.push(remote_command(&["sh", "-lc", script]));
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .stdin(Stdio::null())
@@ -460,20 +490,27 @@ impl RemoteEntry {
             host_name: self.name.clone(),
             findings,
             snapshot,
+            observed_at: Utc::now(),
         })
     }
 
     async fn collect_raw_findings(&self) -> Result<Vec<Finding>> {
         let stdout = self
-            .run_helm_json(&["monitor", "--format", "json"], "findings collection")
+            .run_helm_json(
+                &["monitor", "--profile", "quick", "--format", "json"],
+                "findings collection",
+            )
             .await?;
-        serde_json::from_str::<Vec<Finding>>(&stdout)
+        parse_findings_json(&stdout)
             .with_context(|| format!("parsing findings JSON from {}", self.name))
     }
 
     async fn collect_snapshot(&self) -> Result<SystemSnapshot> {
         let stdout = self
-            .run_helm_json(&["snapshot", "--json"], "snapshot collection")
+            .run_helm_json(
+                &["snapshot", "--profile", "quick", "--json"],
+                "snapshot collection",
+            )
             .await?;
         serde_json::from_str::<SystemSnapshot>(&stdout)
             .with_context(|| format!("parsing snapshot JSON from {}", self.name))
@@ -481,8 +518,10 @@ impl RemoteEntry {
 
     async fn run_helm_json(&self, remote_argv: &[&str], action: &str) -> Result<String> {
         let mut argv = self.ssh_argv();
-        argv.push(self.remote_helm_command());
-        argv.extend(remote_argv.iter().map(|arg| (*arg).to_owned()));
+        let helm = self.remote_helm_command();
+        let mut remote = vec![helm.as_str()];
+        remote.extend_from_slice(remote_argv);
+        argv.push(remote_command(&remote));
 
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..])
@@ -542,6 +581,53 @@ mod tests {
     use helm_monitor::{Confidence, MonitorDomain, Severity};
     use proptest::prelude::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn remote_command_preserves_each_argument_through_a_shell() {
+        let hostile = [
+            "a b",
+            "it's",
+            "$(echo pwned)",
+            ";touch /tmp/helm-should-not-exist",
+            "\"quoted\"",
+        ];
+        let mut argv = vec!["sh", "-c", "printf '%s|' \"$@\"", "_"];
+        argv.extend(hostile);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_command(&argv))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{}|", hostile.join("|"))
+        );
+        assert!(!std::path::Path::new("/tmp/helm-should-not-exist").exists());
+    }
+
+    #[test]
+    fn remote_command_still_expands_home_prefix_only() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_command(&["printf", "%s", "$HOME/.helm/bin"]))
+            .env("HOME", "/h o")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/h o/.helm/bin");
+    }
+
+    #[test]
+    fn findings_parse_from_report_object_and_legacy_array() {
+        assert!(
+            parse_findings_json(r#"{"schema_version":1,"findings":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_findings_json("[]").unwrap().is_empty());
+        // A report without a findings array is incomplete output, not "no findings".
+        assert!(parse_findings_json(r#"{"schema_version":1}"#).is_err());
+        assert!(parse_findings_json("not json").is_err());
+    }
 
     #[test]
     fn registry_load_from_missing_file_returns_default() {
@@ -610,7 +696,7 @@ mod tests {
                 "-o",
                 "BatchMode=yes",
                 "-o",
-                "ConnectTimeout=2",
+                "ConnectTimeout=5",
                 "ubuntu@prod.example.com"
             ]
         );

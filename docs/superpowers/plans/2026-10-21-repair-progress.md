@@ -82,3 +82,15 @@ Final incremental verification for observation/recovery patch: strict workspace 
 Container restart counts now come from `docker|podman inspect` (`.RestartCount`); `ps` status "Restarting (N)" is an exit code and is no longer parsed as a count (unknown when inspect fails). Implicit `psql -U postgres` / `mysql` probing removed from `DbHealthCollector`; explicit DB/web targets are the registered services (TCP/HTTP health checks, no credential discovery). Regression: `collector_never_probes_databases_implicitly`, `inspect_counts_apply_by_id_and_malformed_lines_stay_unknown`.
 Ruling: backups/timers/load/firewall/pipelines stay `Unknown` coverage (never resolve incidents) rather than fabricating a success signal — conservative; cost: incidents in those domains need manual resolution.
 Verification: helm-monitor lib 221 PASS, strict clippy PASS.
+
+## Task 6 — complete (Claude)
+
+- F22: `--db-path` stored once via `paths::set_db_override`; `default_db_path()` (11 callers) honors it. `helm-cli/tests/runtime_paths.rs` RED on old code (stray write to default DB), GREEN now.
+- F11: `monitor --fleet` rewritten (`helm-cli/src/fleet.rs`) to use real SSH `collect_report`; per-host identity (hashed machine/boot id), local `observed_at`, unavailable hosts print UNKNOWN with last-known data labeled STALE; state persisted atomically in `fleet-state.json`. Stub-ssh end-to-end test `helm-cli/tests/fleet.rs`.
+- Found while wiring: remote collection parsed `Vec<Finding>` but `monitor --format json` now emits the versioned report object (Task 5 change) — remote monitoring was silently broken. Parser accepts both; a report without `findings` is an error.
+- Fleet per-host budget was 2s (every real host would time out); now 60s overall, 5s SSH connect, remote runs use `--profile quick`.
+- F27: `remote_command()` quotes every remote argument once (only a leading `$HOME/` expands); used by `run_shell`, remote helm calls and bootstrap. Tests run hostile arguments through a real shell.
+- F26: `SnapshotStore::prune` (7 days, 1000 rows; measured ~135 KB/snapshot ⇒ ≈135 MB cap); newest 2 and rows referenced by changes/plans/unresolved findings are protected. `persist_monitor_snapshot` now returns errors to daemon/monitor/TUI/snapshot callers; prune failure is logged.
+Ruling: fleet state keyed by remote name, not host_id — legacy remotes.toml entries receive a fresh random host_id each load. Cost: renaming a remote forgets its stale data.
+Ruling: remote-vs-local identity equality is not checked at runtime; the demo (Task 14) compares host identities. Cost: a remote that is actually this machine is only flagged if two remotes share it.
+Verification: workspace all-target tests 818 passed / 0 failed; strict clippy and fmt PASS.
