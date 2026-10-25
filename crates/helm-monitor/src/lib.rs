@@ -22,6 +22,7 @@ pub mod ring_buffer;
 pub mod snapshot;
 pub mod thresholds;
 pub mod troubleshoot;
+pub mod webhook_auth;
 
 pub use correlation::{
     CausalLink, CausalRelationship, CorrelationEngine, CorrelationGroup, CorrelationResult,

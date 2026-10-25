@@ -520,25 +520,72 @@ async fn api_change_rollback(
     }
 }
 
+/// Ingress is authenticated by a per-service secret (`HELM_WEBHOOK_SECRET_<SERVICE_ID>` in the
+/// secrets store) checked against the raw body; replays are rejected. No secret means disabled.
 async fn api_pipeline_webhook(
     State(state): State<Arc<WebState>>,
     Path((provider, service_id)): Path<(String, String)>,
-    Json(payload): Json<serde_json::Value>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    match record_pipeline_webhook_event(&provider, &service_id, &payload) {
+    use axum::http::StatusCode;
+    let fail = |status: StatusCode, error: String| {
+        (
+            status,
+            Json(serde_json::json!({"ok": false, "error": error})),
+        )
+    };
+    let name: String = service_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let secret = match state.secrets.get(&format!("HELM_WEBHOOK_SECRET_{name}")) {
+        Ok(Some(secret)) => secret,
+        _ => {
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "webhook ingress is disabled: no secret configured for this service".into(),
+            );
+        }
+    };
+    let header_map: helm_monitor::webhook_auth::Headers = headers
+        .iter()
+        .filter_map(|(k, v)| Some((k.as_str().to_ascii_lowercase(), v.to_str().ok()?.to_owned())))
+        .collect();
+    let delivery_id = match helm_monitor::webhook_auth::verify(
+        &provider,
+        secret.expose().as_bytes(),
+        &header_map,
+        &body,
+        chrono::Utc::now(),
+    ) {
+        Ok(id) => id,
+        Err(error) => return fail(StatusCode::UNAUTHORIZED, error.to_string()),
+    };
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return fail(StatusCode::BAD_REQUEST, "body is not JSON".into());
+    };
+    match record_pipeline_webhook_event(&provider, &service_id, &delivery_id, &payload) {
         Ok(()) => {
             let json = collect_live_snapshot(state.as_ref()).await;
             let _ = state.snapshot_tx.send(json);
-            Json(serde_json::json!({
-                "ok": true,
-                "provider": provider,
-                "serviceId": service_id,
-            }))
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"ok": true, "provider": provider, "serviceId": service_id}),
+                ),
+            )
         }
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error @ helm_monitor::pipeline::PipelineWebhookError::Replay(_)) => {
+            fail(StatusCode::CONFLICT, error.to_string())
+        }
+        Err(error) => fail(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
     }
 }
 

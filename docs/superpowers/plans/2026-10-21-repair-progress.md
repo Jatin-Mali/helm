@@ -104,3 +104,11 @@ Verification: workspace all-target tests 818 passed / 0 failed; strict clippy an
 - F08: audit hash v2 = SHA-256 over domain tag + length-prefixed fields (`v2:` prefix). Legacy FNV rows verify and are counted; legacy-after-v2 is rejected as downgrade; `audit verify` prints heads for external anchoring. Pre-upgrade DB test passes. Docs corrected (they claimed HMAC).
 Ruling: no keyed/HMAC audit — a key readable by the same user adds no protection against the stated same-user threat and key management is out of scope; head hashes + documentation instead. Cost: no tamper evidence against a same-user attacker without off-host anchoring.
 Ruling: provider-key values pasted into `config set` are blocked by pattern, but arbitrary unmarked secrets are not detectable; documented in docs/data-boundary.md.
+
+## Task 8 — PARTIAL (Claude; usage limit reached)
+
+Done: webhook ingress (F23). `webhook_auth::verify` checks raw-body signatures (GitHub HMAC-SHA256 verified against GitHub's published vector; GitLab token; generic timestamped HMAC); Jenkins/others disabled. Per-service secret `HELM_WEBHOOK_SECRET_<SERVICE_ID>` in the secrets store, none ⇒ 503. Replay (delivery id, 7-day memory) and stale-run rejection; pipeline history updates are now one flock-serialized read-merge-write with unique temp files (concurrent test: 16 writers, no loss). Tests: webhook_auth (5), pipeline replay/stale/concurrency.
+NOT done (still required by Task 8): dashboard pairing/session authentication for `/`-data routes, `/api/*` and `/ws`; Host/Origin validation; CSRF; session-bound per-action approval for service actions and rollback via `PlanApprovals` + `DurableJournal` (design: prepare → approve → execute, single-use, 15 min, bound to session/host/cwd); updating `web/dashboard.html`; real-browser positive/negative checks; `tests/web_security.rs`. Until then the dashboard remains unauthenticated on loopback (F05 open) — do not expose it.
+
+## Remaining tasks (not started)
+9 planning/TUI; 10 agent runtime; 11 agent tools/permissions; 12 sessions/workflows; 13 distribution/installer/CI/docs; 14 real demonstrations (needs real provider, browser, two SSH hosts, VM). Real-provider keys exist in the environment (GROQ/GEMINI/OPENROUTER/DEEPSEEK) but were not used.

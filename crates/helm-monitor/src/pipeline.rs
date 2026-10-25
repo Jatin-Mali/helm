@@ -117,6 +117,23 @@ pub struct PipelineRun {
 struct PipelineHistoryFile {
     #[serde(default)]
     pipeline: Vec<PipelineHistoryEntry>,
+    /// Webhook deliveries already applied, for replay protection.
+    #[serde(default)]
+    seen: Vec<SeenDelivery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SeenDelivery {
+    id: String,
+    at: DateTime<Utc>,
+}
+
+const MAX_SEEN_DELIVERIES: usize = 5000;
+
+#[derive(Debug, Default)]
+struct HistoryState {
+    entries: HashMap<String, PipelineHistoryEntry>,
+    seen: Vec<SeenDelivery>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -147,6 +164,10 @@ pub enum PipelineWebhookError {
     Parse(String),
     #[error("failed to persist pipeline history: {0}")]
     Persist(String),
+    #[error("delivery `{0}` was already applied")]
+    Replay(String),
+    #[error("webhook run data is older than the {days}-day acceptance window", days = crate::webhook_auth::REPLAY_WINDOW_DAYS)]
+    Stale,
 }
 
 pub struct PipelineCollector;
@@ -181,7 +202,6 @@ impl PipelineCollector {
             .build()
             .map_err(|error| collector_error(format!("reqwest client init failed: {error}")))?;
 
-        let mut history = load_history(history_path);
         let mut join_set = JoinSet::new();
         for (service, endpoint) in &pipeline_services {
             let client = client.clone();
@@ -193,11 +213,10 @@ impl PipelineCollector {
             });
         }
 
+        let mut probes = Vec::new();
         while let Some(joined) = join_set.join_next().await {
             match joined {
-                Ok((service, Ok(probe))) => {
-                    merge_probe(&mut history, &service, probe);
-                }
+                Ok((service, Ok(probe))) => probes.push((service, probe)),
                 Ok((service, Err(error))) => {
                     warn!(service_id = %service.id, error = %error, "pipeline probe failed");
                 }
@@ -205,9 +224,15 @@ impl PipelineCollector {
             }
         }
 
-        persist_history(history_path, &history).map_err(|error| {
-            collector_error(format!("failed to persist pipeline history: {error}"))
-        })?;
+        // Network fetches happen unlocked; the read-merge-write is one locked step so a
+        // concurrent webhook delivery cannot be lost.
+        let history = update_history(history_path, |state| {
+            for (service, probe) in probes {
+                merge_probe(&mut state.entries, &service, probe);
+            }
+            state.entries.clone()
+        })
+        .map_err(|error| collector_error(format!("failed to persist pipeline history: {error}")))?;
 
         Ok(build_snapshot(&pipeline_services, &history))
     }
@@ -220,9 +245,12 @@ pub fn default_pipeline_history_path() -> PathBuf {
         .join("pipeline-history.json")
 }
 
+/// Applies an already-authenticated delivery (see `webhook_auth::verify`). `delivery_id`
+/// makes the call idempotent: a repeated id is rejected as a replay.
 pub fn record_pipeline_webhook_event(
     provider: &str,
     service_id: &str,
+    delivery_id: &str,
     payload: &Value,
 ) -> Result<(), PipelineWebhookError> {
     let registry = ServiceRegistry::load_default()
@@ -233,21 +261,61 @@ pub fn record_pipeline_webhook_event(
         .find(|service| service.id == service_id)
         .cloned()
         .ok_or_else(|| PipelineWebhookError::NotFound(service_id.to_owned()))?;
+    record_webhook_for_service(
+        &default_pipeline_history_path(),
+        &service,
+        provider,
+        delivery_id,
+        payload,
+        Utc::now(),
+    )
+}
 
+fn record_webhook_for_service(
+    history_path: &Path,
+    service: &RegisteredService,
+    provider: &str,
+    delivery_id: &str,
+    payload: &Value,
+    now: DateTime<Utc>,
+) -> Result<(), PipelineWebhookError> {
     let ServiceType::Pipeline { endpoint } = &service.service_type else {
-        return Err(PipelineWebhookError::NotPipeline(service_id.to_owned()));
+        return Err(PipelineWebhookError::NotPipeline(service.id.clone()));
     };
-
     let provider = PipelineProvider::from_webhook_provider(provider);
     let runs = parse_webhook_runs(payload, &provider, endpoint);
     if runs.is_empty() {
-        return Err(PipelineWebhookError::Parse(service_id.to_owned()));
+        return Err(PipelineWebhookError::Parse(service.id.clone()));
     }
-
-    let mut history = load_history(&default_pipeline_history_path());
-    merge_probe(&mut history, &service, PipelineProbe { provider, runs });
-    persist_history(&default_pipeline_history_path(), &history)
-        .map_err(|error| PipelineWebhookError::Persist(error.to_string()))
+    let window = chrono::Duration::days(crate::webhook_auth::REPLAY_WINDOW_DAYS);
+    // A captured delivery older than the replay memory could otherwise be re-applied.
+    if runs
+        .iter()
+        .all(|run| run.updated_at.is_some_and(|at| now - at > window))
+    {
+        return Err(PipelineWebhookError::Stale);
+    }
+    update_history(history_path, |state| {
+        state.seen.retain(|seen| now - seen.at <= window);
+        if state.seen.iter().any(|seen| seen.id == delivery_id) {
+            return Err(PipelineWebhookError::Replay(delivery_id.to_owned()));
+        }
+        merge_probe(
+            &mut state.entries,
+            service,
+            PipelineProbe { provider, runs },
+        );
+        state.seen.push(SeenDelivery {
+            id: delivery_id.to_owned(),
+            at: now,
+        });
+        if state.seen.len() > MAX_SEEN_DELIVERIES {
+            let excess = state.seen.len() - MAX_SEEN_DELIVERIES;
+            state.seen.drain(..excess);
+        }
+        Ok(())
+    })
+    .map_err(|error| PipelineWebhookError::Persist(error.to_string()))?
 }
 
 pub fn pipeline_failure_findings(
@@ -823,16 +891,10 @@ fn parse_generic_run(value: &Value, endpoint: &str) -> Option<PipelineRun> {
     })
 }
 
-fn load_history(path: &Path) -> HashMap<String, PipelineHistoryEntry> {
-    let Ok(text) = fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    let parsed = toml_or_json_pipeline_history(&text);
-    parsed
-        .pipeline
-        .into_iter()
-        .map(|entry| (entry.service_id.clone(), entry))
-        .collect()
+fn load_history_file(path: &Path) -> PipelineHistoryFile {
+    fs::read_to_string(path)
+        .map(|text| toml_or_json_pipeline_history(&text))
+        .unwrap_or_default()
 }
 
 fn toml_or_json_pipeline_history(text: &str) -> PipelineHistoryFile {
@@ -841,33 +903,60 @@ fn toml_or_json_pipeline_history(text: &str) -> PipelineHistoryFile {
         .unwrap_or_default()
 }
 
-fn persist_history(
+/// Serializes every read-modify-write of the history file (collector pulls and webhook
+/// deliveries, in this or another process) with an exclusive lock on a sibling lock file,
+/// and replaces the file through a uniquely named temporary file.
+fn update_history<T>(
     path: &Path,
-    history: &HashMap<String, PipelineHistoryEntry>,
-) -> Result<(), std::io::Error> {
+    update: impl FnOnce(&mut HistoryState) -> T,
+) -> Result<T, std::io::Error> {
+    use nix::fcntl::{Flock, FlockArg};
+    use std::os::unix::fs::OpenOptionsExt;
     let parent = path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    fs::create_dir_all(&parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&parent, fs::Permissions::from_mode(0o700));
-    }
+    helm_core::private_fs::create_private_dir(&parent)?;
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path.with_extension("lock"))?;
+    let _lock = Flock::lock(lock_file, FlockArg::LockExclusive)
+        .map_err(|(_, errno)| std::io::Error::from(errno))?;
 
-    let mut entries = history.values().cloned().collect::<Vec<_>>();
+    let file = load_history_file(path);
+    let mut state = HistoryState {
+        entries: file
+            .pipeline
+            .into_iter()
+            .map(|entry| (entry.service_id.clone(), entry))
+            .collect(),
+        seen: file.seen,
+    };
+    let result = update(&mut state);
+
+    let mut entries = state.entries.into_values().collect::<Vec<_>>();
     entries.sort_by(|left, right| left.service_id.cmp(&right.service_id));
-    let payload = serde_json::to_string_pretty(&PipelineHistoryFile { pipeline: entries })?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, payload)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    let payload = serde_json::to_string_pretty(&PipelineHistoryFile {
+        pipeline: entries,
+        seen: state.seen,
+    })?;
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let written = std::io::Write::write_all(&mut options.open(&tmp)?, payload.as_bytes())
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(tmp, path)?;
-    Ok(())
+    written?;
+    Ok(result)
 }
 
 fn normalize_status(raw: &str) -> String {
@@ -959,6 +1048,59 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "failed");
         assert_eq!(runs[0].duration_secs, Some(150));
+    }
+
+    fn github_body(id: u64, updated_at: &str) -> Value {
+        serde_json::json!({"workflow_run": {"id": id, "status": "completed",
+            "conclusion": "failure", "updated_at": updated_at}})
+    }
+
+    #[test]
+    fn webhook_replays_and_stale_deliveries_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state").join("pipeline-history.json");
+        let service = pipeline_service("deploy", "https://github.test/actions");
+        let now = Utc::now();
+        let fresh = github_body(1, &now.to_rfc3339());
+        record_webhook_for_service(&path, &service, "github", "github:a", &fresh, now).unwrap();
+        assert!(matches!(
+            record_webhook_for_service(&path, &service, "github", "github:a", &fresh, now),
+            Err(PipelineWebhookError::Replay(_))
+        ));
+        let old = github_body(2, &(now - chrono::Duration::days(30)).to_rfc3339());
+        assert!(matches!(
+            record_webhook_for_service(&path, &service, "github", "github:b", &old, now),
+            Err(PipelineWebhookError::Stale)
+        ));
+        assert_eq!(load_history_file(&path).pipeline[0].runs.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_webhook_writers_do_not_lose_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline-history.json");
+        let service = pipeline_service("deploy", "https://github.test/actions");
+        let now = Utc::now();
+        std::thread::scope(|scope| {
+            for id in 0..16u64 {
+                let (path, service) = (&path, &service);
+                scope.spawn(move || {
+                    let body = github_body(id + 100, &now.to_rfc3339());
+                    record_webhook_for_service(
+                        path,
+                        service,
+                        "github",
+                        &format!("d{id}"),
+                        &body,
+                        now,
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        let file = load_history_file(&path);
+        assert_eq!(file.pipeline[0].runs.len(), 16);
+        assert_eq!(file.seen.len(), 16);
     }
 
     proptest! {
