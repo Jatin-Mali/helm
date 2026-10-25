@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "id": "sess-1792958168-8cb8aae9",
+  "created_at": 1792958168,
+  "updated_at": 1792958168,
+  "goal": "hang",
+  "workspace": "/tmp/.tmpbsfE9N",
+  "provider": "openai-compat",
+  "model": "qwen3:4b",
+  "outcome": "cancelled",
+  "summary": "Cancelled; pending work was not executed",
+  "evidence": [],
+  "steps": 0,
+  "input_tokens": 0,
+  "output_tokens": 0,
+  "cost_usd": 0.0,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "text": "hang",
+          "type": "text"
+        }
+      ]
+    }
+  ],
+  "log": []
+}

@@ -170,7 +170,7 @@ fn action_review(
     }
 }
 
-fn action_plan(
+pub(crate) fn action_plan(
     title: &str,
     command: helm_monitor::CommandPreview,
 ) -> helm_monitor::TroubleshootingPlan {

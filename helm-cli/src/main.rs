@@ -1,5 +1,7 @@
 //! Command-line entry point for HELM.
 
+mod agent_cli;
+mod agent_session;
 mod bootstrap;
 mod custom_commands;
 mod execution_journal;
@@ -128,6 +130,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the general agent on a task (read files, run commands, edit with approval)
+    Run(agent_cli::RunArgs),
     Models,
     Doctor(DoctorArgs),
     Permissions(PermissionsArgs),
@@ -936,11 +940,24 @@ impl ProviderSettings {
     }
 }
 
+/// Resolves on Ctrl-C. While an agent run owns the first interrupt it cancels itself cleanly
+/// (and saves its session); a second Ctrl-C always terminates.
+async fn interrupted() {
+    let mut seen = 0u32;
+    loop {
+        let _ = tokio::signal::ctrl_c().await;
+        seen += 1;
+        if seen > 1 || !agent_cli::OWNS_INTERRUPT.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let result = tokio::select! {
         result = run() => result,
-        _ = tokio::signal::ctrl_c() => Err(anyhow!("cancelled by user")),
+        _ = interrupted() => Err(anyhow!("cancelled by user")),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -976,15 +993,6 @@ fn apply_sandbox(
         );
     }
     Ok(resolved)
-}
-
-pub(crate) fn wrap_for_remote(task: &str, remote: Option<&String>) -> String {
-    match remote {
-        Some(name) => format!(
-            "[Operating against remote target `{name}`. Use the `ssh`, `scp`, and `rsync` tools and always pass `\"remote\": \"{name}\"` in their inputs. Do NOT use the local `shell` tool for anything that should run on the remote.]\n\n{task}"
-        ),
-        None => task.to_owned(),
-    }
 }
 
 async fn run() -> Result<()> {
@@ -1045,7 +1053,10 @@ async fn run() -> Result<()> {
         None => Command::Web(WebArgs { port: 9120 }),
     };
     match command {
-        // stripped: Command::Run
+        Command::Run(args) => {
+            agent_cli::run_command(args, &provider_settings, &secrets_store, &db_path, policy)
+                .await?;
+        }
         // stripped: Command::Replay
         Command::Models => {
             let base_url = provider_settings

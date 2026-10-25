@@ -186,11 +186,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** CLI `main.rs`/`tui.rs`, new agent entry module as needed, existing memory session/episode APIs inspected before reuse, additive migration if required; new `tests/agent_workflows.rs`.
 
-- [ ] Provide explicit `helm run <task>` behavior and connect the TUI assistant to the runtime event stream. Keep chat, monitoring and execution states distinguishable.
-- [ ] Persist redacted conversation, tool outcomes, approvals and terminal outcome; implement resume with fresh authorization for pending mutations. Do not replay tool effects on restart.
-- [ ] Support cancellation, progress, failure explanation and a final evidence-based summary. Remove stale UI actions that still invoke deleted runtimes or advertise unavailable tools.
+- [x] Provide explicit `helm run <task>` behavior and connect the TUI assistant to the runtime event stream. Keep chat, monitoring and execution states distinguishable.
+- [x] Persist redacted conversation, tool outcomes, approvals and terminal outcome; implement resume with fresh authorization for pending mutations. Do not replay tool effects on restart.
+- [x] Support cancellation, progress, failure explanation and a final evidence-based summary. Remove stale UI actions that still invoke deleted runtimes or advertise unavailable tools.
 - [ ] Demonstrate a multi-step temporary-project edit/test task and a Linux diagnostic task. One real provider is mandatory for release; test every provider's tool-call shape with fixtures and label live coverage accurately.
-- [ ] Verify existing monitor/remediation commands still work and both `helm`/`helmops` accept the supported agent command.
+- [x] Verify existing monitor/remediation commands still work and both `helm`/`helmops` accept the supported agent command.
 
 ### Task 13 — Installer and public feature completeness
 

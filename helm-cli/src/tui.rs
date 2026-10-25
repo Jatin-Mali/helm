@@ -6,7 +6,7 @@ use std::{
     io,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -55,7 +55,7 @@ use crate::{
     ops, provider_choice_name,
     remote::RemoteRegistry,
     service_form::{ServiceFormField, ServiceRegistrationDraft},
-    wrap_for_remote, write_helm_config,
+    write_helm_config,
 };
 use crate::{sandbox::ResolvedSandbox, secrets::SecretsStore};
 
@@ -219,6 +219,26 @@ pub(crate) async fn run_tui(runtime: TuiRuntime) -> Result<()> {
     result
 }
 
+/// Everything needed to continue (or conclude) an agent run after it stops.
+struct AgentHandoff {
+    setup: crate::agent_cli::Setup,
+    run: helm_agent::AgentRun,
+    record: crate::agent_session::SessionRecord,
+    observed: Arc<Mutex<crate::agent_cli::Observed>>,
+    approval: Option<(helm_agent::ToolCall, String)>,
+}
+
+impl std::fmt::Debug for AgentHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AgentHandoff({:?})", self.run.outcome)
+    }
+}
+
+enum AgentOp {
+    Start { goal: String, history: Vec<Message> },
+    Resume(Box<helm_agent::AgentRun>),
+}
+
 #[derive(Debug)]
 enum UiEvent {
     Input(Event),
@@ -227,6 +247,14 @@ enum UiEvent {
     AssistantResult {
         run_id: u64,
         result: Result<helm_providers::ChatResponse, String>,
+    },
+    Agent {
+        run_id: u64,
+        event: helm_agent::AgentEvent,
+    },
+    AgentDone {
+        run_id: u64,
+        handoff: Box<AgentHandoff>,
     },
     CatalogResult {
         choice: ProviderChoice,
@@ -377,6 +405,12 @@ enum PanelFocus {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+enum ReviewedAction {
+    Service { action: &'static str, unit: String },
+    Rollback { change_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum ModalState {
     CommandPalette,
     Permission {
@@ -384,6 +418,16 @@ enum ModalState {
         tool_name: String,
         taint: String,
         detail: String,
+    },
+    /// Exact review of one dashboard operation; confirming executes only what is shown.
+    ActionReview {
+        action: ReviewedAction,
+        text: String,
+    },
+    /// Exact approval of one agent tool call; the decision is single-use and host-enforced.
+    AgentApproval {
+        tool_name: String,
+        description: String,
     },
     ProviderSelector {
         selected: usize,
@@ -625,7 +669,7 @@ impl CommandAction {
         match self {
             Self::NewSession => "New Session",
             Self::Clear => "Clear Transcript",
-            Self::Replay => "Replay Episode",
+            Self::Replay => "Resume Session",
             Self::Doctor => "Doctor",
             Self::Remote => "Remote Target",
             Self::Provider => "Provider Selector",
@@ -689,7 +733,7 @@ impl CommandAction {
         match self {
             Self::NewSession => "clear transcript and start over",
             Self::Clear => "clear the visible transcript",
-            Self::Replay => "show replay command for this episode",
+            Self::Replay => "show the command that resumes this agent session",
             Self::Doctor => "show provider and system diagnostics hint",
             Self::Remote => "show or switch the active remote target",
             Self::Provider => "switch LLM backend",
@@ -2229,6 +2273,12 @@ pub struct TuiApp {
     active_run_id: u64,
     ui_tx: Option<mpsc::UnboundedSender<UiEvent>>,
     agent_task: Option<JoinHandle<()>>,
+    agent_cancel: Option<helm_monitor::process_runner::CancellationToken>,
+    agent_history: Vec<Message>,
+    agent_record: Option<crate::agent_session::SessionRecord>,
+    agent_pending: Option<AgentHandoff>,
+    /// Directory agent tools may act in; the process working directory when unset.
+    agent_workspace: Option<PathBuf>,
     pending_auth_retry: Option<String>,
     task_started: Option<Instant>,
     session_tokens_in: u32,
@@ -2243,6 +2293,9 @@ pub struct TuiApp {
 
 impl Drop for TuiApp {
     fn drop(&mut self) {
+        if let Some(cancel) = self.agent_cancel.take() {
+            cancel.cancel();
+        }
         if let Some(task) = self.agent_task.take() {
             task.abort();
         }
@@ -2341,6 +2394,11 @@ impl TuiApp {
             active_run_id: 0,
             ui_tx: None,
             agent_task: None,
+            agent_cancel: None,
+            agent_history: Vec::new(),
+            agent_record: None,
+            agent_pending: None,
+            agent_workspace: None,
             pending_auth_retry: None,
             task_started: None,
             session_tokens_in: 0,
@@ -2558,6 +2616,18 @@ impl TuiApp {
                 }
                 Ok(false)
             }
+            UiEvent::Agent { run_id, event } => {
+                if run_id == self.active_run_id {
+                    self.handle_agent_event(event);
+                }
+                Ok(false)
+            }
+            UiEvent::AgentDone { run_id, handoff } => {
+                if run_id == self.active_run_id {
+                    self.finish_agent_run(*handoff);
+                }
+                Ok(false)
+            }
             UiEvent::CatalogResult { choice, entries } => {
                 self.catalog_tasks.remove(&choice);
                 self.catalog_cache.insert(
@@ -2731,14 +2801,6 @@ impl TuiApp {
             match key.code {
                 KeyCode::Char('n') => self.new_session(),
                 KeyCode::Char('r') => self.push_chat(MessageRole::System, self.replay_hint()),
-                KeyCode::Char('a') => {
-                    self.modal = Some(ModalState::Permission {
-                        capability: Capability::ShellShell,
-                        tool_name: "pending".to_owned(),
-                        taint: "user".to_owned(),
-                        detail: "No pending permission request.".to_owned(),
-                    });
-                }
                 KeyCode::Home => self.session.transcript_scroll = usize::MAX / 2,
                 KeyCode::End => self.session.transcript_scroll = 0,
                 KeyCode::Char('u') => self.input.clear(),
@@ -3402,6 +3464,29 @@ impl TuiApp {
                 }
                 _ => {}
             },
+            Some(ModalState::ActionReview { action, .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.modal = None;
+                    if let Err(error) = self.execute_reviewed_action(action).await {
+                        self.toast_variant(
+                            helm_core::redact_secrets(&error.to_string()),
+                            ToastVariant::Error,
+                        );
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.modal = None;
+                    self.toast("Cancelled; nothing was executed");
+                }
+                _ => {}
+            },
+            Some(ModalState::AgentApproval { .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.decide_agent_approval(true, tx),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.decide_agent_approval(false, tx)
+                }
+                _ => {}
+            },
             Some(ModalState::ProviderSelector { .. }) => match key.code {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Char(d @ '1'..='7') => {
@@ -3851,39 +3936,247 @@ Report the exit status and the concise output."
         self.status_note = "running".to_owned();
         self.active_run_id = self.active_run_id.saturating_add(1);
         self.session.transcript_scroll = 0;
-        let effective_task = wrap_for_remote(&task, self.active_remote.as_ref());
-        let settings = self.active_settings.clone();
-
-        if let Some(previous) = self.agent_task.take() {
-            previous.abort();
-        }
-        let secrets = self.runtime.secrets.clone();
-        let run_id = self.active_run_id;
-        self.agent_task = Some(tokio::spawn(async move {
-            let response = match build_provider(&settings, &secrets) {
-                Ok((provider, model)) => {
-                    let request = ChatRequest {
-                        model,
-                        system: None,
-                        messages: vec![Message::user(&effective_task)],
-                        tools: vec![],
-                        max_tokens: 2048,
-                        temperature: 0.2,
-                    };
-                    tokio::time::timeout(Duration::from_secs(30), provider.chat(request))
-                        .await
-                        .map_err(|_| "Provider timed out after 30s".to_owned())
-                        .and_then(|reply| reply.map_err(|error| error.to_string()))
-                }
-                Err(error) => Err(error.to_string()),
-            };
-
+        if let Some(remote) = &self.active_remote {
+            // The agent's tools act on this machine only; never run them silently here.
+            let message = format!(
+                "Agent tasks run on this machine only, but remote `{remote}` is selected. Use `/remote off`, or `helm monitor --fleet` for remote observation."
+            );
+            let run_id = self.active_run_id;
             let _ = tx.send(UiEvent::AssistantResult {
                 run_id,
-                result: response,
+                result: Err(message),
+            });
+            return Ok(());
+        }
+        let workspace = self
+            .agent_workspace
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_owned());
+        let setup = crate::agent_cli::setup(
+            &self.active_settings,
+            &self.runtime.secrets,
+            &self.runtime.db_path,
+            self.execution_policy(),
+            &workspace,
+            |model| {
+                Ok(helm_agent::AgentConfig {
+                    model: model.to_owned(),
+                    ..Default::default()
+                })
+            },
+        );
+        let setup = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                let run_id = self.active_run_id;
+                let _ = tx.send(UiEvent::AssistantResult {
+                    run_id,
+                    result: Err(error.to_string()),
+                });
+                return Ok(());
+            }
+        };
+        let mut record = self.agent_record.take().unwrap_or_else(|| {
+            crate::agent_session::SessionRecord::new(
+                &task,
+                &workspace,
+                provider_choice_name(self.active_settings.choice),
+                &setup.model,
+            )
+        });
+        record.model = setup.model.clone();
+        record.begin_run();
+        let history = self.agent_history.clone();
+        self.spawn_agent(
+            tx,
+            setup,
+            AgentOp::Start {
+                goal: task,
+                history,
+            },
+            record,
+            Arc::new(Mutex::new(crate::agent_cli::Observed::default())),
+        );
+        Ok(())
+    }
+
+    fn spawn_agent(
+        &mut self,
+        tx: mpsc::UnboundedSender<UiEvent>,
+        setup: crate::agent_cli::Setup,
+        op: AgentOp,
+        mut record: crate::agent_session::SessionRecord,
+        observed: Arc<Mutex<crate::agent_cli::Observed>>,
+    ) {
+        let run_id = self.active_run_id;
+        let cancel = helm_monitor::process_runner::CancellationToken::default();
+        self.agent_cancel = Some(cancel.clone());
+        // A previous task is detached, never aborted: it cancels through its own token and saves.
+        self.agent_task = Some(tokio::spawn(async move {
+            let emit = {
+                let tx = tx.clone();
+                let observed = observed.clone();
+                move |event: helm_agent::AgentEvent| {
+                    crate::agent_cli::observe(&event, &observed, crate::agent_cli::Output::Quiet);
+                    let _ = tx.send(UiEvent::Agent { run_id, event });
+                }
+            };
+            let run = match op {
+                AgentOp::Start { goal, history } => {
+                    setup
+                        .runtime
+                        .run(&goal, history, cancel.clone(), &emit)
+                        .await
+                }
+                AgentOp::Resume(run) => setup.runtime.resume(*run, cancel.clone(), &emit).await,
+            };
+            let approval = observed.lock().ok().and_then(|o| o.approval.clone());
+            crate::agent_cli::conclude(&mut record, &run, &observed);
+            if let Err(error) = crate::agent_session::save(&mut record) {
+                tracing::warn!(%error, "failed to persist agent session");
+            }
+            let _ = tx.send(UiEvent::AgentDone {
+                run_id,
+                handoff: Box::new(AgentHandoff {
+                    setup,
+                    run,
+                    record,
+                    observed,
+                    approval,
+                }),
             });
         }));
-        Ok(())
+    }
+
+    fn handle_agent_event(&mut self, event: helm_agent::AgentEvent) {
+        use helm_agent::AgentEvent;
+        match event {
+            AgentEvent::Request { step } => self.status_note = format!("step {step}"),
+            AgentEvent::ToolCall { call } => {
+                let detail = truncate(call.input.to_string(), 100);
+                self.record_tool_event("run", call.name, detail);
+            }
+            AgentEvent::ToolResult { output, .. } => {
+                let status = if output.is_error { "error" } else { "done" };
+                let detail = truncate(output.content.lines().next().unwrap_or(""), 100);
+                self.record_tool_event(status, "tool", detail);
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_agent_run(&mut self, handoff: AgentHandoff) {
+        use helm_agent::AgentOutcome;
+        self.agent_task = None;
+        self.agent_cancel = None;
+        self.session_tokens_in = self
+            .session_tokens_in
+            .saturating_add(handoff.run.usage.input_tokens);
+        self.session_tokens_out = self
+            .session_tokens_out
+            .saturating_add(handoff.run.usage.output_tokens);
+        self.session.episode_id = Some(handoff.record.id.clone());
+        match handoff.run.outcome {
+            AgentOutcome::WaitingForApproval => {
+                let (call, description) = handoff.approval.clone().unwrap_or_else(|| {
+                    (
+                        handoff
+                            .run
+                            .pending
+                            .first()
+                            .cloned()
+                            .unwrap_or(helm_agent::ToolCall {
+                                id: String::new(),
+                                name: "unknown".into(),
+                                input: serde_json::Value::Null,
+                            }),
+                        handoff.run.summary.clone(),
+                    )
+                });
+                self.modal = Some(ModalState::AgentApproval {
+                    tool_name: call.name,
+                    description,
+                });
+                self.status_note = "awaiting approval".to_owned();
+                self.agent_pending = Some(handoff);
+                return;
+            }
+            AgentOutcome::Completed => {
+                self.push_chat(MessageRole::Assistant, handoff.run.summary.clone());
+                self.record_tool_event("done", "assistant", "response ready");
+                self.status_note = "ready".to_owned();
+            }
+            AgentOutcome::Cancelled => {
+                self.push_chat(MessageRole::System, handoff.run.summary.clone());
+                self.status_note = "cancelled".to_owned();
+            }
+            _ => {
+                self.push_chat(MessageRole::Error, handoff.run.summary.clone());
+                self.record_tool_event("error", "assistant", "request failed");
+                self.status_note = "error".to_owned();
+            }
+        }
+        self.push_chat(
+            MessageRole::System,
+            format!(
+                "session {} · {} step(s) · {} evidence item(s) · `helm run --resume {}`",
+                handoff.record.id,
+                handoff.record.steps,
+                handoff.record.evidence.len(),
+                handoff.record.id
+            ),
+        );
+        self.agent_history = handoff.record.resumable_history();
+        self.agent_record = Some(handoff.record);
+        self.running = false;
+        self.task_started = None;
+    }
+
+    /// Applies the operator's decision to the exact pending call, then resumes the run.
+    fn decide_agent_approval(&mut self, approved: bool, tx: mpsc::UnboundedSender<UiEvent>) {
+        self.modal = None;
+        let Some(handoff) = self.agent_pending.take() else {
+            return;
+        };
+        let Some((call, description)) = handoff.approval.clone() else {
+            self.running = false;
+            return;
+        };
+        if let Err(error) = handoff.setup.tools.decide(&call, approved) {
+            self.push_chat(
+                MessageRole::Error,
+                format!("Approval could not be recorded: {error}"),
+            );
+            self.running = false;
+            return;
+        }
+        if let Ok(mut observed) = handoff.observed.lock() {
+            observed.log.push(crate::agent_session::LogEntry::Approval {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                description: helm_core::redact_secrets(&description),
+                decision: if approved { "approved" } else { "denied" }.into(),
+            });
+        }
+        self.push_chat(
+            MessageRole::System,
+            format!(
+                "{} `{}`.",
+                if approved { "Approved" } else { "Denied" },
+                call.name
+            ),
+        );
+        self.status_note = "running".to_owned();
+        let AgentHandoff {
+            setup,
+            run,
+            record,
+            observed,
+            ..
+        } = handoff;
+        self.spawn_agent(tx, setup, AgentOp::Resume(Box::new(run)), record, observed);
     }
 
     fn finish_assistant_response(
@@ -3968,9 +4261,17 @@ Report the exit status and the concise output."
         if let Some(cancel) = &self.pending_apply_cancel {
             cancel.0.cancel();
         }
-        if let Some(task) = self.agent_task.take() {
-            task.abort();
+        // The agent stops through its token so it can record Cancelled; its task is detached.
+        if let Some(cancel) = self.agent_cancel.take() {
+            cancel.cancel();
         }
+        if matches!(self.modal, Some(ModalState::AgentApproval { .. })) {
+            self.modal = None;
+        }
+        if let Some(pending) = self.agent_pending.take() {
+            self.agent_record = Some(pending.record);
+        }
+        self.agent_task = None;
         self.running = false;
         self.active_run_id = self.active_run_id.saturating_add(1);
         self.status_note = "cancelled".to_owned();
@@ -3985,8 +4286,8 @@ Report the exit status and the concise output."
 
     fn replay_hint(&self) -> String {
         match self.session.episode_id.as_deref() {
-            Some(id) => format!("Replay this episode with `helm replay {id}`."),
-            None => "No episode is loaded yet.".to_owned(),
+            Some(id) => format!("Continue this session with `helm run --resume {id}`."),
+            None => "No agent session yet; submit a task to start one.".to_owned(),
         }
     }
 
@@ -4618,15 +4919,10 @@ Report the exit status and the concise output."
                     entries,
                 });
             }
-            CommandAction::Permissions => {
-                self.modal = Some(ModalState::Permission {
-                    capability: Capability::ShellShell,
-                    tool_name: "permissions".to_owned(),
-                    taint: "user".to_owned(),
-                    detail: "Use `helm permissions list/grant/revoke` for exact grant control."
-                        .to_owned(),
-                })
-            }
+            CommandAction::Permissions => self.push_chat(
+                MessageRole::System,
+                "Agent actions are approved one exact call at a time when they run. Stored grants: `helm permissions list`.",
+            ),
             CommandAction::Audit => {
                 self.record_tool_event("audit", "verify", "run `helm audit verify`")
             }
@@ -5900,55 +6196,14 @@ Report the exit status and the concise output."
                     }
                     Ok(true) => {}
                 }
-                if !self
-                    .prompt_or_require_capability(
-                        Capability::SystemService,
-                        "systemctl",
-                        format!("{action} service {unit}."),
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-                let mut command = tokio::process::Command::new("systemctl");
-                command.args([action, "--", &unit]);
-                let output = helm_monitor::process_runner::run_command(
-                    command,
-                    Default::default(),
-                    &Default::default(),
-                )
-                .await
-                .with_context(|| format!("failed to run systemctl {action} {unit}"))?;
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                let decision = if output.status.success() {
-                    format!("service-{action}-ok")
-                } else {
-                    format!("service-{action}-failed")
-                };
-                self.write_dashboard_event(
-                    "systemctl",
-                    Capability::SystemService.as_str(),
-                    &decision,
-                    &helm_memory::stable_hash_hex(&format!("{action}:{unit}")),
-                    &helm_memory::stable_hash_hex(&format!("{stdout}\n{stderr}")),
-                )?;
-                if output.status.success() {
-                    self.toast(format!("{action} completed for {unit}"));
-                    self.refresh_dashboard();
-                } else {
-                    self.toast_variant(
-                        format!(
-                            "{action} failed for {unit}: {}",
-                            if stderr.is_empty() {
-                                "unknown error".to_owned()
-                            } else {
-                                stderr
-                            }
-                        ),
-                        ToastVariant::Error,
-                    );
-                }
+                let cwd = std::env::current_dir().unwrap_or_default();
+                self.modal = Some(ModalState::ActionReview {
+                    text: format!(
+                        "systemctl {action} -- {unit}\nHost: local; cwd: {}\nRollback unsupported. Execute this exact command once?",
+                        cwd.display()
+                    ),
+                    action: ReviewedAction::Service { action, unit },
+                });
             }
             _ => {}
         }
@@ -5966,32 +6221,95 @@ Report the exit status and the concise output."
             self.toast("No change set selected");
             return Ok(());
         };
-        if !self
-            .prompt_or_require_capability(
-                Capability::ShellShell,
-                "change-set.rollback",
-                format!("Roll back change set {}.", change.id),
-            )
-            .await?
-        {
-            return Ok(());
+        match self.execution_policy().check_mutation() {
+            Err(error) => {
+                self.toast_variant(error, ToastVariant::Error);
+                return Ok(());
+            }
+            Ok(false) => {
+                self.toast(format!("Dry run: would restore change set {}", change.id));
+                return Ok(());
+            }
+            Ok(true) => {}
         }
-        let results = crate::ops::rollback_change_set(
-            &self.runtime.db_path,
-            &change.id,
-            self.execution_policy(),
-            &self.runtime.secrets,
-        )
-        .await?;
-        self.write_dashboard_event(
-            "change-set.rollback",
-            Capability::ShellShell.as_str(),
-            "rollback",
-            &helm_memory::stable_hash_hex(&change.id),
-            &helm_memory::stable_hash_hex(&results.join("\n")),
-        )?;
-        self.refresh_dashboard();
-        self.toast(format!("Rollback attempted for {}", change.id));
+        self.modal = Some(ModalState::ActionReview {
+            text: format!(
+                "Restore change set {} on the local host.\nOnly supported encrypted file backups are restored; newer edits prevent restoration. Proceed?",
+                change.id
+            ),
+            action: ReviewedAction::Rollback {
+                change_id: change.id,
+            },
+        });
+        Ok(())
+    }
+
+    /// Runs the operation shown in `ActionReview` through the same approved, journaled path as
+    /// `apply-plan`; the review is consumed whether or not the operation succeeds.
+    async fn execute_reviewed_action(&mut self, action: ReviewedAction) -> Result<()> {
+        match action {
+            ReviewedAction::Service { action, unit } => {
+                let command = format!("systemctl {action} -- {unit}");
+                let plan = crate::web::action_plan(
+                    &format!("{action} {unit} (service rollback unsupported)"),
+                    helm_monitor::CommandPreview::new(
+                        "shell",
+                        &command,
+                        "Change the requested service state; rollback unsupported",
+                    ),
+                );
+                let mut approvals =
+                    helm_monitor::PlanApprovals::review(&plan).map_err(|e| anyhow!(e))?;
+                approvals.decide(0, true).map_err(|e| anyhow!(e))?;
+                let journal = Arc::new(crate::execution_journal::DurableJournal::new(
+                    &self.runtime.db_path,
+                    self.runtime.secrets.clone(),
+                )?);
+                let mut engine = helm_monitor::ExecutionEngine::with_approvals(approvals)
+                    .with_policy(self.execution_policy())
+                    .with_journal(journal);
+                let change = engine.execute(&plan).await;
+                let ok = change.status == helm_monitor::ChangeSetStatus::Completed;
+                self.write_dashboard_event(
+                    "systemctl",
+                    Capability::SystemService.as_str(),
+                    &format!("service-{action}-{}", if ok { "ok" } else { "failed" }),
+                    &helm_memory::stable_hash_hex(&format!("{action}:{unit}")),
+                    &helm_memory::stable_hash_hex(&change.summary),
+                )?;
+                if ok {
+                    self.toast(format!("{action} completed for {unit}"));
+                    self.refresh_dashboard();
+                } else {
+                    self.toast_variant(
+                        format!(
+                            "{action} failed for {unit}: {} (change set {})",
+                            helm_core::redact_secrets(&change.summary),
+                            change.id
+                        ),
+                        ToastVariant::Error,
+                    );
+                }
+            }
+            ReviewedAction::Rollback { change_id } => {
+                let results = crate::ops::rollback_change_set(
+                    &self.runtime.db_path,
+                    &change_id,
+                    self.execution_policy(),
+                    &self.runtime.secrets,
+                )
+                .await?;
+                self.write_dashboard_event(
+                    "change-set.rollback",
+                    Capability::ShellShell.as_str(),
+                    "rollback",
+                    &helm_memory::stable_hash_hex(&change_id),
+                    &helm_memory::stable_hash_hex(&results.join("\n")),
+                )?;
+                self.refresh_dashboard();
+                self.toast(format!("Rollback attempted for {change_id}"));
+            }
+        }
         Ok(())
     }
 
@@ -7100,7 +7418,9 @@ Do not modify the system. Then explain what the result means for finding {}.\n\n
         self.active_remote = Some(target.to_owned());
         self.push_chat(
             MessageRole::System,
-            format!("Remote target set to `{target}`. New tasks will run against that host."),
+            format!(
+                "Remote target set to `{target}` for dashboard views. Agent tasks run locally only and are refused while a remote is selected; `/remote off` returns to local mode."
+            ),
         );
     }
 
@@ -10699,6 +11019,41 @@ fn render_modal(app: &TuiApp, modal: &ModalState, area: Rect, buf: &mut Buffer) 
                 .wrap(Wrap { trim: false })
                 .render(area, buf);
         }
+        ModalState::ActionReview { text, .. } => {
+            let lines = vec![
+                Line::styled(text.as_str(), Style::default().fg(MODAL_FG)),
+                Line::from(""),
+                Line::from(vec![
+                    key_span("[Y] Execute once"),
+                    Span::raw("  "),
+                    Span::styled("[N/Esc] Cancel", Style::default().fg(ERROR_FG)),
+                ]),
+            ];
+            Paragraph::new(lines)
+                .block(modal_block(" Review Operation "))
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
+        }
+        ModalState::AgentApproval {
+            tool_name,
+            description,
+        } => {
+            let text = vec![
+                modal_kv("tool", tool_name),
+                Line::from(""),
+                Line::styled(description.as_str(), Style::default().fg(MODAL_FG)),
+                Line::from(""),
+                Line::from(vec![
+                    key_span("[Y] Approve this exact action once"),
+                    Span::raw("  "),
+                    Span::styled("[N/Esc] Deny", Style::default().fg(ERROR_FG)),
+                ]),
+            ];
+            Paragraph::new(text)
+                .block(modal_block(" Approval Required "))
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
+        }
         ModalState::ProviderSelector { selected } => {
             let choices = provider_selector_list();
             let mut lines = vec![
@@ -12009,6 +12364,267 @@ mod tests {
             assert!(app.agent_task.is_none());
         });
         server.join().unwrap();
+    }
+
+    /// Serves scripted OpenAI-compatible replies, one per request.
+    fn scripted_provider(replies: Vec<serde_json::Value>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    buffer.extend_from_slice(&chunk[..n]);
+                    let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        if n == 0 {
+                            break;
+                        }
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buffer[..end]).to_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buffer.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                let payload = replies.next().unwrap_or_default().to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        url
+    }
+
+    fn agent_reply(
+        content: Option<&str>,
+        call: Option<(&str, serde_json::Value)>,
+    ) -> serde_json::Value {
+        let tool_calls: Vec<_> = call
+            .into_iter()
+            .map(|(name, args)| {
+                serde_json::json!({"id":"call_1","type":"function","function":{"name":name,"arguments":args.to_string()}})
+            })
+            .collect();
+        let calling = !tool_calls.is_empty();
+        serde_json::json!({"id":"c","model":"m","choices":[{"message":{"role":"assistant","content":content,"tool_calls":tool_calls},
+            "finish_reason": if calling {"tool_calls"} else {"stop"}}],
+            "usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}})
+    }
+
+    async fn pump(
+        app: &mut TuiApp,
+        rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+        until: impl Fn(&TuiApp) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !until(app) {
+            assert!(Instant::now() < deadline, "timed out waiting for the agent");
+            if let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+            {
+                app.handle_ui_event(event, tx.clone()).await.unwrap();
+            }
+        }
+    }
+
+    fn agent_app(
+        dir: &tempfile::TempDir,
+        work: &std::path::Path,
+        replies: Vec<serde_json::Value>,
+    ) -> TuiApp {
+        // Isolated state so sessions, journal and protected paths never touch the real home.
+        let mut app = app_in_dir(dir, crate::ProviderChoice::OpenaiCompat);
+        app.active_settings.api_key_env = None;
+        app.active_settings.base_url = Some(scripted_provider(replies));
+        app.agent_workspace = Some(work.to_path_buf());
+        app
+    }
+
+    #[test]
+    fn tui_assistant_runs_tools_and_reports_an_evidence_backed_result() {
+        let (dir, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(work.path().join("a.txt"), "alpha").unwrap();
+        let mut app = agent_app(
+            &dir,
+            work.path(),
+            vec![
+                agent_reply(
+                    None,
+                    Some(("fs_read", serde_json::json!({"path": "a.txt"}))),
+                ),
+                agent_reply(Some("a.txt contains alpha"), None),
+            ],
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            app.start_task("read a.txt".into(), tx.clone(), true)
+                .await
+                .unwrap();
+            pump(&mut app, &mut rx, &tx, |a| !a.running).await;
+            assert!(
+                app.session
+                    .chat
+                    .iter()
+                    .any(|m| m.role == MessageRole::System && m.text.contains("helm run --resume")),
+                "{:?}",
+                app.session.chat
+            );
+            assert!(
+                app.session
+                    .chat
+                    .iter()
+                    .any(|m| m.role == MessageRole::Assistant && m.text.contains("alpha"))
+            );
+            assert!(
+                app.session
+                    .tool_timeline
+                    .iter()
+                    .any(|t| t.tool == "fs_read")
+            );
+            assert!(
+                app.agent_record
+                    .as_ref()
+                    .is_some_and(|r| !r.evidence.is_empty())
+            );
+            assert!(app.session.episode_id.is_some());
+        });
+    }
+
+    #[test]
+    fn tui_write_waits_for_exact_approval_and_denial_leaves_files_untouched() {
+        for (key, expect_file) in [('y', true), ('n', false)] {
+            let (dir, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let mut app = agent_app(
+                &dir,
+                work.path(),
+                vec![
+                    agent_reply(
+                        None,
+                        Some((
+                            "fs_write",
+                            serde_json::json!({"path": "o.txt", "content": "hi"}),
+                        )),
+                    ),
+                    agent_reply(Some("finished"), None),
+                ],
+            );
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                app.start_task("write o.txt".into(), tx.clone(), true).await.unwrap();
+                pump(&mut app, &mut rx, &tx, |a| matches!(a.modal, Some(ModalState::AgentApproval { .. }))).await;
+                assert!(!work.path().join("o.txt").exists(), "executed before approval");
+                app.handle_modal_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE), tx.clone()).await.unwrap();
+                pump(&mut app, &mut rx, &tx, |a| !a.running).await;
+                assert_eq!(work.path().join("o.txt").exists(), expect_file);
+                let log = &app.agent_record.as_ref().unwrap().log;
+                let decision = if expect_file { "approved" } else { "denied" };
+                assert!(log.iter().any(|e| matches!(e, crate::agent_session::LogEntry::Approval { decision: d, .. } if d == decision)));
+            });
+        }
+    }
+
+    #[test]
+    fn tui_cancel_stops_a_hung_agent_without_leaving_a_modal() {
+        let (dir, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // The server accepts the connection but never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let _held: Vec<_> = listener.incoming().flatten().collect();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let mut app = app_in_dir(&dir, crate::ProviderChoice::OpenaiCompat);
+        app.active_settings.api_key_env = None;
+        app.active_settings.base_url = Some(url);
+        app.agent_workspace = Some(work.path().to_path_buf());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            app.start_task("hang".into(), tx, true).await.unwrap();
+            assert!(app.running);
+            app.cancel_running_task();
+            assert!(!app.running && app.modal.is_none());
+            assert!(app.agent_cancel.is_none());
+        });
+    }
+
+    #[test]
+    fn reviewed_service_action_runs_only_after_confirmation_and_leaves_change_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = env_lock().lock().unwrap();
+        let (dir, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let marker = dir.path().join("marker");
+        let script = bin.path().join("systemctl");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        // SAFETY: serialized by env_lock; restored below.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", bin.path().display(), old_path.to_string_lossy()),
+            );
+        }
+        let mut app = app_in_dir(&dir, crate::ProviderChoice::Ollama);
+        let review = || ModalState::ActionReview {
+            action: ReviewedAction::Service {
+                action: "restart",
+                unit: "demo.service".into(),
+            },
+            text: "systemctl restart -- demo.service".into(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            app.modal = Some(review());
+            app.handle_modal_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                tx.clone(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                app.modal.is_none() && !marker.exists(),
+                "ran without confirmation"
+            );
+            app.modal = Some(review());
+            app.handle_modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), tx)
+                .await
+                .unwrap();
+        });
+        // SAFETY: paired with the guarded set_var above.
+        unsafe {
+            std::env::set_var("PATH", old_path);
+        }
+        // Dashboard refreshes also call systemctl (read-only listings); count mutations only.
+        let calls = std::fs::read_to_string(&marker).unwrap();
+        let mutations: Vec<_> = calls.lines().filter(|l| l.starts_with("restart")).collect();
+        assert_eq!(mutations, ["restart -- demo.service"]);
+        let conn = rusqlite::Connection::open(&app.runtime.db_path).unwrap();
+        assert_eq!(
+            helm_memory::ChangeSetStore::list(&conn, 10).unwrap().len(),
+            1,
+            "durable change evidence missing"
+        );
     }
 
     fn app() -> TuiApp {
@@ -13689,7 +14305,11 @@ mod tests {
                 &finding.fingerprint,
                 Some(&plan_id),
             );
-            let restored = restarted.dashboard.active_plan.take().expect("plan restored");
+            let restored = restarted
+                .dashboard
+                .active_plan
+                .take()
+                .expect("plan restored");
             assert_eq!(restored.plan_id, plan_id);
             match (status, &restored.status) {
                 (
@@ -13697,8 +14317,12 @@ mod tests {
                     PlanStatus::Ready { fix_steps: b, .. },
                 ) => assert_eq!(a[0].command, b[0].command),
                 (
-                    PlanStatus::RateLimited { retry_after_secs: a },
-                    PlanStatus::RateLimited { retry_after_secs: b },
+                    PlanStatus::RateLimited {
+                        retry_after_secs: a,
+                    },
+                    PlanStatus::RateLimited {
+                        retry_after_secs: b,
+                    },
                 ) => assert_eq!(a, b),
                 (a, b) => assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b)),
             }
