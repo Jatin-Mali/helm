@@ -114,6 +114,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_failure_retries_and_recovers() {
+        let addr = start_mock_server(vec![
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ])
+        .await;
+        WebhookSink::new(format!("http://{addr}"))
+            .with_retry_policy(2, 1)
+            .send(&make_payload())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_error_without_retry_storm() {
+        let addr = start_mock_server(vec![
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]).await;
+        assert!(
+            WebhookSink::new(format!("http://{addr}"))
+                .with_retry_policy(2, 1)
+                .send(&make_payload())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn send_success_on_200() {
         let addr = start_mock_server(vec![
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

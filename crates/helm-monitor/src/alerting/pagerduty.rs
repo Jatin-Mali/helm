@@ -139,6 +139,92 @@ mod tests {
         addr
     }
 
+    #[tokio::test]
+    async fn real_endpoint_delivery_deduplicates_and_sends_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut data = Vec::new();
+                loop {
+                    let mut buf = [0; 8192];
+                    let size = socket.read(&mut buf).await.unwrap();
+                    if size == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..size]);
+                    if let Some(end) = data.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if data.len() >= end + 4 + length {
+                            let body: serde_json::Value =
+                                serde_json::from_slice(&data[end + 4..end + 4 + length]).unwrap();
+                            tx.send(body).await.unwrap();
+                            break;
+                        }
+                    }
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut router = crate::alerting::AlertRouter::new(crate::alerting::AlertConfig::default())
+            .with_sink_policy(
+                Box::new(PagerDutySink::new("fixture-key").with_url(format!("http://{addr}"))),
+                crate::alerting::SinkKind::PagerDuty,
+                "mock-pagerduty",
+                crate::alerting::ResolvedSinkPolicy {
+                    min_severity: Severity::Warning,
+                    dedup_window_secs: 300,
+                    rate_limit_per_min: 1,
+                },
+            );
+        let mut finding = Finding::new(
+            "snap",
+            "endpoint",
+            "fixture",
+            "alert",
+            Severity::Critical,
+            Confidence::High,
+            MonitorDomain::Services,
+        );
+        router.route(&finding).await.unwrap();
+        let trigger = rx.recv().await.unwrap();
+        assert_eq!(trigger["event_action"], "trigger");
+        router.route(&finding).await.unwrap();
+        assert!(rx.try_recv().is_err());
+        finding.lifecycle = FindingLifecycle::SelfResolved;
+        finding.severity = Severity::Info;
+        router.route(&finding).await.unwrap();
+        let recovery = rx.recv().await.unwrap();
+        assert_eq!(recovery["event_action"], "resolve");
+        assert_eq!(trigger["dedup_key"], recovery["dedup_key"]);
+    }
+
+    #[tokio::test]
+    async fn endpoint_rejects_bad_requests_and_rate_limits() {
+        for response in [
+            &b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+            &b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+        ] {
+            let addr = start_mock(response).await;
+            let sink = PagerDutySink::new("fixture-key").with_url(format!("http://{addr}"));
+            assert!(sink.send(&make_payload_with_lifecycle(Severity::Critical, FindingLifecycle::Open)).await.is_err());
+        }
+    }
+
     #[test]
     fn trigger_on_open() {
         let p = make_payload_with_lifecycle(Severity::Critical, FindingLifecycle::Open);

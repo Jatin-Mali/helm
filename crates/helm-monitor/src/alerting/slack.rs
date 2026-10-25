@@ -110,6 +110,18 @@ mod tests {
         addr
     }
 
+    #[tokio::test]
+    async fn endpoint_rejects_bad_requests_and_rate_limits() {
+        for response in [
+            &b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+            &b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+        ] {
+            let addr = start_mock(response).await;
+            let sink = SlackSink::new(format!("http://{addr}"));
+            assert!(sink.send(&make_payload(Severity::Critical)).await.is_err());
+        }
+    }
+
     #[test]
     fn critical_color() {
         assert_eq!(severity_to_color(Severity::Critical), "#d32f2f");
