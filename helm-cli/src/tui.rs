@@ -13637,6 +13637,75 @@ mod tests {
     }
 
     #[test]
+    fn persisted_plan_states_survive_restart_and_failures_stay_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in_dir(&dir, ProviderChoice::Groq);
+        app.dashboard.data = test_dash_data();
+        let finding = app.dashboard.data.findings[0].clone();
+        let conn = rusqlite::Connection::open(&app.runtime.db_path).unwrap();
+        let step = ValidatedFixStep {
+            command: "systemctl restart nginx".into(),
+            purpose: "restart".into(),
+            expected_effect: "service restarts".into(),
+            risk: "medium".into(),
+            blast_radius: "service".into(),
+            rollback: "manual".into(),
+            required_capability: "shell.exec".into(),
+            binary_warnings: Vec::new(),
+        };
+        let cases = [
+            PlanStatus::Ready {
+                narrative: "restart it".into(),
+                fix_steps: vec![step],
+            },
+            PlanStatus::Timeout,
+            PlanStatus::AuthFailed,
+            PlanStatus::MalformedResponse,
+            PlanStatus::RateLimited {
+                retry_after_secs: 7,
+            },
+        ];
+        for (index, status) in cases.iter().enumerate() {
+            let plan_id = format!("plan-{index}");
+            TroubleshootingPlanStore::insert(
+                &conn,
+                &plan_id,
+                &format!("finding:{}", finding.id),
+                "snap-001",
+                &finding.fingerprint,
+                "[]",
+                "[]",
+                "[]",
+                true,
+                "",
+            )
+            .unwrap();
+            app.persist_dashboard_plan_status(&conn, &finding, &plan_id, status);
+            // A fresh app over the same database stands in for a restart.
+            let mut restarted = app_in_dir(&dir, ProviderChoice::Groq);
+            restarted.restore_active_dashboard_plan(
+                &conn,
+                &finding.id,
+                &finding.fingerprint,
+                Some(&plan_id),
+            );
+            let restored = restarted.dashboard.active_plan.take().expect("plan restored");
+            assert_eq!(restored.plan_id, plan_id);
+            match (status, &restored.status) {
+                (
+                    PlanStatus::Ready { fix_steps: a, .. },
+                    PlanStatus::Ready { fix_steps: b, .. },
+                ) => assert_eq!(a[0].command, b[0].command),
+                (
+                    PlanStatus::RateLimited { retry_after_secs: a },
+                    PlanStatus::RateLimited { retry_after_secs: b },
+                ) => assert_eq!(a, b),
+                (a, b) => assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b)),
+            }
+        }
+    }
+
+    #[test]
     fn dash_no_provider_guard_blocks_assist_submit() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in_dir(&dir, ProviderChoice::Groq);

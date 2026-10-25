@@ -150,11 +150,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** CLI provider-readiness and plan handlers, `tui.rs`, `web.rs`, monitor `plan_cache.rs`; integration tests. **Findings:** F19–F21, F28.
 
-- [ ] Reuse key resolution for direct requests and readiness: store-only/env-only/custom-env/Ollama/auth-free configured endpoints behave consistently without revealing keys.
-- [ ] Separate ready/error/loading cache states; use atomic in-flight ownership, contextual freshness and an explicit retry action. Failed results must not block retry for 24 hours.
-- [ ] Move provider/chat/catalog calls out of input handlers into cancellable bounded background jobs; deliver progress/results via events. Make rate-limit retry dispatch actual work.
-- [ ] Use Unicode-safe truncation and test multibyte snapshot diffs.
-- [ ] Prove generated plans survive persist/restart/apply through all frontends using the canonical schema, including provider error and malformed response cases.
+- [x] Reuse key resolution for direct requests and readiness: store-only/env-only/custom-env/Ollama/auth-free configured endpoints behave consistently without revealing keys.
+- [x] Separate ready/error/loading cache states; use atomic in-flight ownership, contextual freshness and an explicit retry action. Failed results must not block retry for 24 hours.
+- [x] Move provider/chat/catalog calls out of input handlers into cancellable bounded background jobs; deliver progress/results via events. Make rate-limit retry dispatch actual work.
+- [x] Use Unicode-safe truncation and test multibyte snapshot diffs.
+- [x] Prove generated plans survive persist/restart/apply through all frontends using the canonical schema, including provider error and malformed response cases.
 
 **Acceptance:** TUI remains scrollable/cancellable while a mock provider hangs; simultaneous identical plan requests perform one generation; a failed request can be retried successfully.
 
@@ -162,11 +162,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** new `crates/helm-agent/{Cargo.toml,src/lib.rs,src/runtime.rs,src/context.rs}`, workspace membership, core/provider integration; new `tests/agent_runtime.rs`.
 
-- [ ] Build a bounded multi-step loop over existing `Message`, `ContentBlock` and `Provider` abstractions. Prefer native structured tool calls; normalize provider differences without executing ambiguous text.
-- [ ] Model explicit running/waiting-for-approval/cancelled/failed/completed outcomes. Emit structured progress events for both CLI and TUI; do not couple runtime to rendering.
-- [ ] Bound steps, context, request retries and wall time. Track actual provider usage and enforce a conservative budget before subsequent requests; surface unknown pricing rather than bypassing a hard configured limit.
-- [ ] Preserve tool-call/result pairing while trimming context. Record evidence references for completion and failure; do not claim a tool ran when only prose was generated.
-- [ ] Use scripted mock-provider transcripts to cover multiple tool turns, bad arguments, provider failures, cancellation, step/budget exhaustion and successful completion.
+- [x] Build a bounded multi-step loop over existing `Message`, `ContentBlock` and `Provider` abstractions. Prefer native structured tool calls; normalize provider differences without executing ambiguous text.
+- [x] Model explicit running/waiting-for-approval/cancelled/failed/completed outcomes. Emit structured progress events for both CLI and TUI; do not couple runtime to rendering.
+- [x] Bound steps, context, request retries and wall time. Track actual provider usage and enforce a conservative budget before subsequent requests; surface unknown pricing rather than bypassing a hard configured limit.
+- [x] Preserve tool-call/result pairing while trimming context. Record evidence references for completion and failure; do not claim a tool ran when only prose was generated.
+- [x] Use scripted mock-provider transcripts to cover multiple tool turns, bad arguments, provider failures, cancellation, step/budget exhaustion and successful completion.
 
 **Produces:** one agent runtime and event stream used by CLI/TUI in Task 12; all tool execution delegates to Task 11, never directly to a shell.
 
@@ -174,11 +174,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** new `crates/helm-agent/src/{tools,permissions}.rs`, existing execution policy/runner, core taint/capability models, browser adapter; new `tests/agent_security.rs`.
 
-- [ ] Provide small schema-validated tools for filesystem read/search/write, shell, HTTP and browser interaction. Reuse installed backends; backend absence yields a clear unavailable result.
-- [ ] Route mutations through exact Task 2 approvals and Task 3 policies. Constrain workspace paths, protected local state, HTTP destinations/redirects and browser sessions. File permission checks must withstand symlink/path traversal attempts at use time.
-- [ ] Treat tool/web/file content as untrusted data. It cannot enable tools, expand scope, change grants, access secrets or replace user instructions. Require a user decision for new authority.
-- [ ] Keep tool output bounded and redact/minimize content before sending it to providers. Protect config secrets, DB and logs from general file/shell exposure according to capability policy; broad shell authorization must disclose its broad OS authority.
-- [ ] Test malicious project files/web pages, disguised writes, denied actions, redirects to prohibited destinations, symlink escapes, browser text trying to grant permission, and cancellation during execution.
+- [x] Provide small schema-validated tools for filesystem read/search/write, shell, HTTP and browser interaction. Reuse installed backends; backend absence yields a clear unavailable result.
+- [x] Route mutations through exact Task 2 approvals and Task 3 policies. Constrain workspace paths, protected local state, HTTP destinations/redirects and browser sessions. File permission checks must withstand symlink/path traversal attempts at use time.
+- [x] Treat tool/web/file content as untrusted data. It cannot enable tools, expand scope, change grants, access secrets or replace user instructions. Require a user decision for new authority.
+- [x] Keep tool output bounded and redact/minimize content before sending it to providers. Protect config secrets, DB and logs from general file/shell exposure according to capability policy; broad shell authorization must disclose its broad OS authority.
+- [x] Test malicious project files/web pages, disguised writes, denied actions, redirects to prohibited destinations, symlink escapes, browser text trying to grant permission, and cancellation during execution.
 
 **Acceptance:** the same denied marker tests pass through model tool calls; a real browser can open/read/navigate a test page under an approved session. Prompt wording is supplementary; the host-side policy decides access.
 
