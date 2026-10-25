@@ -12,6 +12,8 @@ use std::{
 struct Mock {
     url: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    /// Lower-cased request heads, to check what credentials were actually sent.
+    heads: Arc<Mutex<Vec<String>>>,
 }
 
 fn tool_call(name: &str, arguments: Value) -> Value {
@@ -30,6 +32,8 @@ fn mock(script: Vec<Value>) -> Mock {
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let seen = requests.clone();
+    let heads = Arc::new(Mutex::new(Vec::new()));
+    let seen_heads = heads.clone();
     std::thread::spawn(move || {
         let mut script = script.into_iter();
         for stream in listener.incoming() {
@@ -46,6 +50,9 @@ fn mock(script: Vec<Value>) -> Mock {
                     continue;
                 };
                 let head = String::from_utf8_lossy(&buffer[..end]).to_lowercase();
+                if buffer.len() == end + 4 || seen_heads.lock().unwrap().is_empty() {
+                    seen_heads.lock().unwrap().push(head.clone());
+                }
                 let length = head
                     .lines()
                     .find_map(|l| l.strip_prefix("content-length:"))
@@ -73,7 +80,11 @@ fn mock(script: Vec<Value>) -> Mock {
             }
         }
     });
-    Mock { url, requests }
+    Mock {
+        url,
+        requests,
+        heads,
+    }
 }
 
 fn command(state: &Path, workspace: &Path, server: &Mock, args: &[&str]) -> Command {
@@ -318,4 +329,27 @@ fn run_refuses_a_remote_target_instead_of_acting_locally() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("this machine only"));
+}
+
+#[test]
+fn api_key_flag_is_sent_to_an_openai_compatible_endpoint() {
+    let (state, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let server = mock(vec![text("ok")]);
+    let output = command(state.path(), work.path(), &server, &["say ok"])
+        .args(["--api-key", "test-key-123"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let heads = server.heads.lock().unwrap();
+    assert!(
+        heads
+            .iter()
+            .any(|h| h.contains("authorization: bearer test-key-123")),
+        "{heads:?}"
+    );
 }

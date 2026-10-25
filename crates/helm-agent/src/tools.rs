@@ -571,10 +571,22 @@ impl HostTools {
         if html.len() > 32 * 1024 {
             return Err("static browser page exceeds 32 KiB".into());
         }
-        let page_url = format!(
-            "data:text/html,{}",
-            url::form_urlencoded::byte_serialize(html.as_bytes()).collect::<String>()
+        // `scriptEnabled=false` makes `--dump-dom` print nothing, so scripts are blocked by a CSP
+        // in a <head> that precedes all page content; the network namespace is the second layer.
+        let guarded = format!(
+            "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"></head><body>{html}</body></html>"
         );
+        // data: URLs take percent-escapes only; form encoding would turn spaces into literal '+'.
+        let escaped: String = guarded
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let page_url = format!("data:text/html,{escaped}");
         let chrome = [
             "/usr/bin/google-chrome",
             "/usr/bin/chromium",
@@ -596,7 +608,6 @@ impl HostTools {
                 "--disable-extensions",
                 "--disable-background-networking",
                 "--no-first-run",
-                "--blink-settings=scriptEnabled=false",
                 "--dump-dom",
             ])
             .arg(format!(

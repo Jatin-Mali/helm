@@ -116,7 +116,10 @@ impl MonitorReporter {
                     .check_health()
                     .await
                     .into_iter()
-                    .map(|finding| {
+                    .map(|mut finding| {
+                        // Health checks run outside the snapshot; bind them to this run so they
+                        // are not discarded as another snapshot's findings.
+                        finding.snapshot_id = snapshot.id.clone();
                         finding.normalize_for_emission("custom-service", snapshot.collected_at)
                     })
                     .filter(|finding| finding.validate_for_emission().is_ok())

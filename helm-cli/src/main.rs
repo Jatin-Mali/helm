@@ -1053,7 +1053,10 @@ async fn run() -> Result<()> {
         None => Command::Web(WebArgs { port: 9120 }),
     };
     match command {
-        Command::Run(args) => {
+        Command::Run(mut args) => {
+            if let Some(limit) = cli.max_iterations {
+                args.max_steps = limit;
+            }
             if let Some(remote) = &cli.remote {
                 anyhow::bail!(
                     "agent tasks run on this machine only; --remote {remote} is not supported by `run` (use `helm monitor --fleet` or `helm remote` for remote observation)"
@@ -3837,9 +3840,10 @@ fn build_provider(
             Ok((Box::new(provider), model))
         }
         ProviderChoice::OpenaiCompat => {
+            // An explicit --api-key / TUI key applies even when no env var name is configured.
             let api_key = match settings.api_key_env.as_deref() {
                 Some(env_name) => Some(resolve_provider_key(env_name, settings, store)?),
-                None => None,
+                None => settings.api_key.clone().map(Secret::new),
             };
             let base_url = settings
                 .base_url

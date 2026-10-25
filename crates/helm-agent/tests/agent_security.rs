@@ -242,3 +242,69 @@ async fn private_network_destinations_fail_closed() {
         );
     }
 }
+
+/// Real headless Chromium reading an approved local page. Skipped (loudly) when no browser is
+/// installed unless HELM_REQUIRE_BROWSER is set, which the demo gate does.
+#[tokio::test]
+async fn real_browser_reads_an_approved_page_and_refuses_unapproved_origins() {
+    use std::io::{Read, Write};
+    if !Path::new("/usr/bin/google-chrome").is_file()
+        && !Path::new("/usr/bin/chromium").is_file()
+        && !Path::new("/usr/bin/chromium-browser").is_file()
+    {
+        assert!(
+            std::env::var_os("HELM_REQUIRE_BROWSER").is_none(),
+            "browser required but not installed"
+        );
+        eprintln!("SKIPPED: no Chromium installed");
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut buffer = [0u8; 2048];
+            let _ = stream.read(&mut buffer);
+            let body = "<html><body><h1>fixture heading 7421</h1><script>document.title='js-ran'</script></body></html>";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let tools = tools(dir.path(), Default::default());
+    let cancel = CancellationToken::default();
+    let page = call(
+        "nav",
+        "browser",
+        json!({"action": "navigate", "url": format!("{origin}/")}),
+    );
+    // Before the operator allows the origin, a loopback destination is refused outright.
+    assert!(
+        matches!(tools.execute(&page, &cancel).await, ToolExecution::Completed(o) if o.is_error)
+            || matches!(tools.execute(&page, &cancel).await, ToolExecution::ApprovalRequired { .. })
+    );
+    tools.allow_http_origin(&origin).unwrap();
+    assert!(matches!(
+        tools.execute(&page, &cancel).await,
+        ToolExecution::ApprovalRequired { .. }
+    ));
+    tools.decide(&page, true).unwrap();
+    let result = output(tools.execute(&page, &cancel).await);
+    assert!(!result.is_error, "{}", result.content);
+    assert!(result.content.contains("fixture heading 7421"), "{}", result.content);
+    assert!(!result.content.contains("<title>js-ran"), "JavaScript must not run: {}", result.content);
+    let other = call(
+        "other",
+        "browser",
+        json!({"action": "navigate", "url": "http://127.0.0.1:9/"}),
+    );
+    let refused = tools.execute(&other, &cancel).await;
+    assert!(
+        matches!(&refused, ToolExecution::Completed(o) if o.is_error),
+        "unapproved origin must be refused before any approval: {refused:?}"
+    );
+}
