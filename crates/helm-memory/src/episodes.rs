@@ -192,6 +192,12 @@ pub struct AuditVerification {
     pub failed_at: Option<i64>,
     /// Human-readable failure reason.
     pub reason: Option<String>,
+    /// Events written before the SHA-256 format. They only prove consistency against accidental
+    /// edits (64-bit FNV, trivially recomputable), never authenticity.
+    pub legacy_events: u32,
+    /// Latest hash per partition (`None` = local). Record these outside this database
+    /// (a remote log, a printed copy) to detect truncation or wholesale rewriting.
+    pub heads: Vec<(Option<String>, String)>,
 }
 
 /// SQLite-backed episode store with blocking database work isolated from async tasks.
@@ -211,9 +217,12 @@ impl MemoryStore {
         let audit_dir = path.parent().map(|p| p.join("audit"));
         let conn = tokio::task::spawn_blocking(move || {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
+                helm_core::private_fs::create_private_dir(parent)
                     .map_err(|error| MemoryError::Other(error.to_string()))?;
             }
+            // Create the file 0600 before SQLite does; its -wal/-shm files copy this mode.
+            helm_core::private_fs::open_private_file(&path, false)
+                .map_err(|error| MemoryError::Other(error.to_string()))?;
             let conn = Connection::open(path).map_err(sqlite_error)?;
             run_migrations(&conn)?;
             Ok::<Connection, MemoryError>(conn)
@@ -239,11 +248,15 @@ impl MemoryStore {
         if let Some(conn) = shards.get(&safe) {
             return Some(Arc::clone(conn));
         }
-        if let Err(e) = std::fs::create_dir_all(dir) {
+        if let Err(e) = helm_core::private_fs::create_private_dir(dir) {
             eprintln!("helm: audit shard dir create failed: {e}");
             return None;
         }
         let db_path = dir.join(format!("{safe}.db"));
+        if let Err(e) = helm_core::private_fs::open_private_file(&db_path, false) {
+            eprintln!("helm: audit shard file unsafe: {e}");
+            return None;
+        }
         match Connection::open(&db_path) {
             Ok(conn) => {
                 if let Err(e) = conn.execute_batch(SHARD_SCHEMA) {
@@ -785,25 +798,29 @@ impl MemoryStore {
 pub fn verify_partitioned_audit_events(
     events: Vec<AuditEventRecord>,
 ) -> Result<AuditVerification, MemoryError> {
-    let mut previous_by_target: std::collections::HashMap<Option<String>, String> =
+    // Per partition: the previous event hash and whether a v2 event has been seen.
+    let mut state: std::collections::HashMap<Option<String>, (String, bool)> =
         std::collections::HashMap::new();
     let mut checked = 0_u32;
+    let mut legacy_events = 0_u32;
     for event in events {
         checked = checked.saturating_add(1);
-        let key = event.target.clone();
-        let previous = previous_by_target
-            .entry(key.clone())
-            .or_insert_with(|| "GENESIS".to_owned())
+        let fail = |reason: &str, legacy_events| AuditVerification {
+            ok: false,
+            checked,
+            failed_at: Some(event.id),
+            reason: Some(reason.to_owned()),
+            legacy_events,
+            heads: Vec::new(),
+        };
+        let (previous, seen_v2) = state
+            .entry(event.target.clone())
+            .or_insert_with(|| ("GENESIS".to_owned(), false))
             .clone();
         if event.previous_hash != previous {
-            return Ok(AuditVerification {
-                ok: false,
-                checked,
-                failed_at: Some(event.id),
-                reason: Some("previous hash mismatch".to_owned()),
-            });
+            return Ok(fail("previous hash mismatch", legacy_events));
         }
-        let expected = audit_hash(AuditHashParts {
+        let parts = AuditHashParts {
             previous_hash: &event.previous_hash,
             episode_id: event.episode_id.as_deref(),
             target: event.target.as_deref(),
@@ -815,22 +832,37 @@ pub fn verify_partitioned_audit_events(
             taint: &event.taint,
             cwd: &event.cwd,
             decision: &event.decision,
-        });
-        if expected != event.event_hash {
-            return Ok(AuditVerification {
-                ok: false,
-                checked,
-                failed_at: Some(event.id),
-                reason: Some("event hash mismatch".to_owned()),
-            });
+        };
+        let is_v2 = event.event_hash.starts_with(AUDIT_HASH_V2);
+        if !is_v2 && seen_v2 {
+            return Ok(fail(
+                "legacy-format event after a v2 event (downgrade)",
+                legacy_events,
+            ));
         }
-        previous_by_target.insert(key, event.event_hash);
+        let expected = if is_v2 {
+            audit_hash(parts)
+        } else {
+            legacy_events = legacy_events.saturating_add(1);
+            audit_hash_legacy(parts)
+        };
+        if expected != event.event_hash {
+            return Ok(fail("event hash mismatch", legacy_events));
+        }
+        state.insert(event.target, (event.event_hash, seen_v2 || is_v2));
     }
+    let mut heads: Vec<_> = state
+        .into_iter()
+        .map(|(target, (hash, _))| (target, hash))
+        .collect();
+    heads.sort();
     Ok(AuditVerification {
         ok: true,
         checked,
         failed_at: None,
         reason: None,
+        legacy_events,
+        heads,
     })
 }
 
@@ -1221,7 +1253,40 @@ pub struct AuditHashParts<'a> {
     pub decision: &'a str,
 }
 
+/// Prefix of the versioned, SHA-256 based event hash. Anything else is a legacy FNV hash.
+const AUDIT_HASH_V2: &str = "v2:";
+
+/// Canonical v2 event hash: SHA-256 over a domain tag and length-prefixed fields, so no
+/// delimiter inside a field can shift a boundary. It is unkeyed: anyone able to rewrite the
+/// database can recompute it. See `AuditVerification::heads` for external anchoring.
 pub fn audit_hash(parts: AuditHashParts<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    fn field(hasher: &mut Sha256, tag: u8, value: Option<&str>) {
+        hasher.update([tag, u8::from(value.is_some())]);
+        let bytes = value.unwrap_or("").as_bytes();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"helm-audit-event\0v2\0");
+    field(&mut hasher, 1, Some(parts.previous_hash));
+    field(&mut hasher, 2, parts.episode_id);
+    field(&mut hasher, 3, parts.target);
+    field(&mut hasher, 4, Some(&parts.timestamp.to_string()));
+    field(&mut hasher, 5, Some(parts.tool_name));
+    field(&mut hasher, 6, Some(parts.input_hash));
+    field(&mut hasher, 7, Some(parts.output_hash));
+    field(&mut hasher, 8, Some(parts.capability));
+    field(&mut hasher, 9, Some(parts.taint));
+    field(&mut hasher, 10, Some(parts.cwd));
+    field(&mut hasher, 11, Some(parts.decision));
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{AUDIT_HASH_V2}{hex}")
+}
+
+/// Pre-v2 hash, kept only to verify historical rows.
+fn audit_hash_legacy(parts: AuditHashParts<'_>) -> String {
     let payload = format!(
         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         parts.previous_hash,
@@ -1567,5 +1632,162 @@ mod tests {
     #[test]
     fn enum_strings_match_schema() {
         assert_eq!(EpisodeOutcome::Partial.as_str(), "partial");
+    }
+
+    #[tokio::test]
+    async fn database_is_private_from_creation_and_symlinks_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("state").join("helm.db");
+        MemoryStore::open(&db).await.unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&db), 0o600);
+        assert_eq!(mode(db.parent().unwrap()), 0o700);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o600, "{suffix}");
+            }
+        }
+        let victim = root.path().join("victim.db");
+        std::fs::write(&victim, "not a database").unwrap();
+        let link = root.path().join("state").join("linked.db");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(MemoryStore::open(&link).await.is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "not a database");
+    }
+
+    fn parts<'a>(previous: &'a str, tool: &'a str, input: &'a str) -> super::AuditHashParts<'a> {
+        super::AuditHashParts {
+            previous_hash: previous,
+            episode_id: Some("ep"),
+            target: None,
+            timestamp: 1,
+            tool_name: tool,
+            input_hash: input,
+            output_hash: "o",
+            capability: "shell",
+            taint: "clean",
+            cwd: "/",
+            decision: "allow",
+        }
+    }
+
+    #[test]
+    fn v2_hash_is_sha256_with_unambiguous_field_boundaries() {
+        let a = super::audit_hash(parts("GENESIS", "a|b", "c"));
+        let b = super::audit_hash(parts("GENESIS", "a", "b|c"));
+        assert_ne!(a, b, "a delimiter inside a field must not shift a boundary");
+        assert!(a.starts_with("v2:") && a.len() == 3 + 64);
+        assert_ne!(
+            super::audit_hash(parts("GENESIS", "t", "i")),
+            super::audit_hash(super::AuditHashParts {
+                episode_id: None,
+                ..parts("GENESIS", "t", "i")
+            }),
+            "absent and empty optional fields differ"
+        );
+    }
+
+    fn raw_event(id: i64, previous: &str, hash: &str) -> super::AuditEventRecord {
+        super::AuditEventRecord {
+            id,
+            episode_id: Some("ep".to_owned()),
+            target: None,
+            timestamp: 1,
+            tool_name: "shell".to_owned(),
+            input_hash: "i".to_owned(),
+            output_hash: "o".to_owned(),
+            capability: Capability::ShellShell,
+            taint: "clean".to_owned(),
+            cwd: "/".to_owned(),
+            decision: "allow".to_owned(),
+            previous_hash: previous.to_owned(),
+            event_hash: hash.to_owned(),
+        }
+    }
+
+    fn event_parts(previous: &str) -> super::AuditHashParts<'_> {
+        super::AuditHashParts {
+            previous_hash: previous,
+            episode_id: Some("ep"),
+            target: None,
+            timestamp: 1,
+            tool_name: "shell",
+            input_hash: "i",
+            output_hash: "o",
+            capability: "shell.shell",
+            taint: "clean",
+            cwd: "/",
+            decision: "allow",
+        }
+    }
+
+    #[test]
+    fn pre_upgrade_chain_verifies_as_legacy_then_continues_in_v2_without_downgrade() {
+        let legacy = super::audit_hash_legacy(event_parts("GENESIS"));
+        let v2 = super::audit_hash(event_parts(&legacy));
+        let ok = super::verify_partitioned_audit_events(vec![
+            raw_event(1, "GENESIS", &legacy),
+            raw_event(2, &legacy, &v2),
+        ])
+        .unwrap();
+        assert!(ok.ok, "{ok:?}");
+        assert_eq!(ok.legacy_events, 1);
+        assert_eq!(ok.heads, vec![(None, v2.clone())]);
+        // An attacker re-labelling a later event with a recomputed FNV hash is a downgrade.
+        let forged = super::audit_hash_legacy(event_parts(&v2));
+        let bad = super::verify_partitioned_audit_events(vec![
+            raw_event(1, "GENESIS", &legacy),
+            raw_event(2, &legacy, &v2),
+            raw_event(3, &v2, &forged),
+        ])
+        .unwrap();
+        assert!(!bad.ok);
+        assert_eq!(bad.failed_at, Some(3));
+    }
+
+    #[tokio::test]
+    async fn new_events_are_v2_and_each_field_change_fails_verification() {
+        for column in [
+            "tool_name",
+            "decision",
+            "cwd",
+            "timestamp",
+            "episode_id",
+            "capability",
+        ] {
+            let dir = tempdir().unwrap();
+            let db = dir.path().join("audit.db");
+            let store = MemoryStore::open(&db).await.unwrap();
+            for _ in 0..2 {
+                store
+                    .append_audit_event(super::AuditEventInput {
+                        episode_id: Some("ep".to_owned()),
+                        target: None,
+                        tool_name: "shell".to_owned(),
+                        input_hash: super::stable_hash_hex("in"),
+                        output_hash: super::stable_hash_hex("out"),
+                        capability: Capability::ShellShell,
+                        taint: helm_core::Taint::User,
+                        cwd: "/tmp".to_owned(),
+                        decision: "allow".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let events = store.audit_events(None, None).await.unwrap();
+            assert!(events.iter().all(|e| e.event_hash.starts_with("v2:")));
+            let conn = Connection::open(&db).unwrap();
+            let sql = if column == "timestamp" {
+                "UPDATE audit_events SET timestamp = timestamp + 1 WHERE id = 1".to_owned()
+            } else {
+                format!("UPDATE audit_events SET {column} = 'fs.read' WHERE id = 1")
+            };
+            conn.execute(&sql, []).unwrap();
+            let verification = store.verify_audit_chain().await.unwrap();
+            assert!(!verification.ok, "{column} edit went undetected");
+            assert_eq!(verification.failed_at, Some(1), "{column}");
+        }
     }
 }

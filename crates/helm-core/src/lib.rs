@@ -3,6 +3,7 @@
 pub mod capability;
 pub mod error;
 pub mod message;
+pub mod private_fs;
 pub mod secret;
 pub mod taint;
 pub mod validation;

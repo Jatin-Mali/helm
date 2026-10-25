@@ -73,7 +73,7 @@ helm explain finding-123
 - capability gate checked before every tool call
 - taint level propagated through `Tainted<T>` so external content never
   auto-approves writes
-- audit log append-only with HMAC chain verification
+- audit log append-only with a SHA-256 hash chain (unkeyed; see docs/threat-model.md for what it does not protect against)
 - command-by-command approval in CLI and TUI apply flows
 
 **Invocation:**

@@ -4847,41 +4847,8 @@ Report the exit status and the concise output."
             self.push_chat(MessageRole::Error, "[config] empty key");
             return;
         }
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut root: toml::Value = existing
-            .parse()
-            .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
-        let parts: Vec<&str> = key.split('.').collect();
-        let parsed_val = if value == "true" {
-            toml::Value::Boolean(true)
-        } else if value == "false" {
-            toml::Value::Boolean(false)
-        } else if let Ok(i) = value.parse::<i64>() {
-            toml::Value::Integer(i)
-        } else if let Ok(f) = value.parse::<f64>() {
-            toml::Value::Float(f)
-        } else {
-            toml::Value::String(value.to_owned())
-        };
-        if let Err(error) = crate::set_toml_path(&mut root, &parts, parsed_val) {
+        if let Err(error) = crate::update_config_file(&path, key, value) {
             self.push_chat(MessageRole::Error, format!("[config] {error}"));
-            return;
-        }
-        let pretty = match toml::to_string_pretty(&root) {
-            Ok(text) => text,
-            Err(error) => {
-                self.push_chat(MessageRole::Error, format!("[config] serialize: {error}"));
-                return;
-            }
-        };
-        if let Some(parent) = path.parent()
-            && let Err(error) = std::fs::create_dir_all(parent)
-        {
-            self.push_chat(MessageRole::Error, format!("[config] create dir: {error}"));
-            return;
-        }
-        if let Err(error) = std::fs::write(&path, pretty) {
-            self.push_chat(MessageRole::Error, format!("[config] write: {error}"));
             return;
         }
         self.push_chat(

@@ -177,7 +177,7 @@ impl ServiceRegistrationDraft {
                 fields.push(ServiceFieldSpec {
                     field: ServiceFormField::DatabaseConnectionString,
                     label: "Connection",
-                    value: self.database_connection_string.clone(),
+                    value: helm_core::redact_secrets(&self.database_connection_string),
                     hint: "full connection string",
                 });
             }

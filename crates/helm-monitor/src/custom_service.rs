@@ -177,6 +177,18 @@ impl ServiceRegistry {
 
     pub fn add(&mut self, service: RegisteredService) -> Result<(), ServiceRegistryError> {
         validate_service(&service)?;
+        // Health checks only need host and port; a password in services.toml (and in every
+        // finding that echoes the target) would be a needless plaintext copy.
+        if let ServiceType::Database {
+            connection_string, ..
+        } = &service.service_type
+            && Url::parse(connection_string).is_ok_and(|url| url.password().is_some())
+        {
+            return Err(validation_error(
+                &service,
+                "database connection_string must not embed a password; health checks only use host and port",
+            ));
+        }
         if self
             .services
             .iter()
@@ -454,7 +466,7 @@ fn build_service_finding(service: &RegisteredService, severity: Severity, detail
         } => format!(
             "check {} reachability for {}",
             kind.label(),
-            connection_string
+            helm_core::redact_secrets(connection_string)
         ),
         ServiceType::Kubernetes { kubeconfig_path } => {
             format!(
@@ -549,7 +561,11 @@ async fn check_service_health(service: &RegisteredService) -> HealthCheckOutcome
                 tcp_connect_health(
                     &host,
                     port,
-                    &format!("{} {}", kind.label(), connection_string),
+                    &format!(
+                        "{} {}",
+                        kind.label(),
+                        helm_core::redact_secrets(connection_string)
+                    ),
                 )
                 .await
             }
@@ -703,6 +719,29 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn database_registration_refuses_embedded_passwords_and_findings_redact_legacy_ones() {
+        let path = temp_services_path("db-password");
+        let mut registry = ServiceRegistry::new(&path);
+        let mut service = sample_service("db");
+        service.service_type = ServiceType::Database {
+            kind: DbKind::PostgreSQL,
+            connection_string: "postgres://app:hunter2-sentinel@db.internal:5432/app".to_owned(),
+        };
+        let error = registry.add(service.clone()).unwrap_err();
+        assert!(error.to_string().contains("must not embed a password"));
+        assert!(!path.exists(), "a refused registration must write nothing");
+        // A password-free target registers; a legacy entry's text never reaches findings.
+        let finding = build_service_finding(&service, Severity::Warning, "tcp connect failed");
+        assert!(!format!("{finding:?}").contains("hunter2-sentinel"));
+        let mut clean = service;
+        clean.service_type = ServiceType::Database {
+            kind: DbKind::PostgreSQL,
+            connection_string: "postgres://app@db.internal:5432/app".to_owned(),
+        };
+        registry.add(clean).unwrap();
     }
 
     #[test]

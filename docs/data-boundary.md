@@ -89,3 +89,24 @@ helm audit verify
 ```
 
 to inspect boundary-related trust signals.
+
+### What the audit chain does and does not prove
+
+New events are chained with SHA-256 over a canonical, length-prefixed encoding (`v2:` hashes).
+Rows written by earlier versions use a 64-bit FNV hash; `helm audit verify` counts them and
+labels them legacy. They still detect accidental edits, but anyone can recompute them.
+
+The chain is **unkeyed**. Whoever can write `helm.db` (the same OS user, or root) can rewrite
+history and recompute every hash; a key stored beside the database would not change that. To
+detect rewriting or truncation, copy the `head[...]` hashes printed by `helm audit verify` to a
+place the host cannot modify (a remote log, a printed note) and compare later. Stronger
+guarantees need externally anchored audit, which HELM does not provide.
+
+### Redaction limits
+
+`redact_secrets` removes recognisable provider keys, bearer/basic credentials, URL passwords,
+`password=`/`token:`-style assignments (quoted or bare), private-key blocks and HELM's own
+protected paths at the persistence, trace, export and provider-prompt boundaries. A credential
+with no recognisable marker cannot be found by pattern; keep such values out of evidence.
+Provider keys belong only in `secrets.toml`; `helm config set` and the TUI refuse
+credential-looking keys and values.

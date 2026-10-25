@@ -121,3 +121,23 @@ pub fn default_allowlist_path() -> PathBuf {
 pub fn default_mcp_servers_path() -> PathBuf {
     config_file("mcp-servers.toml")
 }
+
+/// Replaces `path` atomically with a sibling temp file created with `mode` from the start.
+pub fn write_atomic(path: &std::path::Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)?;
+    let written = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}

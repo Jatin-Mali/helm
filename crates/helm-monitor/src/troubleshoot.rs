@@ -539,7 +539,8 @@ Rules:\n\
 - Do not use rm -rf /, mkfs, dd to raw devices, chmod 777 /, fork bombs, or redirects to /dev/* devices.\n",
     );
 
-    prompt
+    // Outbound boundary: this text leaves the host for a model provider.
+    helm_core::redact_secrets(&prompt)
 }
 
 // ── Response parser ─────────────────────────────────────────────────────────

@@ -94,3 +94,13 @@ Verification: helm-monitor lib 221 PASS, strict clippy PASS.
 Ruling: fleet state keyed by remote name, not host_id — legacy remotes.toml entries receive a fresh random host_id each load. Cost: renaming a remote forgets its stale data.
 Ruling: remote-vs-local identity equality is not checked at runtime; the demo (Task 14) compares host identities. Cost: a remote that is actually this machine is only flagged if two remotes share it.
 Verification: workspace all-target tests 818 passed / 0 failed; strict clippy and fmt PASS.
+
+## Task 7 — complete (Claude)
+
+- F09/F17: `redact_secrets` extended (XDG/legacy protected paths incl. wal/shm/lock/log, bearer/basic, URL passwords, quoted or bare `password=`-style values, PEM, GitHub/Slack/AWS/JWT shapes; counters like `max_tokens` untouched). Applied at actual boundaries: `SnapshotStore::insert`, `write_audit_event`, runbook output, `build_narrative_prompt` (provider-bound). `tests/privacy_boundaries.rs` reads the real DB rows / prompt.
+- F10: `update_config_file` is the single editor for CLI `config set` and TUI `/config`: rejects credential-looking keys/values, refuses to overwrite unparseable TOML, atomic 0600 write. `write_helm_config` updates only provider identity and keeps security/telemetry/custom sections. `config validate` flags credentials already on disk.
+- F24: `helm_core::private_fs` (0700 dirs created, 0600 files from creation, O_NOFOLLOW, owner check) used by `MemoryStore::open`, audit shards, log writer and state dirs. Existing directories are never chmod-ed. Core `SecretStore`: atomic 0600 write, retired values no longer retained, legacy history values scrubbed on next write; marked deprecated for provider keys (CLI `secrets.toml` store remains the home).
+- Service registry refuses new DB connection strings with embedded passwords; legacy entries are redacted in findings/forms.
+- F08: audit hash v2 = SHA-256 over domain tag + length-prefixed fields (`v2:` prefix). Legacy FNV rows verify and are counted; legacy-after-v2 is rejected as downgrade; `audit verify` prints heads for external anchoring. Pre-upgrade DB test passes. Docs corrected (they claimed HMAC).
+Ruling: no keyed/HMAC audit — a key readable by the same user adds no protection against the stated same-user threat and key management is out of scope; head hashes + documentation instead. Cost: no tamper evidence against a same-user attacker without off-host anchoring.
+Ruling: provider-key values pasted into `config set` are blocked by pattern, but arbitrary unmarked secrets are not detectable; documented in docs/data-boundary.md.

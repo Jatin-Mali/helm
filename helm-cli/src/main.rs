@@ -1098,6 +1098,18 @@ async fn run() -> Result<()> {
                         }
                         None => println!("audit ok: checked {} event(s)", verification.checked),
                     }
+                    if verification.legacy_events > 0 {
+                        println!(
+                            "  {} legacy event(s) use the old 64-bit FNV hash: they detect accidental edits only, not forgery",
+                            verification.legacy_events
+                        );
+                    }
+                    for (target, head) in &verification.heads {
+                        println!("  head[{}] = {head}", target.as_deref().unwrap_or("local"));
+                    }
+                    println!(
+                        "  The chain is unkeyed: someone who can write this database can recompute it. Copy the head hash(es) off this host to detect rewriting or truncation."
+                    );
                 } else {
                     println!(
                         "audit FAILED at event {}: {}",
@@ -1410,37 +1422,7 @@ fn run_config_command(args: ConfigArgs, config_path: &Path) -> Result<()> {
             }
         }
         ConfigCommand::Set(args) => {
-            let config_text = if config_path.exists() {
-                fs::read_to_string(config_path).unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let mut value: toml::Value = config_text
-                .parse()
-                .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
-
-            let parts: Vec<&str> = args.key.split('.').collect();
-            if parts.is_empty() {
-                return Err(anyhow!("Invalid key"));
-            }
-
-            let parsed_val = if args.value == "true" {
-                toml::Value::Boolean(true)
-            } else if args.value == "false" {
-                toml::Value::Boolean(false)
-            } else if let Ok(i) = args.value.parse::<i64>() {
-                toml::Value::Integer(i)
-            } else if let Ok(f) = args.value.parse::<f64>() {
-                toml::Value::Float(f)
-            } else {
-                toml::Value::String(args.value.clone())
-            };
-
-            set_toml_path(&mut value, &parts, parsed_val)?;
-            let new_text = toml::to_string_pretty(&value)?;
-            ensure_parent_dir(config_path)?;
-            fs::write(config_path, new_text)
-                .with_context(|| format!("failed to write config to {}", config_path.display()))?;
+            update_config_file(config_path, &args.key, &args.value)?;
             println!("Set {} = {}", args.key, args.value);
         }
         ConfigCommand::Edit => {
@@ -1463,6 +1445,18 @@ fn run_config_command(args: ConfigArgs, config_path: &Path) -> Result<()> {
                 return Ok(());
             }
             let config_text = fs::read_to_string(config_path)?;
+            if let Ok(value) = config_text.parse::<toml::Value>() {
+                let mut leaked = Vec::new();
+                find_secret_config_keys(&value, "", &mut leaked);
+                if !leaked.is_empty() {
+                    println!(
+                        "Config is invalid: credential field(s) {} must not be stored here; move them with `helm secrets set` and delete them from {}",
+                        leaked.join(", "),
+                        config_path.display()
+                    );
+                    return Ok(());
+                }
+            }
             match toml::from_str::<FileConfig>(&config_text) {
                 Ok(config) => {
                     resolve_provider_settings_with_env(
@@ -1847,6 +1841,89 @@ async fn render_audit_events(
     Ok(format_audit_events(&events))
 }
 
+/// Config keys that would hold a credential. `*_env` names an environment variable and is fine.
+fn is_secret_config_key(part: &str) -> bool {
+    let part = part.to_ascii_lowercase();
+    !part.ends_with("_env")
+        && [
+            "api_key",
+            "apikey",
+            "password",
+            "secret",
+            "token",
+            "private_key",
+        ]
+        .iter()
+        .any(|needle| part.contains(needle))
+        && !part.ends_with("tokens")
+}
+
+fn find_secret_config_keys(value: &toml::Value, prefix: &str, found: &mut Vec<String>) {
+    if let Some(table) = value.as_table() {
+        for (key, child) in table {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            if is_secret_config_key(key) {
+                found.push(path);
+            } else {
+                find_secret_config_keys(child, &path, found);
+            }
+        }
+    }
+}
+
+fn parse_config_value(raw: &str) -> toml::Value {
+    if raw == "true" {
+        toml::Value::Boolean(true)
+    } else if raw == "false" {
+        toml::Value::Boolean(false)
+    } else if let Ok(i) = raw.parse::<i64>() {
+        toml::Value::Integer(i)
+    } else if let Ok(f) = raw.parse::<f64>() {
+        toml::Value::Float(f)
+    } else {
+        toml::Value::String(raw.to_owned())
+    }
+}
+
+/// The one place `config set` and the TUI `/config` edit the config file: refuses secrets,
+/// refuses to overwrite a file it cannot parse, and replaces the file atomically.
+pub(crate) fn update_config_file(path: &Path, key: &str, raw_value: &str) -> Result<()> {
+    let parts: Vec<&str> = key.split('.').collect();
+    if let Some(part) = parts.iter().find(|part| is_secret_config_key(part)) {
+        anyhow::bail!(
+            "`{part}` looks like a credential; store it with `helm secrets set`, not in config.toml"
+        );
+    }
+    if helm_core::redact_secrets(raw_value) != raw_value {
+        anyhow::bail!("the value looks like a credential; store it with `helm secrets set`");
+    }
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let mut root: toml::Value = if existing.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        existing.parse().with_context(|| {
+            format!(
+                "{} is not valid TOML; fix it before editing",
+                path.display()
+            )
+        })?
+    };
+    set_toml_path(&mut root, &parts, parse_config_value(raw_value))?;
+    ensure_parent_dir(path)?;
+    paths::write_atomic(path, toml::to_string_pretty(&root)?.as_bytes(), 0o600)
+        .with_context(|| format!("failed to write config to {}", path.display()))
+}
+
 pub(crate) fn set_toml_path(
     root: &mut toml::Value,
     parts: &[&str],
@@ -1900,28 +1977,51 @@ pub(crate) fn write_helm_config(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let mut provider_table = toml::map::Map::new();
-    provider_table.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
-    provider_table.insert("model".to_owned(), toml::Value::String(model.to_owned()));
-    if let Some(url) = base_url {
-        provider_table.insert("base_url".to_owned(), toml::Value::String(url.to_owned()));
+    // Update only provider identity; every other setting (security, telemetry, ...) survives.
+    let existing = match fs::read_to_string(config_path) {
+        Ok(text) if !text.trim().is_empty() => text.parse::<toml::Value>().with_context(|| {
+            format!(
+                "{} is not valid TOML; refusing to overwrite it",
+                config_path.display()
+            )
+        })?,
+        _ => toml::Value::Table(toml::map::Map::new()),
+    };
+    let mut root = match existing {
+        toml::Value::Table(table) => table,
+        _ => toml::map::Map::new(),
+    };
+    let provider = root
+        .entry("provider")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if !provider.is_table() {
+        *provider = toml::Value::Table(toml::map::Map::new());
     }
-    if let Some(env_name) = api_key_env {
-        provider_table.insert(
-            "api_key_env".to_owned(),
-            toml::Value::String(env_name.to_owned()),
-        );
+    if let Some(provider) = provider.as_table_mut() {
+        provider.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
+        provider.insert("model".to_owned(), toml::Value::String(model.to_owned()));
+        for (field, value) in [("base_url", base_url), ("api_key_env", api_key_env)] {
+            match value {
+                Some(value) => {
+                    provider.insert(field.to_owned(), toml::Value::String(value.to_owned()))
+                }
+                None => provider.remove(field),
+            };
+        }
     }
-    let mut root = toml::map::Map::new();
-    root.insert("provider".to_owned(), toml::Value::Table(provider_table));
-    let mut security_table = toml::map::Map::new();
-    security_table.insert("tui_paste_key_modal".to_owned(), toml::Value::Boolean(true));
-    root.insert("security".to_owned(), toml::Value::Table(security_table));
-    let mut telemetry_table = toml::map::Map::new();
-    telemetry_table.insert("enabled".to_owned(), toml::Value::Boolean(false));
-    root.insert("telemetry".to_owned(), toml::Value::Table(telemetry_table));
+    for (section, field, default) in [
+        ("security", "tui_paste_key_modal", true),
+        ("telemetry", "enabled", false),
+    ] {
+        let table = root
+            .entry(section)
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if let Some(table) = table.as_table_mut() {
+            table.entry(field).or_insert(toml::Value::Boolean(default));
+        }
+    }
     let config_text = toml::to_string_pretty(&toml::Value::Table(root))?;
-    fs::write(config_path, &config_text)
+    paths::write_atomic(config_path, config_text.as_bytes(), 0o600)
         .with_context(|| format!("failed to write {}", config_path.display()))?;
     Ok(())
 }
@@ -3924,11 +4024,8 @@ impl<'a> MakeWriter<'a> for LogFileMakeWriter {
     type Writer = LogFileWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .ok();
+        // Logs carry operational evidence: private from creation, never through a symlink.
+        let file = helm_core::private_fs::open_private_file(&self.path, true).ok();
         LogFileWriter { file }
     }
 }
@@ -3969,8 +4066,8 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("database path must have a parent: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create database directory {}", parent.display()))?;
+    helm_core::private_fs::create_private_dir(parent)
+        .with_context(|| format!("failed to create state directory {}", parent.display()))?;
     Ok(())
 }
 
@@ -5958,7 +6055,7 @@ async fn run_runbook_command(args: RunbookArgs) -> Result<()> {
         "*Next step: run `helm troubleshoot \"<problem>\"` for guided investigation".to_string(),
     );
 
-    let content = lines.join("\n");
+    let content = helm_core::redact_secrets(&lines.join("\n"));
     std::fs::write(&args.output, &content)
         .with_context(|| format!("failed to write runbook to {}", args.output.display()))?;
 
@@ -6345,6 +6442,12 @@ fn write_audit_event(
     cwd: &str,
     decision: &str,
 ) -> Result<(), anyhow::Error> {
+    // Same boundary as MemoryStore::append_audit_event: stored and hashed text is redacted.
+    let (cwd, decision) = (
+        helm_core::redact_secrets(cwd),
+        helm_core::redact_secrets(decision),
+    );
+    let (cwd, decision) = (cwd.as_str(), decision.as_str());
     let timestamp = next_audit_timestamp(conn, target)?;
     let previous_hash = latest_audit_hash(conn, target).unwrap_or_else(|_| "GENESIS".to_string());
     let event_hash = audit_hash(AuditHashParts {
@@ -6976,6 +7079,83 @@ mod tests {
         assert!(!config.contains("api_key ="));
         assert!(config.contains("[security]"));
         assert!(config.contains("[telemetry]"));
+    }
+
+    #[test]
+    fn config_set_rejects_credentials_and_keeps_unparseable_files_intact() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for key in [
+            "provider.api_key",
+            "provider.OPENAI_API_KEY",
+            "x.password",
+            "a.auth_token",
+        ] {
+            let error = super::update_config_file(&path, key, "harmless").unwrap_err();
+            assert!(error.to_string().contains("credential"), "{key}: {error}");
+        }
+        let error =
+            super::update_config_file(&path, "provider.model", "sk-abcdefghijklmnopqrstuvwxyz")
+                .unwrap_err();
+        assert!(error.to_string().contains("credential"));
+        assert!(!path.exists(), "a rejected edit must not create the file");
+        // `*_env` names a variable, and token counters are not secrets.
+        super::update_config_file(&path, "provider.api_key_env", "MY_KEY").unwrap();
+        super::update_config_file(&path, "limits.max_tokens", "512").unwrap();
+        // Malformed config is reported, never silently replaced.
+        fs::write(&path, "provider = [oops").unwrap();
+        assert!(super::update_config_file(&path, "provider.model", "m").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "provider = [oops");
+    }
+
+    #[test]
+    fn config_validate_flags_plaintext_credentials_already_on_disk() {
+        let value: toml::Value =
+            "[provider]\napi_key = \"x\"\napi_key_env = \"K\"\n[a.b]\npassword = \"p\""
+                .parse()
+                .unwrap();
+        let mut found = Vec::new();
+        super::find_secret_config_keys(&value, "", &mut found);
+        found.sort();
+        assert_eq!(found, ["a.b.password", "provider.api_key"]);
+    }
+
+    #[test]
+    fn provider_switch_preserves_unrelated_settings() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[provider]\nkind = \"groq\"\nmodel = \"m\"\nbase_url = \"http://old\"\n\n\
+             [security]\ntui_paste_key_modal = false\n\n[telemetry]\nenabled = true\nendpoint = \"http://otel\"\n\n\
+             [custom]\nkeep = 1\n",
+        )
+        .unwrap();
+        super::write_helm_config(
+            &config_path,
+            &dir.path().join("h.db"),
+            "openai",
+            "gpt",
+            None,
+            Some("OPENAI_API_KEY"),
+        )
+        .unwrap();
+        let config: toml::Value = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+        assert_eq!(config["provider"]["kind"].as_str(), Some("openai"));
+        assert!(
+            config["provider"].get("base_url").is_none(),
+            "stale endpoint of the old provider"
+        );
+        assert_eq!(
+            config["security"]["tui_paste_key_modal"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(config["telemetry"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["telemetry"]["endpoint"].as_str(),
+            Some("http://otel")
+        );
+        assert_eq!(config["custom"]["keep"].as_integer(), Some(1));
     }
 
     #[test]

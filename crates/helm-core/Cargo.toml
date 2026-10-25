@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 regex.workspace = true
+nix.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

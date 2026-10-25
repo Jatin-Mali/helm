@@ -109,7 +109,12 @@ impl From<&str> for Secret {
     }
 }
 
-/// Store for secret rotation history (JSON-backed).
+/// JSON-backed store with rotation metadata.
+///
+/// Deprecated for provider credentials: the CLI's `secrets.toml` store is the designated,
+/// advisory-locked home for those. Retired values are no longer retained here; only
+/// rotation timestamps are kept, and legacy `history[].value` fields are scrubbed on the
+/// next write.
 pub struct SecretStore {
     path: std::path::PathBuf,
 }
@@ -181,16 +186,9 @@ impl SecretStore {
 
         if let Some(entry) = data.get_mut(key) {
             if let Some(obj) = entry.as_object_mut() {
-                let old_val = obj.get("value").cloned();
                 let rotated_at = obj.get("rotated_at").cloned();
-
-                if let Some(old_v) = old_val {
-                    if let Some(hist) = obj.get_mut("history").and_then(|h| h.as_array_mut()) {
-                        hist.push(serde_json::json!({
-                            "value": old_v,
-                            "rotated_at": rotated_at
-                        }));
-                    }
+                if let Some(hist) = obj.get_mut("history").and_then(|h| h.as_array_mut()) {
+                    hist.push(serde_json::json!({ "rotated_at": rotated_at }));
                 }
                 obj["value"] = serde_json::Value::String(new_value.to_string());
                 obj["rotated_at"] = serde_json::Value::Number(now.into());
@@ -201,26 +199,20 @@ impl SecretStore {
         Ok(())
     }
 
-    /// Get rotation history for a secret key.
-    pub fn rotation_history(&self, key: &str) -> Result<Vec<(String, i64)>, SecretError> {
+    /// Timestamps (unix seconds) of previous rotations; retired values are not kept.
+    pub fn rotation_history(&self, key: &str) -> Result<Vec<i64>, SecretError> {
         let data = self.load_data()?;
-        if let Some(entry) = data.get(key) {
-            if let Some(hist) = entry.get("history") {
-                if let Some(arr) = hist.as_array() {
-                    let mut results = Vec::new();
-                    for item in arr {
-                        if let (Some(val), Some(ts)) = (
-                            item.get("value").and_then(|v| v.as_str()),
-                            item.get("rotated_at").and_then(|t| t.as_i64()),
-                        ) {
-                            results.push((val.to_string(), ts));
-                        }
-                    }
-                    return Ok(results);
-                }
-            }
-        }
-        Ok(Vec::new())
+        Ok(data
+            .get(key)
+            .and_then(|entry| entry.get("history"))
+            .and_then(|hist| hist.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("rotated_at").and_then(|t| t.as_i64()))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Check which keys need rotation based on the policy.
@@ -256,47 +248,113 @@ impl SecretStore {
         }
     }
 
+    /// Scrubs legacy retired values, then replaces the file atomically with mode 0600 from
+    /// creation (never a window where secrets are world-readable).
     fn save_data(
         &self,
         data: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), SecretError> {
-        let json = serde_json::to_string_pretty(&serde_json::Value::Object(data.clone()))?;
-        std::fs::write(&self.path, json)?;
+        use std::io::Write;
+        let mut data = data.clone();
+        for entry in data.values_mut() {
+            if let Some(history) = entry.get_mut("history").and_then(|h| h.as_array_mut()) {
+                for item in history {
+                    if let Some(item) = item.as_object_mut() {
+                        item.remove("value");
+                    }
+                }
+            }
+        }
+        let json = serde_json::to_string_pretty(&serde_json::Value::Object(data))?;
+        let tmp = self
+            .path
+            .with_extension(format!("tmp-{}", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::fs;
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&self.path, perms)?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        Ok(())
+        let mut file = options.open(&tmp)?;
+        let written = file
+            .write_all(json.as_bytes())
+            .and_then(|()| file.sync_all())
+            .and_then(|()| std::fs::rename(&tmp, &self.path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Ok(written?)
     }
 }
 
-/// Redacts known API key patterns from a string.
+/// Redacts credentials and protected local-state paths from text bound for persistence,
+/// exports, traces or providers. It is defence in depth: arbitrary secrets that carry no
+/// recognisable marker cannot be found by pattern, so callers should still minimise data.
 pub fn redact_secrets(input: &str) -> String {
     use std::sync::OnceLock;
-    static KEY_RE: OnceLock<regex::Regex> = OnceLock::new();
-    static PATH_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let key_re = KEY_RE.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)(sk-[a-zA-Z0-9_-]{20,}|gsk_[a-zA-Z0-9_-]{20,}|nvapi-[a-zA-Z0-9_-]{20,}|key-[a-zA-Z0-9_-]{20,}|AIza[0-9A-Za-z-_]{35})",
-        )
-        .unwrap_or_else(|error| panic!("invalid built-in secret redaction regex: {error}"))
+    struct Rules {
+        pem: regex::Regex,
+        keys: regex::Regex,
+        bearer: regex::Regex,
+        url_credentials: regex::Regex,
+        assignment: regex::Regex,
+        path: regex::Regex,
+    }
+    static RULES: OnceLock<Rules> = OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        let build = |pattern: &str| {
+            regex::Regex::new(pattern)
+                .unwrap_or_else(|error| panic!("invalid built-in redaction regex: {error}"))
+        };
+        Rules {
+            pem: build(
+                r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)",
+            ),
+            keys: build(
+                r"(?i)(sk-[a-zA-Z0-9_-]{20,}|gsk_[a-zA-Z0-9_-]{20,}|nvapi-[a-zA-Z0-9_-]{20,}|key-[a-zA-Z0-9_-]{20,}|AIza[0-9A-Za-z-_]{35}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,})",
+            ),
+            bearer: build(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"),
+            url_credentials: build(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+):[^/\s@]+@"),
+            // key=value, key: value and JSON "key": "value" for credential-looking names. A quoted
+            // value is consumed whole (it may contain spaces); a bare one stops at punctuation.
+            assignment: build(
+                r#"(?i)(["']?[\w.-]*(?:password|passwd|pwd|passphrase|secret|token|api[_-]?key|apikey|credential|authorization|private[_-]?key)[\w.-]*["']?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|'[^']*'|[^\s"',;&}\]]+)"#,
+            ),
+            // Resolved XDG or legacy locations of HELM's own protected state.
+            path: build(
+                r#"(?x)
+                (?:~|(?:/[^\s"'`]+)+)
+                /(?:\.helm|helm)/
+                (?:secrets\.toml|\.secrets\.toml\.lock|audit\.key|helm\.db(?:-wal|-shm|\.execution\.lock)?
+                  |helm\.log|logs/[^\s"'`/]*\.log|[^\s"'`/]*\.key)
+                "#,
+            ),
+        }
     });
-    let path_re = PATH_RE.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?x)
-            (?:~|(?:/[^\s"'`]+)+)
-            /\.helm/
-            (?:secrets\.toml|\.secrets\.toml\.lock|helm\.db|helm\.log)
-            "#,
-        )
-        .unwrap_or_else(|error| panic!("invalid built-in path redaction regex: {error}"))
-    });
-    let redacted_keys = key_re.replace_all(input, "***REDACTED***").into_owned();
-    path_re
-        .replace_all(&redacted_keys, "[REDACTED_PATH]")
+    let text = rules.pem.replace_all(input, "***REDACTED***");
+    let text = rules.keys.replace_all(&text, "***REDACTED***");
+    let text = rules.bearer.replace_all(&text, "$1 ***REDACTED***");
+    let text = rules
+        .url_credentials
+        .replace_all(&text, "$1:***REDACTED***@");
+    // Counters such as `max_tokens: 4096` are not credentials.
+    let text = rules
+        .assignment
+        .replace_all(&text, |caps: &regex::Captures<'_>| {
+            let name = caps[1].trim_end_matches(|c: char| !c.is_alphanumeric());
+            if name.to_ascii_lowercase().ends_with("tokens") {
+                return caps[0].to_owned();
+            }
+            let quote = match caps[2].chars().next() {
+                Some(q @ ('"' | '\'')) => q.to_string(),
+                _ => String::new(),
+            };
+            format!("{}{quote}***REDACTED***{quote}", &caps[1])
+        });
+    rules
+        .path
+        .replace_all(&text, "[REDACTED_PATH]")
         .into_owned()
 }
 
@@ -357,6 +415,69 @@ mod tests {
     }
 
     #[test]
+    fn redacts_resolved_xdg_state_paths_for_custom_roots() {
+        for text in [
+            "/srv/xdg/config/helm/secrets.toml",
+            "/srv/xdg/config/helm/.secrets.toml.lock",
+            "/var/lib/me/.local/share/helm/helm.db",
+            "/var/lib/me/.local/share/helm/helm.db-wal",
+            "/var/lib/me/.local/share/helm/logs/helm.log",
+            "/var/lib/me/.local/share/helm/logs/helmopsd.log",
+        ] {
+            let redacted = redact_secrets(&format!("opened {text} ok"));
+            assert_eq!(redacted, "opened [REDACTED_PATH] ok", "{text}");
+        }
+        assert_eq!(
+            redact_secrets("/etc/helm/other.conf"),
+            "/etc/helm/other.conf"
+        );
+    }
+
+    #[test]
+    fn redacts_arbitrary_credential_shapes() {
+        for sentinel in [
+            "PASSWORD=hunter2-sentinel",
+            "db_password: hunter2-sentinel",
+            r#"{"api_key": "hunter2-sentinel"}"#,
+            "Authorization: Bearer hunter2sentinelvalue",
+            "postgres://app:hunter2-sentinel@db.internal:5432/app",
+            "aws AKIAABCDEFGHIJKLMNOP",
+            "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig_nature",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----",
+        ] {
+            let redacted = redact_secrets(sentinel);
+            for leaked in ["hunter2", "AKIAABC", "eyJhbGci", "ghp_abc", "b3BlbnNzaC"] {
+                assert!(!redacted.contains(leaked), "{sentinel:?} -> {redacted:?}");
+            }
+            assert!(
+                redacted.contains("REDACTED"),
+                "{sentinel:?} -> {redacted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacts_quoted_values_containing_spaces_and_escapes_without_breaking_json() {
+        let json = r#"{"db_password": "my pass \"phrase\" here", "name": "web", "secret": 'x y'}"#;
+        let redacted = redact_secrets(json);
+        for leaked in ["my pass", "phrase", "here", "x y"] {
+            assert!(!redacted.contains(leaked), "{redacted}");
+        }
+        assert!(redacted.contains(r#""name": "web""#), "{redacted}");
+        let valid = r#"{"db_password": "a b c", "n": 1}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(&redact_secrets(valid)).is_ok());
+    }
+
+    #[test]
+    fn redaction_keeps_ordinary_operational_text_and_is_idempotent() {
+        let text = "max_tokens: 4096 unit sshd.service failed; host=web1 user:bob";
+        assert_eq!(redact_secrets(text), text);
+        let once = redact_secrets("password=abc123 url=https://u:p@h/x");
+        assert_eq!(redact_secrets(&once), once);
+    }
+
+    #[test]
     fn secret_store_set_get() {
         let dir = tempfile::tempdir().unwrap();
         let store = SecretStore::new(dir.path().join("secrets.json"));
@@ -395,5 +516,34 @@ mod tests {
         assert_eq!(store.get("KEY").unwrap(), Some("value2".to_string()));
         let hist = store.rotation_history("KEY").unwrap();
         assert_eq!(hist.len(), 1);
+    }
+
+    #[test]
+    fn store_never_retains_retired_values_and_scrubs_legacy_history() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        // A pre-upgrade file that kept the retired plaintext value.
+        std::fs::write(
+            &path,
+            r#"{"KEY":{"value":"current","created_at":1,"rotated_at":2,
+               "history":[{"value":"retired-sentinel","rotated_at":1}]}}"#,
+        )
+        .unwrap();
+        let store = SecretStore::new(path.clone());
+        store.rotate("KEY", "newer").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("retired-sentinel") && !raw.contains("\"current\""),
+            "{raw}"
+        );
+        assert_eq!(store.get("KEY").unwrap().as_deref(), Some("newer"));
+        assert_eq!(store.rotation_history("KEY").unwrap().len(), 2);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // No temporary file is left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

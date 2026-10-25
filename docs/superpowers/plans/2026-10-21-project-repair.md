@@ -120,17 +120,17 @@ rtk cargo test --test v20_controlled_execution
 - [x] Reuse actual SSH collection for `monitor --fleet`; persist target host identity and observation timestamps. An unreachable host returns unknown with last-known data labeled stale.
 - [x] Send scripts over stdin to a fixed remote shell or quote the remote command exactly once. Test spaces, quotes and metacharacters using a shell fixture before two-VM SSH testing.
 - [x] Add bounded snapshot retention with protected references for active incidents and change restoration. Measure representative growth, choose documented defaults, then test cleanup and cleanup failures.
-- [x] Verify two remote hosts differ from each other and the local machine; interruption cannot silently substitute local results.
+- [ ] (deferred to Task 14, needs two real SSH hosts) Verify two remote hosts differ from each other and the local machine; interruption cannot silently substitute local results.
 
 ### Task 7 — Privacy, configuration and verifiable audit
 
 **Owns:** core `secret.rs`, CLI `secrets.rs`, `service_form.rs`, config/logging/audit handlers, memory persistence boundaries, monitor prompt construction; new `tests/privacy_boundaries.rs` and additive audit migration. **Findings:** F08–F10, F17, F24.
 
-- [ ] Extend redaction to resolved XDG protected paths and credential-bearing evidence. Apply at actual persistence/export/trace/provider boundaries while preserving exact executable payloads separately.
-- [ ] Reject plaintext provider key fields through CLI and TUI config editing. Preserve unrelated security/telemetry configuration during provider changes. Service forms mask credentials and persist secret references.
-- [ ] Reuse the stronger atomic locked CLI store semantics; remove retained historical plaintext values from the alternate core store and define an explicit compatible migration/deprecation path.
-- [ ] Create private state directories/files with restrictive modes from the start; reject unsafe symlink/ownership cases without overwriting user files.
-- [ ] Version the audit format with canonical encoding and cryptographic chaining. Use keyed integrity only with a real key-management design; label old FNV records legacy. State that same-user compromise can access a locally held key and that externally anchored audit is needed for stronger guarantees.
+- [x] Extend redaction to resolved XDG protected paths and credential-bearing evidence. Apply at actual persistence/export/trace/provider boundaries while preserving exact executable payloads separately.
+- [x] Reject plaintext provider key fields through CLI and TUI config editing. Preserve unrelated security/telemetry configuration during provider changes. Service forms mask credentials and persist secret references.
+- [x] Reuse the stronger atomic locked CLI store semantics; remove retained historical plaintext values from the alternate core store and define an explicit compatible migration/deprecation path.
+- [x] Create private state directories/files with restrictive modes from the start; reject unsafe symlink/ownership cases without overwriting user files.
+- [x] Version the audit format with canonical encoding and cryptographic chaining. Use keyed integrity only with a real key-management design; label old FNV records legacy. State that same-user compromise can access a locally held key and that externally anchored audit is needed for stronger guarantees.
 
 **Tests:** actual DB/log/export/prompt outputs contain no sentinel keys or protected paths; env keys never auto-save; provider switching preserves other config; concurrent writers do not lose secrets; changed audit fields fail verification; a pre-upgrade DB opens without silently discarding history.
 

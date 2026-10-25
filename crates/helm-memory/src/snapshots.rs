@@ -23,6 +23,12 @@ pub struct SnapshotStore;
 impl SnapshotStore {
     /// Insert a snapshot into the database. `findings_json` is optional; pass "[]" if absent.
     pub fn insert(conn: &Connection, json: &str, findings_json: &str) -> Result<(), MemoryError> {
+        // Persistence boundary: callers may or may not have redacted already (idempotent).
+        let (json, findings_json) = (
+            helm_core::redact_secrets(json),
+            helm_core::redact_secrets(findings_json),
+        );
+        let (json, findings_json) = (json.as_str(), findings_json.as_str());
         let val: serde_json::Value =
             serde_json::from_str(json).map_err(|e| MemoryError::Other(e.to_string()))?;
 
@@ -220,6 +226,29 @@ impl SnapshotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insert_redacts_credentials_in_snapshot_and_findings() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (id TEXT PRIMARY KEY, host_hostname TEXT, host_id TEXT,
+                collected_at INTEGER NOT NULL, profile TEXT, domains_json TEXT,
+                collector_errors_json TEXT, findings_json TEXT);",
+        )
+        .unwrap();
+        let snapshot = r#"{"id":"s","host":{"hostname":"h"},"collected_at":"2026-01-01T00:00:00Z",
+            "domains":{"logs":"login failed password=hunter2-sentinel from 10.0.0.1"},
+            "collector_errors":[{"message":"postgres://app:hunter2-sentinel@db/x"}]}"#;
+        let findings = r#"[{"evidence":"Authorization: Bearer hunter2sentinelvalue"}]"#;
+        SnapshotStore::insert(&conn, snapshot, findings).unwrap();
+        let row = SnapshotStore::get(&conn, "s").unwrap().unwrap();
+        let stored = format!(
+            "{} {} {}",
+            row.domains_json, row.collector_errors_json, row.findings_json
+        );
+        assert!(!stored.contains("hunter2"), "{stored}");
+        assert!(stored.contains("10.0.0.1"), "ordinary evidence survives");
+    }
 
     #[test]
     fn test_host_id_roundtrip() {
