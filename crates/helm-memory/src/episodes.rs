@@ -167,8 +167,10 @@ pub struct AuditEventRecord {
     pub input_hash: String,
     /// Hash of the tool output or denial text.
     pub output_hash: String,
-    /// Capability checked for this event.
+    /// Capability checked for this event (legacy spellings are mapped to their capability).
     pub capability: Capability,
+    /// Capability text exactly as stored; the event hash covers this text, not the mapping.
+    pub capability_text: String,
     /// Taint label stored at execution time.
     pub taint: String,
     /// Current working directory used for execution.
@@ -827,7 +829,7 @@ pub fn verify_partitioned_audit_events(
             tool_name: &event.tool_name,
             input_hash: &event.input_hash,
             output_hash: &event.output_hash,
-            capability: event.capability.as_str(),
+            capability: &event.capability_text,
             taint: &event.taint,
             cwd: &event.cwd,
             decision: &event.decision,
@@ -1182,7 +1184,13 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<CapabilityGrantReco
 
 fn row_to_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEventRecord> {
     let capability_text: String = row.get(7)?;
-    let capability = capability_text.parse().map_err(|error: String| {
+    // Builds before the audit repair wrote bare "read"/"shell" for apply-plan events.
+    let capability = match capability_text.as_str() {
+        "read" => Ok(Capability::FsRead),
+        "shell" => Ok(Capability::ShellShell),
+        other => other.parse(),
+    }
+    .map_err(|error: String| {
         rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, error.into())
     })?;
     Ok(AuditEventRecord {
@@ -1194,6 +1202,7 @@ fn row_to_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEventRecord> {
         input_hash: row.get(5)?,
         output_hash: row.get(6)?,
         capability,
+        capability_text,
         taint: row.get(8)?,
         cwd: row.get(9)?,
         decision: row.get(10)?,
@@ -1698,6 +1707,7 @@ mod tests {
             input_hash: "i".to_owned(),
             output_hash: "o".to_owned(),
             capability: Capability::ShellShell,
+            capability_text: "shell.shell".to_owned(),
             taint: "clean".to_owned(),
             cwd: "/".to_owned(),
             decision: "allow".to_owned(),
@@ -1788,5 +1798,41 @@ mod tests {
             assert!(!verification.ok, "{column} edit went undetected");
             assert_eq!(verification.failed_at, Some(1), "{column}");
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_bare_capability_text_still_reads_and_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let store = MemoryStore::open(&path).await.unwrap();
+        // A pre-repair apply-plan row: bare "read" capability and the legacy (FNV) hash.
+        let parts = super::AuditHashParts {
+            previous_hash: "GENESIS",
+            episode_id: Some("plan-1"),
+            target: None,
+            timestamp: 1,
+            tool_name: "apply-plan",
+            input_hash: "i",
+            output_hash: "o",
+            capability: "read",
+            taint: "clean",
+            cwd: "",
+            decision: "plan_shown",
+        };
+        let hash = super::audit_hash_legacy(parts);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO audit_events (episode_id, target, timestamp, tool_name, input_hash, output_hash, capability, taint, cwd, decision, previous_hash, event_hash) VALUES ('plan-1', NULL, 1, 'apply-plan', 'i', 'o', 'read', 'clean', '', 'plan_shown', 'GENESIS', ?1)",
+                [&hash],
+            )
+            .unwrap();
+        }
+        let events = store.audit_events(None, None).await.unwrap();
+        assert_eq!(events[0].capability, Capability::FsRead);
+        assert_eq!(events[0].capability_text, "read");
+        let report = store.verify_audit_chain().await.unwrap();
+        assert!(report.ok, "{report:?}");
+        assert_eq!(report.legacy_events, 1);
     }
 }
