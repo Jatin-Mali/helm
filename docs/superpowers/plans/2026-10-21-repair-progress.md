@@ -150,3 +150,11 @@ Ruling: `rust-version` raised 1.85 → 1.89 — the resolved dependency set alre
 Docs from tested commands: README rewritten, new `docs/agent.md`, `docs/agent-on-remote.md` rewritten (the NDJSON agent-on-remote transport it described no longer exists), AGENTS.md index rebuilt to the real crates/commands/tests (the user's uncommitted graphify section was left unstaged).
 Also fixed: security review finding (terminal control/bidi characters in approval prompts — `sanitize_for_terminal`, used by CLI prompt, progress lines and TUI modal); agent sessions now live beside the database (a test run had written session files into the repository; removed from the index); `--remote` with `run` is refused and the global flag's help no longer promises remote tool execution.
 Verification: workspace all-target tests PASS, strict clippy PASS, fmt PASS, `cargo check --workspace --all-targets --all-features` and `--no-default-features` PASS (before ratatui bump; re-run in the Task 14 release gate).
+
+## Task 14 — complete (Claude)
+
+Acceptance: `scripts/verify-demo.sh --strict` (workspace acceptance tests, ops, upgrade, fleet on two Docker SSH hosts, real-provider agent scenario, soak). Guide and capability matrix: `docs/demo.md`.
+Defects found by the demonstrations and fixed with RED→GREEN tests: systemctl status bullets collapsed distinct failed units; registered-service findings dropped from `monitor` output (snapshot id); agent browser returned an empty DOM and '+'-corrupted text; apply-plan wrote capability "read"/"shell", which broke `audit verify`/`show` (writer fixed, legacy rows still read and verify, baseline-created DBs included); `--api-key` ignored for openai-compat.
+Soak (3 min): collection 0.74 s, RSS 29.5→32.8 MB, DB ~0.197 MB/snapshot (~197 MB at the 1000-row cap; row-limited at the default 60 s interval, ~16.7 h).
+Not verified (stated in docs/demo.md): true fresh VM, root systemctl on a real unit, providers other than Ollama gemma4:31b-cloud (Groq/Gemini keys invalid, OpenRouter/DeepSeek 402), physical power-loss, soak beyond 3 min.
+Ruling: Docker + isolated XDG state substitutes for a VM; labeled as such. No release tag.

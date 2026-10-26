@@ -2,7 +2,11 @@
 //! unsupported sandbox, failed verification. Each prints a consistent state, exits accordingly
 //! and never changes the host unless the exact step was approved and policy allows it.
 use helm_monitor::{CommandPreview, PlanSource, PlanStep, TroubleshootingPlan};
-use std::{path::Path, process::{Command, Stdio}, io::Write};
+use std::{
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+};
 
 fn run(state: &Path, args: &[&str], stdin: &str) -> (i32, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_helm"))
@@ -16,7 +20,12 @@ fn run(state: &Path, args: &[&str], stdin: &str) -> (i32, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     (
         out.status.code().unwrap_or(-1),
@@ -102,7 +111,10 @@ fn apply_plan_outcomes_agree_across_denial_modes_and_failed_verification() {
     assert!(text_of("read-only").to_lowercase().contains("read-only"));
     assert!(text_of("dry-run").to_lowercase().contains("dry"));
     assert!(text_of("sandbox-unavailable").contains("refusing host execution"));
-    assert!(text_of("denied").to_lowercase().contains("denied") || text_of("denied").to_lowercase().contains("skipped"));
+    assert!(
+        text_of("denied").to_lowercase().contains("denied")
+            || text_of("denied").to_lowercase().contains("skipped")
+    );
 }
 
 #[test]
@@ -113,7 +125,11 @@ fn failed_verification_is_a_failed_change_with_a_failing_exit() {
         "plan-verify",
         vec![step("printf changed", Some(("printf actual", "expected")))],
     );
-    let (code, out, err) = run(state.path(), &["apply-plan", "plan-verify", "--json"], "y\n");
+    let (code, out, err) = run(
+        state.path(),
+        &["apply-plan", "plan-verify", "--json"],
+        "y\n",
+    );
     let text = format!("{out}{err}");
     assert_ne!(code, 0, "{text}");
     assert!(text.to_lowercase().contains("fail"), "{text}");

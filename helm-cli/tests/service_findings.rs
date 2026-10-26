@@ -19,18 +19,36 @@ fn repeatedly_failing_registered_service_is_reported() {
     let added = helm(
         state.path(),
         &[
-            "service", "add", "--id", "closed-port", "--name", "closed-port", "--type",
-            "tcp-endpoint", "--host", "127.0.0.1", "--port", "9",
+            "service",
+            "add",
+            "--id",
+            "closed-port",
+            "--name",
+            "closed-port",
+            "--type",
+            "tcp-endpoint",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9",
         ],
     );
-    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
     let mut titles = Vec::new();
     for _ in 0..4 {
         let out = helm(
             state.path(),
             &["monitor", "--format", "json", "--profile", "quick"],
         );
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         titles = report["findings"]
             .as_array()

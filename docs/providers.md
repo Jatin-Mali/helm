@@ -73,3 +73,8 @@ reliable agent tasks.
 - API providers are shown as `llm api`
 
 That boundary is also reported by `helm trust-report`.
+
+## Verification status
+
+Only Ollama (`gemma4:31b-cloud`) has been exercised live end to end. Other providers are
+covered by scripted-server tests; see [demo.md](demo.md#what-is-not-verified).

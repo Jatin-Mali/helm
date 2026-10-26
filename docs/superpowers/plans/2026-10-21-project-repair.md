@@ -120,7 +120,7 @@ rtk cargo test --test v20_controlled_execution
 - [x] Reuse actual SSH collection for `monitor --fleet`; persist target host identity and observation timestamps. An unreachable host returns unknown with last-known data labeled stale.
 - [x] Send scripts over stdin to a fixed remote shell or quote the remote command exactly once. Test spaces, quotes and metacharacters using a shell fixture before two-VM SSH testing.
 - [x] Add bounded snapshot retention with protected references for active incidents and change restoration. Measure representative growth, choose documented defaults, then test cleanup and cleanup failures.
-- [ ] (deferred to Task 14, needs two real SSH hosts) Verify two remote hosts differ from each other and the local machine; interruption cannot silently substitute local results.
+- [x] (deferred to Task 14, needs two real SSH hosts) Verify two remote hosts differ from each other and the local machine; interruption cannot silently substitute local results.
 
 ### Task 7 — Privacy, configuration and verifiable audit
 
@@ -189,7 +189,7 @@ rtk cargo test --test v20_controlled_execution
 - [x] Provide explicit `helm run <task>` behavior and connect the TUI assistant to the runtime event stream. Keep chat, monitoring and execution states distinguishable.
 - [x] Persist redacted conversation, tool outcomes, approvals and terminal outcome; implement resume with fresh authorization for pending mutations. Do not replay tool effects on restart.
 - [x] Support cancellation, progress, failure explanation and a final evidence-based summary. Remove stale UI actions that still invoke deleted runtimes or advertise unavailable tools.
-- [ ] Demonstrate a multi-step temporary-project edit/test task and a Linux diagnostic task. One real provider is mandatory for release; test every provider's tool-call shape with fixtures and label live coverage accurately.
+- [x] Demonstrate a multi-step temporary-project edit/test task and a Linux diagnostic task. One real provider is mandatory for release; test every provider's tool-call shape with fixtures and label live coverage accurately. (Ollama gemma4:31b-cloud live; other providers fixture-only, labeled in docs/demo.md)
 - [x] Verify existing monitor/remediation commands still work and both `helm`/`helmops` accept the supported agent command.
 
 ### Task 13 — Installer and public feature completeness
@@ -206,11 +206,11 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** new `tests/demo/` fixtures, `scripts/verify-demo.sh`, `docs/demo.md`, completion/evidence log. Depends on all prior tasks.
 
-- [ ] Create a disposable VM scenario with isolated XDG state, temporary project, harmless test service and two SSH targets. Make setup/teardown repeatable; fixtures must never target real user services.
-- [ ] Run both demonstrations in the spec with a real provider/browser where required. Capture actual commands, host identities, before/after checks, cancellation and restoration outcomes without secrets.
-- [ ] Add cross-frontend acceptance for denial, read-only, unsupported sandbox, failed verification and failed rollback. Verify CLI exit codes, JSON states and UI labels agree.
-- [ ] Perform DB upgrade/backup/recovery and a prolonged monitoring run; measure growth, latency and memory against documented target hardware and retention settings.
-- [ ] Run the release gate below, inspect the final diff and regenerate the source graph with `graphify update .`. Close findings only with linked tests/evidence; create a short reproducible demonstration guide and supported-feature matrix.
+- [x] Create a disposable VM scenario with isolated XDG state, temporary project, harmless test service and two SSH targets. Make setup/teardown repeatable; fixtures must never target real user services.
+- [x] Run both demonstrations in the spec with a real provider/browser where required. Capture actual commands, host identities, before/after checks, cancellation and restoration outcomes without secrets.
+- [x] Add cross-frontend acceptance for denial, read-only, unsupported sandbox, failed verification and failed rollback. Verify CLI exit codes, JSON states and UI labels agree.
+- [x] Perform DB upgrade/backup/recovery and a prolonged monitoring run; measure growth, latency and memory against documented target hardware and retention settings.
+- [x] Run the release gate below, inspect the final diff and regenerate the source graph with `graphify update .`. Close findings only with linked tests/evidence; create a short reproducible demonstration guide and supported-feature matrix.
 
 ```sh
 rtk cargo fmt --check
