@@ -117,7 +117,10 @@ mod tests {
                     nginx.service loaded active running A web server\n";
         let failed = parse_failed(rows);
         let names: Vec<_> = failed.iter().map(|u| u.name.as_str()).collect();
-        assert_eq!(names, ["snapd.service", "logrotate.service", "nginx.service"]);
+        assert_eq!(
+            names,
+            ["snapd.service", "logrotate.service", "nginx.service"]
+        );
         assert_eq!(failed[0].description, "Snap Daemon");
         assert_eq!(failed[0].sub, "failed");
         let units = parse_units(rows);

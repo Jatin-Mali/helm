@@ -285,7 +285,10 @@ async fn real_browser_reads_an_approved_page_and_refuses_unapproved_origins() {
     // Before the operator allows the origin, a loopback destination is refused outright.
     assert!(
         matches!(tools.execute(&page, &cancel).await, ToolExecution::Completed(o) if o.is_error)
-            || matches!(tools.execute(&page, &cancel).await, ToolExecution::ApprovalRequired { .. })
+            || matches!(
+                tools.execute(&page, &cancel).await,
+                ToolExecution::ApprovalRequired { .. }
+            )
     );
     tools.allow_http_origin(&origin).unwrap();
     assert!(matches!(
@@ -295,8 +298,16 @@ async fn real_browser_reads_an_approved_page_and_refuses_unapproved_origins() {
     tools.decide(&page, true).unwrap();
     let result = output(tools.execute(&page, &cancel).await);
     assert!(!result.is_error, "{}", result.content);
-    assert!(result.content.contains("fixture heading 7421"), "{}", result.content);
-    assert!(!result.content.contains("<title>js-ran"), "JavaScript must not run: {}", result.content);
+    assert!(
+        result.content.contains("fixture heading 7421"),
+        "{}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("<title>js-ran"),
+        "JavaScript must not run: {}",
+        result.content
+    );
     let other = call(
         "other",
         "browser",
