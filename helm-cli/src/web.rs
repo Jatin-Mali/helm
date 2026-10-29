@@ -56,6 +56,7 @@ struct WebState {
     live_findings: Mutex<HashMap<String, Finding>>,
     refresh_secs: u64,
     last_snapshot: Mutex<Option<String>>,
+    collect_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Serialize, Clone)]
@@ -341,12 +342,12 @@ pub async fn serve(
         live_findings: Mutex::new(HashMap::new()),
         refresh_secs: web_refresh_secs,
         last_snapshot: Mutex::new(None),
+        collect_lock: tokio::sync::Mutex::new(()),
     });
 
     let bg_state = Arc::clone(&state);
     tokio::spawn(async move {
         // The first reader collects; ticking immediately would duplicate that collection.
-        // ponytail: simultaneous first readers can still each collect once; add a collect lock if that matters.
         let period = Duration::from_secs(web_refresh_secs);
         let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         loop {
@@ -479,14 +480,49 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<WebState>) {
 /// The last published snapshot; collects only before the first one exists.
 async fn current_snapshot(state: &WebState) -> String {
     let cached = state.last_snapshot.lock().unwrap().clone();
-    match cached {
-        Some(json) => json,
-        None => publish_snapshot(state).await,
+    if let Some(json) = cached {
+        return with_current_plans(state, json);
     }
+    let _collecting = state.collect_lock.lock().await;
+    // Another reader may have collected while this one waited.
+    let cached = state.last_snapshot.lock().unwrap().clone();
+    match cached {
+        Some(json) => with_current_plans(state, json),
+        None => store_and_send(state).await,
+    }
+}
+
+/// Plan state changes between collections; a cached snapshot gets it re-read from the store.
+fn with_current_plans(state: &WebState, json: String) -> String {
+    let Ok(conn) = rusqlite::Connection::open(&state.db_path) else {
+        return json;
+    };
+    let Ok(mut snapshot) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return json;
+    };
+    let live = state.live_findings.lock().unwrap().clone();
+    if let Some(entries) = snapshot["findings"].as_array_mut() {
+        for entry in entries {
+            let Some(finding) = entry["id"].as_str().and_then(|id| live.get(id)) else {
+                continue;
+            };
+            let plan = plan_view(state, &conn, finding);
+            entry["planStatus"] = plan.as_ref().map(|plan| plan.status).into();
+            entry["aiPlan"] = plan.as_ref().and_then(|plan| plan.plan.clone()).into();
+            entry["planError"] = plan.and_then(|plan| plan.error).into();
+        }
+    }
+    snapshot.to_string()
 }
 
 /// Collects now, stores the result for readers and broadcasts it to every websocket.
 async fn publish_snapshot(state: &WebState) -> String {
+    let _collecting = state.collect_lock.lock().await;
+    store_and_send(state).await
+}
+
+/// Callers hold `collect_lock`, so an older collection can never replace a newer one.
+async fn store_and_send(state: &WebState) -> String {
     let json = collect_live_snapshot(state).await;
     *state.last_snapshot.lock().unwrap() = Some(json.clone());
     let _ = state.snapshot_tx.send(json.clone());
@@ -571,6 +607,8 @@ struct PlanView {
     error: Option<String>,
 }
 
+const STALE_LOADING_SECS: i64 = 40;
+
 fn plan_view(state: &WebState, conn: &rusqlite::Connection, finding: &Finding) -> Option<PlanView> {
     let record =
         helm_memory::TroubleshootingPlanStore::latest_for_fingerprint(conn, &finding.fingerprint)
@@ -588,6 +626,12 @@ fn plan_view(state: &WebState, conn: &rusqlite::Connection, finding: &Finding) -
             error: None,
         }),
         "ready" => None,
+        // Past the generator's outer 35 s bound the row is orphaned (restart, dropped task).
+        "loading" if age > STALE_LOADING_SECS => Some(PlanView {
+            status: "failed",
+            plan: None,
+            error: Some(plan_failure_message("timeout", "")),
+        }),
         "loading" => Some(PlanView {
             status: "loading",
             plan: None,
@@ -1505,6 +1549,7 @@ mod tests {
             live_findings: Mutex::new(HashMap::new()),
             refresh_secs: 60,
             last_snapshot: Mutex::new(None),
+            collect_lock: tokio::sync::Mutex::new(()),
         };
         let session = crate::web_auth::Session {
             id: "client-a".into(),
@@ -1621,6 +1666,7 @@ mod tests {
                 live_findings: Mutex::new(HashMap::new()),
                 refresh_secs: 60,
                 last_snapshot: Mutex::new(None),
+                collect_lock: tokio::sync::Mutex::new(()),
             });
             let service = api_service_action(
                 State(state.clone()),

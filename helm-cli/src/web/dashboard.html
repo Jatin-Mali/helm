@@ -984,6 +984,7 @@ function applySnapshot(snapshot) {
   syncServiceSelectionState();
   syncChangeSelectionState();
   renderAll();
+  resumePlanPolling();
 }
 
 function renderAll() {
@@ -1771,6 +1772,7 @@ function selectFinding(id, tab = 'overview') {
   state.focusedFindingId = id;
   state.activeTab = tab;
   renderAll();
+  resumePlanPolling();
 }
 
 function syncServiceSelectionState() {
@@ -2263,6 +2265,12 @@ async function requestPlan(retry = false) {
     button.disabled = false;
     button.textContent = 'generate plan';
   }
+}
+
+// A snapshot (or a reload) can show a plan as loading while nothing polls for it; ask the
+// server, which answers with the current state and keeps polling while it is still loading.
+function resumePlanPolling() {
+  if (!planBusy && selectedFinding()?.planStatus === 'loading') requestPlan();
 }
 
 function aiPlanRow(finding) {

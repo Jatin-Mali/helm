@@ -377,3 +377,98 @@ async fn refresh_forces_a_new_collection() {
     let refreshed = session.post("/api/refresh", json!({})).await;
     assert_ne!(first["collectedAt"], refreshed["snapshot"]["collectedAt"]);
 }
+
+/// Accepts connections and never answers, like a provider that hangs.
+fn hanging_provider() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            held.push(stream);
+        }
+    });
+    url
+}
+
+/// A `loading` row whose generator died (server restart, outer timeout) must surface as a
+/// failure with Retry instead of spinning forever.
+#[tokio::test]
+async fn stale_loading_plan_reports_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = hanging_provider();
+    let session = start(dir.path(), Some(&url)).await;
+    let finding = session.broken_finding().await;
+    let body = json!({"findingId": finding["id"], "fingerprint": finding["fingerprint"]});
+    assert_eq!(
+        session.post("/api/plan", body.clone()).await["plan_status"],
+        "loading"
+    );
+    let conn = rusqlite::Connection::open(dir.path().join("helm.db")).unwrap();
+    let mut aged = 0;
+    for _ in 0..50 {
+        aged = conn
+            .execute(
+                "UPDATE troubleshooting_plans SET updated_at = updated_at - 600 \
+                 WHERE dashboard_plan_status = 'loading'",
+                [],
+            )
+            .unwrap();
+        if aged > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(aged > 0, "no loading row was written");
+    let plan = session.post("/api/plan", body).await;
+    assert_eq!(plan["plan_status"], "failed", "{plan}");
+    assert!(
+        !plan["plan_error"].as_str().unwrap_or_default().is_empty(),
+        "{plan}"
+    );
+}
+
+/// Concurrent publishes must not let an older collection replace a newer cached snapshot.
+#[tokio::test]
+async fn concurrent_refreshes_keep_the_newest_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = start(dir.path(), None).await;
+    let refreshes = futures_join(&session).await;
+    let newest = refreshes
+        .iter()
+        .map(|r| r["snapshot"]["collectedAt"].as_str().unwrap().to_owned())
+        .max()
+        .unwrap();
+    let cached = session.get("/api/snapshot").await;
+    assert_eq!(cached["collectedAt"], newest);
+}
+
+async fn futures_join(session: &Session) -> Vec<Value> {
+    let (a, b, c, d) = tokio::join!(
+        session.post("/api/refresh", json!({})),
+        session.post("/api/refresh", json!({})),
+        session.post("/api/refresh", json!({})),
+        session.post("/api/refresh", json!({})),
+    );
+    vec![a, b, c, d]
+}
+
+/// A page loaded after a plan was requested must show the plan's current state, even though
+/// snapshot reads are served from the cached collection.
+#[tokio::test]
+async fn cached_snapshot_reflects_current_plan_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = provider(200, PLAN_TEXT);
+    let session = start(dir.path(), Some(&url)).await;
+    let finding = session.broken_finding().await;
+    let body = json!({"findingId": finding["id"], "fingerprint": finding["fingerprint"]});
+    assert_eq!(settled_plan(&session, body).await["plan_status"], "ready");
+    let reloaded = session.broken_finding().await;
+    assert_eq!(reloaded["planStatus"], "ready", "{reloaded}");
+    assert!(
+        reloaded["aiPlan"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("The unit failed on start.")
+    );
+}
