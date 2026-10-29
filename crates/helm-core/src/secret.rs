@@ -295,7 +295,22 @@ pub fn redact_secrets(input: &str) -> String {
     fn redact_value(value: &mut serde_json::Value) {
         match value {
             serde_json::Value::String(text) => *text = redact_text(text),
-            serde_json::Value::Array(items) => items.iter_mut().for_each(redact_value),
+            serde_json::Value::Array(items) => {
+                // A key logged line by line spans elements; redact everything until its END line.
+                let mut in_key = false;
+                for item in items.iter_mut() {
+                    let text = item.as_str().unwrap_or_default();
+                    let opens = text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----");
+                    let closes = text.contains("-----END ") && text.contains("PRIVATE KEY-----");
+                    if in_key {
+                        *item = serde_json::Value::String("***REDACTED***".into());
+                        in_key = !closes;
+                    } else {
+                        in_key = opens && !closes;
+                        redact_value(item);
+                    }
+                }
+            }
             serde_json::Value::Object(fields) => {
                 for (key, mut value) in std::mem::take(fields) {
                     // Reuse the text rules to recognize credential field names (except counters).
@@ -483,6 +498,25 @@ mod tests {
                 "{sentinel:?} -> {redacted:?}"
             );
         }
+    }
+
+    #[test]
+    fn private_key_split_across_json_array_elements_is_redacted() {
+        let value = serde_json::json!({"lines": [
+            "before",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU",
+            "-----END OPENSSH PRIVATE KEY-----",
+            "after"
+        ]});
+        let redacted = redact_secrets(&value.to_string());
+        assert!(
+            !redacted.contains("b3BlbnNzaC1rZXktdjEAAAAABG5vbmU"),
+            "{redacted}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(parsed["lines"][0], "before");
+        assert_eq!(parsed["lines"][4], "after");
     }
 
     #[test]
