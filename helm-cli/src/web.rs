@@ -51,6 +51,9 @@ struct WebState {
     provider_settings: ProviderSettings,
     secrets: SecretsStore,
     fleet_cache: Mutex<HashMap<uuid::Uuid, FleetHost>>,
+    /// Findings of the most recent snapshot by id. Live (no-daemon) cycles are never
+    /// persisted, so id lookups must not rely on `SnapshotStore` alone.
+    live_findings: Mutex<HashMap<String, Finding>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -320,6 +323,7 @@ pub async fn serve(
         provider_settings,
         secrets,
         fleet_cache: Mutex::new(HashMap::new()),
+        live_findings: Mutex::new(HashMap::new()),
     });
     let web_refresh_secs = helm_monitor::load_thresholds_config()
         .refresh_interval_secs
@@ -483,7 +487,7 @@ async fn api_generate_plan(
         Err(e) => return Json(serde_json::json!({"error": format!("DB error: {e}")})),
     };
 
-    match crate::find_finding_by_id(&conn, &req.finding_id) {
+    match lookup_finding(&state, &conn, &req.finding_id) {
         Some(finding) => {
             if let Ok(Some(record)) = helm_memory::TroubleshootingPlanStore::latest_for_fingerprint(
                 &conn,
@@ -910,6 +914,10 @@ async fn collect_live_snapshot(state: &WebState) -> String {
                 .collect()
         });
     let collector_health = collector_health(&snapshot);
+    *state.live_findings.lock().unwrap() = findings
+        .iter()
+        .map(|finding| (finding.id.clone(), finding.clone()))
+        .collect();
     let findings = findings
         .iter()
         .map(|finding| finding_entry(finding, &history, &state_by_fingerprint))
@@ -958,6 +966,11 @@ async fn collect_live_snapshot(state: &WebState) -> String {
     };
 
     serde_json::to_string(&live).unwrap_or_default()
+}
+
+fn lookup_finding(state: &WebState, conn: &rusqlite::Connection, id: &str) -> Option<Finding> {
+    let live = state.live_findings.lock().unwrap().get(id).cloned();
+    live.or_else(|| crate::find_finding_by_id(conn, id))
 }
 
 fn latest_snapshot_and_findings(
@@ -1408,6 +1421,7 @@ mod tests {
             .unwrap(),
             secrets: SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap(),
             fleet_cache: Mutex::new(HashMap::new()),
+            live_findings: Mutex::new(HashMap::new()),
         };
         let session = crate::web_auth::Session {
             id: "client-a".into(),
@@ -1521,6 +1535,7 @@ mod tests {
                 .unwrap(),
                 secrets: SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap(),
                 fleet_cache: Mutex::new(HashMap::new()),
+                live_findings: Mutex::new(HashMap::new()),
             });
             let service = api_service_action(
                 State(state.clone()),
