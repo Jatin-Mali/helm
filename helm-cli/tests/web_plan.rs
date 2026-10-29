@@ -519,3 +519,17 @@ async fn freshly_inserted_pending_plan_is_loading_not_failed() {
     let answer = session.post("/api/plan", body).await;
     assert_eq!(answer["plan_status"], "loading", "{answer}");
 }
+
+/// Live findings have no persisted history, but they were observed now; the console must not
+/// show "seen n/a" for something it is looking at.
+#[tokio::test]
+async fn live_findings_carry_last_seen() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = start(dir.path(), None).await;
+    let finding = session.broken_finding().await;
+    let last_seen = finding["lastSeen"].as_str().unwrap_or_default();
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(last_seen).is_ok(),
+        "{finding}"
+    );
+}

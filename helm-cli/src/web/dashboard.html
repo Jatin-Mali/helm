@@ -7,11 +7,11 @@
 <style>
 :root {
   --bg: #07111f;
-  --bg-elev: rgba(11, 24, 38, 0.92);
-  --bg-panel: rgba(10, 20, 34, 0.88);
-  --bg-soft: rgba(23, 38, 56, 0.72);
-  --line: rgba(114, 151, 196, 0.18);
-  --line-strong: rgba(114, 151, 196, 0.34);
+  --bg-elev: var(--bg-soft);
+  --bg-panel: var(--bg-soft);
+  --bg-soft: var(--bg-soft);
+  --line: var(--line);
+  --line-strong: var(--line);
   --text: #e4ecf7;
   --muted: #a8b9ce;
   --dim: #8fa6c2;
@@ -20,7 +20,7 @@
   --warn: #ffbf66;
   --danger: #ff6d7c;
   --info: #8db4ff;
-  --shadow: 0 20px 80px rgba(0, 0, 0, 0.32);
+  --shadow: 0 20px 80px var(--bg-soft);
   --font-sans: "IBM Plex Sans", "Source Sans 3", "Avenir Next", "Segoe UI", sans-serif;
   --font-mono: "IBM Plex Mono", "JetBrains Mono", "Fira Code", monospace;
 }
@@ -33,25 +33,10 @@ body {
   color: var(--text);
   font-family: var(--font-sans);
   font-size: 16px;
-  background:
-    radial-gradient(circle at top left, rgba(91, 158, 255, 0.18), transparent 32%),
-    radial-gradient(circle at 80% 10%, rgba(102, 227, 255, 0.12), transparent 24%),
-    linear-gradient(160deg, #08111b 0%, #07111f 45%, #050b14 100%);
-  background-color: var(--bg);
+  background: var(--bg);
   overflow: auto;
 }
 
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background:
-    linear-gradient(rgba(113, 150, 190, 0.04) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(113, 150, 190, 0.04) 1px, transparent 1px);
-  background-size: 22px 22px;
-  mask-image: linear-gradient(to bottom, rgba(0,0,0,0.85), transparent);
-}
 
 #app {
   position: relative;
@@ -105,8 +90,8 @@ body::before {
 .button,
 .tab {
   border: 1px solid var(--line);
-  background: rgba(11, 24, 38, 0.58);
-  backdrop-filter: blur(10px);
+  background: var(--bg-soft);
+
 }
 
 .chip {
@@ -141,7 +126,7 @@ body::before {
 .button:hover {
   transform: translateY(-1px);
   border-color: var(--line-strong);
-  background: rgba(21, 39, 61, 0.9);
+  background: var(--bg-soft);
 }
 
 .inline-actions {
@@ -154,7 +139,7 @@ body::before {
   margin: 12px 0 0;
   padding: 14px;
   border-radius: 16px;
-  background: rgba(6, 12, 22, 0.92);
+  background: var(--bg-soft);
   border: 1px solid var(--line);
   color: var(--text);
   font-size: 0.875rem;
@@ -186,8 +171,8 @@ body::before {
   padding: 20px;
   border-radius: 22px;
   background:
-    linear-gradient(180deg, rgba(17, 29, 46, 0.86), rgba(9, 16, 29, 0.92)),
-    rgba(11, 24, 38, 0.88);
+    linear-gradient(180deg, var(--bg-soft), var(--bg-soft)),
+    var(--bg-soft);
   border: 1px solid var(--line);
   box-shadow: var(--shadow);
   display: grid;
@@ -200,7 +185,7 @@ body::before {
   position: absolute;
   inset: auto 0 0 0;
   height: 2px;
-  background: linear-gradient(90deg, transparent, rgba(102, 227, 255, 0.7), transparent);
+  background: linear-gradient(90deg, transparent, var(--selection), transparent);
 }
 
 .metric-label {
@@ -247,14 +232,14 @@ body::before {
 
 .metric-spark polyline {
   fill: none;
-  stroke: rgba(102, 227, 255, 0.9);
+  stroke: var(--selection);
   stroke-width: 2.4;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
 
 .metric-spark .spark-fill {
-  fill: rgba(102, 227, 255, 0.12);
+  fill: var(--selection);
   stroke: none;
 }
 
@@ -312,7 +297,7 @@ body::before {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 14px;
-  background: rgba(11, 24, 38, 0.78);
+  background: var(--bg-soft);
   color: var(--text);
   min-height: 48px;
   padding: 12px 14px;
@@ -330,7 +315,7 @@ body::before {
   padding: 8px 12px;
   border-radius: 999px;
   font-size: 0.875rem;
-  background: rgba(17, 30, 48, 0.84);
+  background: var(--bg-soft);
   color: var(--muted);
   border: 1px solid var(--line);
 }
@@ -345,9 +330,9 @@ body::before {
 .incident-row {
   padding: 16px;
   min-height: 88px;
-  border: 1px solid rgba(114, 151, 196, 0.12);
+  border: 1px solid var(--line);
   border-radius: 18px;
-  background: rgba(8, 17, 29, 0.78);
+  background: var(--bg-soft);
   cursor: pointer;
   display: grid;
   gap: 8px;
@@ -359,13 +344,13 @@ body::before {
 }
 
 .incident-row.active {
-  border-color: rgba(102, 227, 255, 0.56);
-  background: rgba(18, 34, 53, 0.94);
-  box-shadow: 0 0 0 1px rgba(102, 227, 255, 0.18);
+  border-color: var(--selection);
+  background: var(--bg-soft);
+  box-shadow: 0 0 0 1px var(--selection);
 }
 
 .incident-row.focused {
-  outline: 1px solid rgba(141, 180, 255, 0.55);
+  outline: 1px solid var(--bg-soft);
   outline-offset: 2px;
 }
 
@@ -379,7 +364,7 @@ body::before {
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  box-shadow: 0 0 16px currentColor;
+
 }
 
 .sev-critical { color: var(--danger); }
@@ -426,9 +411,9 @@ body::before {
 }
 
 .tab.active {
-  border-color: rgba(102, 227, 255, 0.42);
+  border-color: var(--selection);
   color: var(--text);
-  background: rgba(20, 42, 63, 0.94);
+  background: var(--bg-soft);
 }
 
 .tab-body {
@@ -472,7 +457,7 @@ body::before {
   padding: 7px 10px;
   border-radius: 999px;
   margin-bottom: 14px;
-  background: rgba(24, 41, 63, 0.86);
+  background: var(--bg-soft);
   border: 1px solid var(--line);
   color: var(--muted);
   font-size: 0.875rem;
@@ -521,8 +506,8 @@ body::before {
   margin: 0;
   padding: 11px 12px;
   border-radius: 14px;
-  background: rgba(4, 9, 18, 0.88);
-  border: 1px solid rgba(114, 151, 196, 0.12);
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
   color: #c7f4ff;
   font-family: var(--font-mono);
   font-size: 0.875rem;
@@ -538,7 +523,7 @@ body::before {
 .pill {
   padding: 7px 10px;
   border-radius: 999px;
-  background: rgba(20, 37, 56, 0.86);
+  background: var(--bg-soft);
   border: 1px solid var(--line);
   font-size: 0.875rem;
   color: var(--muted);
@@ -547,7 +532,7 @@ body::before {
 .table-wrap {
   overflow: auto;
   border-radius: 18px;
-  border: 1px solid rgba(114, 151, 196, 0.08);
+  border: 1px solid var(--line);
 }
 
 table {
@@ -559,7 +544,7 @@ table {
 th, td {
   padding: 12px 14px;
   text-align: left;
-  border-bottom: 1px solid rgba(114, 151, 196, 0.08);
+  border-bottom: 1px solid var(--line);
   vertical-align: top;
 }
 
@@ -569,7 +554,7 @@ th {
   font-size: 0.875rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  background: rgba(8, 14, 24, 0.55);
+  background: var(--bg-soft);
   position: sticky;
   top: 0;
 }
@@ -580,7 +565,7 @@ td {
 }
 
 tr:hover td {
-  background: rgba(19, 34, 53, 0.48);
+  background: var(--bg-soft);
 }
 
 .state {
@@ -593,16 +578,16 @@ tr:hover td {
   gap: 8px;
 }
 
-.state.ok { color: var(--accent-2); background: rgba(30, 67, 48, 0.32); }
-.state.warn { color: var(--warn); background: rgba(88, 61, 10, 0.32); }
-.state.fail { color: var(--danger); background: rgba(88, 25, 34, 0.32); }
-.state.info { color: var(--info); background: rgba(27, 49, 84, 0.32); }
+.state.ok { color: var(--accent-2); background: var(--bg-soft); }
+.state.warn { color: var(--warn); background: var(--bg-soft); }
+.state.fail { color: var(--danger); background: var(--bg-soft); }
+.state.info { color: var(--info); background: var(--bg-soft); }
 
 .empty {
   padding: 28px;
   text-align: center;
   color: var(--muted);
-  border: 1px dashed rgba(114, 151, 196, 0.18);
+  border: 1px dashed var(--line);
   border-radius: 18px;
 }
 
@@ -627,8 +612,8 @@ tr:hover td {
   gap: 12px;
   padding: 16px;
   border-radius: 18px;
-  border: 1px solid rgba(114, 151, 196, 0.12);
-  background: rgba(8, 14, 24, 0.58);
+  border: 1px solid var(--line);
+  background: var(--bg-soft);
 }
 
 .record-row {
@@ -664,8 +649,8 @@ tr:hover td {
   max-width: min(420px, calc(100vw - 32px));
   padding: 14px 16px;
   border-radius: 16px;
-  border: 1px solid rgba(102, 227, 255, 0.24);
-  background: rgba(9, 19, 33, 0.94);
+  border: 1px solid var(--selection);
+  background: var(--bg-soft);
   color: var(--text);
   box-shadow: var(--shadow);
   font-size: 0.9375rem;
@@ -694,21 +679,21 @@ tr:hover td {
   gap: 8px;
   padding: 14px;
   border-radius: 18px;
-  border: 1px solid rgba(114, 151, 196, 0.12);
-  background: rgba(8, 17, 29, 0.78);
+  border: 1px solid var(--line);
+  background: var(--bg-soft);
   cursor: pointer;
   transition: transform .18s ease, border-color .18s ease, background .18s ease;
 }
 
 .log-card:hover {
   transform: translateY(-1px);
-  border-color: rgba(114, 151, 196, 0.28);
+  border-color: var(--line);
 }
 
 .log-card.active {
-  border-color: rgba(102, 227, 255, 0.52);
-  background: rgba(18, 34, 53, 0.94);
-  box-shadow: 0 0 0 1px rgba(102, 227, 255, 0.14);
+  border-color: var(--selection);
+  background: var(--bg-soft);
+  box-shadow: 0 0 0 1px var(--selection);
 }
 
 .log-top,
@@ -736,15 +721,15 @@ tr:hover td {
   gap: 10px;
   padding: 11px 12px;
   border-radius: 14px;
-  border: 1px solid rgba(114, 151, 196, 0.12);
-  background: rgba(4, 9, 18, 0.88);
+  border: 1px solid var(--line);
+  background: var(--bg-soft);
   font-family: var(--font-mono);
   font-size: 0.875rem;
 }
 
 .log-line.match {
-  border-color: rgba(102, 227, 255, 0.32);
-  background: rgba(13, 28, 44, 0.96);
+  border-color: var(--selection);
+  background: var(--bg-soft);
 }
 
 .mono {
@@ -777,15 +762,112 @@ tr:hover td {
   .tab-body { padding: 16px; }
   .toast-stack { right: 16px; left: 16px; bottom: 16px; }
 }
+
+/* Operator console: a quiet status rail and a bounded queue beside the evidence. */
+:root {
+  color-scheme: dark light;
+  --bg: #101619; --bg-panel: #171f23; --bg-elev: #1c262b; --bg-soft: #243137;
+  --line: #3b4b52; --line-strong: #647b86; --selection: #244a50;
+  --text: #eef3f4; --muted: #bbc8ce; --dim: #a4b7bf;
+  --accent: #82ddd3; --accent-2: #a1deb0; --warn: #f3c378; --danger: #ff9caa; --info: #a6caff;
+  --shadow: 0 6px 20px #00000018;
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-6: 24px;
+}
+body { font-size: 15px; line-height: 1.5; }
+::selection { background: var(--selection); color: var(--text); }
+input, textarea { caret-color: var(--accent); }
+button, input, select, a { touch-action: manipulation; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.topbar { padding: 20px 24px 16px; border-bottom: 1px solid var(--line); }
+.brand { letter-spacing: .08em; font-size: .75rem; }
+.title { margin: 0; font-size: 1.5rem; line-height: 1.3; }
+.skip-link { position: fixed; left: 16px; top: -100px; z-index: 100; padding: 12px; background: var(--bg-panel); color: var(--accent); }
+.skip-link:focus { top: 12px; }
+.title-context { color: var(--muted); font-weight: 400; }
+.subtitle { max-width: 72ch; font-size: .875rem; }
+.signal-strip { gap: 8px; }
+.chip { border: 0; background: none; border-radius: 0; padding: 0 12px 0 0; gap: 5px; min-height: 0; }
+.chip + .chip { padding-left: 12px; border-left: 1px solid var(--line); }
+.button, .tab { font-family: var(--font-sans); border-radius: 5px; padding: 8px 12px; }
+.button:hover, .incident-row:hover, .log-card:hover { transform: none; background: var(--bg-soft); }
+.button:disabled { opacity: .6; cursor: wait; transform: none; }
+.button.primary { background: var(--selection); border-color: var(--accent); gap: 12px; margin: 12px 0 4px; }
+kbd { font: .75rem var(--font-mono); color: var(--muted); padding: 2px 4px; border: 1px solid var(--line); border-radius: 3px; }
+.hero-grid { grid-template-columns: repeat(5,minmax(0,1fr)); gap: 0; padding: 0 24px; margin: 16px 0; }
+.metric-card { background: transparent; border: 0; border-right: 1px solid var(--line); border-radius: 0; padding: 8px 16px; box-shadow: none; min-height: 0; }
+.metric-card:first-child { padding-left: 0; }
+.metric-card:last-child { border-right: 0; }
+.metric-label, .panel-title, .kv-label { font-family: var(--font-sans); text-transform: none; letter-spacing: 0; font-size: .8125rem; font-weight: 600; }
+.metric-value { font-size: 1.125rem; line-height: 1.4; margin: 4px 0; }
+.metric-sub, .metric-trend { font-size: .8125rem; }
+.metric-trend { flex-wrap: wrap; gap: 4px; }
+.workspace { grid-template-columns: minmax(260px,310px) minmax(0,1fr); align-items: start; }
+.panel, .card { border-radius: 6px; box-shadow: none; }
+.sidebar { grid-template-rows: auto auto minmax(0,1fr); position: sticky; top: 12px; max-height: calc(100dvh - 24px); }
+.queue-list { grid-auto-rows: max-content; align-content: start; min-height: 0; gap: 4px; padding: 0 8px 8px; overscroll-behavior: contain; }
+.incident-row { min-height: 0; padding: 12px; gap: 6px; border-radius: 4px; background: transparent; }
+.incident-row.active, .log-card.active { background: var(--selection); border-color: var(--accent); box-shadow: none; }
+.incident-title { font-size: .875rem; }
+.incident-sub, .incident-times { font-size: .75rem; gap: 6px; }
+.sev-dot { flex: 0 0 8px; width: 8px; height: 8px; }
+.dot-fill { background: currentColor; }
+.queue-stat, .pill, .detail-kicker { border-radius: 4px; padding: 4px 8px; font-size: .75rem; }
+.tabs { gap: 4px; padding: 8px; border-bottom: 1px solid var(--line); }
+.tab.active { background: var(--selection); border-color: var(--accent); }
+.tab-body { padding: 16px; min-width: 0; }
+.card { padding: 16px; }
+.card .card { background: transparent; border: 0; border-top: 1px solid var(--line); border-radius: 0; padding: 16px 0 0; }
+.detail-kicker { flex-wrap: wrap; }
+.detail-title { font-size: 1.25rem; line-height: 1.4; overflow-wrap: anywhere; }
+.detail-columns { grid-template-columns: minmax(0,1fr); }
+.detail-columns > .stack { min-width: 0; }
+.code, .code-block { background: var(--bg); color: var(--text); border-color: var(--line); border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.kv-value, .metric-sub, .panel-meta, .log-message { overflow-wrap: anywhere; }
+.card p { max-width: 72ch; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.section-heading h3 { margin: 0; }
+.plan-state { font-size: .75rem; color: var(--accent); border: 1px solid var(--line); border-radius: 4px; padding: 3px 8px; }
+.mt-2 { margin-top: var(--space-2); } .mt-3 { margin-top: var(--space-3); } .mt-4 { margin-top: var(--space-4); }
+.inset { padding: var(--space-4); } .read-only { cursor: default; }
+.flat-section { padding: 0; border: 0; background: none; box-shadow: none; }
+.context-title { margin: 12px 0 8px; }
+.pressure { display: grid; gap: 6px; min-width: 120px; font-variant-numeric: tabular-nums; }
+meter { width: 100%; height: 12px; accent-color: var(--accent-2); }
+meter::-webkit-meter-bar { background: var(--bg-soft); border: 1px solid var(--line); }
+meter::-webkit-meter-optimum-value { background: var(--accent-2); }
+meter.pressure-warn::-webkit-meter-optimum-value { background: var(--warn); }
+meter.pressure-fail::-webkit-meter-optimum-value { background: var(--danger); }
+.footer { gap: 12px; font-size: .75rem; }
+dialog { padding: 24px; color: var(--text); background: var(--bg-panel); border: 1px solid var(--line); border-radius: 6px; max-width: min(440px,calc(100vw - 32px)); }
+dialog::backdrop { background: #0009; }
+#login-form { display: grid; gap: 12px; } #pairing-code { min-height: 44px; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); padding: 8px; }
+@media (max-width: 1120px) { .hero-grid { grid-template-columns: repeat(3,minmax(0,1fr)); gap: 12px; } .workspace { grid-template-columns: minmax(240px,280px) minmax(0,1fr); } .section-grid { grid-template-columns: 1fr; } }
+@media (max-width: 720px) {
+ .topbar { padding: 16px; } .signal-strip { gap: 6px 14px; } .chip + .chip { border-left: 0; padding-left: 0; }
+ .hero-grid { grid-template-columns: repeat(2,minmax(0,1fr)); padding: 0 16px; gap: 8px; }
+ .metric-card { padding: 8px 0; border: 0; } .metric-trend { display: none; }
+ .workspace { grid-template-columns: minmax(0,1fr); padding: 0 12px 16px; gap: 12px; }
+ #app { display: flex; flex-direction: column; } .hero-grid { order: 1; } .footer { order: 2; }
+ .sidebar { position: static; max-height: 320px; } .queue-list { max-height: 180px; }
+ .tabs { gap: 4px; padding: 8px; } .tab { flex: 1 0 auto; }
+ .tab-body { padding: 12px; } .card { padding: 12px; }
+ .log-line { grid-template-columns: 48px minmax(0,1fr); } .section-heading { flex-wrap: wrap; }
+}
+@media (prefers-color-scheme: light) {
+ :root { --bg: #f2f5f4; --bg-panel: #ffffff; --bg-elev: #f8faf9; --bg-soft: #e8eeed; --line: #c2d0cd; --line-strong: #7b938e; --selection: #d7eeea; --text: #172b29; --muted: #425d58; --dim: #4f6763; --accent: #116e63; --accent-2: #246c39; --warn: #805700; --danger: #ad2844; --info: #275eb2; }
+}
+@media (prefers-reduced-motion: reduce) { .button, .tab, .incident-row, .log-card { transition: none; } }
+
 </style>
 </head>
 <body>
+<a class="skip-link" href="#tab-body">Skip to workspace</a>
 <dialog id="login-dialog" aria-labelledby="login-title">
   <form id="login-form">
     <h2 id="login-title">Pair this browser</h2>
     <p>Enter the single-use pairing code printed by helm web. Sessions expire after 15 minutes.</p>
     <label for="pairing-code">Pairing code</label>
-    <input id="pairing-code" type="password" autocomplete="off" required>
+    <input id="pairing-code" name="pairing-code" spellcheck="false" type="password" autocomplete="off" required>
     <button type="submit" class="button">Sign in</button>
     <p id="login-error" role="alert"></p>
   </form>
@@ -793,8 +875,7 @@ tr:hover td {
 <div id="app">
   <div class="topbar">
     <div class="brand-block">
-      <div class="brand">HELMOPS</div>
-      <div class="title">Operations Console</div>
+      <h1 class="title">HELM <span class="title-context">Operations Console</span></h1>
       <div class="subtitle" id="hero-subtitle">Realtime troubleshooting across host, services, containers, data, and fleet.</div>
     </div>
     <div class="signal-strip">
@@ -805,7 +886,6 @@ tr:hover td {
       <div class="chip"><strong id="chip-daemon">offline</strong> daemon</div>
       <div class="chip"><strong id="chip-clock">--:--:--</strong> utc</div>
       <button class="button" id="btn-refresh" type="button">refresh snapshot</button>
-      <button class="button" id="btn-plan" type="button">generate plan</button>
     </div>
   </div>
 
@@ -821,15 +901,15 @@ tr:hover td {
         <div class="panel-meta" id="queue-selection">no selection</div>
       </div>
       <div class="sidebar-tools">
-        <input id="search" class="search" type="search" placeholder="Filter incidents by title, resource, or domain">
+        <input id="search" name="incident-filter" autocomplete="off" class="search" type="search" aria-label="Filter incidents" placeholder="Filter incidents by title, resource, or domain">
         <div class="queue-stats" id="queue-stats"></div>
       </div>
       <div class="queue-list" id="queue-list"></div>
     </aside>
 
     <section class="panel content">
-      <div class="tabs" id="tabs"></div>
-      <div class="tab-body" id="tab-body"></div>
+      <nav class="tabs" id="tabs" aria-label="Workspaces"></nav>
+      <main class="tab-body" id="tab-body" tabindex="-1"><div class="empty" role="status">Connecting to HELM… Pair this browser to load a snapshot.</div></main>
     </section>
   </div>
 
@@ -906,12 +986,34 @@ async function postJson(url, body) {
     return {error: `Cannot reach HELM: ${error.message}`};
   }
 }
+const pendingActions = new Set();
+function actionKey(url, payload) { return `${url}:${JSON.stringify(payload)}`; }
+function syncActionButtons() {
+  document.querySelectorAll('[data-service-action]').forEach(node => {
+    node.disabled = pendingActions.has(actionKey('/api/service-action', {unit: node.dataset.serviceUnit, action: node.dataset.serviceAction}));
+  });
+  document.querySelectorAll('[data-change-rollback]').forEach(node => {
+    node.disabled = pendingActions.has(actionKey('/api/change-rollback', {changeSetId: node.dataset.changeRollback}));
+  });
+  document.querySelectorAll('[data-plan-generate], [data-plan-retry]').forEach(node => {
+    node.disabled = planBusy;
+    node.setAttribute('aria-busy', String(planBusy));
+  });
+}
 async function reviewedAction(url, payload) {
-  const send = body => postJson(url, body);
-  const prepared = await send(payload);
-  if (!prepared.approvalId) return prepared;
-  if (!window.confirm(prepared.review)) return {ok: false, error: 'Action denied; nothing executed'};
-  return send({...payload, approvalId: prepared.approvalId});
+  const key = actionKey(url, payload);
+  if (pendingActions.has(key)) return {ok: false, error: 'This action is already in progress'};
+  pendingActions.add(key);
+  syncActionButtons();
+  try {
+    const prepared = await postJson(url, payload);
+    if (!prepared.approvalId) return prepared;
+    if (!window.confirm(prepared.review)) return {ok: false, error: 'Action denied; nothing executed'};
+    return await postJson(url, {...payload, approvalId: prepared.approvalId});
+  } finally {
+    pendingActions.delete(key);
+    syncActionButtons();
+  }
 }
 function showLogin() {
   const dialog = document.getElementById('login-dialog');
@@ -987,13 +1089,30 @@ function applySnapshot(snapshot) {
   resumePlanPolling();
 }
 
+function rememberFocus() {
+  const el = document.activeElement;
+  if (!el || el === document.body) return () => {};
+  const id = el.id;
+  const dataset = {...el.dataset};
+  const keys = ['tab', 'fingerprint', 'serviceAction', 'serviceUnit', 'changeId', 'changeRollback', 'planGenerate', 'planRetry'].filter(key => key in dataset);
+  const start = el.selectionStart;
+  const end = el.selectionEnd;
+  return () => {
+    const target = id ? document.getElementById(id) : keys.length ? [...document.querySelectorAll('button, a, [tabindex]')].find(node => keys.every(key => node.dataset?.[key] === dataset[key])) : null;
+    if (!target || target === document.activeElement) return;
+    target.focus({preventScroll: true});
+    if (typeof start === 'number' && typeof target.setSelectionRange === 'function') target.setSelectionRange(start, end);
+  };
+}
 function renderAll() {
+  const restore = rememberFocus();
   renderConnection();
   renderHeader();
   renderHero();
   renderQueue();
   renderTabs();
   renderActiveTab();
+  restore();
 }
 
 function renderConnection() {
@@ -1010,7 +1129,7 @@ function renderHeader() {
   document.getElementById('chip-scope').textContent = d.scope || 'local';
   document.getElementById('chip-provider').textContent = d.provider || 'unconfigured';
   document.getElementById('chip-ai').textContent = d.aiState || 'off';
-  document.getElementById('chip-daemon').textContent = daemon.running ? (daemon.status || 'running') : 'offline';
+  document.getElementById('chip-daemon').textContent = daemon.running ? (daemon.status || 'running') : (daemon.status || 'stopped');
   document.getElementById('chip-clock').textContent = new Date().toISOString().slice(11, 19);
 }
 
@@ -1040,7 +1159,7 @@ function renderHero() {
   const cards = [
     {
       label: 'daemon status',
-      value: daemon.running ? (daemon.status || 'running') : 'offline',
+      value: daemon.running ? (daemon.status || 'running') : (daemon.status || 'stopped'),
       sub: `${d.profile || 'quick'} profile · ${d.snapshotSource || 'live'} source`,
       trend: ['refresh', `${daemon.refreshIntervalSecs || 0}s cadence · ${daemonSummary()}`],
       spark: d.metricHistory?.load || [],
@@ -1081,7 +1200,7 @@ function renderHero() {
       <div class="metric-value">${esc(card.value)}</div>
       <div class="metric-sub">${esc(card.sub)}</div>
       <div class="metric-trend"><span>${esc(card.trend[0])}</span><strong>${esc(card.trend[1])}</strong></div>
-      <div class="metric-spark">${sparkline(card.spark)}</div>
+
     </section>
   `).join('');
 }
@@ -1121,7 +1240,7 @@ function renderQueue() {
     return `
       <article class="incident-row${active}${focused}" data-id="${f.id}" tabindex="0">
         <div class="incident-top">
-          <span class="sev-dot sev-${esc(f.severity)}" style="background: currentColor"></span>
+          <span class="sev-dot sev-${esc(f.severity)} dot-fill"></span>
           <div class="incident-title">${esc(f.title)}</div>
         </div>
         <div class="incident-sub">
@@ -1131,7 +1250,7 @@ function renderQueue() {
           ${correlationLabel ? `<span>${esc(correlationLabel)}</span>` : ''}
         </div>
         <div class="incident-times">
-          <span>open ${fmtAgo(f.firstSeen)}</span>
+          ${f.firstSeen ? `<span>open ${fmtAgo(f.firstSeen)}</span>` : ''}
           <span>seen ${fmtAgo(f.lastSeen)}</span>
           <span>${esc(f.confidence || 'unknown')} confidence</span>
         </div>
@@ -1161,18 +1280,20 @@ function renderQueue() {
 function renderTabs() {
   const tabsEl = document.getElementById('tabs');
   tabsEl.innerHTML = tabs.map(([id, label]) => `
-    <button type="button" class="tab${state.activeTab === id ? ' active' : ''}" data-tab="${id}">${esc(label)}</button>
+    <button type="button" class="tab${state.activeTab === id ? ' active' : ''}" data-tab="${id}" aria-current="${state.activeTab === id ? "page" : "false"}">${esc(label)}</button>
   `).join('');
   tabsEl.querySelectorAll('.tab').forEach(btn => {
     btn.addEventListener('click', () => {
       state.activeTab = btn.dataset.tab;
       renderTabs();
       renderActiveTab();
+      document.querySelector(`[data-tab="${state.activeTab}"]`).focus({preventScroll: true});
     });
   });
 }
 
 function renderActiveTab() {
+  const restore = rememberFocus();
   if (!state.snapshot) {
     document.getElementById('tab-body').innerHTML = '<div class="empty">Waiting for live snapshot…</div>';
     return;
@@ -1200,6 +1321,8 @@ function renderActiveTab() {
   if (state.activeTab === 'changes') {
     wireChangesTab();
   }
+  syncActionButtons();
+  restore();
 }
 
 function renderOverview() {
@@ -1212,13 +1335,13 @@ function renderOverview() {
       <div class="section-grid">
         <section class="card">
           <div class="panel-title">Collector Health</div>
-          <div class="pill-group" style="margin-top:12px">
+          <div class="pill-group mt-3">
             ${(d.collectorHealth || []).map(item => `<span class="pill">${esc(item.domain)} · ${esc(item.status || 'unknown')}</span>`).join('')}
           </div>
         </section>
         <section class="card">
           <div class="panel-title">Runtime Coverage</div>
-          <div class="pill-group" style="margin-top:12px">
+          <div class="pill-group mt-3">
             <span class="pill">services ${esc(String(inv.services?.units?.length || 0))}</span>
             <span class="pill">containers ${esc(String(inv.containers?.containers?.length || 0))}</span>
             <span class="pill">compose ${esc(String(inv.compose?.projects?.length || 0))}</span>
@@ -1228,10 +1351,6 @@ function renderOverview() {
             <span class="pill">sites ${esc(String(d.websites?.length || 0))}</span>
             <span class="pill">pipelines ${esc(String(inv.pipelines?.pipelines?.length || 0))}</span>
           </div>
-        </section>
-        <section class="card">
-          <h3>What changed before it broke</h3>
-          <p>The console preserves finding fingerprints across refresh cycles, groups correlated symptoms, and keeps the live queue stable while new daemon snapshots arrive over WebSocket. Older persisted findings can still show legacy metadata until the next fresh monitor cycle replaces them.</p>
         </section>
         <section class="card">
           <h3>Daemon posture</h3>
@@ -1260,12 +1379,12 @@ function renderServices() {
       <div class="section-grid">
         <section class="card">
           <div class="panel-title">Systemd Units</div>
-          <p class="metric-sub" style="margin-top:8px">${esc(String(overdue.length))} overdue timer(s) across ${(timers || []).length} timer(s)</p>
-          <div class="stack" style="margin-top:14px">
+          <p class="metric-sub mt-2">${esc(String(overdue.length))} overdue timer(s) across ${(timers || []).length} timer(s)</p>
+          <div class="stack mt-4">
             ${units.length ? units.map(unit => `
               <button type="button" class="incident-row${state.selectedServiceUnit === unit.name ? ' active' : ''}" data-service-unit="${escAttr(unit.name)}">
                 <div class="incident-top">
-                  <span class="sev-dot sev-${unit.active === 'failed' || unit.sub === 'failed' ? 'critical' : (unit.active === 'inactive' ? 'warning' : 'info')}" style="background: currentColor"></span>
+                  <span class="sev-dot sev-${unit.active === 'failed' || unit.sub === 'failed' ? 'critical' : (unit.active === 'inactive' ? 'warning' : 'info')} dot-fill"></span>
                   <div class="incident-title">${esc(unit.name)}</div>
                 </div>
                 <div class="incident-sub">
@@ -1281,20 +1400,20 @@ function renderServices() {
         <section class="card">
           <div class="panel-title">${selectedUnit ? esc(selectedUnit.name) : 'Service Detail'}</div>
           ${selectedUnit ? `
-            <div class="pill-group" style="margin-top:12px">
+            <div class="pill-group mt-3">
               <span class="pill">${esc(selectedUnit.active)} / ${esc(selectedUnit.sub || 'n/a')}</span>
               <span class="pill">${esc(selectedUnit.description || 'no description')}</span>
             </div>
-            <div class="inline-actions" style="margin-top:16px">
+            <div class="inline-actions mt-4">
               <button type="button" class="button" data-service-action="journal" data-service-unit="${escAttr(selectedUnit.name)}">Load Journal</button>
               <button type="button" class="button" data-service-action="restart" data-service-unit="${escAttr(selectedUnit.name)}">Restart</button>
               <button type="button" class="button" data-service-action="stop" data-service-unit="${escAttr(selectedUnit.name)}">Stop</button>
             </div>
-            <div class="stack" style="margin-top:16px">
-              <section class="card" style="padding:16px">
+            <div class="stack mt-4">
+              <section class="card inset">
                 <div class="panel-title">Timers</div>
                 ${relatedTimers.length ? relatedTimers.map(timer => `
-                  <div class="incident-row" style="cursor:default">
+                  <div class="incident-row read-only">
                     <div class="incident-top">
                       <div class="incident-title">${esc(timer.name)}</div>
                       ${isTimerOverdue(timer) ? '<span class="pill">overdue</span>' : ''}
@@ -1307,7 +1426,7 @@ function renderServices() {
                   </div>
                 `).join('') : '<div class="empty">No timers activate this unit.</div>'}
               </section>
-              <section class="card" style="padding:16px">
+              <section class="card inset">
                 <div class="panel-title">Recent Journal</div>
                 ${state.serviceJournalError ? `<div class="empty">${esc(state.serviceJournalError)}</div>` : ''}
                 ${state.serviceJournal.length
@@ -1357,8 +1476,8 @@ function renderChanges() {
     <div class="section-grid">
       <section class="card">
         <div class="panel-title">Changesets</div>
-        <p class="metric-sub" style="margin-top:8px">Chronological execution history with snapshot diffs and rollback context.</p>
-        <div class="stack" style="margin-top:14px">
+        <p class="metric-sub mt-2">Chronological execution history with snapshot diffs and rollback context.</p>
+        <div class="stack mt-4">
           ${changes.length ? changes.map(change => `
             <button type="button" class="incident-row${state.selectedChangeId === change.id ? ' active' : ''}" data-change-id="${escAttr(change.id)}">
               <div class="incident-top">
@@ -1379,29 +1498,29 @@ function renderChanges() {
       <section class="card">
         <div class="panel-title">${selected ? esc(selected.planTitle || selected.id) : 'Change Detail'}</div>
         ${selected ? `
-          <div class="pill-group" style="margin-top:12px">
+          <div class="pill-group mt-3">
             <span class="pill">${esc(selected.status)}</span>
             <span class="pill">${esc(selected.createdAt)}</span>
             ${selected.rollbackSupported ? '<span class="pill">rollback available</span>' : ''}
           </div>
-          <div class="inline-actions" style="margin-top:16px">
+          <div class="inline-actions mt-4">
             <button type="button" class="button" data-change-rollback="${escAttr(selected.id)}" ${selected.rollbackSupported ? '' : 'disabled'}>Rollback</button>
           </div>
-          <section class="card" style="padding:16px; margin-top:16px">
+          <section class="card inset mt-4">
             <div class="panel-title">Affected Resources</div>
             <p>${esc((selected.affectedResources || []).join(' · ') || 'host')}</p>
             <p class="metric-sub">${esc(selected.triggerFindingTitle || 'No triggering finding linked')}</p>
           </section>
-          <section class="card" style="padding:16px; margin-top:16px">
+          <section class="card inset mt-4">
             <div class="panel-title">Snapshot Diff</div>
             ${(selected.diffLines || []).length
               ? `<ul class="bullets">${selected.diffLines.map(line => `<li>${esc(line)}</li>`).join('')}</ul>`
               : '<div class="empty">No pre/post snapshot diff captured.</div>'}
           </section>
-          <section class="card" style="padding:16px; margin-top:16px">
+          <section class="card inset mt-4">
             <div class="panel-title">Execution Log</div>
             ${(selected.steps || []).length ? selected.steps.map((step, index) => `
-              <div class="incident-row" style="cursor:default">
+              <div class="incident-row read-only">
                 <div class="incident-top">
                   <div class="incident-title">${index + 1}. ${esc(step.title)}</div>
                   <span class="pill">${esc(step.status)}</span>
@@ -1484,7 +1603,7 @@ function renderData() {
     <div class="stack">
       <section class="card">
         <div class="panel-title">Deployment Metrics</div>
-        <div class="pill-group" style="margin-top:12px">
+        <div class="pill-group mt-3">
           <span class="pill">deploy/day ${esc(fmt1(inv.pipelines?.deployment_frequency_per_day || 0))}</span>
           <span class="pill">change failure ${esc(`${fmt1(inv.pipelines?.change_failure_rate || 0)}%`)}</span>
           <span class="pill">running builds ${esc(String(inv.pipelines?.running_builds || 0))}</span>
@@ -1522,12 +1641,12 @@ function renderLogs() {
     <div class="stack">
       <section class="card">
         <div class="panel-title">Log Filters</div>
-        <div class="filter-bar" style="margin-top:14px">
-          <input id="log-unit-filter" class="search" type="search" value="${esc(state.logFilters.unit)}" placeholder="Filter by unit name">
-          <select id="log-severity-filter" class="search" aria-label="Filter by severity">
+        <div class="filter-bar mt-4">
+          <input id="log-unit-filter" name="log-unit-filter" autocomplete="off" aria-label="Filter logs by unit" class="search" type="search" value="${esc(state.logFilters.unit)}" placeholder="Filter by unit name">
+          <select id="log-severity-filter" name="log-severity-filter" class="search" aria-label="Filter by severity">
             ${['all', 'warning', 'error', 'critical'].map(level => `<option value="${level}" ${state.logFilters.severity === level ? 'selected' : ''}>${esc(level)}</option>`).join('')}
           </select>
-          <select id="log-range-filter" class="search" aria-label="Filter by time range">
+          <select id="log-range-filter" name="log-range-filter" class="search" aria-label="Filter by time range">
             ${[
               ['15m', 'last 15 minutes'],
               ['1h', 'last hour'],
@@ -1541,7 +1660,7 @@ function renderLogs() {
       <div class="log-shell">
         <section class="card">
           <div class="panel-title">Pattern Queue</div>
-          <div class="panel-meta" style="margin-top:8px">${patterns.length} filtered · ${totalPatterns.length} total</div>
+          <div class="panel-meta mt-2">${patterns.length} filtered · ${totalPatterns.length} total</div>
           <div class="log-list">
             ${patterns.length ? patterns.map(pattern => logPatternCard(pattern)).join('') : '<div class="empty">No grouped journal patterns match the current filter set.</div>'}
           </div>
@@ -1577,7 +1696,7 @@ function renderNetwork() {
       ]), 3)}
       <section class="card">
         <div class="panel-title">Name Servers</div>
-        <div class="pill-group" style="margin-top:12px">
+        <div class="pill-group mt-3">
           ${(inv.network?.nameservers || []).map(ns => `<span class="pill">${esc(ns)}</span>`).join('') || '<span class="pill">none discovered</span>'}
         </div>
       </section>
@@ -1632,7 +1751,7 @@ function incidentDetailCard(finding) {
   return `
     <section class="card">
       <div class="detail-kicker">
-        <span class="sev-dot sev-${esc(finding.severity)}" style="background: currentColor"></span>
+        <span class="sev-dot sev-${esc(finding.severity)} dot-fill"></span>
         <span>${esc(finding.category)}</span>
         <span>${esc(finding.lifecycleState || 'open')}</span>
         <span>${esc(finding.confidence || 'unknown')} confidence</span>
@@ -1640,7 +1759,7 @@ function incidentDetailCard(finding) {
       <h2 class="detail-title">${esc(finding.title)}</h2>
       <div class="detail-columns">
         <div class="stack">
-          <section class="card" style="padding:0;border:none;background:none;box-shadow:none">
+          <section class="card flat-section">
             <div class="kv">
               <div class="kv-row">
                 <div class="kv-label">What broke</div>
@@ -1652,11 +1771,11 @@ function incidentDetailCard(finding) {
               </div>
               <div class="kv-row">
                 <div class="kv-label">Evidence summary</div>
-                <div class="kv-value">${esc(finding.evidenceSummary || 'No evidence captured')}</div>
+                <div class="kv-value">${esc([finding.evidenceSummary, finding.evidence?.[0]?.note].filter(Boolean).join(' — ') || 'No evidence captured')}</div>
               </div>
               <div class="kv-row">
                 <div class="kv-label">Timing</div>
-                <div class="kv-value">open ${fmtAgo(finding.firstSeen)} · seen ${fmtAgo(finding.lastSeen)} · ${esc(String(finding.occurrenceCount || 1))} occurrence(s)</div>
+                <div class="kv-value">${finding.firstSeen ? `open ${fmtAgo(finding.firstSeen)}` : 'first seen unknown (no persisted history)'} · seen ${fmtAgo(finding.lastSeen)} · ${esc(String(finding.occurrenceCount || 1))} occurrence(s)</div>
               </div>
               <div class="kv-row">
                 <div class="kv-label">Correlation</div>
@@ -1670,7 +1789,7 @@ function incidentDetailCard(finding) {
           </section>
           <section class="card">
             <div class="panel-title">Evidence trail</div>
-            <div class="code-list" style="margin-top:12px">
+            <div class="code-list mt-3">
               ${(finding.evidence || []).map(item => `<pre class="code">${esc(item.source)}\n${esc(item.value)}\n${esc(item.note || '')}</pre>`).join('') || '<div class="empty">No structured evidence captured.</div>'}
             </div>
           </section>
@@ -1678,13 +1797,14 @@ function incidentDetailCard(finding) {
         <div class="stack">
           <section class="card">
             <div class="panel-title">Verify</div>
-            <div class="code-list" style="margin-top:12px">
+            <div class="code-list mt-3">
               ${(finding.readOnlyChecks || []).map(cmd => `<pre class="code">${esc(cmd)}</pre>`).join('') || '<div class="empty">No verification commands captured.</div>'}
             </div>
           </section>
           <section class="card">
-            <div class="panel-title">Recommended fix</div>
-            <div class="kv" style="margin-top:12px">
+            <div class="section-heading"><h3>Fix / AI plan</h3><span class="plan-state" role="status">${esc(finding.planStatus || (state.planNotes[finding.fingerprint] ? 'disabled' : 'not generated'))}</span></div>
+            <button type="button" class="button primary" data-plan-generate ${planBusy ? 'disabled' : ''}>${finding.planStatus === 'loading' ? 'Generating…' : 'Generate plan'} <kbd>Alt+G</kbd></button>
+            <div class="kv mt-3">
               <div class="kv-row">
                 <div class="kv-label">Fix plan</div>
                 <div class="kv-value">${finding.fixPlan ? `<pre class="code">${esc(finding.fixPlan)}</pre>` : 'No deterministic fix plan for this finding.'}</div>
@@ -1708,7 +1828,7 @@ function incidentDetailCard(finding) {
 
 function tableCard(title, headers, rows, colspan) {
   if (!rows.length) {
-    return `<section class="card"><div class="panel-title">${esc(title)}</div><div class="empty" style="margin-top:12px">No data available.</div></section>`;
+    return `<section class="card"><div class="panel-title">${esc(title)}</div><div class="empty mt-3">No data available.</div></section>`;
   }
   const width = colspan || headers.length;
   const records = rows.map(row => `
@@ -1724,7 +1844,7 @@ function tableCard(title, headers, rows, colspan) {
   return `
     <section class="card">
       <div class="panel-title">${esc(title)}</div>
-      <div class="table-wrap" style="margin-top:12px">
+      <div class="table-wrap mt-3">
         <table>
           <thead><tr>${headers.map(head => `<th>${esc(head)}</th>`).join('')}</tr></thead>
           <tbody>
@@ -1894,7 +2014,7 @@ function logPatternDetail(pattern) {
   const context = pattern.context_lines || [];
   return `
     <div class="panel-title">Selected Pattern</div>
-    <h3 style="margin:12px 0 8px">${esc(pattern.unit || 'journal')}</h3>
+    <h3 class="context-title">${esc(pattern.unit || 'journal')}</h3>
     <div class="pill-group">
       ${statePill(classifyStatus(pattern.severity), pattern.severity)}
       <span class="pill">occurrences ${esc(String(pattern.occurrence_count || 0))}</span>
@@ -1902,8 +2022,8 @@ function logPatternDetail(pattern) {
       <span class="pill">last ${esc(fmtAgoFromUnixMs(pattern.last_seen_unix_ms || 0))}</span>
       ${pattern.isNew ? '<span class="pill">new in previous cycle comparison</span>' : ''}
     </div>
-    <p style="margin-top:14px">${esc(pattern.sample_message || pattern.normalized_message || '')}</p>
-    <div class="code" style="margin-top:12px">${esc(pattern.normalized_message || '')}</div>
+    <p class="mt-4">${esc(pattern.sample_message || pattern.normalized_message || '')}</p>
+    <div class="code mt-3">${esc(pattern.normalized_message || '')}</div>
     <div class="log-context">
       ${context.length ? context.map(line => `
         <div class="log-line${line.offset === 0 ? ' match' : ''}">
@@ -2080,14 +2200,7 @@ function statePill(kind, label) {
 function pressureBar(value) {
   const v = Math.max(0, Math.min(100, value || 0));
   const kind = v >= 90 ? 'fail' : v >= 75 ? 'warn' : 'ok';
-  return `
-    <div style="display:grid;gap:6px;min-width:160px">
-      <div>${Math.round(v)}%</div>
-      <div style="height:8px;border-radius:999px;background:rgba(255,255,255,0.06);overflow:hidden">
-        <div style="width:${v}%;height:100%;background:${kind === 'fail' ? 'var(--danger)' : kind === 'warn' ? 'var(--warn)' : 'var(--accent-2)'}"></div>
-      </div>
-    </div>
-  `;
+  return `<div class="pressure"><span>${Math.round(v)}%</span><meter class="pressure-${kind}" min="0" max="100" value="${v}" aria-label="Usage">${Math.round(v)}%</meter></div>`;
 }
 
 function fmt1(value) {
@@ -2169,7 +2282,7 @@ function renderSecuritySections() {
   return `
     <section class="card">
       <div class="panel-title">Firewall posture</div>
-      <div class="pill-group" style="margin-top:12px">
+      <div class="pill-group mt-3">
         <span class="pill">tool ${esc(firewall.firewall_tool || 'none')}</span>
         <span class="pill">ufw ${String(firewall.ufw_active ?? false)}</span>
         <span class="pill">firewalld ${String(firewall.firewalld_active ?? false)}</span>
@@ -2186,7 +2299,7 @@ function renderSecuritySections() {
     ]))}
     <section class="card">
       <div class="panel-title">Recent security-relevant logs</div>
-      <div class="code-list" style="margin-top:12px">
+      <div class="code-list mt-3">
         ${(d.logEntries || []).map(line => `<pre class="code">${esc(line)}</pre>`).join('') || '<div class="empty">No recent security-relevant logs.</div>'}
       </div>
     </section>
@@ -2229,17 +2342,23 @@ async function requestPlan(retry = false) {
     toast('Select an incident first');
     return;
   }
-  if (planBusy) return;
+  if (planBusy) { toast('A plan is already generating. Its result will remain with that incident.'); return; }
   planBusy = true;
+  finding.planStatus = 'loading';
+  finding.planError = null;
+  if (state.activeTab === 'overview') renderActiveTab();
+  syncActionButtons();
   const button = document.getElementById('btn-plan');
-  button.disabled = true;
-  button.textContent = 'generating…';
+  if (button) { button.disabled = true; button.textContent = 'Generating…'; }
   const started = Date.now();
   try {
     let body = { findingId: finding.id, fingerprint: finding.fingerprint, retry };
     for (;;) {
       const data = await postJson('/api/plan', body);
       if (data.error) {
+        const target = state.findings.find(item => item.fingerprint === finding.fingerprint) || finding;
+        target.planStatus = 'failed'; target.planError = data.error;
+        if (state.activeTab === 'overview') renderActiveTab();
         toast(data.error);
         return;
       }
@@ -2262,8 +2381,8 @@ async function requestPlan(retry = false) {
     toast(`Plan request failed: ${error.message}`);
   } finally {
     planBusy = false;
-    button.disabled = false;
-    button.textContent = 'generate plan';
+    if (button) { button.disabled = false; button.textContent = 'Generate plan'; }
+    syncActionButtons();
   }
 }
 
@@ -2293,6 +2412,7 @@ function aiPlanRow(finding) {
 
 document.getElementById('tab-body').addEventListener('click', (event) => {
   if (event.target.closest('[data-plan-retry]')) requestPlan(true);
+  else if (event.target.closest('[data-plan-generate]')) requestPlan();
 });
 
 document.getElementById('search').addEventListener('input', (event) => {
@@ -2303,10 +2423,13 @@ document.getElementById('search').addEventListener('input', (event) => {
 });
 
 document.getElementById('btn-refresh').addEventListener('click', refreshSnapshot);
-document.getElementById('btn-plan').addEventListener('click', () => requestPlan());
+document.getElementById('btn-plan')?.addEventListener('click', () => requestPlan());
 
 document.addEventListener('keydown', (event) => {
-  const isTyping = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
+  if (event.defaultPrevented || document.getElementById('login-dialog').open) return;
+  const active = document.activeElement;
+  const isTyping = ['INPUT', 'TEXTAREA', 'SELECT'].includes(active?.tagName) || active?.isContentEditable;
+  const nativeControl = active?.closest('button, a, input, textarea, select, [contenteditable]');
   if (event.key === 'F5') {
     event.preventDefault();
     refreshSnapshot();
@@ -2323,7 +2446,7 @@ document.addEventListener('keydown', (event) => {
     event.preventDefault();
     return;
   }
-  if (isTyping) return;
+  if (isTyping || nativeControl || event.ctrlKey || event.metaKey || event.altKey) return;
   if (event.key === 'Enter') {
     const target = state.focusedFindingId || filteredFindings()[0]?.id;
     if (target) {

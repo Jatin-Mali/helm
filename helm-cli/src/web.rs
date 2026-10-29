@@ -1214,9 +1214,11 @@ fn finding_entry(
         first_seen: history
             .map(|h| timestamp_to_rfc3339(h.first_seen_ts))
             .unwrap_or_default(),
+        // Without persisted history (live, no daemon) the finding was observed this cycle;
+        // first-seen stays unknown rather than pretending the problem just started.
         last_seen: history
             .map(|h| timestamp_to_rfc3339(h.last_seen_ts))
-            .unwrap_or_default(),
+            .unwrap_or_else(|| finding.detected_at.to_rfc3339()),
         occurrence_count: history.map(|h| h.count).unwrap_or(1),
         detector_id: finding.detector_id.clone(),
         correlation_id: finding.correlation_id.clone(),
