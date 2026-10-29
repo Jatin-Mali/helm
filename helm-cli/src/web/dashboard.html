@@ -889,11 +889,25 @@ async function authenticatedFetch(url, options = {}) {
   if (response.status === 401) showLogin();
   return response;
 }
-async function reviewedAction(url, payload) {
-  const send = async body => {
+// Every API answer becomes an object; an expired session or non-JSON reply becomes {error}.
+async function jsonOrError(response) {
+  if (response.status === 401) return {error: 'Session expired — enter a new pairing code'};
+  try {
+    return await response.json();
+  } catch {
+    return {error: `Unexpected server reply (HTTP ${response.status})`};
+  }
+}
+async function postJson(url, body) {
+  try {
     const response = await authenticatedFetch(url, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body)});
-    return response.json();
-  };
+    return await jsonOrError(response);
+  } catch (error) {
+    return {error: `Cannot reach HELM: ${error.message}`};
+  }
+}
+async function reviewedAction(url, payload) {
+  const send = body => postJson(url, body);
   const prepared = await send(payload);
   if (!prepared.approvalId) return prepared;
   if (!window.confirm(prepared.review)) return {ok: false, error: 'Action denied; nothing executed'};
@@ -1954,6 +1968,7 @@ function wireServicesTab() {
     node.addEventListener('click', async () => {
       const unit = node.dataset.serviceUnit;
       const action = node.dataset.serviceAction;
+      node.disabled = true;
       try {
         const data = await reviewedAction('/api/service-action', {unit, action});
         if (!data.ok) {
@@ -1986,6 +2001,7 @@ function wireChangesTab() {
   document.querySelectorAll('[data-change-rollback]').forEach(node => {
     node.addEventListener('click', async () => {
       const changeSetId = node.dataset.changeRollback;
+      node.disabled = true;
       try {
         const data = await reviewedAction('/api/change-rollback', {changeSetId});
         if (!data.ok) {
@@ -1995,6 +2011,8 @@ function wireChangesTab() {
         toast(`Rollback attempted for ${changeSetId}`);
       } catch (error) {
         toast(error.message);
+      } finally {
+        node.disabled = false;
       }
     });
   });
@@ -2174,12 +2192,22 @@ function renderSecuritySections() {
 }
 
 async function refreshSnapshot() {
-  const response = await authenticatedFetch('/api/refresh', { method: 'POST' });
-  const data = await response.json();
-  if (data.snapshot) {
-    applySnapshot(data.snapshot);
+  const button = document.getElementById('btn-refresh');
+  if (button.disabled) return;
+  button.disabled = true;
+  button.textContent = 'refreshing…';
+  try {
+    const data = await postJson('/api/refresh', {});
+    if (data.error) {
+      toast(data.error);
+      return;
+    }
+    if (data.snapshot) applySnapshot(data.snapshot);
+    toast(data.daemonRequested ? 'Daemon refresh requested' : 'Snapshot refreshed');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'refresh snapshot';
   }
-  toast(data.daemonRequested ? 'Daemon refresh requested' : 'Snapshot refreshed');
 }
 
 const PLAN_POLL_MS = 3000;
@@ -2208,12 +2236,7 @@ async function requestPlan(retry = false) {
   try {
     let body = { findingId: finding.id, fingerprint: finding.fingerprint, retry };
     for (;;) {
-      const response = await authenticatedFetch('/api/plan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await response.json();
+      const data = await postJson('/api/plan', body);
       if (data.error) {
         toast(data.error);
         return;

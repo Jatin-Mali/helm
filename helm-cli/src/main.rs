@@ -4641,7 +4641,7 @@ pub(crate) async fn daemon_stop_core() -> Result<String> {
 
 /// A "running" daemon whose heartbeat stopped advancing (hung, or its state file outlived it)
 /// is reported stale instead of healthy. Allows three missed intervals, minimum 30s.
-fn effective_daemon_status(state: &DaemonState) -> &str {
+pub(crate) fn effective_daemon_status(state: &DaemonState) -> &str {
     if state.status != "running" {
         return &state.status;
     }

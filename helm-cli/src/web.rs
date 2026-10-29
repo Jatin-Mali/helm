@@ -54,6 +54,7 @@ struct WebState {
     /// Findings of the most recent snapshot by id. Live (no-daemon) cycles are never
     /// persisted, so id lookups must not rely on `SnapshotStore` alone.
     live_findings: Mutex<HashMap<String, Finding>>,
+    refresh_secs: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -322,6 +323,9 @@ pub async fn serve(
             .await
             .with_context(|| format!("opening memory store at {}", db_path.display()))?,
     );
+    let web_refresh_secs = helm_monitor::load_thresholds_config()
+        .refresh_interval_secs
+        .clamp(5, 300);
     let state = Arc::new(WebState {
         auth,
         pending: Mutex::new(HashMap::new()),
@@ -334,10 +338,8 @@ pub async fn serve(
         secrets,
         fleet_cache: Mutex::new(HashMap::new()),
         live_findings: Mutex::new(HashMap::new()),
+        refresh_secs: web_refresh_secs,
     });
-    let web_refresh_secs = helm_monitor::load_thresholds_config()
-        .refresh_interval_secs
-        .clamp(5, 300);
 
     let bg_state = Arc::clone(&state);
     let bg_tx = tx.clone();
@@ -890,9 +892,9 @@ async fn collect_live_snapshot(state: &WebState) -> String {
 
     let history = load_finding_history(&conn);
     let state_by_fingerprint = load_finding_states(&conn);
-    let daemon = daemon_summary();
+    let daemon = daemon_summary(state.refresh_secs);
     let metric_history = load_metric_history(&conn);
-    let (provider, ai_state) = provider_context();
+    let (provider, ai_state) = provider_context(state);
     let change_sets = ops::load_change_set_views(&conn, 16);
 
     let db_future = DbHealthCollector.collect(snapshot.profile);
@@ -1406,41 +1408,41 @@ async fn collect_fleet_hosts(state: &WebState) -> Vec<FleetHost> {
     }
 }
 
-fn daemon_summary() -> DaemonSummary {
+/// `web_refresh_secs` is reported as the cadence when no daemon is running, because the
+/// console's own collection loop is then what refreshes the page.
+fn daemon_summary(web_refresh_secs: u64) -> DaemonSummary {
+    let stopped = DaemonSummary {
+        status: "stopped".to_owned(),
+        refresh_interval_secs: web_refresh_secs,
+        ..DaemonSummary::default()
+    };
+    if !crate::daemon_is_running() {
+        return stopped;
+    }
     crate::read_daemon_state()
         .map(|state| DaemonSummary {
-            running: crate::daemon_is_running(),
-            status: state.status,
+            running: true,
+            status: crate::effective_daemon_status(&state).to_owned(),
             started_at: state.started_at,
             last_heartbeat: state.last_heartbeat,
             last_success_at: state.last_success_at,
             last_error: state.last_error,
             refresh_interval_secs: state.refresh_interval_secs,
         })
-        .unwrap_or_default()
+        .unwrap_or(stopped)
 }
 
-fn provider_context() -> (String, String) {
-    let config_path = match crate::default_config_path() {
-        Ok(path) => path,
-        Err(_) => return ("unconfigured".to_owned(), "off".to_owned()),
-    };
-    let config = match crate::load_config(&config_path) {
-        Ok(config) => config,
-        Err(_) => return ("unconfigured".to_owned(), "off".to_owned()),
-    };
-    let settings = match crate::resolve_provider_settings(config.as_ref(), None, None, None, None) {
-        Ok(settings) => settings,
-        Err(_) => return ("unconfigured".to_owned(), "off".to_owned()),
-    };
-
+fn provider_context(state: &WebState) -> (String, String) {
+    let settings = &state.provider_settings;
     let provider = crate::provider_choice_name(settings.choice).to_owned();
-    let ai_state = if matches!(settings.choice, crate::ProviderChoice::Ollama) {
-        "local".to_owned()
+    let ai_state = if !llm_provider_usable(settings, &state.secrets) {
+        "off"
+    } else if crate::provider_inference_is_local(settings) {
+        "local"
     } else {
-        "api".to_owned()
+        "api"
     };
-    (provider, ai_state)
+    (provider, ai_state.to_owned())
 }
 
 fn monitor_profile_label(profile: MonitorProfile) -> String {
@@ -1484,6 +1486,7 @@ mod tests {
             secrets: SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap(),
             fleet_cache: Mutex::new(HashMap::new()),
             live_findings: Mutex::new(HashMap::new()),
+            refresh_secs: 60,
         };
         let session = crate::web_auth::Session {
             id: "client-a".into(),
@@ -1598,6 +1601,7 @@ mod tests {
                 secrets: SecretsStore::open_at(dir.path().join("secrets.toml")).unwrap(),
                 fleet_cache: Mutex::new(HashMap::new()),
                 live_findings: Mutex::new(HashMap::new()),
+                refresh_secs: 60,
             });
             let service = api_service_action(
                 State(state.clone()),

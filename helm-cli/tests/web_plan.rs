@@ -314,3 +314,35 @@ async fn stale_finding_id_resolves_by_fingerprint() {
     assert!(plan.get("error").is_none(), "{plan}");
     assert_eq!(plan["finding_id"], finding["id"], "{plan}");
 }
+
+#[tokio::test]
+async fn snapshot_reports_stopped_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = start(dir.path(), None).await;
+    let snapshot = session.get("/api/snapshot").await;
+    assert_eq!(
+        snapshot["daemon"]["status"], "stopped",
+        "{}",
+        snapshot["daemon"]
+    );
+    assert_eq!(
+        snapshot["daemon"]["refreshIntervalSecs"], 60,
+        "{}",
+        snapshot["daemon"]
+    );
+}
+
+/// The header must describe the provider the server actually uses (CLI flags included).
+#[tokio::test]
+async fn snapshot_reports_the_served_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = provider(200, PLAN_TEXT);
+    let session = start(dir.path(), Some(&url)).await;
+    let snapshot = session.get("/api/snapshot").await;
+    assert_eq!(
+        snapshot["provider"], "openai-compat",
+        "{}",
+        snapshot["provider"]
+    );
+    assert_ne!(snapshot["aiState"], "off", "{}", snapshot["aiState"]);
+}
