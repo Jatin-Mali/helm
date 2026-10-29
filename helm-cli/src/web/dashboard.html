@@ -872,6 +872,7 @@ const state = {
   serviceJournal: [],
   serviceJournalError: '',
   selectedChangeId: null,
+  planNotes: {},
   logFilters: {
     unit: '',
     severity: 'all',
@@ -955,8 +956,15 @@ function connect() {
 }
 
 function applySnapshot(snapshot) {
+  // Finding ids embed the snapshot id; carry the selection over by stable fingerprint.
+  const fingerprintOf = id => state.findings.find(f => f.id === id)?.fingerprint;
+  const selected = fingerprintOf(state.selectedFindingId);
+  const focused = fingerprintOf(state.focusedFindingId);
   state.snapshot = snapshot;
   state.findings = sortFindings(snapshot.findings || []);
+  const idOf = fingerprint => state.findings.find(f => f.fingerprint === fingerprint)?.id;
+  if (selected) state.selectedFindingId = idOf(selected) || state.selectedFindingId;
+  if (focused) state.focusedFindingId = idOf(focused) || state.focusedFindingId;
   syncSelectionState();
   syncLogSelectionState();
   syncServiceSelectionState();
@@ -1664,8 +1672,9 @@ function incidentDetailCard(finding) {
             <div class="kv" style="margin-top:12px">
               <div class="kv-row">
                 <div class="kv-label">Fix plan</div>
-                <div class="kv-value">${finding.fixPlan ? `<pre class="code">${esc(finding.fixPlan)}</pre>` : 'No fix plan stored yet. Use the plan action to request one.'}</div>
+                <div class="kv-value">${finding.fixPlan ? `<pre class="code">${esc(finding.fixPlan)}</pre>` : 'No deterministic fix plan for this finding.'}</div>
               </div>
+              ${aiPlanRow(finding)}
               <div class="kv-row">
                 <div class="kv-label">Assumptions</div>
                 <div class="kv-value">${(finding.assumptions || []).length ? (finding.assumptions || []).map(esc).join('<br>') : 'No explicit assumptions recorded.'}</div>
@@ -2173,36 +2182,87 @@ async function refreshSnapshot() {
   toast(data.daemonRequested ? 'Daemon refresh requested' : 'Snapshot refreshed');
 }
 
-async function requestPlan() {
+const PLAN_POLL_MS = 3000;
+const PLAN_POLL_LIMIT_MS = 120000;
+let planBusy = false;
+
+function applyPlanResponse(finding, data) {
+  finding.planStatus = data.plan_status === 'disabled' ? null : data.plan_status;
+  finding.aiPlan = data.plan_status === 'ready' ? data.fix_plan : null;
+  finding.planError = data.plan_error || null;
+  if (data.plan_note) state.planNotes[finding.fingerprint] = data.plan_note;
+}
+
+async function requestPlan(retry = false) {
   const finding = selectedFinding();
   if (!finding) {
     toast('Select an incident first');
     return;
   }
-  const response = await authenticatedFetch('/api/plan', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ findingId: finding.id }),
-  });
-  const data = await response.json();
-  if (data.error) {
-    toast(data.error);
-    return;
-  }
-  const target = state.findings.find(item => item.id === finding.id);
-  if (target) {
-    target.fixPlan = data.fix_plan || target.fixPlan;
-  }
-  state.activeTab = 'overview';
-  renderActiveTab();
-  if (data.plan_status === 'loading') {
-    toast('Plan generation started');
-  } else if (data.plan_status === 'ready') {
-    toast('Cached plan loaded');
-  } else {
-    toast('Plan metadata loaded');
+  if (planBusy) return;
+  planBusy = true;
+  const button = document.getElementById('btn-plan');
+  button.disabled = true;
+  button.textContent = 'generating…';
+  const started = Date.now();
+  try {
+    let body = { findingId: finding.id, fingerprint: finding.fingerprint, retry };
+    for (;;) {
+      const response = await authenticatedFetch('/api/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await response.json();
+      if (data.error) {
+        toast(data.error);
+        return;
+      }
+      // The snapshot may have been replaced while waiting; update whichever entry is current.
+      const target = state.findings.find(item => item.fingerprint === finding.fingerprint) || finding;
+      applyPlanResponse(target, data);
+      if (state.activeTab === 'overview') renderActiveTab();
+      if (data.plan_status !== 'loading') {
+        toast({ ready: 'Plan ready', failed: 'Plan generation failed', disabled: 'No AI provider configured' }[data.plan_status] || 'Plan updated');
+        return;
+      }
+      if (Date.now() - started > PLAN_POLL_LIMIT_MS) {
+        toast('Still generating — the plan will appear here when ready');
+        return;
+      }
+      body = { findingId: target.id, fingerprint: finding.fingerprint };
+      await new Promise(resolve => setTimeout(resolve, PLAN_POLL_MS));
+    }
+  } catch (error) {
+    toast(`Plan request failed: ${error.message}`);
+  } finally {
+    planBusy = false;
+    button.disabled = false;
+    button.textContent = 'generate plan';
   }
 }
+
+function aiPlanRow(finding) {
+  let value;
+  if (finding.planStatus === 'ready' && finding.aiPlan) {
+    value = `<pre class="code">${esc(finding.aiPlan)}</pre>`;
+  } else if (finding.planStatus === 'loading') {
+    value = 'Generating… this usually takes under 30 seconds.';
+  } else if (finding.planStatus === 'failed') {
+    value = `${esc(finding.planError || 'Plan generation failed.')} <button type="button" class="button" data-plan-retry>Retry</button>`;
+  } else {
+    value = esc(state.planNotes[finding.fingerprint] || 'Not generated yet. Use generate plan (Alt+G).');
+  }
+  return `
+    <div class="kv-row">
+      <div class="kv-label">AI plan</div>
+      <div class="kv-value">${value}</div>
+    </div>`;
+}
+
+document.getElementById('tab-body').addEventListener('click', (event) => {
+  if (event.target.closest('[data-plan-retry]')) requestPlan(true);
+});
 
 document.getElementById('search').addEventListener('input', (event) => {
   state.query = event.target.value || '';
@@ -2212,7 +2272,7 @@ document.getElementById('search').addEventListener('input', (event) => {
 });
 
 document.getElementById('btn-refresh').addEventListener('click', refreshSnapshot);
-document.getElementById('btn-plan').addEventListener('click', requestPlan);
+document.getElementById('btn-plan').addEventListener('click', () => requestPlan());
 
 document.addEventListener('keydown', (event) => {
   const isTyping = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);

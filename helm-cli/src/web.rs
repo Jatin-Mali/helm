@@ -220,6 +220,10 @@ pub struct FindingEntry {
     pub impact: String,
     pub read_only_checks: Vec<String>,
     pub fix_plan: Option<String>,
+    /// Generated-plan state: `ready | loading | failed`, absent when none was requested.
+    pub plan_status: Option<String>,
+    pub ai_plan: Option<String>,
+    pub plan_error: Option<String>,
     pub risk: String,
     pub lifecycle_state: String,
     pub first_seen: String,
@@ -291,6 +295,12 @@ struct FindingHistory {
 struct PlanRequest {
     #[serde(rename = "findingId")]
     finding_id: String,
+    /// Stable across collection cycles, unlike `finding_id`.
+    #[serde(default)]
+    fingerprint: Option<String>,
+    /// Regenerate even though the last attempt failed.
+    #[serde(default)]
+    retry: bool,
 }
 
 pub async fn serve(
@@ -486,73 +496,105 @@ async fn api_generate_plan(
         Ok(c) => c,
         Err(e) => return Json(serde_json::json!({"error": format!("DB error: {e}")})),
     };
-
-    match lookup_finding(&state, &conn, &req.finding_id) {
-        Some(finding) => {
-            if let Ok(Some(record)) = helm_memory::TroubleshootingPlanStore::latest_for_fingerprint(
-                &conn,
-                &finding.fingerprint,
-            ) && record.dashboard_plan_status == "ready"
-                && record.id.starts_with(&format!(
-                    "plan-{}-",
-                    crate::plan_context_key(&state.provider_settings, &finding)
-                ))
-                && chrono::Utc::now().timestamp() - record.updated_at
-                    < state.plan_cache.ttl().as_secs() as i64
-            {
-                return Json(serde_json::json!({
-                    "finding_id": req.finding_id,
-                    "title": finding.title,
-                    "severity": finding.severity.as_str(),
-                    "impact": finding.impact,
-                    "evidence": finding.evidence.first().map(|e| &e.value),
-                    "read_only_checks": finding.read_only_checks,
-                    "fix_plan": web_plan_summary(&record),
-                    "plan_status": record.dashboard_plan_status,
-                }));
-            }
-
-            if llm_provider_usable(&state.provider_settings, &state.secrets) {
-                let runtime = crate::PlanGenerationRuntime {
-                    provider_settings: state.provider_settings.clone(),
-                    secrets: state.secrets.clone(),
-                    cache: state.plan_cache.clone(),
-                };
-                if let Err(error) =
-                    crate::queue_background_plan_generation(&runtime, &state.db_path, &finding)
-                {
-                    return Json(
-                        serde_json::json!({"error": format!("Plan queue failed: {error}")}),
-                    );
-                }
-                Json(serde_json::json!({
-                    "finding_id": req.finding_id,
-                    "title": finding.title,
-                    "severity": finding.severity.as_str(),
-                    "impact": finding.impact,
-                    "evidence": finding.evidence.first().map(|e| &e.value),
-                    "read_only_checks": finding.read_only_checks,
-                    "fix_plan": "Generating plan... retry in a few seconds.",
-                    "plan_status": "loading",
-                }))
-            } else {
-                Json(serde_json::json!({
-                    "finding_id": req.finding_id,
-                    "title": finding.title,
-                    "severity": finding.severity.as_str(),
-                    "impact": finding.impact,
-                    "evidence": finding.evidence.first().map(|e| &e.value),
-                    "read_only_checks": finding.read_only_checks,
-                    "fix_plan": finding.fix_plan,
-                    "plan_status": "disabled",
-                    "plan_note": "No LLM provider is configured for cached remediation plans yet."
-                }))
-            }
-        }
-        None => Json(serde_json::json!({
+    let Some(finding) = lookup_finding(&state, &conn, &req.finding_id, req.fingerprint.as_deref())
+    else {
+        return Json(serde_json::json!({
             "error": "Finding not found. Run a collection first.",
             "plan": null
-        })),
+        }));
+    };
+    let mut body = serde_json::json!({
+        "finding_id": finding.id,
+        "title": finding.title,
+        "severity": finding.severity.as_str(),
+        "impact": finding.impact,
+        "evidence": finding.evidence.first().map(|e| &e.value),
+        "read_only_checks": finding.read_only_checks,
+    });
+    let view = plan_view(&state, &conn, &finding);
+    let (status, fix_plan, error, note) = match view {
+        Some(view) if view.status == "ready" => ("ready", view.plan, None, None),
+        _ if !llm_provider_usable(&state.provider_settings, &state.secrets) => (
+            "disabled",
+            finding.fix_plan.clone(),
+            None,
+            Some("No LLM provider is configured. Run `helm config` to set one up."),
+        ),
+        Some(view) if view.status == "failed" && !req.retry => ("failed", None, view.error, None),
+        _ => {
+            let runtime = crate::PlanGenerationRuntime {
+                provider_settings: state.provider_settings.clone(),
+                secrets: state.secrets.clone(),
+                cache: state.plan_cache.clone(),
+            };
+            if let Err(error) =
+                crate::queue_background_plan_generation(&runtime, &state.db_path, &finding)
+            {
+                return Json(serde_json::json!({"error": format!("Plan queue failed: {error}")}));
+            }
+            ("loading", None, None, None)
+        }
+    };
+    body["plan_status"] = status.into();
+    body["fix_plan"] = fix_plan.into();
+    body["plan_error"] = error.into();
+    body["plan_note"] = note.into();
+    Json(body)
+}
+
+/// The generated-plan state for `finding` under the current provider context, as one of
+/// `ready | loading | failed`. `None` means no usable plan exists yet (or the ready one expired).
+struct PlanView {
+    status: &'static str,
+    plan: Option<String>,
+    error: Option<String>,
+}
+
+fn plan_view(state: &WebState, conn: &rusqlite::Connection, finding: &Finding) -> Option<PlanView> {
+    let record =
+        helm_memory::TroubleshootingPlanStore::latest_for_fingerprint(conn, &finding.fingerprint)
+            .ok()
+            .flatten()?;
+    let context = crate::plan_context_key(&state.provider_settings, finding);
+    if !record.id.starts_with(&format!("plan-{context}-")) {
+        return None;
+    }
+    let age = chrono::Utc::now().timestamp() - record.updated_at;
+    match record.dashboard_plan_status.as_str() {
+        "ready" if age < state.plan_cache.ttl().as_secs() as i64 => Some(PlanView {
+            status: "ready",
+            plan: Some(web_plan_summary(&record)),
+            error: None,
+        }),
+        "ready" => None,
+        "loading" => Some(PlanView {
+            status: "loading",
+            plan: None,
+            error: None,
+        }),
+        failure => Some(PlanView {
+            status: "failed",
+            plan: None,
+            error: Some(plan_failure_message(failure, &record.generation_error)),
+        }),
+    }
+}
+
+fn plan_failure_message(status: &str, detail: &str) -> String {
+    match status {
+        "timeout" => "The provider did not answer in time.".to_owned(),
+        "auth_failed" => {
+            "The provider rejected the credentials (401/403). Check the API key.".to_owned()
+        }
+        "rate_limited" => format!(
+            "The provider rate-limited the request ({}). Retry shortly.",
+            detail.replace(['_', '='], " ")
+        ),
+        "malformed_response" => {
+            "The provider's answer could not be parsed into a safe plan.".to_owned()
+        }
+        "dangerous_command" => format!("The proposed plan used a blocked command ({detail})."),
+        other => format!("Plan generation failed ({other})."),
     }
 }
 
@@ -920,7 +962,10 @@ async fn collect_live_snapshot(state: &WebState) -> String {
         .collect();
     let findings = findings
         .iter()
-        .map(|finding| finding_entry(finding, &history, &state_by_fingerprint))
+        .map(|finding| {
+            let plan = plan_view(state, &conn, finding);
+            finding_entry(finding, &history, &state_by_fingerprint, plan)
+        })
         .collect::<Vec<_>>();
 
     let live = LiveSnapshot {
@@ -968,8 +1013,21 @@ async fn collect_live_snapshot(state: &WebState) -> String {
     serde_json::to_string(&live).unwrap_or_default()
 }
 
-fn lookup_finding(state: &WebState, conn: &rusqlite::Connection, id: &str) -> Option<Finding> {
-    let live = state.live_findings.lock().unwrap().get(id).cloned();
+fn lookup_finding(
+    state: &WebState,
+    conn: &rusqlite::Connection,
+    id: &str,
+    fingerprint: Option<&str>,
+) -> Option<Finding> {
+    let live = {
+        let live = state.live_findings.lock().unwrap();
+        live.get(id).cloned().or_else(|| {
+            let fingerprint = fingerprint?;
+            live.values()
+                .find(|f| f.fingerprint == fingerprint)
+                .cloned()
+        })
+    };
     live.or_else(|| crate::find_finding_by_id(conn, id))
 }
 
@@ -1045,6 +1103,7 @@ fn finding_entry(
     finding: &Finding,
     history: &HashMap<String, FindingHistory>,
     states: &HashMap<String, helm_memory::FindingStateRecord>,
+    plan: Option<PlanView>,
 ) -> FindingEntry {
     let key = finding_key(finding);
     let lifecycle_state = states
@@ -1080,6 +1139,9 @@ fn finding_entry(
         impact: finding.impact.clone(),
         read_only_checks: finding.read_only_checks.clone(),
         fix_plan: finding.fix_plan.clone(),
+        plan_status: plan.as_ref().map(|plan| plan.status.to_owned()),
+        ai_plan: plan.as_ref().and_then(|plan| plan.plan.clone()),
+        plan_error: plan.and_then(|plan| plan.error),
         risk: risk_label(finding.severity).to_owned(),
         lifecycle_state,
         first_seen: history

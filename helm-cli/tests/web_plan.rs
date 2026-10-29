@@ -1,5 +1,5 @@
 use std::{
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     os::unix::fs::PermissionsExt,
     path::Path,
@@ -69,7 +69,8 @@ impl Session {
 
 /// Starts `helm web` with isolated state, no daemon, and a fake `systemctl` that reports one
 /// failed unit, so the live snapshot always carries a deterministic finding.
-async fn start(dir: &Path) -> Session {
+/// `provider_url`: an OpenAI-compatible endpoint to plan with; `None` leaves no provider usable.
+async fn start(dir: &Path, provider_url: Option<&str>) -> Session {
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -103,7 +104,18 @@ async fn start(dir: &Path) -> Session {
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("GEMINI_API_KEY")
         .env_remove("OPENROUTER_API_KEY")
-        .env_remove("DEEPSEEK_API_KEY")
+        .env_remove("DEEPSEEK_API_KEY");
+    if let Some(provider_url) = provider_url {
+        command.args([
+            "--provider",
+            "openai-compat",
+            "--model",
+            "m",
+            "--base-url",
+            provider_url,
+        ]);
+    }
+    command
         .args([
             "--db-path",
             dir.join("helm.db").to_str().unwrap(),
@@ -163,7 +175,7 @@ async fn start(dir: &Path) -> Session {
 #[tokio::test]
 async fn plan_endpoint_resolves_live_snapshot_finding() {
     let dir = tempfile::tempdir().unwrap();
-    let session = start(dir.path()).await;
+    let session = start(dir.path(), None).await;
     let finding = session.broken_finding().await;
     let plan = session
         .post("/api/plan", json!({"findingId": finding["id"]}))
@@ -171,4 +183,134 @@ async fn plan_endpoint_resolves_live_snapshot_finding() {
     assert!(plan.get("error").is_none(), "{plan}");
     let status = plan["plan_status"].as_str().unwrap_or_default();
     assert!(["disabled", "loading", "ready"].contains(&status), "{plan}");
+}
+
+const PLAN_TEXT: &str = "---NARRATIVE---
+The unit failed on start.
+---FIX PLAN---
+COMMAND: systemctl status helm-test-broken.service
+PURPOSE: Inspect the failed unit
+EFFECT: Unit state is visible
+RISK: none
+BLAST: read-only service inspection
+ROLLBACK: none
+CAPABILITY: system.service
+";
+
+/// Serves every request with `status` and an OpenAI chat completion whose text is `content`.
+fn provider(status: u16, content: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..n]);
+                let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let length = String::from_utf8_lossy(&buffer[..end])
+                    .to_lowercase()
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().to_owned())
+                    })
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buffer.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let body = json!({"id":"c","model":"m","choices":[{"message":{"role":"assistant","content":content},
+                "finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":5,"total_tokens":10}})
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    url
+}
+
+/// Polls `/api/plan` until it leaves `loading`.
+async fn settled_plan(session: &Session, body: Value) -> Value {
+    for _ in 0..100 {
+        let plan = session.post("/api/plan", body.clone()).await;
+        if plan["plan_status"] != "loading" {
+            return plan;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("plan never left loading");
+}
+
+#[tokio::test]
+async fn failed_plan_reports_error_and_retry_requeues() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = provider(401, "unused");
+    let session = start(dir.path(), Some(&url)).await;
+    let finding = session.broken_finding().await;
+    let id = json!({"findingId": finding["id"], "fingerprint": finding["fingerprint"]});
+    let plan = settled_plan(&session, id.clone()).await;
+    assert_eq!(plan["plan_status"], "failed", "{plan}");
+    assert!(
+        !plan["plan_error"].as_str().unwrap_or_default().is_empty(),
+        "{plan}"
+    );
+    // Without an explicit retry the failure is reported, not silently regenerated.
+    let again = session.post("/api/plan", id.clone()).await;
+    assert_eq!(again["plan_status"], "failed", "{again}");
+    let retried = session
+        .post(
+            "/api/plan",
+            json!({"findingId": id["findingId"], "fingerprint": id["fingerprint"], "retry": true}),
+        )
+        .await;
+    assert_eq!(retried["plan_status"], "loading", "{retried}");
+}
+
+#[tokio::test]
+async fn snapshot_carries_ready_ai_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = provider(200, PLAN_TEXT);
+    let session = start(dir.path(), Some(&url)).await;
+    let finding = session.broken_finding().await;
+    let id = json!({"findingId": finding["id"], "fingerprint": finding["fingerprint"]});
+    let plan = settled_plan(&session, id).await;
+    assert_eq!(plan["plan_status"], "ready", "{plan}");
+    let finding = session.broken_finding().await;
+    assert_eq!(finding["planStatus"], "ready", "{finding}");
+    assert!(
+        finding["aiPlan"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("The unit failed on start."),
+        "{finding}"
+    );
+}
+
+/// Finding ids embed the snapshot id, so a request made before the next collection carries a
+/// stale id; the stable fingerprint must still resolve it.
+#[tokio::test]
+async fn stale_finding_id_resolves_by_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = start(dir.path(), None).await;
+    let finding = session.broken_finding().await;
+    let plan = session
+        .post(
+            "/api/plan",
+            json!({"findingId": "from-an-older-snapshot", "fingerprint": finding["fingerprint"]}),
+        )
+        .await;
+    assert!(plan.get("error").is_none(), "{plan}");
+    assert_eq!(plan["finding_id"], finding["id"], "{plan}");
 }
