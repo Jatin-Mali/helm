@@ -117,7 +117,7 @@ Each FAIL becomes `Task N` here in the Task 1 shape (failing test → root-cause
 
 ### Task 7: Final verification
 
-- [ ] `scripts/verify-demo.sh` and full gate; update `docs/VERIFICATION.md` with the matrix results; every FEATURE_MATRIX row PASS or explicitly documented as out of scope.
+- [x] `scripts/verify-demo.sh` and full gate; update `docs/VERIFICATION.md` with the matrix results; every FEATURE_MATRIX row PASS or explicitly documented as out of scope.
 
 
 ## Continuation defects found in Task 5

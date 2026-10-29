@@ -19,7 +19,9 @@ strict=${REQUIRE_ALL:-0}; soak=2
 while [ $# -gt 0 ]; do
   case "$1" in
     --strict) strict=1 ;;
-    --soak-minutes) soak=$2; shift ;;
+    --soak-minutes)
+      [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]*$ ]] || { echo "--soak-minutes requires a positive integer" >&2; exit 2; }
+      soak=$2; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -42,6 +44,8 @@ fi
 [ -x "$helm" ] || { echo "no helm binary at $helm" >&2; exit 1; }
 
 # --- workspace tests that encode the acceptance scenarios (browser is required here) ---------------
+step "dashboard interaction regression tests" node "$root/tests/demo/dashboard.test.cjs"
+step "acceptance driver regression tests" python3 -m unittest discover -s "$root/tests/demo" -p test_drivers.py
 step "agent workflows (scripted provider: approve/deny/resume/cancel)" \
   bash -c "cd '$root' && cargo test -q -p helm-cli --test agent_workflows"
 step "cross-frontend outcomes (denied/read-only/dry-run/sandbox/failed verification)" \
@@ -56,12 +60,14 @@ step "installer (mismatch, malformed, OS/arch, atomic replace)" bash "$root/scri
 step "operations demonstration" python3 "$root/tests/demo/ops.py" "$helm" "$tmp/ops"
 
 # --- upgrade: state written by the pre-repair build survives ----------------------------------------
+# Release build, as shipped: the baseline's debug overflow trap in journal context offsets (fixed
+# since) would abort it on hosts with long journals before it writes any state.
 baseline=${HELM_BASELINE_BIN:-}
 if [ -z "$baseline" ] && git -C "$root" cat-file -e fbbbec3631b23965f692893e0a35b24e43f9f680 2>/dev/null; then
   worktree=$tmp/baseline-src
   git -C "$root" worktree add -q --detach "$worktree" fbbbec3631b23965f692893e0a35b24e43f9f680 \
-    && (cd "$worktree" && CARGO_TARGET_DIR="$tmp/baseline-target" cargo build -q -p helm-cli) \
-    && baseline=$tmp/baseline-target/debug/helm
+    && (cd "$worktree" && CARGO_TARGET_DIR="$tmp/baseline-target" cargo build -q --release -p helm-cli) \
+    && baseline=$tmp/baseline-target/release/helm
 fi
 if [ -n "$baseline" ] && [ -x "$baseline" ]; then
   step "database upgrade, backup and recovery" python3 "$root/tests/demo/upgrade.py" "$baseline" "$helm" "$tmp/upgrade"
@@ -82,10 +88,11 @@ if [ -n "${HELM_DEMO_PROVIDER:-}" ] && [ -n "${HELM_DEMO_MODEL:-}" ]; then
     mkdir -p "$tmp/real" && cp -r "$root/tests/demo/project" "$tmp/real/work" || return 1
     XDG_CONFIG_HOME=$tmp/real/config XDG_DATA_HOME=$tmp/real/data XDG_CACHE_HOME=$tmp/real/cache \
       python3 "$root/tests/demo/drive_agent.py" --transcript "$tmp/real/transcript.txt" --timeout 300 \
-        --allow 'Write[^\n]*calc\.py|calc\.py' --allow 'Run shell command:\s+(ls|cat|find|head|python3 -m unittest)' -- \
+        --allow '\AWrite (?:calc\.py|[^\n]*/calc\.py) \([0-9]+ bytes\)\nNew content:\n' \
+        --allow '\ARun shell command:\npython3 -m unittest(?: -[qv])?\nBROAD OS AUTHORITY:' -- \
         "$helm" --provider "$HELM_DEMO_PROVIDER" --model "$HELM_DEMO_MODEL" run \
-        "Inspect this small project, explain its structure, fix the failing test by correcting the bug, run the tests with python3 -m unittest, and summarize with evidence." \
-        --workspace "$tmp/real/work" >/dev/null || return 1
+        "This project contains calc.py and test_calc.py. First run exactly python3 -m unittest to reproduce the failure. Read both files with fs_read, explain their structure, fix the bug in calc.py using fs_write, rerun exactly python3 -m unittest, and summarize with evidence. Do not request shell listing commands. Only the calc.py file write and that exact test command will be approved." \
+        --workspace "$tmp/real/work" >/dev/null || { tail -n 30 "$tmp/real/transcript.txt" >&2; return 1; }
     grep -q "Completed" "$tmp/real/transcript.txt" && (cd "$tmp/real/work" && python3 -m unittest -q 2>&1 | tail -1 | grep -q OK)
   }
   step "general agent, real provider ($HELM_DEMO_PROVIDER/$HELM_DEMO_MODEL): inspect, approved edit, check, summary" real
