@@ -48,3 +48,10 @@ vendor/
 coverage/
 .cache/
 tmp/
+
+# local tool caches
+.codex/
+.playwright-cli/
+graphify-out/
+.code-review-graph/
+.superpowers/
