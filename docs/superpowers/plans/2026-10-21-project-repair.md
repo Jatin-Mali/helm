@@ -206,7 +206,7 @@ rtk cargo test --test v20_controlled_execution
 
 **Owns:** new `tests/demo/` fixtures, `scripts/verify-demo.sh`, `docs/demo.md`, completion/evidence log. Depends on all prior tasks.
 
-- [x] Create a disposable VM scenario with isolated XDG state, temporary project, harmless test service and two SSH targets. Make setup/teardown repeatable; fixtures must never target real user services.
+- [ ] Create a disposable VM scenario with isolated XDG state, temporary project, harmless test service and two SSH targets. Make setup/teardown repeatable; fixtures must never target real user services. Independent review: Docker SSH hosts and a loopback HTTP fixture exist; a fresh VM and disposable real systemd service have not been demonstrated.
 - [x] Run both demonstrations in the spec with a real provider/browser where required. Capture actual commands, host identities, before/after checks, cancellation and restoration outcomes without secrets.
 - [x] Add cross-frontend acceptance for denial, read-only, unsupported sandbox, failed verification and failed rollback. Verify CLI exit codes, JSON states and UI labels agree.
 - [x] Perform DB upgrade/backup/recovery and a prolonged monitoring run; measure growth, latency and memory against documented target hardware and retention settings.

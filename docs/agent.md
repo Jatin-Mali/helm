@@ -26,7 +26,12 @@ retries after a failed request whose charge is unknown. `--read-only` and
 | `http` | exact call, once | GET only; private/loopback/link-local destinations, credentials in URLs and cross-origin redirects are refused |
 | `browser` | exact call, once | Static page reader through a headless Chromium (needs `chromium`/`google-chrome` installed); JavaScript and sub-resource network are disabled |
 
-HELM state (database, secrets, config, sessions) is unreadable to every tool.
+Filesystem tools block protected HELM state (database, secrets, config, sessions).
+Approved shell commands have your OS authority and can bypass path checks through
+indirect commands; HELM does not provide an OS sandbox. Review shell approvals accordingly.
+Commands explicitly naming `/proc/`, `/sys/`, `/dev/`, SSH/AWS credential paths or
+protected state are refused before approval. Use ordinary observation commands
+such as `uname -s` and `uptime` for Linux diagnostics.
 Content returned by tools, files or web pages is data: it cannot add tools,
 widen scope, change grants, or approve anything.
 

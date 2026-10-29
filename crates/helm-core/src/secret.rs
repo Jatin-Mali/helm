@@ -292,6 +292,34 @@ impl SecretStore {
 /// exports, traces or providers. It is defence in depth: arbitrary secrets that carry no
 /// recognisable marker cannot be found by pattern, so callers should still minimise data.
 pub fn redact_secrets(input: &str) -> String {
+    fn redact_value(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => *text = redact_text(text),
+            serde_json::Value::Array(items) => items.iter_mut().for_each(redact_value),
+            serde_json::Value::Object(fields) => {
+                for (key, mut value) in std::mem::take(fields) {
+                    // Reuse the text rules to recognize credential field names (except counters).
+                    let probe = format!("{key}=redaction-probe");
+                    if (value.is_string() || value.is_number()) && redact_text(&probe) != probe {
+                        value = serde_json::Value::String("***REDACTED***".into());
+                    } else {
+                        redact_value(&mut value);
+                    }
+                    fields.insert(redact_text(&key), value);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Redact decoded strings, then re-encode: regex replacements on JSON can break escaping.
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(input) {
+        redact_value(&mut value);
+        return value.to_string();
+    }
+    redact_text(input)
+}
+
+fn redact_text(input: &str) -> String {
     use std::sync::OnceLock;
     struct Rules {
         pem: regex::Regex,
@@ -455,6 +483,30 @@ mod tests {
                 "{sentinel:?} -> {redacted:?}"
             );
         }
+    }
+
+    #[test]
+    fn redaction_preserves_json_with_credentials_inside_nested_text() {
+        let value = serde_json::json!({
+            "logs": ["failed password=\"quoted credential\" next", "postgres://u:pass@db/x"],
+            "api_key": "sentinel-credential",
+            "password": 12345678,
+            "max_tokens": 4096,
+            "next": "intact"
+        });
+        let redacted = redact_secrets(&value.to_string());
+        let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(parsed["next"], "intact");
+        assert_eq!(parsed["max_tokens"], 4096);
+        for secret in [
+            "quoted credential",
+            "sentinel-credential",
+            "u:pass@",
+            "12345678",
+        ] {
+            assert!(!redacted.contains(secret));
+        }
+        assert_eq!(redact_secrets(&redacted), redacted);
     }
 
     #[test]

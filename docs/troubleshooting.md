@@ -6,7 +6,7 @@ Collect a fresh snapshot:
 
 ```sh
 helm monitor
-helm monitor --watch --interval 60s
+helm monitor --watch --interval 60
 ```
 
 Inside the dashboard, `F5` refreshes the current monitor snapshot.
@@ -36,7 +36,8 @@ cargo build --release -p helm-cli
 
 The status bar reflects provider class, not where the host runs.
 
-- `llm local` means local model inference, usually Ollama
+- An Ollama provider label alone does not prove local inference. Cloud models
+  and remote Ollama endpoints send prompts off-machine; check the model and endpoint.
 - `llm api` means prompts leave the machine for provider inference
 
 To switch to local inference:
@@ -54,7 +55,7 @@ read-only until you explicitly open an apply flow.
 
 ```sh
 helm explain <finding-id>
-helm troubleshoot --from-finding <finding-id>
+helm troubleshoot "investigate this finding" --from-finding <finding-id>
 helm apply-plan <plan-id>
 ```
 
@@ -81,19 +82,19 @@ helm
 
 ## Browser tool missing
 
-Install and start PinchTab:
+The agent's static reader uses installed Chromium or Google Chrome. PinchTab
+is not its backend. Confirm a browser executable is available, then retry:
 
 ```sh
-pinchtab health
-pinchtab nav https://example.com --snap
+command -v chromium || command -v google-chrome || command -v chromium-browser
 ```
 
 ## Permission denied
 
-Grant only the capability needed:
+Inspect stored grants with the following command. Agent calls and dashboard
+actions require their own exact review; a stored grant does not bypass it.
 
 ```sh
-helm permissions grant shell.shell --scope once
 helm permissions list
 ```
 

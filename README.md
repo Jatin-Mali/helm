@@ -32,8 +32,8 @@ modifies an existing install on failure.
 git clone https://github.com/Jatin-Mali/helm.git
 cd helm
 cargo build --release -p helm-cli
-./target/release/helmops init
-./target/release/helmops doctor
+./target/release/helm init
+./target/release/helm doctor
 ```
 
 Requires Rust 1.89 or newer.
@@ -52,7 +52,8 @@ holds provider and model only. Environment variables work without being saved.
 
 Providers: Ollama (local), Groq, OpenRouter, Gemini, Anthropic, NVIDIA NIM and
 any OpenAI-compatible endpoint. See `docs/providers.md`. API providers mean
-prompts (redacted) leave your machine; Ollama keeps inference local.
+prompts (redacted) leave your machine. Ollama inference is local only with a
+local endpoint and a locally running model; Ollama cloud models use remote inference.
 
 ## Operations
 
@@ -61,7 +62,7 @@ helmops snapshot --profile standard           # typed system snapshot
 helmops monitor --domain disks,services       # findings with coverage (what was and was not observed)
 helmops monitor --fleet                       # every registered SSH host; unreachable hosts are UNKNOWN, never healthy
 helmops explain <finding-id>
-helmops troubleshoot --from-finding <id>      # reviewed plan
+helmops troubleshoot "investigate this finding" --from-finding <id>  # reviewed plan
 helmops apply-plan <plan-id>                  # approve step by step; changes are journaled
 helmops change-set list
 helmops audit verify                          # hash chain check, prints head hashes
@@ -139,6 +140,8 @@ Remote support is SSH-based observation. See `docs/agent-on-remote.md`.
 
 ## Docs
 
+[Usage and project presentation guide](docs/PROJECT_GUIDE.md) ·
+[Independent verification](docs/VERIFICATION.md) · [Demo tests](docs/demo.md) ·
 `docs/providers.md` · `docs/agent.md` · `docs/agent-on-remote.md` ·
 `docs/threat-model.md` · `docs/trust-ladder.md` · `docs/data-boundary.md` ·
 `docs/troubleshooting.md` · `docs/detector-review-checklist.md` ·

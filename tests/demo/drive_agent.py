@@ -22,10 +22,12 @@ if pid == 0:
 buf, decisions, start = "", [], time.time()
 prompt = "Approve this exact action once? [y/N] "
 cancelled = False
+code = None
 with open(a.transcript, "w") as log:
     while True:
         if time.time() - start > a.timeout:
-            os.kill(pid, signal.SIGKILL); log.write("\n[driver] timeout\n"); break
+            os.kill(pid, signal.SIGKILL); os.waitpid(pid, 0)
+            code = 124; log.write("\n[driver] timeout\n"); break
         if a.cancel_after and not cancelled and time.time() - start > a.cancel_after:
             os.kill(pid, signal.SIGINT); cancelled = True; log.write("\n[driver] SIGINT sent\n")
         r, _, _ = select.select([fd], [], [], 0.2)
@@ -39,7 +41,9 @@ with open(a.transcript, "w") as log:
             buf += data; log.write(data); log.flush()
             while buf.count(prompt) > len(decisions):
                 idx = [m.start() for m in re.finditer(re.escape(prompt), buf)][len(decisions)]
-                block = buf[max(0, buf.rfind("Approval required:", 0, idx)):idx]
+                begin = buf.rfind("Approval required:", 0, idx)
+                block = buf[begin + len("Approval required:"):idx] if begin >= 0 else ""
+                block = block.replace("\r\n", "\n").lstrip("\n")
                 ok = any(re.search(p, block) for p in a.allow)
                 decisions.append(ok)
                 os.write(fd, b"y\n" if ok else b"n\n")
@@ -50,12 +54,12 @@ with open(a.transcript, "w") as log:
             except ChildProcessError:
                 break
             if done:
+                code = os.waitstatus_to_exitcode(status)
                 break
-    try:
+    if code is None:
         _, status = os.waitpid(pid, 0)
         code = os.waitstatus_to_exitcode(status)
-    except ChildProcessError:
-        code = -1
     log.write(f"\n[driver] exit={code} approvals={decisions}\n")
+os.close(fd)
 print(f"exit={code} approvals={decisions}")
-sys.exit(0)
+sys.exit(code if code >= 0 else 128 - code)

@@ -33,7 +33,8 @@ r = run(old, "service", "add", "--id", "svc", "--name", "svc", "--type", "tcp-en
 ok(r.returncode == 0, "baseline: service registered")
 for _ in range(2):
     r = run(old, "monitor", "--format", "json", "--profile", "quick")
-    ok(r.returncode == 0, "baseline: monitor persisted a snapshot")
+    ok(r.returncode == 0, "baseline: monitor persisted a snapshot" +
+       (f" (exit {r.returncode}: {r.stderr[-500:]})" if r.returncode else ""))
 # A plan in the baseline's legacy step format, applied by the baseline: writes audit events
 # (legacy hash) and a change set that the new build must still be able to read.
 legacy = json.dumps([{"title": "echo", "command": {"tool": "shell", "input": {"command": "echo baseline-ok"}, "command_text": "echo baseline-ok",
@@ -47,7 +48,8 @@ ok(r.returncode == 0, "baseline: legacy-format plan applied (change set + legacy
 snaps_old, audit_old = rows("snapshots"), rows("audit_events", "event_hash")
 changes_old = rows("change_sets")
 ok(len(changes_old) >= 1, "baseline database holds %d change set(s)" % len(changes_old))
-ok(len(audit_old) >= 1 or True, "audit rows noted"); ok(len(snaps_old) >= 2, f"baseline database holds {len(snaps_old)} snapshots and {len(audit_old)} audit events")
+ok(len(audit_old) >= 1, "baseline produced audit rows to verify after upgrade")
+ok(len(snaps_old) >= 2, f"baseline database holds {len(snaps_old)} snapshots and {len(audit_old)} audit events")
 r = run(old, "audit", "verify")
 print("INFO  baseline build's own `audit verify`: exit %d %s" % (r.returncode, (r.stdout + r.stderr).strip()[:100]))
 

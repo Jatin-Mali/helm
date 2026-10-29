@@ -33,8 +33,10 @@ try:
     ok(all(rows[n]["status"] == "observed" for n in "ab"), "both hosts observed over SSH")
     ids = {n: rows[n]["last_known"]["identity"] for n in "ab"}
     ok(ids["a"] != ids["b"], "host identities are distinguishable (%s… vs %s…)" % (ids["a"][:10], ids["b"][:10]))
-    local = sh(helm, "monitor", "--format", "json", "--profile", "quick")
-    ok(json.loads(local.stdout)["host"] not in ("helm-demo-a", "helm-demo-b"), "local host is a different machine from both targets")
+    local = sh(helm, "snapshot", "--json", "--profile", "quick")
+    local_id = json.loads(local.stdout)["domains"]["collection"]["host_id"]
+    ok(local_id is not None and all(identity and identity != local_id for identity in ids.values()),
+       "local and remote collection identities are distinct")
     sh("docker", "stop", "helm-demo-b")
     r = sh(helm, "monitor", "--fleet", "--json")
     rows = {x["host"]: x for x in json.loads(r.stdout)}

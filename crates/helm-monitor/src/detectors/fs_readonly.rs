@@ -26,7 +26,9 @@ impl Detector for FilesystemReadOnlyDetector {
             .mounts
             .iter()
             .filter_map(|m| {
-                if m.options.contains("ro") && !m.target.starts_with("/sys") {
+                if m.options.split(',').any(|option| option == "ro")
+                    && !m.target.starts_with("/sys")
+                {
                     Some(
                         Finding::new(
                             &snapshot.id,
@@ -50,5 +52,34 @@ impl Detector for FilesystemReadOnlyDetector {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{MonitorProfile, MountEntry};
+
+    #[test]
+    fn read_only_mount_option_is_exact_not_a_remount_policy() {
+        let mut snapshot = SystemSnapshot::new(
+            "fixture".into(),
+            Default::default(),
+            MonitorProfile::Quick,
+            Default::default(),
+        );
+        for (options, expected) in [("rw,relatime,errors=remount-ro", 0), ("ro,relatime", 1)] {
+            snapshot.domains.disks.mounts = vec![MountEntry {
+                source: "/dev/test".into(),
+                target: "/".into(),
+                fs_type: "ext4".into(),
+                options: options.into(),
+            }];
+            assert_eq!(
+                FilesystemReadOnlyDetector.detect(&snapshot, None).len(),
+                expected,
+                "{options}"
+            );
+        }
     }
 }

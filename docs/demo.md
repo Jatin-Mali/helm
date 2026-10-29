@@ -1,5 +1,10 @@
 # Verification and demonstration guide
 
+The results below record Claude's original demonstration on 2026-10-26. The
+[independent verification report](VERIFICATION.md) records the subsequent review,
+fixes and fresh results. For usage and a project-guide presentation, see
+[PROJECT_GUIDE.md](PROJECT_GUIDE.md). Fresh-VM acceptance remains incomplete.
+
 Everything here is reproducible with one command. Nothing touches your real data:
 every scenario uses temporary XDG state, a temporary project and loopback services.
 
@@ -21,7 +26,7 @@ Env: `HELM_BIN`, `HELM_BASELINE_BIN` (older build for the upgrade check),
 | Agent read/edit/test loop, approvals, cancel, resume without replay | `helm-cli/tests/agent_workflows.rs`; real provider via `tests/demo/drive_agent.py` | PASS |
 | Agent security (tamper, single-use approval, denial, origin allow-list, real headless browser) | `crates/helm-agent/tests/agent_security.rs` (`HELM_REQUIRE_BROWSER=1`) | PASS |
 | Prompt injection in a workspace file | real provider; no approval requested, no file created, target untouched | PASS |
-| Same plan from CLI / web / TUI: denied, read-only, dry-run, sandbox, approved, failed verification; `audit verify` after each | `helm-cli/tests/cross_frontend.rs` | PASS |
+| CLI plan outcomes: denied, read-only, dry-run, sandbox, approved, failed verification; `audit verify` after each | `helm-cli/tests/cross_frontend.rs`; separate TUI/web tests cover their review paths | PASS |
 | Dashboard authentication (pairing code, session cookie, Host/Origin/CSRF, single-use reviews) | `helm-cli/tests/` web tests | PASS |
 | Installer (checksum mismatch / missing / wrong OS / arch / success) | `scripts/test-install.sh` | PASS |
 | Operations: finding, explain, deny/approve plan, HTTP 500→200, durable change set, rollback, rollback refuses to clobber a newer edit, failed collectors not reported healthy | `tests/demo/ops.py` | PASS |
@@ -49,8 +54,10 @@ prompt from an explicit allow-list.
 | Projected DB at the 1000-snapshot cap | ~197 MB |
 
 At the default 60 s refresh the 1000-snapshot cap is reached in ~16.7 h, so retention is
-bounded by row count, not by the 7-day age limit. Plan about 200 MB of disk for the
-database. Three minutes does not prove multi-day stability; run `--soak-minutes 30` or
+bounded by row count for unreferenced snapshots, not by the 7-day age limit.
+Referenced snapshots are retained beyond this target, and audit, session and backup
+data add disk usage: 200 MB is an estimate for these snapshots, not a database-size cap.
+Three minutes does not prove multi-day stability; run `--soak-minutes 30` or
 longer on target hardware before relying on it.
 
 ## What is NOT verified

@@ -72,6 +72,11 @@ reliable agent tasks.
 - Ollama is shown in the dashboard as `llm local`
 - API providers are shown as `llm api`
 
+Provider-class labels are not a privacy guarantee. Ollama cloud models (including
+`gemma4:31b-cloud`) use remote inference even when the Ollama endpoint is localhost.
+A remote Ollama endpoint also sends prompts off-machine. Use a downloaded model
+on a local endpoint when local inference is required.
+
 That boundary is also reported by `helm trust-report`.
 
 ## Verification status
