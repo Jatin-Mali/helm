@@ -115,10 +115,10 @@ struct Cli {
     /// Show system evidence report before executing permission-sensitive tools
     #[arg(long, global = true)]
     evidence: bool,
-    /// Confine local tool execution with Bubblewrap. Default root is the current working directory.
+    /// Request sandboxed execution (currently unavailable; host execution is refused).
     #[arg(long, global = true)]
     sandbox: bool,
-    /// Use this directory as the Bubblewrap sandbox root instead of the current directory.
+    /// Requested sandbox root (sandboxed execution is currently unavailable).
     #[arg(long, value_name = "PATH", global = true)]
     sandbox_dir: Option<PathBuf>,
     /// Select a registered remote (`helm remote add`) for the dashboard; agent tasks stay local.
@@ -132,32 +132,59 @@ struct Cli {
 enum Command {
     /// Run the general agent on a task (read files, run commands, edit with approval)
     Run(agent_cli::RunArgs),
+    /// List models the selected provider offers and whether they support tool calls
     Models,
+    /// Check the distribution, provider, database and tool prerequisites
     Doctor(DoctorArgs),
+    /// List, grant or revoke capability grants
     Permissions(PermissionsArgs),
+    /// Verify or show the audit log chain
     Audit(AuditArgs),
+    /// Manage provider keys and other secrets in the dedicated store
     Secrets(SecretsArgs),
+    /// Interactive first-time setup of provider and database
     Init(InitArgs),
+    /// Read, set, edit or validate config.toml
     Config(ConfigArgs),
+    /// Register custom services and endpoints to monitor
     Service(ServiceArgs),
+    /// Print shell completion script
     Completion(CompletionArgs),
+    /// Open the interactive terminal console
     Tui(TuiArgs),
+    /// Register and test SSH remotes for fleet monitoring
     Remote(RemoteArgs),
+    /// Install, register and test HELMOPS agents on remote hosts
     Agent(AgentArgs),
+    /// Install HELMOPS on a remote host over SSH
     Bootstrap(BootstrapArgs),
+    /// Report the inference boundary, grants and audit chain state
     TrustReport(TrustReportArgs),
+    /// Open the terminal console (alias of `tui`)
     Dashboard(TuiArgs),
+    /// Start, stop or inspect the background monitoring daemon
     Daemon(DaemonArgs),
+    /// Show a finding, build its troubleshooting plan, or apply it
     Incident(IncidentArgs),
+    /// Collect one system snapshot and print it
     Snapshot(SnapshotArgs),
+    /// Run a monitoring cycle and report findings
     Monitor(MonitorArgs),
+    /// Build an evidence-backed troubleshooting plan for a problem
     Troubleshoot(TroubleshootArgs),
+    /// Explain a finding: evidence, impact and checks
     Explain(ExplainArgs),
+    /// Execute a stored plan step by step with approval
     ApplyPlan(ApplyPlanArgs),
+    /// List, show or roll back recorded change sets
     ChangeSet(ChangeSetArgs),
+    /// Check backup tooling and schedules
     Backup(BackupArgs),
+    /// Write a Markdown runbook of current findings
     Runbook(RunbookArgs),
+    /// Show alert sink configuration
     Alerting(AlertingArgs),
+    /// Serve the web operations console on localhost
     Web(WebArgs),
 }
 
@@ -962,11 +989,11 @@ async fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let rendered = format!("{error:#}");
-            if rendered.trim_start().starts_with("Usage:") {
-                println!("{rendered}");
-                return ExitCode::SUCCESS;
+            if let Some(error) = error.downcast_ref::<clap::Error>() {
+                let _ = error.print();
+                return ExitCode::from(error.exit_code() as u8);
             }
+            let rendered = format!("{error:#}");
             eprintln!("{rendered}");
             match classify_exit_code(error.as_ref()) {
                 2 => ExitCode::from(2),
@@ -1420,14 +1447,28 @@ fn run_secrets_command(args: SecretsArgs, store: &SecretsStore) -> Result<()> {
 fn run_config_command(args: ConfigArgs, config_path: &Path) -> Result<()> {
     match args.command {
         ConfigCommand::Get(args) => {
-            let config_text = fs::read_to_string(config_path)
-                .with_context(|| format!("failed to read config from {}", config_path.display()))?;
+            let not_set = || {
+                anyhow!(
+                    "{} is not set in {}; the built-in default applies",
+                    args.key,
+                    config_path.display()
+                )
+            };
+            let config_text = match fs::read_to_string(config_path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(not_set());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to read config from {}", config_path.display())
+                    });
+                }
+            };
             let value = config_text.parse::<toml::Value>()?;
             let mut current = &value;
             for part in args.key.split('.') {
-                current = current
-                    .get(part)
-                    .ok_or_else(|| anyhow!("Key not found: {}", args.key))?;
+                current = current.get(part).ok_or_else(not_set)?;
             }
             if let Some(s) = current.as_str() {
                 println!("{}", s);
@@ -1508,7 +1549,7 @@ where
     if let Some(error) = unknown_subcommand_error(&raw) {
         return Err(anyhow!(error));
     }
-    Cli::try_parse_from(normalize_args(raw)).map_err(|error| anyhow!(error.to_string()))
+    Cli::try_parse_from(normalize_args(raw)).map_err(anyhow::Error::new)
 }
 
 fn load_config(path: &Path) -> Result<Option<FileConfig>, CliConfigError> {
@@ -1939,8 +1980,17 @@ pub(crate) fn update_config_file(path: &Path, key: &str, raw_value: &str) -> Res
         })?
     };
     set_toml_path(&mut root, &parts, parse_config_value(raw_value))?;
+    let text = toml::to_string_pretty(&root)?;
+    // A write the loader rejects would break every later command, so refuse it here.
+    toml::from_str::<FileConfig>(&text).map_err(|error| {
+        anyhow!(
+            "`{key} = {raw_value}` would make the config unloadable ({}). Provider settings are \
+             provider.kind, provider.model, provider.base_url and provider.api_key_env",
+            error.message()
+        )
+    })?;
     ensure_parent_dir(path)?;
-    paths::write_atomic(path, toml::to_string_pretty(&root)?.as_bytes(), 0o600)
+    paths::write_atomic(path, text.as_bytes(), 0o600)
         .with_context(|| format!("failed to write config to {}", path.display()))
 }
 
@@ -2050,7 +2100,9 @@ fn prompt(label: &str) -> Result<String> {
     print!("{label}");
     io::stdout().flush()?;
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
+    if io::stdin().read_line(&mut buf)? == 0 {
+        anyhow::bail!("input closed; run this command in an interactive terminal");
+    }
     Ok(buf.trim().to_owned())
 }
 
@@ -3400,6 +3452,25 @@ struct TrustDiagnoseSummary {
     write_ops_gated: bool,
 }
 
+fn provider_inference_is_local(settings: &ProviderSettings) -> bool {
+    if settings.choice != ProviderChoice::Ollama
+        || settings
+            .model
+            .as_deref()
+            .is_some_and(|model| model.contains("cloud"))
+    {
+        return false;
+    }
+    let endpoint = settings
+        .base_url
+        .clone()
+        .or_else(|| std::env::var("OLLAMA_HOST").ok())
+        .unwrap_or_else(|| "http://localhost:11434".into());
+    reqwest::Url::parse(&endpoint)
+        .ok()
+        .is_some_and(|url| matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+}
+
 async fn run_trust_report(
     memory: &std::sync::Arc<MemoryStore>,
     secrets: &SecretsStore,
@@ -3417,7 +3488,7 @@ async fn run_trust_report(
     let chain_ok = memory.verify_audit_chain().await?.ok;
 
     // Provider summary
-    let is_local = matches!(provider_settings.choice, ProviderChoice::Ollama);
+    let is_local = provider_inference_is_local(provider_settings);
     let provider_kind = provider_choice_name(provider_settings.choice);
 
     // Sandbox
@@ -5486,6 +5557,7 @@ pub(crate) async fn generate_llm_plan_status(
         Ok(Ok(resp)) => resp,
         Ok(Err(error)) => match error {
             ProviderError::Timeout => return helm_monitor::LlmPlanStatus::Timeout,
+            ProviderError::Request(_) => return helm_monitor::LlmPlanStatus::ProviderUnavailable,
             ProviderError::HttpStatus { status, .. } => {
                 if status == 401 || status == 403 {
                     return helm_monitor::LlmPlanStatus::AuthFailed;
@@ -5602,6 +5674,12 @@ pub(crate) fn persist_llm_plan_status(
             helm_monitor::LlmPlanStatus::AuthFailed => {
                 ("auth_failed", String::new(), "[]".to_owned(), String::new())
             }
+            helm_monitor::LlmPlanStatus::ProviderUnavailable => (
+                "provider_unavailable",
+                String::new(),
+                "[]".to_owned(),
+                String::new(),
+            ),
             helm_monitor::LlmPlanStatus::MalformedResponse => (
                 "malformed_response",
                 String::new(),
@@ -7183,6 +7261,23 @@ mod tests {
     }
 
     #[test]
+    fn config_set_rejects_values_the_config_cannot_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let error = super::update_config_file(&path, "provider", "ollama").unwrap_err();
+        assert!(error.to_string().contains("provider.kind"), "{error}");
+        assert!(!path.exists(), "a rejected edit must not create the file");
+        assert!(super::update_config_file(&path, "provider.kind", "nonsense").is_err());
+        assert!(!path.exists());
+        super::update_config_file(&path, "provider.kind", "ollama").unwrap();
+        let config = super::load_config(&path).unwrap().unwrap();
+        assert_eq!(
+            config.provider.unwrap().kind,
+            Some(super::ProviderChoice::Ollama)
+        );
+    }
+
+    #[test]
     fn config_validate_flags_plaintext_credentials_already_on_disk() {
         let value: toml::Value =
             "[provider]\napi_key = \"x\"\napi_key_env = \"K\"\n[a.b]\npassword = \"p\""
@@ -7279,6 +7374,24 @@ mod tests {
     fn permission_and_audit_formatters_handle_empty_edge_case() {
         assert!(format_permissions(&[]).contains("CAPABILITY"));
         assert!(format_audit_events(&[]).contains("DECISION"));
+    }
+
+    #[test]
+    fn cloud_models_and_remote_ollama_endpoints_are_not_local_inference() {
+        let mut settings = super::ProviderSettings {
+            choice: ProviderChoice::Ollama,
+            base_url: Some("http://localhost:11434".into()),
+            model: Some("qwen3:4b".into()),
+            api_key_env: None,
+            api_key: None,
+            source: ProviderSource::Cli,
+        };
+        assert!(super::provider_inference_is_local(&settings));
+        settings.model = Some("gemma4:31b-cloud".into());
+        assert!(!super::provider_inference_is_local(&settings));
+        settings.model = Some("qwen3:4b".into());
+        settings.base_url = Some("https://ollama.example.com".into());
+        assert!(!super::provider_inference_is_local(&settings));
     }
 
     #[test]

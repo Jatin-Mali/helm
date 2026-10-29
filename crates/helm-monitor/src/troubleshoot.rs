@@ -410,6 +410,8 @@ pub enum LlmPlanStatus {
     RateLimited(u64),
     /// Authentication/configuration failure.
     AuthFailed,
+    /// Provider could not be reached.
+    ProviderUnavailable,
     /// Response was received but couldn't be parsed.
     MalformedResponse,
     /// Response included a command blocked by the validator.
@@ -461,6 +463,10 @@ impl std::fmt::Display for LlmPlanStatus {
             Self::AuthFailed => {
                 write!(f, "Authentication failed — check provider config")
             }
+            Self::ProviderUnavailable => write!(
+                f,
+                "Cannot reach the provider — check the endpoint and connection"
+            ),
             Self::MalformedResponse => {
                 write!(f, "LLM response was malformed — check debug log")
             }

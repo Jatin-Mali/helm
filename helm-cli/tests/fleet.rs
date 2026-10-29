@@ -55,3 +55,19 @@ fn fleet_reports_each_ssh_host_and_marks_a_dead_one_unknown_without_local_substi
     assert_eq!(rows[0]["status"], "unavailable");
     assert!(rows[0]["stale_last_known"]["observed_at"].is_string());
 }
+
+#[test]
+fn empty_fleet_still_emits_a_json_array() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_helm"))
+        .args(["monitor", "--fleet", "--json"])
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("XDG_CACHE_HOME", dir.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rows: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--json must always emit JSON");
+    assert_eq!(rows, serde_json::json!([]));
+}

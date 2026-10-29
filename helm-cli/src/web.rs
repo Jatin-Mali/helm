@@ -626,13 +626,14 @@ fn plan_view(state: &WebState, conn: &rusqlite::Connection, finding: &Finding) -
             error: None,
         }),
         "ready" => None,
+        // `pending` is the row insert's placeholder before the generator marks it `loading`.
         // Past the generator's outer 35 s bound the row is orphaned (restart, dropped task).
-        "loading" if age > STALE_LOADING_SECS => Some(PlanView {
+        "loading" | "pending" if age > STALE_LOADING_SECS => Some(PlanView {
             status: "failed",
             plan: None,
             error: Some(plan_failure_message("timeout", "")),
         }),
-        "loading" => Some(PlanView {
+        "loading" | "pending" => Some(PlanView {
             status: "loading",
             plan: None,
             error: None,
@@ -655,6 +656,9 @@ fn plan_failure_message(status: &str, detail: &str) -> String {
             "The provider rate-limited the request ({}). Retry shortly.",
             detail.replace(['_', '='], " ")
         ),
+        "provider_unavailable" => {
+            "Cannot reach the provider. Check the endpoint and connection, then retry.".to_owned()
+        }
         "malformed_response" => {
             "The provider's answer could not be parsed into a safe plan.".to_owned()
         }

@@ -150,6 +150,9 @@ pub fn apply_results(
 pub async fn run(json: bool) -> Result<()> {
     let registry = RemoteRegistry::load()?;
     if registry.remotes.is_empty() {
+        if json {
+            println!("[]");
+        }
         eprintln!("No remote hosts configured. Use `helm remote add <name> <host>` first.");
         return Ok(());
     }

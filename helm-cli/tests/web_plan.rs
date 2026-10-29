@@ -69,7 +69,7 @@ impl Session {
 
 /// Starts `helm web` with isolated state, no daemon, and a fake `systemctl` that reports one
 /// failed unit, so the live snapshot always carries a deterministic finding.
-/// `provider_url`: an OpenAI-compatible endpoint to plan with; `None` leaves no provider usable.
+/// `provider_url`: an OpenAI-compatible endpoint; `None` uses the default Ollama provider.
 async fn start(dir: &Path, provider_url: Option<&str>) -> Session {
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -471,4 +471,51 @@ async fn cached_snapshot_reflects_current_plan_state() {
             .unwrap_or_default()
             .contains("The unit failed on start.")
     );
+}
+
+#[tokio::test]
+async fn unreachable_provider_reports_connection_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let session = start(dir.path(), Some(&endpoint)).await;
+    let finding = session.broken_finding().await;
+    let body = json!({"findingId": finding["id"], "fingerprint": finding["fingerprint"]});
+    session.post("/api/plan", body.clone()).await;
+    for _ in 0..100 {
+        let plan = session.post("/api/plan", body.clone()).await;
+        if plan["plan_status"] == "failed" {
+            let error = plan["plan_error"].as_str().unwrap();
+            assert!(error.contains("reach"), "{error}");
+            assert!(!error.contains("parsed"), "{error}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("provider failure never surfaced");
+}
+
+#[tokio::test]
+async fn freshly_inserted_pending_plan_is_loading_not_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = provider(200, PLAN_TEXT);
+    let session = start(dir.path(), Some(&url)).await;
+    let finding = session.broken_finding().await;
+    let body = json!({"findingId": finding["id"], "fingerprint": finding["fingerprint"]});
+    assert_eq!(
+        settled_plan(&session, body.clone()).await["plan_status"],
+        "ready"
+    );
+    let conn = rusqlite::Connection::open(dir.path().join("helm.db")).unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE troubleshooting_plans SET dashboard_plan_status = 'pending'",
+            []
+        )
+        .unwrap()
+            > 0
+    );
+    let answer = session.post("/api/plan", body).await;
+    assert_eq!(answer["plan_status"], "loading", "{answer}");
 }

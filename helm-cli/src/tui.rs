@@ -1230,6 +1230,7 @@ enum PlanStatus {
         retry_after_secs: u64,
     },
     AuthFailed,
+    ProviderUnavailable,
     MalformedResponse,
     DangerousCommand {
         pattern: String,
@@ -1268,6 +1269,7 @@ impl DashboardPlan {
                 "Provider authentication failed. Run `helmops init --provider X` to reconfigure."
                     .into()
             }
+            PlanStatus::ProviderUnavailable => "Cannot reach the provider. Check the endpoint and connection, then press Alt+G to retry.".into(),
             PlanStatus::MalformedResponse => {
                 "LLM returned unparseable response. Debug info logged. Press Alt+G to retry.".into()
             }
@@ -5630,6 +5632,11 @@ Report the exit status and the concise output."
     ) -> Option<DashboardPlan> {
         let fix_steps = Self::validated_steps_from_plan_json(&record.proposed_fix_steps_json);
         let status = match record.dashboard_plan_status.as_str() {
+            "loading" | "pending"
+                if Utc::now().timestamp().saturating_sub(record.updated_at) > 120 =>
+            {
+                PlanStatus::Timeout
+            }
             "loading" | "pending" => PlanStatus::Loading {
                 started_at: record.updated_at.max(record.created_at),
             },
@@ -5655,6 +5662,7 @@ Report the exit status and the concise output."
                 pattern: record.generation_error.clone(),
                 command_text: String::new(),
             },
+            "provider_unavailable" => PlanStatus::ProviderUnavailable,
             "malformed_response" => PlanStatus::MalformedResponse,
             _ if !fix_steps.is_empty() => PlanStatus::Ready {
                 narrative: if record.narrative_summary.trim().is_empty() {
@@ -5667,6 +5675,16 @@ Report the exit status and the concise output."
             _ => return None,
         };
 
+        let rate_limit_retry_at = match &status {
+            PlanStatus::RateLimited { retry_after_secs } => {
+                let elapsed = Utc::now()
+                    .timestamp()
+                    .saturating_sub(record.updated_at)
+                    .max(0) as u64;
+                Some(Instant::now() + Duration::from_secs(retry_after_secs.saturating_sub(elapsed)))
+            }
+            _ => None,
+        };
         Some(DashboardPlan {
             finding_id: if !record.finding_id.is_empty() {
                 record.finding_id.clone()
@@ -5681,7 +5699,7 @@ Report the exit status and the concise output."
                 .map(|steps| steps.len())
                 .unwrap_or(0),
             fix_steps: fix_steps.len(),
-            rate_limit_retry_at: None,
+            rate_limit_retry_at,
             rate_limit_retry_pending: false,
         })
     }
@@ -5734,6 +5752,12 @@ Report the exit status and the concise output."
                 PlanStatus::AuthFailed => {
                     ("auth_failed", String::new(), "[]".to_owned(), String::new())
                 }
+                PlanStatus::ProviderUnavailable => (
+                    "provider_unavailable",
+                    String::new(),
+                    "[]".to_owned(),
+                    String::new(),
+                ),
                 PlanStatus::MalformedResponse => (
                     "malformed_response",
                     String::new(),
@@ -6632,6 +6656,7 @@ Report the exit status and the concise output."
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => match &e {
                 ProviderError::Timeout => return PlanStatus::Timeout,
+                ProviderError::Request(_) => return PlanStatus::ProviderUnavailable,
                 ProviderError::HttpStatus { status, .. } => {
                     if *status == 401 || *status == 403 {
                         return PlanStatus::AuthFailed;
@@ -8587,6 +8612,7 @@ fn render_ops_troubleshoot_plan(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                     "🔒 Provider authentication failed.\nRun `helmops init --provider X` to reconfigure.\n\nAlt+A open reviewed apply flow   Enter apply   Esc detail"
                         .to_string()
                 }
+                PlanStatus::ProviderUnavailable => plan.summary_from_status(),
                 PlanStatus::MalformedResponse => {
                     "⚠ LLM returned unparseable response. Debug info logged.\nPress Alt+G to retry.\n\nAlt+A open reviewed apply flow   Enter apply   Esc detail"
                         .to_string()
@@ -10606,8 +10632,7 @@ fn format_log_age(last_seen_unix_ms: i64) -> String {
 fn provider_boundary_label(app: &TuiApp) -> &'static str {
     if !app.is_llm_provider_configured() {
         "ai off"
-    } else if app.active_settings.choice == ProviderChoice::Ollama && !app.model.ends_with(":cloud")
-    {
+    } else if crate::provider_inference_is_local(&app.active_settings) {
         "ai local"
     } else {
         "ai api"
@@ -12003,7 +12028,7 @@ fn base_url_for_provider(choice: ProviderChoice, settings: &ProviderSettings) ->
 fn model_note_for(choice: ProviderChoice, model: &str, live: bool) -> Option<String> {
     if model == default_model_name(choice) {
         Some("default".to_owned())
-    } else if choice == ProviderChoice::Ollama && model.ends_with(":cloud") {
+    } else if choice == ProviderChoice::Ollama && model.contains("cloud") {
         Some("cloud".to_owned())
     } else if choice == ProviderChoice::Ollama {
         Some("local".to_owned())
@@ -12259,6 +12284,24 @@ mod tests {
     use proptest::prelude::*;
     use ratatui::backend::TestBackend;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn provider_label_distinguishes_cloud_models_and_remote_endpoints() {
+        let mut app = app();
+        assert_eq!(provider_boundary_label(&app), "ai local");
+        for model in ["gemma4:31b-cloud", "glm-5.1:cloud"] {
+            app.model = model.into();
+            app.active_settings.model = Some(model.into());
+            assert_eq!(provider_boundary_label(&app), "ai api");
+            assert_eq!(
+                model_note_for(ProviderChoice::Ollama, model, true).as_deref(),
+                Some("cloud")
+            );
+        }
+        app.active_settings.model = Some("qwen3:4b".into());
+        app.active_settings.base_url = Some("https://remote.example.com".into());
+        assert_eq!(provider_boundary_label(&app), "ai api");
+    }
 
     type AuditRow = (
         String,
@@ -14281,6 +14324,7 @@ mod tests {
             },
             PlanStatus::Timeout,
             PlanStatus::AuthFailed,
+            PlanStatus::ProviderUnavailable,
             PlanStatus::MalformedResponse,
             PlanStatus::RateLimited {
                 retry_after_secs: 7,
@@ -14316,6 +14360,12 @@ mod tests {
                 .take()
                 .expect("plan restored");
             assert_eq!(restored.plan_id, plan_id);
+            if matches!(status, PlanStatus::RateLimited { .. }) {
+                assert!(
+                    restored.rate_limit_retry_at.is_some(),
+                    "restored rate limit must resume its countdown"
+                );
+            }
             match (status, &restored.status) {
                 (
                     PlanStatus::Ready { fix_steps: a, .. },
@@ -14332,6 +14382,33 @@ mod tests {
                 (a, b) => assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b)),
             }
         }
+    }
+
+    #[test]
+    fn restored_orphaned_loading_plan_becomes_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_in_dir(&dir, ProviderChoice::Groq);
+        let conn = rusqlite::Connection::open(&app.runtime.db_path).unwrap();
+        TroubleshootingPlanStore::insert(
+            &conn,
+            "orphan",
+            "finding:f",
+            "s",
+            "fp",
+            "[]",
+            "[]",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        let mut record = TroubleshootingPlanStore::get(&conn, "orphan")
+            .unwrap()
+            .unwrap();
+        record.dashboard_plan_status = "loading".into();
+        record.updated_at = Utc::now().timestamp() - 121;
+        let restored = app.dashboard_plan_from_record(&record).unwrap();
+        assert!(matches!(restored.status, PlanStatus::Timeout));
     }
 
     #[test]
