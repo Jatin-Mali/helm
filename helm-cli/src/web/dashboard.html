@@ -993,7 +993,8 @@ function syncActionButtons() {
     node.disabled = pendingActions.has(actionKey('/api/service-action', {unit: node.dataset.serviceUnit, action: node.dataset.serviceAction}));
   });
   document.querySelectorAll('[data-change-rollback]').forEach(node => {
-    node.disabled = pendingActions.has(actionKey('/api/change-rollback', {changeSetId: node.dataset.changeRollback}));
+    node.disabled = node.dataset.rollbackSupported !== 'true'
+      || pendingActions.has(actionKey('/api/change-rollback', {changeSetId: node.dataset.changeRollback}));
   });
   document.querySelectorAll('[data-plan-generate], [data-plan-retry]').forEach(node => {
     node.disabled = planBusy;
@@ -1238,7 +1239,7 @@ function renderQueue() {
       ? (f.id === f.rootCauseFindingId ? `root cause × ${relatedCount + 1}` : `grouped × ${relatedCount + 1}`)
       : '';
     return `
-      <article class="incident-row${active}${focused}" data-id="${f.id}" tabindex="0">
+      <article class="incident-row${active}${focused}" data-id="${escAttr(f.id)}" data-fingerprint="${escAttr(f.fingerprint)}" tabindex="0">
         <div class="incident-top">
           <span class="sev-dot sev-${esc(f.severity)} dot-fill"></span>
           <div class="incident-title">${esc(f.title)}</div>
@@ -1504,7 +1505,7 @@ function renderChanges() {
             ${selected.rollbackSupported ? '<span class="pill">rollback available</span>' : ''}
           </div>
           <div class="inline-actions mt-4">
-            <button type="button" class="button" data-change-rollback="${escAttr(selected.id)}" ${selected.rollbackSupported ? '' : 'disabled'}>Rollback</button>
+            <button type="button" class="button" data-change-rollback="${escAttr(selected.id)}" data-rollback-supported="${selected.rollbackSupported ? 'true' : 'false'}" ${selected.rollbackSupported ? '' : 'disabled'}>Rollback</button>
           </div>
           <section class="card inset mt-4">
             <div class="panel-title">Affected Resources</div>

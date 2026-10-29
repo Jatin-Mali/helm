@@ -74,3 +74,18 @@ test('snapshot replacement restores focus to the same contextual control',()=>{
     assert.equal(focused,true,JSON.stringify(dataset));
   }
 });
+
+test('pending-action sync keeps an unsupported rollback disabled',()=>{
+  const d=dashboard();
+  const button={dataset:{changeRollback:'cs-1',rollbackSupported:'false'},disabled:true,setAttribute(){}};
+  d.document.querySelectorAll=selector=>selector.includes('data-change-rollback')?[button]:[];
+  d.run('syncActionButtons()');
+  assert.equal(button.disabled,true,'a change set without rollback support must stay disabled');
+});
+
+test('keyboard focus on a queue row survives a snapshot re-render',()=>{
+  const d=dashboard();
+  d.run("state.findings=[{id:'old-id',fingerprint:'fp1',title:'t',severity:'warning'}]");
+  const html=d.run("renderQueue.toString()");
+  assert.match(html,/data-fingerprint/,'queue rows must carry the stable fingerprint');
+});

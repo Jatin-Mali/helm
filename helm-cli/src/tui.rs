@@ -5681,7 +5681,10 @@ Report the exit status and the concise output."
                     .timestamp()
                     .saturating_sub(record.updated_at)
                     .max(0) as u64;
-                Some(Instant::now() + Duration::from_secs(retry_after_secs.saturating_sub(elapsed)))
+                // An expired window waits for Alt+G: resuming it would call the provider
+                // as soon as the restored incident is opened.
+                (elapsed < *retry_after_secs)
+                    .then(|| Instant::now() + Duration::from_secs(retry_after_secs - elapsed))
             }
             _ => None,
         };
@@ -14382,6 +14385,36 @@ mod tests {
                 (a, b) => assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b)),
             }
         }
+    }
+
+    #[test]
+    fn restored_expired_rate_limit_waits_for_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_in_dir(&dir, ProviderChoice::Groq);
+        let conn = rusqlite::Connection::open(&app.runtime.db_path).unwrap();
+        TroubleshootingPlanStore::insert(
+            &conn,
+            "limited",
+            "finding:f",
+            "s",
+            "fp",
+            "[]",
+            "[]",
+            "[]",
+            false,
+            "",
+        )
+        .unwrap();
+        let mut record = TroubleshootingPlanStore::get(&conn, "limited")
+            .unwrap()
+            .unwrap();
+        record.dashboard_plan_status = "rate_limited".into();
+        record.generation_error = "retry_after_secs=7".into();
+        record.updated_at = Utc::now().timestamp() - 100;
+        let restored = app.dashboard_plan_from_record(&record).unwrap();
+        // An auto-retry here would call the provider the moment the incident is opened.
+        assert!(restored.rate_limit_retry_at.is_none());
+        assert!(matches!(restored.status, PlanStatus::RateLimited { .. }));
     }
 
     #[test]
