@@ -55,6 +55,7 @@ struct WebState {
     /// persisted, so id lookups must not rely on `SnapshotStore` alone.
     live_findings: Mutex<HashMap<String, Finding>>,
     refresh_secs: u64,
+    last_snapshot: Mutex<Option<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -339,16 +340,18 @@ pub async fn serve(
         fleet_cache: Mutex::new(HashMap::new()),
         live_findings: Mutex::new(HashMap::new()),
         refresh_secs: web_refresh_secs,
+        last_snapshot: Mutex::new(None),
     });
 
     let bg_state = Arc::clone(&state);
-    let bg_tx = tx.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(web_refresh_secs));
+        // The first reader collects; ticking immediately would duplicate that collection.
+        // ponytail: simultaneous first readers can still each collect once; add a collect lock if that matters.
+        let period = Duration::from_secs(web_refresh_secs);
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         loop {
             interval.tick().await;
-            let json = collect_live_snapshot(bg_state.as_ref()).await;
-            let _ = bg_tx.send(json);
+            publish_snapshot(bg_state.as_ref()).await;
         }
     });
 
@@ -456,7 +459,7 @@ async fn ws_handler(
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<WebState>) {
     let mut rx = state.snapshot_tx.subscribe();
-    let initial = collect_live_snapshot(state.as_ref()).await;
+    let initial = current_snapshot(state.as_ref()).await;
     if socket.send(Message::Text(initial.into())).await.is_err() {
         return;
     }
@@ -473,15 +476,31 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<WebState>) {
     }
 }
 
+/// The last published snapshot; collects only before the first one exists.
+async fn current_snapshot(state: &WebState) -> String {
+    let cached = state.last_snapshot.lock().unwrap().clone();
+    match cached {
+        Some(json) => json,
+        None => publish_snapshot(state).await,
+    }
+}
+
+/// Collects now, stores the result for readers and broadcasts it to every websocket.
+async fn publish_snapshot(state: &WebState) -> String {
+    let json = collect_live_snapshot(state).await;
+    *state.last_snapshot.lock().unwrap() = Some(json.clone());
+    let _ = state.snapshot_tx.send(json.clone());
+    json
+}
+
 async fn api_snapshot(State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    let json = collect_live_snapshot(state.as_ref()).await;
+    let json = current_snapshot(state.as_ref()).await;
     Json(serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default())
 }
 
 async fn api_refresh(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     let daemon_requested = crate::request_daemon_refresh().unwrap_or(false);
-    let json = collect_live_snapshot(state.as_ref()).await;
-    let _ = state.snapshot_tx.send(json.clone());
+    let json = publish_snapshot(state.as_ref()).await;
     let snapshot = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
     Json(serde_json::json!({
         "ok": true,
@@ -748,8 +767,7 @@ async fn api_change_rollback(
     .await
     {
         Ok(results) => {
-            let json = collect_live_snapshot(state.as_ref()).await;
-            let _ = state.snapshot_tx.send(json);
+            publish_snapshot(state.as_ref()).await;
             Json(serde_json::json!({
                 "ok": true,
                 "changeSetId": req.change_set_id,
@@ -816,8 +834,7 @@ async fn api_pipeline_webhook(
     };
     match record_pipeline_webhook_event(&provider, &service_id, &delivery_id, &payload) {
         Ok(()) => {
-            let json = collect_live_snapshot(state.as_ref()).await;
-            let _ = state.snapshot_tx.send(json);
+            publish_snapshot(state.as_ref()).await;
             (
                 StatusCode::OK,
                 Json(
@@ -1487,6 +1504,7 @@ mod tests {
             fleet_cache: Mutex::new(HashMap::new()),
             live_findings: Mutex::new(HashMap::new()),
             refresh_secs: 60,
+            last_snapshot: Mutex::new(None),
         };
         let session = crate::web_auth::Session {
             id: "client-a".into(),
@@ -1602,6 +1620,7 @@ mod tests {
                 fleet_cache: Mutex::new(HashMap::new()),
                 live_findings: Mutex::new(HashMap::new()),
                 refresh_secs: 60,
+                last_snapshot: Mutex::new(None),
             });
             let service = api_service_action(
                 State(state.clone()),

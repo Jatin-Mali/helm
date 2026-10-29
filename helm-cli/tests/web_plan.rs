@@ -287,7 +287,15 @@ async fn snapshot_carries_ready_ai_plan() {
     let id = json!({"findingId": finding["id"], "fingerprint": finding["fingerprint"]});
     let plan = settled_plan(&session, id).await;
     assert_eq!(plan["plan_status"], "ready", "{plan}");
-    let finding = session.broken_finding().await;
+    // Snapshot reads are cached for one interval; refresh publishes the plan state now.
+    let refreshed = session.post("/api/refresh", json!({})).await;
+    let finding = refreshed["snapshot"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["title"].as_str().unwrap_or("").contains(BROKEN_UNIT))
+        .cloned()
+        .unwrap();
     assert_eq!(finding["planStatus"], "ready", "{finding}");
     assert!(
         finding["aiPlan"]
@@ -345,4 +353,27 @@ async fn snapshot_reports_the_served_provider() {
         snapshot["provider"]
     );
     assert_ne!(snapshot["aiState"], "off", "{}", snapshot["aiState"]);
+}
+
+/// Readers (page loads, extra tabs, websocket reconnects) share the background collection
+/// instead of each running a full monitor cycle.
+#[tokio::test]
+async fn snapshot_reads_share_one_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = start(dir.path(), None).await;
+    let first = session.get("/api/snapshot").await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let second = session.get("/api/snapshot").await;
+    assert_eq!(first["collectedAt"], second["collectedAt"]);
+}
+
+/// An explicit refresh still forces a new collection.
+#[tokio::test]
+async fn refresh_forces_a_new_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = start(dir.path(), None).await;
+    let first = session.get("/api/snapshot").await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let refreshed = session.post("/api/refresh", json!({})).await;
+    assert_ne!(first["collectedAt"], refreshed["snapshot"]["collectedAt"]);
 }
